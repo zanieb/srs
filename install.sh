@@ -59,8 +59,11 @@ if [[ ! -x "$sld_bin" ]]; then
     exit 2
 fi
 
-# A linked Rust bootstrap sysroot does not include Cargo by default.
-ln -sf "$cargo_bin" "$toolchain_dir/bin/cargo"
+# A linked Rust bootstrap sysroot does not include Cargo by default. Keep the
+# built Cargo binary next to an SRS wrapper that separates host helpers from
+# normal Cranelift target artifacts.
+ln -sf "$cargo_bin" "$toolchain_dir/bin/cargo-srs-real"
+ln -sf "$root/cargo-srs.sh" "$toolchain_dir/bin/cargo"
 
 # Rustc prepends this per-target tools directory to PATH before spawning the
 # configured linker. Keep the baked-in default linker name relocatable.
@@ -71,4 +74,5 @@ ln -sf "$sld_bin" "$tools_bin/sld"
 
 rustup toolchain link "$name" "$toolchain_dir"
 printf 'linked rustup toolchain %s -> %s\n' "$name" "$toolchain_dir"
+printf 'attached Cargo wrapper %s -> %s\n' "$toolchain_dir/bin/cargo" "$root/cargo-srs.sh"
 printf 'attached sld linker %s -> %s\n' "$tools_bin/sld" "$sld_bin"

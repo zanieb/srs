@@ -18,13 +18,18 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
 - `scripts/build-apple-containers.sh`: builds the Linux x86_64 SRS lane from
   macOS through Apple containers.
 - `install.sh`: links the built stage 2 toolchain into rustup under a custom
-  name and attaches the built Cargo and `sld` binaries to that linked sysroot.
+  name and attaches SRS Cargo plus `sld` to that linked sysroot.
+- `cargo-srs.sh`: the installed Cargo wrapper that keeps build scripts, proc
+  macros, and their host-side dependencies on LLVM.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
 bootstrap build back through LLVM. The Rust fork makes the installed macOS
-arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS workloads.
+arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
+artifacts. The installed Cargo wrapper keeps build scripts, proc macros, and
+their host-side dependencies on LLVM because those helpers run during the
+build and can exercise host intrinsics that Cranelift does not support yet.
 LLVM stays available in the toolchain for explicit overrides. For macOS arm64,
 SRS bakes `sld` in as rustc's default linker.
 
@@ -77,9 +82,9 @@ run.
 
 ## Usage
 
-The SRS toolchain uses Cranelift by default and still has LLVM available. On
-macOS arm64 it links through the `sld` binary attached to the installed
-toolchain:
+The SRS toolchain uses Cranelift by default for target artifacts and still has
+LLVM available. Its Cargo wrapper uses LLVM for host build helpers. On macOS
+arm64 it links through the `sld` binary attached to the installed toolchain:
 
 ```bash
 cargo +srs build
