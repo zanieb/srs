@@ -6,7 +6,7 @@ extended = true
 tools = ["cargo"]
 
 [llvm]
-download-ci-llvm = true
+download-ci-llvm = false
 
 [rust]
 channel = "dev"
