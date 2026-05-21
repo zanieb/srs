@@ -22,14 +22,13 @@ dev profile into Cranelift explicitly.
 
 ## Build
 
-The source repositories are intentionally owned by this directory:
+The source repositories are pinned as submodules owned by this directory:
 
 ```bash
-git clone https://github.com/rust-lang/rust.git repos/rust
-git clone https://github.com/bytecodealliance/wasmtime.git repos/cranelift
+git submodule update --init repos/rust repos/cranelift
 ```
 
-After the Rust fork carries the SRS Cranelift patches:
+After the submodules contain the SRS Rust and Cranelift patches:
 
 ```bash
 ./build.sh
@@ -40,3 +39,7 @@ After the Rust fork carries the SRS Cranelift patches:
 The default rustup toolchain name is `srs`. The build, installer, and proof
 scripts accept overrides through their command-line arguments or documented
 environment variables in the scripts.
+
+Development happens inside each submodule. Commit Rust and Cranelift changes in
+their owning repositories, then stage the updated submodule paths in SRS to pin
+the integrated stack revision.

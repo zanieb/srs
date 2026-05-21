@@ -1,0 +1,6 @@
+[submodule "repos/rust"]
+	path = repos/rust
+	url = https://github.com/rust-lang/rust.git
+[submodule "repos/cranelift"]
+	path = repos/cranelift
+	url = https://github.com/bytecodealliance/wasmtime.git
