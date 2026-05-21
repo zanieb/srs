@@ -15,6 +15,8 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
   Cranelift backends, plus Cargo from the Rust tree's Cargo submodule.
 - `build-sld.sh`: builds the `sld` binary, using the linked SRS toolchain by
   default when called directly.
+- `scripts/build-apple-containers.sh`: builds the Linux x86_64 SRS lane from
+  macOS through Apple containers.
 - `install.sh`: links the built stage 2 toolchain into rustup under a custom
   name and attaches the built Cargo and `sld` binaries to that linked sysroot.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
@@ -55,6 +57,23 @@ compiler driver while the installed SRS compiler defaults to `sld`; set
 `SRS_SLD_BOOTSTRAP_TOOLCHAIN` to choose another existing rustup toolchain for
 that step. `./install.sh` relinks the resulting stage 2 sysroot; it does not
 copy the toolchain.
+
+On Apple silicon macOS, use Apple containers to exercise the Linux x86_64 build
+lane locally:
+
+```bash
+container system start
+./scripts/build-apple-containers.sh
+```
+
+The script mounts SRS at `/work`, runs an amd64 Linux Rust image with Rosetta,
+installs the Linux build dependencies in that disposable container, and keeps
+its build output under `target/apple-containers/`. It passes additional
+arguments through to `build.sh`, for example
+`./scripts/build-apple-containers.sh --dry-run -v`. Set
+`SRS_APPLE_CONTAINER_IMAGE`, `SRS_APPLE_CONTAINER_MEMORY`,
+`SRS_APPLE_CONTAINER_CPUS`, or `SRS_APPLE_CONTAINER_DNS` to tune the container
+run.
 
 ## Usage
 
