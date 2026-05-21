@@ -38,9 +38,14 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Fetch Rust history for CI LLVM
+        # SRS is a Rust fork. Rust bootstrap needs upstream history to select
+        # the last upstream CI LLVM build instead of a fork-only parent commit.
+        run: git -C repos/rust fetch --unshallow origin
+
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
-        run: ./build.sh --set=rust.incremental=false --set=rust.debuginfo-level=0
+        run: ./build.sh --ci false --set=rust.incremental=false --set=rust.debuginfo-level=0
 
       - name: Install SRS
         run: ./install.sh
