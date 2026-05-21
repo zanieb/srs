@@ -4,3 +4,6 @@
 [submodule "repos/cranelift"]
 	path = repos/cranelift
 	url = https://github.com/bytecodealliance/wasmtime.git
+[submodule "repos/sld"]
+	path = repos/sld
+	url = https://github.com/zanieb/sld.git
