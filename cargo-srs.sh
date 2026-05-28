@@ -9,6 +9,10 @@ if [[ ! -x "$real_cargo" ]]; then
     exit 2
 fi
 
+# Target artifacts link through sld by default. Preserve an explicit override
+# while making incremental link reuse the normal SRS developer-loop behavior.
+export SLD_INCREMENTAL="${SLD_INCREMENTAL:-1}"
+
 # Build scripts and proc macros execute on the build host. Keep those helpers
 # on LLVM while SRS target artifacts follow rustc's Cranelift default.
 exec "$real_cargo" \
