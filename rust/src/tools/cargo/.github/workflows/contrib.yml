@@ -1,0 +1,59 @@
+name: Contrib Deploy
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  cancel-in-progress: false
+  group: "gh-pages"
+
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: 0.5.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+    - name: Install mdbook
+      run: |
+        mkdir mdbook
+        curl -Lf https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=./mdbook
+        echo `pwd`/mdbook >> $GITHUB_PATH
+    - name: Build
+      run: |
+        GENERATE_PY="$(pwd)/ci/generate.py"
+
+        cd src/doc/contrib
+        mdbook build
+
+        mkdir gh-pages
+        cd gh-pages
+        mv ../book contrib
+
+        # Generate HTML for link redirections.
+        python3 "$GENERATE_PY"
+    - name: Upload Artifact
+      uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+      with:
+        path: src/doc/contrib/gh-pages
+
+  deploy:
+    needs: build
+
+    permissions:
+      pages: write # to deploy to Pages
+      id-token: write # to verify the deployment originates from an appropriate source
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0
