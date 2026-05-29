@@ -1,0 +1,163 @@
+use std::path::Path;
+
+use cargo_util_schemas::manifest::InheritableField;
+use cargo_util_schemas::manifest::TomlToolLints;
+use cargo_util_terminal::report::AnnotationKind;
+use cargo_util_terminal::report::Group;
+use cargo_util_terminal::report::Level;
+use cargo_util_terminal::report::Origin;
+use cargo_util_terminal::report::Patch;
+use cargo_util_terminal::report::Snippet;
+use tracing::instrument;
+
+use super::STYLE;
+use crate::CargoResult;
+use crate::GlobalContext;
+use crate::core::Package;
+use crate::diagnostics::DiagnosticStats;
+use crate::diagnostics::Lint;
+use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelSource;
+use crate::diagnostics::get_key_value_span;
+use crate::diagnostics::rel_cwd_manifest_path;
+
+pub static LINT: &Lint = &Lint {
+    name: "redundant_homepage",
+    desc: "`package.homepage` is redundant with another manifest field",
+    primary_group: &STYLE,
+    msrv: Some(super::CARGO_LINTS_MSRV),
+    feature_gate: None,
+    docs: Some(
+        r#"
+### What it does
+
+Checks if the value of `package.homepage` is already covered by another field.
+
+See also [`package.homepage` reference documentation](manifest.md#the-homepage-field).
+
+### Why it is bad
+
+When package browsers render each link, a redundant link adds visual noise.
+
+### Drawbacks
+
+### Example
+
+```toml
+[package]
+name = "foo"
+homepage = "https://github.com/rust-lang/cargo/"
+repository = "https://github.com/rust-lang/cargo/"
+```
+
+Should be written as:
+
+```toml
+[package]
+name = "foo"
+repository = "https://github.com/rust-lang/cargo/"
+```
+"#,
+    ),
+};
+
+#[instrument(skip_all)]
+pub fn redundant_homepage(
+    pkg: &Package,
+    manifest_path: &Path,
+    cargo_lints: &TomlToolLints,
+    stats: &mut DiagnosticStats,
+    gctx: &GlobalContext,
+) -> CargoResult<()> {
+    let (lint_level, source) = LINT.level(
+        cargo_lints,
+        pkg.rust_version(),
+        pkg.manifest().unstable_features(),
+    );
+
+    if lint_level == LintLevel::Allow {
+        return Ok(());
+    }
+
+    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+
+    lint_package(pkg, &manifest_path, lint_level, source, stats, gctx)
+}
+
+fn lint_package(
+    pkg: &Package,
+    manifest_path: &str,
+    lint_level: LintLevel,
+    source: LintLevelSource,
+    stats: &mut DiagnosticStats,
+    gctx: &GlobalContext,
+) -> CargoResult<()> {
+    let manifest = pkg.manifest();
+
+    let Some(normalized_pkg) = &manifest.normalized_toml().package else {
+        return Ok(());
+    };
+    let Some(InheritableField::Value(homepage)) = &normalized_pkg.homepage else {
+        return Ok(());
+    };
+
+    let other_field = if let Some(InheritableField::Value(repository)) = &normalized_pkg.repository
+        && repository == homepage
+    {
+        "repository"
+    } else if let Some(InheritableField::Value(documentation)) = &normalized_pkg.documentation
+        && documentation == homepage
+    {
+        "documentation"
+    } else {
+        return Ok(());
+    };
+
+    let document = manifest.document();
+    let contents = manifest.contents();
+    let level = lint_level.to_diagnostic_level();
+    let emitted_source = LINT.emitted_source(lint_level, source);
+
+    let mut primary = Group::with_title(level.primary_title(LINT.desc));
+    if let Some(document) = document
+        && let Some(contents) = contents
+        && let Some(span) = get_key_value_span(document, &["package", "homepage"])
+    {
+        let mut snippet = Snippet::source(contents)
+            .path(manifest_path)
+            .annotation(AnnotationKind::Primary.span(span.value));
+        if let Some(span) = get_key_value_span(document, &["package", other_field]) {
+            snippet = snippet.annotation(AnnotationKind::Context.span(span.value));
+        }
+        primary = primary.element(snippet);
+    } else {
+        primary = primary.element(Origin::path(manifest_path));
+    }
+    primary = primary.element(Level::NOTE.message(emitted_source));
+    let mut report = vec![primary];
+    if let Some(document) = document
+        && let Some(contents) = contents
+        && let Some(span) = get_key_value_span(document, &["package", "homepage"])
+    {
+        let span = if let Some(workspace_span) =
+            get_key_value_span(document, &["package", "homepage", "workspace"])
+        {
+            span.key.start..workspace_span.value.end
+        } else {
+            span.key.start..span.value.end
+        };
+        let mut help =
+            Group::with_title(Level::HELP.secondary_title("consider removing `package.homepage`"));
+        help = help.element(
+            Snippet::source(contents)
+                .path(manifest_path)
+                .patch(Patch::new(span, "")),
+        );
+        report.push(help);
+    }
+
+    stats.record_lint(lint_level);
+    gctx.shell().print_report(&report, lint_level.force())?;
+
+    Ok(())
+}
