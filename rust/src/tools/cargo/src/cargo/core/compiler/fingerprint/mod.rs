@@ -407,6 +407,7 @@ use crate::{CARGO_ENV, GlobalContext};
 
 use super::BuildContext;
 use super::BuildRunner;
+use super::CompileMode;
 use super::FileFlavor;
 use super::Job;
 use super::Unit;
@@ -1606,7 +1607,7 @@ fn calculate_normal(
 
     // Figure out what the outputs of our unit is, and we'll be storing them
     // into the fingerprint as well.
-    let outputs = build_runner
+    let mut outputs = build_runner
         .outputs(unit)?
         .iter()
         .filter(|output| {
@@ -1616,7 +1617,23 @@ fn calculate_normal(
             )
         })
         .map(|output| output.path.clone())
-        .collect();
+        .collect::<Vec<_>>();
+    if build_runner.bcx.build_config.artifact_cache.is_some()
+        && unit.target.is_lib()
+        && !unit.target.proc_macro()
+        && matches!(unit.mode, CompileMode::Build)
+        && !unit.pkg.has_custom_build()
+        && build_runner.sbom_output_files(unit)?.is_empty()
+    {
+        // Cached hardlinks stay immutable; this target-local completion stamp
+        // records a successful restore after freshly built dependencies.
+        outputs.push(
+            build_runner
+                .files()
+                .fingerprint_dir(unit)
+                .join(super::ARTIFACT_CACHE_FRESHNESS_STAMP),
+        );
+    }
 
     // Fill out a bunch more information that we'll be tracking typically
     // hashed to take up less space on disk as we just need to know when things

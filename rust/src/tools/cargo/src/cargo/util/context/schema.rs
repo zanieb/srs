@@ -210,6 +210,12 @@ pub struct CargoBuildConfig {
     pub rustc: Option<ConfigRelativePath>,
     pub rustdoc: Option<ConfigRelativePath>,
     pub artifact_dir: Option<ConfigRelativePath>,
+    /// Unstable feature `-Zartifact-cache`.
+    pub artifact_cache_dir: Option<ConfigRelativePath>,
+    /// Unstable feature `-Zartifact-cache`.
+    pub artifact_cache_materialization: Option<String>,
+    /// Unstable feature `-Zartifact-cache`.
+    pub artifact_cache_max_size: Option<String>,
     pub warnings: Option<WarningHandling>,
     /// Unstable feature `-Zsbom`.
     pub sbom: Option<bool>,

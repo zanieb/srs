@@ -509,22 +509,27 @@ impl GlobalContext {
     pub fn load_global_rustc(&self, ws: Option<&Workspace<'_>>) -> CargoResult<Rustc> {
         let cache_location =
             ws.map(|ws| ws.build_dir().join(".rustc_info.json").into_path_unlocked());
-        let wrapper = self.maybe_get_tool("rustc_wrapper", &self.build_config()?.rustc_wrapper);
+        let build_config = self.build_config()?;
+        let wrapper = self.maybe_get_tool("rustc_wrapper", &build_config.rustc_wrapper);
         let rustc_workspace_wrapper = self.maybe_get_tool(
             "rustc_workspace_wrapper",
-            &self.build_config()?.rustc_workspace_wrapper,
+            &build_config.rustc_workspace_wrapper,
         );
+        let artifact_cache_identity_is_modeled =
+            self.maybe_get_tool("rustc", &build_config.rustc).is_none();
+        let rustup_rustc = self
+            .home()
+            .join("bin")
+            .join("rustc")
+            .into_path_unlocked()
+            .with_extension(env::consts::EXE_EXTENSION);
 
         Rustc::new(
-            self.get_tool(Tool::Rustc, &self.build_config()?.rustc),
+            self.get_tool(Tool::Rustc, &build_config.rustc),
             wrapper,
             rustc_workspace_wrapper,
-            &self
-                .home()
-                .join("bin")
-                .join("rustc")
-                .into_path_unlocked()
-                .with_extension(env::consts::EXE_EXTENSION),
+            artifact_cache_identity_is_modeled,
+            &rustup_rustc,
             if self.cache_rustc_info {
                 cache_location
             } else {

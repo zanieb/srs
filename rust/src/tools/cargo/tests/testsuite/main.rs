@@ -4,6 +4,10 @@
 
 mod advanced_env;
 mod alt_registry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod artifact_cache;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod artifact_cache_unsupported;
 mod artifact_dep;
 mod artifact_dir;
 mod bad_config;

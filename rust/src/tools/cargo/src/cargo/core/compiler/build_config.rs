@@ -48,9 +48,26 @@ pub struct BuildConfig {
     pub timing_report: bool,
     /// Output SBOM precursor files.
     pub sbom: bool,
+    /// Reuse verified ordinary-library outputs from a shared content cache.
+    pub artifact_cache: Option<ArtifactCacheConfig>,
     /// Build compile time dependencies only, e.g., build scripts and proc macros
     pub compile_time_deps_only: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactCacheMaterialization {
+    Copy,
+    Hardlink,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactCacheConfig {
+    pub dir: PathBuf,
+    pub materialization: ArtifactCacheMaterialization,
+    pub max_size: u64,
+}
+
+const DEFAULT_ARTIFACT_CACHE_MAX_SIZE: u64 = 10_000_000_000;
 
 fn default_parallelism() -> CargoResult<u32> {
     Ok(available_parallelism()
@@ -112,6 +129,41 @@ impl BuildConfig {
             }
             (None, _) => false,
         };
+        let artifact_cache = match (&cfg.artifact_cache_dir, gctx.cli_unstable().artifact_cache) {
+            (Some(dir), true) => {
+                let materialization = match cfg.artifact_cache_materialization.as_deref() {
+                    None | Some("hardlink") => ArtifactCacheMaterialization::Hardlink,
+                    Some("copy") => ArtifactCacheMaterialization::Copy,
+                    Some(mode) => anyhow::bail!(
+                        "unsupported build.artifact-cache-materialization value `{mode}`; expected `hardlink` or `copy`"
+                    ),
+                };
+                let max_size = cfg
+                    .artifact_cache_max_size
+                    .as_deref()
+                    .map(crate::core::gc::parse_human_size)
+                    .transpose()?
+                    .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_SIZE);
+                Some(ArtifactCacheConfig {
+                    dir: dir.resolve_path(gctx),
+                    materialization,
+                    max_size,
+                })
+            }
+            (Some(_), false) => {
+                gctx.shell().warn(
+                    "ignoring 'artifact-cache-dir' config, pass `-Zartifact-cache` to enable it",
+                )?;
+                None
+            }
+            (None, true) if cfg.artifact_cache_materialization.is_some() => anyhow::bail!(
+                "build.artifact-cache-materialization requires build.artifact-cache-dir"
+            ),
+            (None, true) if cfg.artifact_cache_max_size.is_some() => {
+                anyhow::bail!("build.artifact-cache-max-size requires build.artifact-cache-dir")
+            }
+            (None, _) => None,
+        };
 
         Ok(BuildConfig {
             requested_kinds,
@@ -129,6 +181,7 @@ impl BuildConfig {
             future_incompat_report: false,
             timing_report: false,
             sbom,
+            artifact_cache,
             compile_time_deps_only: false,
         })
     }

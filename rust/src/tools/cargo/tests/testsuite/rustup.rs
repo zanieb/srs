@@ -142,6 +142,12 @@ impl RustupEnvironmentBuilder {
             .join("test-toolchain")
             .join("bin");
         toolchain_bin.mkdir_p();
+        rustup_home
+            .join("toolchains")
+            .join("test-toolchain")
+            .join("lib")
+            .join("rustlib")
+            .mkdir_p();
         let rustc_toolchain_exe = real_rustc_wrapper(&toolchain_bin, "real rustc running");
         let cargo_toolchain_exe = if self.proxy_calls_cargo {
             crate::utils::cargo_exe()
@@ -254,6 +260,76 @@ real rustc running
 
 "#]])
         .run();
+}
+
+#[cargo_test(ignore_windows = "PATH can't be overridden on Windows")]
+fn artifact_cache_rejects_unresolved_rustup_proxy() {
+    let RustupEnvironment { cargo_bin, .. } = RustupEnvironmentBuilder::new().build();
+    let cache = root().join("shared-cache");
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{}"
+                "#,
+                cache.display()
+            ),
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("-Zartifact-cache build --lib")
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env_remove("RUSTUP_HOME")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env("PATH", prepend_path(&cargo_bin))
+        .run();
+
+    assert!(
+        !cache.exists(),
+        "an unresolved rustup proxy must not publish restorable artifacts"
+    );
+}
+
+#[cargo_test(ignore_windows = "PATH can't be overridden on Windows")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn artifact_cache_models_rustup_proxy_with_default_home() {
+    let RustupEnvironment { cargo_bin, .. } = RustupEnvironmentBuilder::new().build();
+    let cache = root().join("shared-cache");
+    let proxy_only_bin = root().join("proxy-only-bin");
+    proxy_only_bin.mkdir_p();
+    fs::hard_link(
+        cargo_bin.join("rustc").with_extension(EXE_EXTENSION),
+        proxy_only_bin.join("rustc").with_extension(EXE_EXTENSION),
+    )
+    .unwrap();
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{}"
+                "#,
+                cache.display()
+            ),
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("-Zartifact-cache build --lib")
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env_remove("RUSTUP_HOME")
+        .env("RUSTUP_TOOLCHAIN", "test-toolchain")
+        .env("PATH", &proxy_only_bin)
+        .run();
+
+    assert!(
+        cache.join(".cargo-artifact-cache-size").exists(),
+        "a rustup proxy with a selected default-home toolchain should publish artifacts"
+    );
 }
 
 // This doesn't work on Windows because Cargo forces the PATH to contain the
