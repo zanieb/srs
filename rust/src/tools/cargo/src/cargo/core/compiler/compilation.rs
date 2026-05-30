@@ -141,7 +141,11 @@ pub struct Compilation<'gctx> {
 impl<'gctx> Compilation<'gctx> {
     pub fn new<'a>(bcx: &BuildContext<'a, 'gctx>) -> CargoResult<Compilation<'gctx>> {
         let rustc_process = bcx.rustc().process();
-        let primary_rustc_process = bcx.build_config.primary_unit_rustc.clone();
+        let primary_rustc_process = bcx
+            .build_config
+            .primary_unit_rustc
+            .as_ref()
+            .map(|rustc| rustc.process.clone());
         let rustc_workspace_wrapper_process = bcx.rustc().workspace_process();
         let host = bcx.host_triple().to_string();
 

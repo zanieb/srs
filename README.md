@@ -104,6 +104,20 @@ The installed Cargo wrapper sets `SLD_INCREMENTAL=1` by default so `sld` can
 reuse link state across development builds. Set `SLD_INCREMENTAL=0` for a
 full-link comparison or when diagnosing incremental-link behavior.
 
+SRS also builds and installs Clippy. Its `--fix` mode keeps the same
+dependency-linting mode as a preceding plain Clippy run, so workspace-member
+artifacts remain reusable when applying suggestions that Clippy just reported:
+
+```bash
+cargo +srs clippy --fix
+```
+
+Pass `--no-deps` explicitly when only the selected crate should be linted:
+
+```bash
+cargo +srs clippy --fix --no-deps
+```
+
 `with-sld.sh` is useful when the `sld` choice needs to be explicit, such as
 testing a non-installed linker binary or composing the linker with another
 toolchain:

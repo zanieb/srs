@@ -86,9 +86,11 @@ impl ClippyCmd {
         }
 
         clippy_args.append(&mut (old_args.collect()));
-        if cargo_subcommand == "fix" && !clippy_args.iter().any(|arg| arg == "--no-deps") {
-            clippy_args.push("--no-deps".into());
-        }
+        // Keep `--fix` aligned with a preceding `cargo clippy` run. The driver
+        // records `CLIPPY_ARGS` in dep-info, so implicitly adding `--no-deps`
+        // here invalidates workspace-member artifacts just before Cargo can
+        // apply the suggestions that Clippy reported. Users can still request
+        // `--no-deps` explicitly when they want to lint only the selected crate.
 
         Self {
             cargo_subcommand,
@@ -160,7 +162,7 @@ pub fn help_message() -> &'static str {
 
 <green,bold>Common options:</>
     <cyan,bold>--no-deps</>                Run Clippy only on the given crate, without linting the dependencies
-    <cyan,bold>--fix</>                    Automatically apply lint suggestions. This flag implies <cyan>--no-deps</> and <cyan>--all-targets</>
+    <cyan,bold>--fix</>                    Automatically apply lint suggestions. This flag implies <cyan>--all-targets</>
     <cyan,bold>-h</>, <cyan,bold>--help</>               Print this message
     <cyan,bold>-V</>, <cyan,bold>--version</>            Print version info and exit
     <cyan,bold>--explain [LINT]</>         Print the documentation for a given lint
@@ -200,14 +202,14 @@ mod tests {
     }
 
     #[test]
-    fn fix_implies_no_deps() {
+    fn fix_does_not_imply_no_deps() {
         let args = "cargo clippy --fix".split_whitespace().map(ToString::to_string);
         let cmd = ClippyCmd::new(args);
-        assert!(cmd.clippy_args.iter().any(|arg| arg == "--no-deps"));
+        assert!(!cmd.clippy_args.iter().any(|arg| arg == "--no-deps"));
     }
 
     #[test]
-    fn no_deps_not_duplicated_with_fix() {
+    fn explicit_no_deps_preserved_with_fix() {
         let args = "cargo clippy --fix -- --no-deps"
             .split_whitespace()
             .map(ToString::to_string);

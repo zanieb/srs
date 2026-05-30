@@ -73,7 +73,7 @@ use regex::Regex;
 use tracing::{debug, instrument, trace};
 
 pub use self::build_config::UserIntent;
-pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
+pub use self::build_config::{BuildConfig, CompileMode, MessageFormat, PrimaryUnitRustc};
 pub use self::build_context::BuildContext;
 pub use self::build_context::DepKindSet;
 pub use self::build_context::FileFlavor;

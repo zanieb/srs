@@ -199,6 +199,86 @@ fn prepare_for_2018() {
 }
 
 #[cargo_test]
+fn fix_edition_is_not_fresh_after_prior_plain_fix() {
+    let p = project()
+        .file(
+            "src/lib.rs",
+            r#"
+                #![allow(unused)]
+
+                mod foo {
+                    pub const FOO: &str = "fooo";
+                }
+
+                mod bar {
+                    use ::foo::FOO;
+                }
+
+                fn main() {
+                    let x = ::foo::FOO;
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("fix --allow-no-vcs --lib").run();
+    p.cargo("fix --edition --allow-no-vcs --lib")
+        .with_stderr_contains("[CHECKING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+
+    assert!(p.read_file("src/lib.rs").contains("use crate::foo::FOO;"));
+    assert!(
+        p.read_file("src/lib.rs")
+            .contains("let x = crate::foo::FOO;")
+    );
+}
+
+#[cargo_test]
+fn fix_edition_idioms_is_not_fresh_after_prior_plain_fix() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                edition = "2018"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+                extern crate bar;
+
+                pub fn foo() {
+                    bar::bar();
+                }
+            "#,
+        )
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.1.0"
+            "#,
+        )
+        .file("bar/src/lib.rs", "pub fn bar() {}")
+        .build();
+
+    p.cargo("fix --allow-no-vcs --lib").run();
+    assert!(p.read_file("src/lib.rs").contains("extern crate bar;"));
+
+    p.cargo("fix --edition-idioms --allow-no-vcs --lib")
+        .with_stderr_contains("[CHECKING] foo v0.1.0 ([ROOT]/foo)")
+        .run();
+    assert!(!p.read_file("src/lib.rs").contains("extern crate bar;"));
+}
+
+#[cargo_test]
 fn fix_tests_with_edition() {
     let p = project()
         .file(
@@ -1250,7 +1330,6 @@ fn doesnt_rebuild_dependencies() {
         .env("__CARGO_FIX_YOLO", "1")
         .with_stdout_data("")
         .with_stderr_data(str![[r#"
-[CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])

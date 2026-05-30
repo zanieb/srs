@@ -780,6 +780,21 @@ fn compute_metadata(
         }
     }
 
+    if build_runner.is_primary_package(unit) {
+        // Primary-unit rustc overrides can change the resulting artifacts.
+        // Hash their stable identity instead of the process itself: `cargo fix`
+        // uses a Cargo-as-rustc proxy with run-local socket addresses. This
+        // keeps equivalent fix runs fresh while separating them from normal
+        // `check`, `clippy`, and behaviorally distinct fix-mode artifacts.
+        build_runner
+            .bcx
+            .build_config
+            .primary_unit_rustc
+            .as_ref()
+            .map(|rustc| &rustc.metadata)
+            .hash(&mut shared_hasher);
+    }
+
     // Seed the contents of `__CARGO_DEFAULT_LIB_METADATA` to the hasher if present.
     // This should be the release channel, to get a different hash for each channel.
     if let Ok(ref channel) = build_runner

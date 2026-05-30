@@ -10,6 +10,16 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread::available_parallelism;
 
+/// An alternate rustc process for primary units and its stable artifact identity.
+///
+/// The process itself can contain per-invocation state, such as socket
+/// addresses, that must not participate in artifact metadata.
+#[derive(Debug, Clone)]
+pub struct PrimaryUnitRustc {
+    pub process: ProcessBuilder,
+    pub metadata: String,
+}
+
 /// Configuration information for a rustc build.
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
@@ -31,8 +41,8 @@ pub struct BuildConfig {
     pub unit_graph: bool,
     /// `true` to avoid really compiling.
     pub dry_run: bool,
-    /// An optional override of the rustc process for primary units
-    pub primary_unit_rustc: Option<ProcessBuilder>,
+    /// An optional override of the rustc process for primary units.
+    pub primary_unit_rustc: Option<PrimaryUnitRustc>,
     /// A thread used by `cargo fix` to receive messages on a socket regarding
     /// the success/failure of applying fixes.
     pub rustfix_diagnostic_server: Rc<RefCell<Option<RustfixDiagnosticServer>>>,
