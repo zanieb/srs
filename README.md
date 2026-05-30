@@ -101,8 +101,64 @@ cargo +srs build
 ```
 
 The installed Cargo wrapper sets `SLD_INCREMENTAL=1` by default so `sld` can
-reuse link state across development builds. Set `SLD_INCREMENTAL=0` for a
-full-link comparison or when diagnosing incremental-link behavior.
+reuse link state across development builds. It also enables Cargo's verified
+ordinary-library artifact cache at
+`${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2`. Dependencies compiled from
+a shared source location, such as registry packages, can be restored by
+hardlink across SRS worktrees on macOS and Linux; separate local checkouts
+remain distinct when their source location can affect output. Restoration
+copies automatically when the cache and build directory are on different
+filesystems.
+
+Wrapped `rustc` invocations, explicitly configured or otherwise unmodeled
+compiler dispatch, self-profile builds, rustc tracing runs,
+`RUSTC_BOOTSTRAP` builds, forced rustc version identity overrides, builds
+using profile-guided compiler inputs, arbitrary LLVM backend arguments,
+external codegen backend libraries, custom target specifications or search
+paths, explicit sysroot overrides, unmodeled dynamic loader overrides, and
+unmodeled dependency search paths execute normally without artifact
+restoration. Rustc `-Z` options do as well unless they select a named sysroot
+codegen backend, because those flows can change output or request side effects
+outside Cargo's cache key. Windows GNU-family targets also run without
+restoration because raw-dylib compilation can invoke unmodeled `dlltool`
+programs.
+
+Sysroot compiler and target library file identity, named sysroot codegen
+backend contents including SRS's Cranelift backend, and compiler-visible
+dynamic library search inputs participate in each cache key. Linux runs with
+nonempty `GLIBC_TUNABLES` or nested shared objects in compiler loader roots,
+including glibc hardware-capability candidates in configured or installed
+compiler loader roots, execute without restoration because they can change
+the selected compiler library.
+
+Sysroot library identity assumes ordinary toolchain publication updates file
+identity metadata. Overwriting one in place while preserving identity, size,
+and modification time, or mutating installed toolchain files in place during
+an active Cargo invocation, is outside the cache model. For ordinary
+publication that replaces watched installed files or directory trees, file
+and directory identity metadata are included in the cache identity and
+rechecked before artifact restoration and publication.
+
+Cargo detaches restored hardlinks before rebuilding them, but tools outside
+Cargo must not overwrite restored `.rlib` or `.rmeta` files in place: in
+hardlink mode, those files share storage with the central cache. Use copy
+materialization when a workflow mutates build artifacts after compilation.
+The cache is capped at 10 GB by default; completed entries are evicted
+oldest-first, entries larger than the configured limit are not published, and
+aborted publications are cleaned during later cache publication activity.
+Concurrent restores use shared cache locks; publication and eviction use an
+exclusive cache lock.
+
+Set `SLD_INCREMENTAL=0` for a full-link comparison or when diagnosing
+incremental-link behavior.
+
+Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
+Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root or
+`SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse without
+hardlink materialization. Set `SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE` to a
+human-readable cache limit such as `2GiB`. Choose a cache root writable only
+by trusted build processes; integrity checks are not authentication for
+artifacts supplied by another writer.
 
 `with-sld.sh` is useful when the `sld` choice needs to be explicit, such as
 testing a non-installed linker binary or composing the linker with another

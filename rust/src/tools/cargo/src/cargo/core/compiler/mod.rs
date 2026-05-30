@@ -60,20 +60,24 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::fs::{self, File};
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippet};
 use itertools::Itertools;
+use portable_atomic::{AtomicU64, Ordering};
 use regex::Regex;
 use tracing::{debug, instrument, trace};
 
 pub use self::build_config::UserIntent;
-pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
+pub use self::build_config::{
+    ArtifactCacheMaterialization, BuildConfig, CompileMode, MessageFormat,
+};
 pub use self::build_context::BuildContext;
 pub use self::build_context::DepKindSet;
 pub use self::build_context::FileFlavor;
@@ -110,7 +114,7 @@ use crate::util::OnceExt;
 use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message};
-use crate::util::{add_path_args, internal, path_args};
+use crate::util::{Filesystem, add_path_args, internal, path_args};
 
 use cargo_util::{ProcessBuilder, ProcessError, paths};
 use cargo_util_schemas::manifest::TomlDebugInfo;
@@ -120,6 +124,29 @@ use cargo_util_terminal::Verbosity;
 use rustfix::diagnostics::Applicability;
 
 const RUSTDOC_CRATE_VERSION_FLAG: &str = "--crate-version";
+const ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS";
+const ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS";
+const ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_DELAY_MS_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS";
+const ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS";
+const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE";
+const ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_KEY_FAILURE";
+const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING";
+const ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE";
+const ARTIFACT_CACHE_SIZE_STATE: &str = ".cargo-artifact-cache-size";
+const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v1";
+pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
+static ARTIFACT_CACHE_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A glorified callback for executing calls to rustc. Rather than calling rustc
 /// directly, we'll use an `Executor`, giving clients an opportunity to intercept
@@ -333,12 +360,57 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
+    let rustc_verbose_version = build_runner.bcx.rustc().verbose_version.clone();
+    let rustc_host = build_runner.bcx.rustc().host.to_string();
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let message_cache_path = build_runner.files().message_cache_path(unit);
+    let show_cached_diagnostics = unit.show_warnings(build_runner.bcx.gctx);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
     let artifact = unit.artifact;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = build_sbom(build_runner, unit)?;
+    let artifact_cache = build_runner
+        .bcx
+        .build_config
+        .artifact_cache
+        .clone()
+        .filter(|_| {
+            unit.target.is_lib()
+                && !unit.target.proc_macro()
+                && matches!(unit.mode, CompileMode::Build)
+                && !unit.pkg.has_custom_build()
+                && sbom_files.is_empty()
+                && artifact_cache_host_is_supported()
+                && artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc)
+        });
+    let artifact_cache_compiler_identity = artifact_cache
+        .as_ref()
+        .and_then(|_| build_runner.bcx.rustc().artifact_cache_identity());
+    let artifact_cache_identity_witness = artifact_cache
+        .as_ref()
+        .and_then(|_| build_runner.bcx.rustc().artifact_cache_identity_witness());
+    let artifact_cache_compiler_program = build_runner.bcx.rustc().path.clone();
+    let artifact_cache_loader_input_paths = artifact_cache
+        .as_ref()
+        .map(|_| compiler_loader_input_paths(build_runner.bcx.gctx, &rustc, &cwd))
+        .unwrap_or_default();
+    let artifact_cache = artifact_cache.filter(|_| {
+        artifact_cache_loader_input_paths_are_modeled(&artifact_cache_loader_input_paths)
+    });
+    let artifact_cache_dependency_search_paths = artifact_cache
+        .as_ref()
+        .map(|_| {
+            lib_search_paths(build_runner, unit).map(|args| {
+                args.chunks_exact(2)
+                    .filter(|pair| pair[0] == OsStr::new("-L"))
+                    .map(|pair| pair[1].clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let cache_crate_name = unit.target.crate_name().to_string();
 
     let hide_diagnostics_for_scrape_unit = build_runner.bcx.unit_can_fail_for_docscraping(unit)
         && !matches!(
@@ -395,94 +467,180 @@ fn rustc(
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
         }
 
-        for output in outputs.iter() {
-            // If there is both an rmeta and rlib, rustc will prefer to use the
-            // rlib, even if it is older. Therefore, we must delete the rlib to
-            // force using the new rmeta.
-            if output.path.extension() == Some(OsStr::new("rmeta")) {
-                let dst = root.join(&output.path).with_extension("rlib");
-                if dst.exists() {
-                    paths::remove_file(&dst)?;
-                }
-            }
-
-            // Some linkers do not remove the executable, but truncate and modify it.
-            // That results in the old hard-link being modified even after renamed.
-            // We delete the old artifact here to prevent this behavior from confusing users.
-            // See rust-lang/cargo#8348.
-            if output.hardlink.is_some() && output.path.exists() {
-                _ = paths::remove_file(&output.path).map_err(|e| {
-                    tracing::debug!(
-                        "failed to delete previous output file `{:?}`: {e:?}",
-                        output.path
-                    );
-                });
-            }
-        }
-
-        state.running(&rustc);
+        // Record the invocation before reading cache-discovered inputs so edits
+        // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        for file in sbom_files {
-            tracing::debug!("writing sbom to {}", file.display());
-            let outfile = BufWriter::new(paths::create(&file)?);
-            serde_json::to_writer(outfile, &sbom)?;
-        }
-
-        let result = exec
-            .exec(
+        let cache_entry = match artifact_cache
+            .as_ref()
+            .zip(artifact_cache_compiler_identity.as_ref())
+            .filter(|_| {
+                rlib_action_is_cacheable_with_search_paths(
+                    &rustc,
+                    &root,
+                    &artifact_cache_compiler_program,
+                    &rustc_host,
+                    &artifact_cache_dependency_search_paths,
+                )
+            }) {
+            Some((cache, compiler_identity)) => match rlib_cache_entry(
+                &cache.dir,
                 &rustc,
-                package_id,
-                &target,
-                mode,
-                &mut |line| on_stdout_line(state, line, package_id, &target),
-                &mut |line| {
-                    on_stderr_line(
-                        state,
-                        line,
-                        package_id,
-                        &manifest,
-                        &target,
-                        &mut output_options,
-                    )
-                },
-            )
-            .map_err(|e| {
-                if output_options.errors_seen == 0 {
-                    // If we didn't expect an error, do not require --verbose to fail.
-                    // This is intended to debug
-                    // https://github.com/rust-lang/crater/issues/733, where we are seeing
-                    // Cargo exit unsuccessfully while seeming to not show any errors.
-                    e
-                } else {
-                    verbose_if_simple_exit_code(e)
+                &build_dir,
+                &root,
+                &rustc_verbose_version,
+                compiler_identity,
+                &artifact_cache_dependency_search_paths,
+                &artifact_cache_loader_input_paths,
+            ) {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    debug!("ignoring artifact cache key failure for {cache_crate_name}: {error:#}");
+                    None
                 }
-            })
-            .with_context(|| {
-                // adapted from rustc_errors/src/lib.rs
-                let warnings = match output_options.warnings_seen {
-                    0 => String::new(),
-                    1 => "; 1 warning emitted".to_string(),
-                    count => format!("; {} warnings emitted", count),
-                };
-                let errors = match output_options.errors_seen {
-                    0 => String::new(),
-                    1 => " due to 1 previous error".to_string(),
-                    count => format!(" due to {} previous errors", count),
-                };
-                let name = descriptive_pkg_name(&name, &target, &mode);
-                format!("could not compile {name}{errors}{warnings}")
-            });
+            },
+            None => None,
+        };
+        let cache_hit = match cache_entry
+            .as_ref()
+            .zip(artifact_cache.as_ref())
+            .zip(artifact_cache_identity_witness.as_ref())
+        {
+            Some((((entry, loader_inputs_digest), cache), identity_witness)) => {
+                match restore_rlib_cache(
+                    entry,
+                    outputs.as_slice(),
+                    &rustc_dep_info_loc,
+                    &message_cache_path,
+                    &rustc,
+                    &cwd,
+                    &pkg_root,
+                    &root,
+                    identity_witness,
+                    &artifact_cache_loader_input_paths,
+                    loader_inputs_digest,
+                    cache.materialization,
+                    cache.max_size,
+                ) {
+                    Ok(cache_hit) => cache_hit,
+                    Err(error) => {
+                        debug!(
+                            "ignoring artifact cache restore failure for {cache_crate_name}: {error:#}"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
 
-        if let Err(e) = result {
-            if let Some(diagnostic) = failed_scrape_diagnostic {
-                state.warning(diagnostic);
+        if cache_hit {
+            debug!("artifact cache hit for {cache_crate_name}");
+            let mut replay_options = OutputOptions {
+                format: output_options.format,
+                cache_cell: None,
+                show_diagnostics: show_cached_diagnostics,
+                warnings_seen: 0,
+                errors_seen: 0,
+            };
+            replay_output_cache_file(
+                state,
+                package_id,
+                &manifest,
+                &target,
+                &message_cache_path,
+                &mut replay_options,
+            )?;
+        } else {
+            for output in outputs.iter() {
+                prepare_materialized_rlib_output_for_write(&output.path)?;
+
+                // If there is both an rmeta and rlib, rustc will prefer to use the
+                // rlib, even if it is older. Therefore, we must delete the rlib to
+                // force using the new rmeta.
+                if output.path.extension() == Some(OsStr::new("rmeta")) {
+                    let dst = root.join(&output.path).with_extension("rlib");
+                    if dst.exists() {
+                        paths::remove_file(&dst)?;
+                    }
+                }
+
+                // Some linkers do not remove the executable, but truncate and modify it.
+                // That results in the old hard-link being modified even after renamed.
+                // We delete the old artifact here to prevent this behavior from confusing users.
+                // See rust-lang/cargo#8348.
+                if output.hardlink.is_some() && output.path.exists() {
+                    _ = paths::remove_file(&output.path).map_err(|e| {
+                        tracing::debug!(
+                            "failed to delete previous output file `{:?}`: {e:?}",
+                            output.path
+                        );
+                    });
+                }
             }
 
-            return Err(e);
-        }
+            state.running(&rustc);
+            for file in sbom_files {
+                tracing::debug!("writing sbom to {}", file.display());
+                let outfile = BufWriter::new(paths::create(&file)?);
+                serde_json::to_writer(outfile, &sbom)?;
+            }
 
-        // Exec should never return with success *and* generate an error.
-        debug_assert_eq!(output_options.errors_seen, 0);
+            let result = exec
+                .exec(
+                    &rustc,
+                    package_id,
+                    &target,
+                    mode,
+                    &mut |line| on_stdout_line(state, line, package_id, &target),
+                    &mut |line| {
+                        on_stderr_line(
+                            state,
+                            line,
+                            package_id,
+                            &manifest,
+                            &target,
+                            &mut output_options,
+                        )
+                    },
+                )
+                .map_err(|e| {
+                    if output_options.errors_seen == 0 {
+                        // If we didn't expect an error, do not require --verbose to fail.
+                        // This is intended to debug
+                        // https://github.com/rust-lang/crater/issues/733, where we are seeing
+                        // Cargo exit unsuccessfully while seeming to not show any errors.
+                        e
+                    } else {
+                        verbose_if_simple_exit_code(e)
+                    }
+                })
+                .with_context(|| {
+                    // adapted from rustc_errors/src/lib.rs
+                    let warnings = match output_options.warnings_seen {
+                        0 => String::new(),
+                        1 => "; 1 warning emitted".to_string(),
+                        count => format!("; {} warnings emitted", count),
+                    };
+                    let errors = match output_options.errors_seen {
+                        0 => String::new(),
+                        1 => " due to 1 previous error".to_string(),
+                        count => format!(" due to {count} previous errors"),
+                    };
+                    let name = descriptive_pkg_name(&name, &target, &mode);
+                    format!("could not compile {name}{errors}{warnings}")
+                });
+
+            if let Err(e) = result {
+                if let Some(diagnostic) = failed_scrape_diagnostic {
+                    state.warning(diagnostic);
+                }
+
+                return Err(e);
+            }
+
+            // Exec should never return with success *and* generate an error.
+            debug_assert_eq!(output_options.errors_seen, 0);
+        }
 
         if rustc_dep_info_loc.exists() {
             fingerprint::translate_dep_info(
@@ -523,6 +681,42 @@ fn rustc(
         if mode.is_check() {
             for output in outputs.iter() {
                 paths::set_file_time_no_err(&output.path, timestamp);
+            }
+        }
+
+        if artifact_cache.is_some() {
+            let stamp = fingerprint_dir.join(ARTIFACT_CACHE_FRESHNESS_STAMP);
+            drop(paths::create(&stamp)?);
+            paths::set_file_time_no_err(stamp, timestamp);
+        }
+
+        if !cache_hit
+            && let Some(((entry, loader_inputs_digest), cache)) =
+                cache_entry.as_ref().zip(artifact_cache.as_ref())
+            && let Some(identity_witness) = artifact_cache_identity_witness.as_ref()
+        {
+            match store_rlib_cache(
+                entry,
+                outputs.as_slice(),
+                &rustc_dep_info_loc,
+                &message_cache_path,
+                timestamp,
+                &cwd,
+                &pkg_root,
+                &build_dir,
+                &root,
+                identity_witness,
+                &artifact_cache_loader_input_paths,
+                loader_inputs_digest,
+                cache.max_size,
+            ) {
+                Ok(true) => debug!("stored artifact cache entry for {cache_crate_name}"),
+                Ok(false) => {}
+                Err(error) => {
+                    debug!(
+                        "ignoring artifact cache store failure for {cache_crate_name}: {error:#}"
+                    );
+                }
             }
         }
 
@@ -596,6 +790,1817 @@ fn rustc(
             }
         }
         Ok(())
+    }
+}
+
+fn unmodeled_codegen_behavior_flag(arg: &str) -> bool {
+    ["profile-use", "profile-sample-use", "llvm-args"]
+        .iter()
+        .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+}
+
+fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
+    ["codegen-backend=", "codegen_backend="]
+        .iter()
+        .find_map(|prefix| arg.strip_prefix(prefix))
+        .is_some_and(|backend| !backend.contains('.'))
+}
+
+fn custom_target_spec_flag(arg: &str) -> bool {
+    arg.ends_with(".json")
+}
+
+fn windows_gnu_target(target: &str) -> bool {
+    target.contains("-windows-gnu")
+}
+
+#[cfg(test)]
+fn rlib_action_is_cacheable(
+    rustc: &ProcessBuilder,
+    output_root: &Path,
+    compiler_program: &Path,
+    host_triple: &str,
+) -> bool {
+    rlib_action_is_cacheable_with_search_paths(
+        rustc,
+        output_root,
+        compiler_program,
+        host_triple,
+        &[],
+    )
+}
+
+fn rlib_action_is_cacheable_with_search_paths(
+    rustc: &ProcessBuilder,
+    output_root: &Path,
+    compiler_program: &Path,
+    host_triple: &str,
+    modeled_dependency_search_paths: &[OsString],
+) -> bool {
+    let args = rustc
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    let target_profile_root = output_root.parent().unwrap_or(output_root);
+    let action_program = paths::resolve_executable(Path::new(rustc.get_program()))
+        .unwrap_or_else(|_| PathBuf::from(rustc.get_program()));
+    let compiler_program = paths::resolve_executable(compiler_program)
+        .unwrap_or_else(|_| compiler_program.to_path_buf());
+    let action_target = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--target="))
+        .or_else(|| {
+            args.windows(2)
+                .find_map(|pair| (pair[0] == "--target").then_some(pair[1].as_ref()))
+        })
+        .unwrap_or(host_triple);
+    let unmodeled_environment = [
+        "RUSTC_BOOTSTRAP",
+        "RUSTC_FORCE_RUSTC_VERSION",
+        "RUSTC_LOG",
+        "RUSTC_LOG_COLOR",
+        "RUSTC_LOG_ENTRY_EXIT",
+        "RUSTC_LOG_THREAD_IDS",
+        "RUSTC_LOG_BACKTRACE",
+        "RUSTC_LOG_LINES",
+        "RUSTC_LOG_FORMAT_JSON",
+        "RUSTC_LOG_OUTPUT_TARGET",
+        "RUST_TARGET_PATH",
+    ];
+    rustc.get_programs().count() == 1
+        && action_program == compiler_program
+        && !unmodeled_environment
+            .iter()
+            .any(|key| rustc.get_env(key).is_some())
+        // Windows GNU raw-dylib rlibs may embed output from a PATH-selected
+        // or explicitly configured dlltool, which is outside this cache key.
+        && !windows_gnu_target(action_target)
+        && args
+            .windows(2)
+            .filter(|pair| pair[0] == "--crate-type")
+            .map(|pair| pair[1].as_ref())
+            .eq(["lib"])
+        && args
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--emit="))
+            .all(|emit| matches!(emit, "dep-info,link" | "dep-info,metadata,link"))
+        && args.iter().filter(|arg| arg.starts_with("--emit=")).count() == 1
+        && !args.windows(2).any(|pair| pair[0] == "--emit")
+        && args
+            .windows(2)
+            .filter(|pair| pair[0] == "--out-dir")
+            .count()
+            == 1
+        && !args.iter().any(|arg| {
+            arg.starts_with("--crate-type=")
+                || arg.starts_with("--out-dir=")
+                || arg.starts_with("--print=")
+                || arg.starts_with("--pretty=")
+                || arg.starts_with("--unpretty=")
+                || arg
+                    .strip_prefix("--target=")
+                    .is_some_and(custom_target_spec_flag)
+                || arg.starts_with("--sysroot=")
+                || arg.starts_with("-Zunpretty=")
+                || arg == "-o"
+                || arg == "--print"
+                || arg == "--pretty"
+                || arg == "--unpretty"
+                || arg == "-Csave-temps"
+                || arg.starts_with("-Csave-temps=")
+                || arg
+                    .strip_prefix("-C")
+                    .is_some_and(unmodeled_codegen_behavior_flag)
+        })
+        && !args.windows(2).any(|pair| {
+            (pair[0] == "--target" && custom_target_spec_flag(&pair[1]))
+                || pair[0] == "--sysroot"
+                || (pair[0] == "-C"
+                    && (pair[1].starts_with("save-temps")
+                        || unmodeled_codegen_behavior_flag(&pair[1])))
+        })
+        && !args.iter().any(|arg| arg == "--test")
+        && !args.iter().any(|arg| arg.starts_with('@'))
+        && !args.iter().any(|arg| arg.starts_with("-l"))
+        && !args.iter().any(|arg| arg != "-L" && arg.starts_with("-L"))
+        && !args.windows(2).any(|pair| {
+            pair[0] == "-L"
+                && (pair[1].starts_with("dependency=") || pair[1].starts_with("crate="))
+                && !modeled_dependency_search_paths
+                    .iter()
+                    .any(|path| path == OsStr::new(pair[1].as_ref()))
+        })
+        && !args.windows(2).any(|pair| {
+            if pair[0] != "-L"
+                || pair[1].starts_with("dependency=")
+                || pair[1].starts_with("crate=")
+            {
+                return false;
+            }
+            let path = pair[1]
+                .split_once('=')
+                .map_or(pair[1].as_ref(), |(_, path)| path);
+            !Path::new(path).starts_with(target_profile_root)
+        })
+        && !args.windows(2).any(|pair| {
+            pair[0] == "--extern"
+                && [".dylib", ".so", ".dll"]
+                    .iter()
+                    .any(|suffix| pair[1].ends_with(suffix))
+        })
+        && !args.iter().any(|arg| arg.starts_with("--extern="))
+        && !args
+            .windows(2)
+            .any(|pair| pair[0] == "--extern" && !pair[1].contains('='))
+        && !args.iter().any(|arg| {
+            arg.starts_with("link-arg=")
+                || arg.starts_with("link-args=")
+                || arg.starts_with("-Clink-arg=")
+                || arg.starts_with("-Clink-args=")
+                || (arg != "-Z"
+                    && arg
+                        .strip_prefix("-Z")
+                        .is_some_and(|arg| !modeled_sysroot_codegen_backend_flag(arg)))
+        })
+        && !args
+            .windows(2)
+            .any(|pair| pair[0] == "-Z" && !modeled_sysroot_codegen_backend_flag(&pair[1]))
+}
+
+#[cfg(test)]
+mod artifact_cache_admission_tests {
+    use super::*;
+
+    fn ordinary_rlib_command() -> ProcessBuilder {
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--crate-type")
+            .arg("lib")
+            .arg("--emit=dep-info,metadata,link")
+            .arg("--out-dir")
+            .arg("target/debug/deps");
+        rustc
+    }
+
+    #[test]
+    fn profile_inputs_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        assert!(rlib_action_is_cacheable(
+            &ordinary_rlib_command(),
+            output_root,
+            compiler,
+            host
+        ));
+        for flag in ["profile-use", "profile-sample-use"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-C{flag}=profile.profdata"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split.arg("-C").arg(format!("{flag}=profile.profdata"));
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+    }
+
+    #[test]
+    fn profile_generation_is_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("-Cprofile-generate=profile-output");
+        assert!(rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut split = ordinary_rlib_command();
+        split.arg("-C").arg("profile-generate=profile-output");
+        assert!(rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn arbitrary_llvm_arguments_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("-Cllvm-args=-load=/path/to/plugin.dylib");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut split = ordinary_rlib_command();
+        split.arg("-C").arg("llvm-args=-load=/path/to/plugin.dylib");
+        assert!(!rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn path_backed_codegen_backends_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        for flag in ["codegen-backend", "codegen_backend"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-Z{flag}=path/to/backend.dylib"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split.arg("-Z").arg(format!("{flag}=path/to/backend.dylib"));
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+
+        let mut sysroot_backend = ordinary_rlib_command();
+        sysroot_backend.arg("-Z").arg("codegen-backend=cranelift");
+        assert!(rlib_action_is_cacheable(
+            &sysroot_backend,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut compact_sysroot_backend = ordinary_rlib_command();
+        compact_sysroot_backend.arg("-Zcodegen-backend=cranelift");
+        assert!(rlib_action_is_cacheable(
+            &compact_sysroot_backend,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn unmodeled_unstable_options_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        for option in [
+            "llvm-plugins=path/to/plugin.dylib",
+            "sanitizer-dataflow-abilist=path/to/list.txt",
+            "remark-dir=path/to/remarks",
+            "metrics-dir=path/to/metrics",
+            "self-profile=path/to/profile",
+        ] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-Z{option}"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split.arg("-Z").arg(option);
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+    }
+
+    #[test]
+    fn custom_target_specs_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        let mut compact = ordinary_rlib_command();
+        compact.arg("--target=custom-target.json");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut split = ordinary_rlib_command();
+        split.arg("--target").arg("path/to/custom-target.json");
+        assert!(!rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn explicit_sysroots_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        let mut compact = ordinary_rlib_command();
+        compact.arg("--sysroot=path/to/sysroot");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut split = ordinary_rlib_command();
+        split.arg("--sysroot").arg("path/to/sysroot");
+        assert!(!rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn custom_target_search_paths_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let mut rustc = ordinary_rlib_command();
+        rustc.env("RUST_TARGET_PATH", "path/to/targets");
+        assert!(!rlib_action_is_cacheable(
+            &rustc,
+            output_root,
+            compiler,
+            "aarch64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn unmodeled_dependency_search_paths_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        let mut rustc = ordinary_rlib_command();
+        rustc.arg("-L").arg("dependency=target/debug/deps");
+        assert!(!rlib_action_is_cacheable(
+            &rustc,
+            output_root,
+            compiler,
+            host
+        ));
+        assert!(rlib_action_is_cacheable_with_search_paths(
+            &rustc,
+            output_root,
+            compiler,
+            host,
+            &[OsString::from("dependency=target/debug/deps")]
+        ));
+    }
+
+    #[test]
+    fn windows_gnu_targets_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+
+        assert!(!rlib_action_is_cacheable(
+            &ordinary_rlib_command(),
+            output_root,
+            compiler,
+            "x86_64-pc-windows-gnu"
+        ));
+
+        let mut explicit = ordinary_rlib_command();
+        explicit.arg("--target").arg("x86_64-pc-windows-gnu");
+        assert!(!rlib_action_is_cacheable(
+            &explicit,
+            output_root,
+            compiler,
+            "aarch64-apple-darwin"
+        ));
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("--target=x86_64-pc-windows-gnullvm");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            "aarch64-apple-darwin"
+        ));
+    }
+}
+
+fn rlib_cache_entry(
+    cache_root: &Path,
+    rustc: &ProcessBuilder,
+    build_dir: &Path,
+    output_root: &Path,
+    rustc_verbose_version: &str,
+    compiler_identity: &blake3::Hash,
+    modeled_dependency_search_paths: &[OsString],
+    loader_input_paths: &[(OsString, PathBuf)],
+) -> CargoResult<(PathBuf, blake3::Hash)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if std::env::var_os(ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS).is_some() {
+        return Err(internal("test-only artifact cache key failure".to_string()));
+    }
+    let target_profile_root = output_root.parent().unwrap_or(output_root);
+    let normalize = |value: &str| {
+        value
+            .replace(
+                &target_profile_root.to_string_lossy().to_string(),
+                "/__cargo_artifact_cache_target_profile",
+            )
+            .replace(
+                &build_dir.to_string_lossy().to_string(),
+                "/__cargo_artifact_cache_build_dir",
+            )
+    };
+    let normalize_cargo_dylib_path = |value: &OsStr| -> CargoResult<OsString> {
+        let mut search_path = env::split_paths(value).collect::<Vec<_>>();
+        if let Some(cargo_path) = search_path.first_mut() {
+            *cargo_path = PathBuf::from(normalize(&cargo_path.to_string_lossy()));
+        }
+        paths::join_paths(&search_path, paths::dylib_path_envvar())
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-v6\0");
+    hasher.update(b"rustc-verbose-version\0");
+    hasher.update(rustc_verbose_version.as_bytes());
+    hasher.update(b"\0");
+    let program = paths::resolve_executable(Path::new(rustc.get_program()))
+        .unwrap_or_else(|_| PathBuf::from(rustc.get_program()));
+    hasher.update(b"rustc-command-program\0");
+    hasher.update(program.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(b"rustc-command-program-content\0");
+    hasher.update(compiler_identity.as_bytes());
+    hasher.update(b"\0");
+    let args = rustc.get_args().collect::<Vec<_>>();
+    for (index, arg) in args.iter().enumerate() {
+        let value = arg.to_string_lossy();
+        let normalize_operand = index > 0
+            && (args[index - 1] == OsStr::new("--out-dir")
+                || args[index - 1] == OsStr::new("--extern")
+                || (args[index - 1] == OsStr::new("-L")
+                    && ((!value.starts_with("dependency=") && !value.starts_with("crate="))
+                        || modeled_dependency_search_paths
+                            .iter()
+                            .any(|path| path == OsStr::new(value.as_ref()))))
+                || (args[index - 1] == OsStr::new("-C") && value.starts_with("incremental=")));
+        if normalize_operand || value.starts_with("-Cincremental=") {
+            hasher.update(normalize(&value).as_bytes());
+        } else {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    let mut envs = rustc.get_envs().iter().collect::<Vec<_>>();
+    envs.sort_by_key(|(key, _)| *key);
+    for (key, value) in envs {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = value {
+            if key == "OUT_DIR" || key.ends_with("_OUT_DIR") {
+                hasher.update(normalize(&value.to_string_lossy()).as_bytes());
+            } else if key == paths::dylib_path_envvar() {
+                hasher.update(
+                    normalize_cargo_dylib_path(value.as_os_str())?
+                        .to_string_lossy()
+                        .as_bytes(),
+                );
+            } else {
+                hasher.update(value.to_string_lossy().as_bytes());
+            }
+        }
+        hasher.update(b"\0");
+    }
+    let loader_inputs_digest = compiler_loader_inputs_digest(loader_input_paths)?;
+    hasher.update(b"compiler-loader-inputs-content\0");
+    hasher.update(loader_inputs_digest.as_bytes());
+    hasher.update(b"\0");
+    for pair in args.windows(2) {
+        if pair[0] != OsStr::new("--extern") {
+            continue;
+        }
+        let value = pair[1].to_string_lossy();
+        let Some((_, path)) = value.split_once('=') else {
+            continue;
+        };
+        let path = Path::new(path);
+        if path.is_file() {
+            hasher.update(b"extern-content\0");
+            hasher.update(normalize(&path.to_string_lossy()).as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&fs::read(path)?);
+            hasher.update(b"\0");
+        }
+    }
+    for (key, value) in rustc.get_envs() {
+        if key != "OUT_DIR" && !key.ends_with("_OUT_DIR") {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let path = Path::new(value);
+        if path.is_dir() {
+            hasher.update(b"generated-input-tree\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"\0");
+            hash_path_tree(&mut hasher, path, path, None, false)?;
+        }
+    }
+    for pair in args.windows(2) {
+        if pair[0] != OsStr::new("-L") {
+            continue;
+        }
+        let value = pair[1].to_string_lossy();
+        if value.starts_with("dependency=") || value.starts_with("crate=") {
+            continue;
+        }
+        let path = value
+            .split_once('=')
+            .map_or(value.as_ref(), |(_, path)| path);
+        let path = Path::new(path);
+        if path.is_dir() {
+            hasher.update(b"link-search-input-tree\0");
+            hasher.update(normalize(&value).as_bytes());
+            hasher.update(b"\0");
+            hash_path_tree(&mut hasher, path, path, None, true)?;
+        }
+    }
+    Ok((
+        cache_root.join(hasher.finalize().to_hex().as_str()),
+        loader_inputs_digest,
+    ))
+}
+
+fn artifact_cache_host_is_supported() -> bool {
+    cfg!(target_os = "linux") || cfg!(target_os = "macos")
+}
+
+const CARGO_INJECTED_COMPILER_LOADER_ROOT: &str = "cargo-injected-compiler-loader-root";
+
+fn artifact_cache_loader_environment_is_modeled(
+    gctx: &crate::util::GlobalContext,
+    rustc: &ProcessBuilder,
+) -> bool {
+    fn variable_is_modeled(key: &str, value: &OsStr) -> bool {
+        let bytes = value.as_encoded_bytes();
+        let has_loader_expansion = (cfg!(target_os = "linux") && bytes.contains(&b'$'))
+            || (cfg!(target_os = "macos") && (bytes.contains(&b'@') || bytes.contains(&b'$')));
+        if value.is_empty()
+            || (key == paths::dylib_path_envvar() && !has_loader_expansion)
+            || (cfg!(target_os = "macos")
+                && (key == "DYLD_LIBRARY_PATH" || key == "LD_LIBRARY_PATH")
+                && !has_loader_expansion)
+        {
+            return true;
+        }
+        !(cfg!(unix) && key.starts_with("LD_"))
+            && !(cfg!(target_os = "linux") && key == "GLIBC_TUNABLES")
+            && !(cfg!(target_os = "macos") && key.starts_with("DYLD_"))
+    }
+
+    gctx.env()
+        .all(|(key, value)| variable_is_modeled(key, OsStr::new(value)))
+        && rustc.get_envs().iter().all(|(key, value)| {
+            value
+                .as_deref()
+                .is_none_or(|value| variable_is_modeled(key, value))
+        })
+}
+
+fn compiler_loader_input_paths(
+    gctx: &crate::util::GlobalContext,
+    rustc: &ProcessBuilder,
+    rustc_cwd: &Path,
+) -> Vec<(OsString, PathBuf)> {
+    fn resolve_path(path: PathBuf, rustc_cwd: &Path) -> PathBuf {
+        if path.as_os_str().is_empty() {
+            rustc_cwd.to_path_buf()
+        } else if path.is_absolute() {
+            path
+        } else {
+            rustc_cwd.join(path)
+        }
+    }
+
+    fn extend_paths(
+        inputs: &mut Vec<(OsString, PathBuf)>,
+        key: &str,
+        value: &OsStr,
+        rustc_cwd: &Path,
+    ) {
+        inputs.extend(
+            env::split_paths(value)
+                .map(|path| (OsString::from(key), resolve_path(path, rustc_cwd))),
+        );
+    }
+
+    let mut inputs = Vec::new();
+    let primary = paths::dylib_path_envvar();
+    if let Some(value) = rustc.get_env(primary).filter(|value| !value.is_empty()) {
+        let mut paths = env::split_paths(&value);
+        if let Some(path) = paths.next() {
+            inputs.push((
+                OsString::from(CARGO_INJECTED_COMPILER_LOADER_ROOT),
+                resolve_path(path, rustc_cwd),
+            ));
+        }
+        inputs.extend(paths.map(|path| (OsString::from(primary), resolve_path(path, rustc_cwd))));
+    } else if cfg!(target_os = "macos") {
+        if let Some(home) = gctx.get_env_os("HOME") {
+            inputs.push((
+                OsString::from(primary),
+                resolve_path(PathBuf::from(home).join("lib"), rustc_cwd),
+            ));
+        }
+        inputs.push((OsString::from(primary), PathBuf::from("/usr/local/lib")));
+        inputs.push((OsString::from(primary), PathBuf::from("/usr/lib")));
+    }
+    if cfg!(target_os = "macos") {
+        for key in ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
+            if let Some(value) = rustc.get_env(key).filter(|value| !value.is_empty()) {
+                extend_paths(&mut inputs, key, &value, rustc_cwd);
+            }
+        }
+        inputs.push((OsString::from("PWD"), rustc_cwd.to_path_buf()));
+    }
+    inputs
+}
+
+fn compiler_loader_inputs_digest(
+    loader_input_paths: &[(OsString, PathBuf)],
+) -> CargoResult<blake3::Hash> {
+    // Bind Linux nested-library admission to key creation and publication as
+    // well as the early eligibility check, since loader trees can change.
+    if !artifact_cache_loader_input_paths_are_modeled(loader_input_paths) {
+        anyhow::bail!("Linux compiler loader roots contain nested dynamic libraries");
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-compiler-loader-inputs-v1\0");
+    for (source, path) in loader_input_paths {
+        hasher.update(source.as_encoded_bytes());
+        hasher.update(b"\0");
+        if source == OsStr::new(CARGO_INJECTED_COMPILER_LOADER_ROOT) {
+            hasher.update(b"/__cargo_artifact_cache_compiler_loader_root");
+        } else {
+            hasher.update(path.as_os_str().as_encoded_bytes());
+        }
+        hasher.update(b"\0");
+        hash_dynamic_library_inputs(
+            &mut hasher,
+            path,
+            source == OsStr::new(CARGO_INJECTED_COMPILER_LOADER_ROOT),
+        )?;
+    }
+    Ok(hasher.finalize())
+}
+
+fn artifact_cache_loader_input_paths_are_modeled(
+    loader_input_paths: &[(OsString, PathBuf)],
+) -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+
+    fn is_dynamic_library(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.ends_with(".dylib") || name.ends_with(".dll") || name.contains(".so")
+        })
+    }
+
+    fn has_nested_dynamic_library(
+        path: &Path,
+        nested: bool,
+        visited: &mut HashSet<PathBuf>,
+    ) -> CargoResult<bool> {
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !visited.insert(canonical) {
+            return Ok(false);
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() && has_nested_dynamic_library(&path, true, visited)? {
+                return Ok(true);
+            }
+            if nested && path.is_file() && is_dynamic_library(&path) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    loader_input_paths.iter().all(|(_, path)| {
+        !has_nested_dynamic_library(path, false, &mut HashSet::new()).unwrap_or(true)
+    })
+}
+
+fn hash_dynamic_library_inputs(
+    hasher: &mut blake3::Hasher,
+    path: &Path,
+    normalize_directory_locations: bool,
+) -> CargoResult<()> {
+    fn hash_directory(
+        hasher: &mut blake3::Hasher,
+        root: &Path,
+        path: &Path,
+        recurse: bool,
+        normalize_directory_locations: bool,
+        visited: &mut HashSet<PathBuf>,
+    ) -> CargoResult<()> {
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        hasher.update(b"compiler-loader-search-directory\0");
+        hasher.update(
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        hasher.update(b"\0");
+        if normalize_directory_locations {
+            hasher.update(b"/__cargo_artifact_cache_compiler_loader_root/");
+            hasher.update(
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+        } else {
+            hasher.update(canonical.as_os_str().as_encoded_bytes());
+        }
+        hasher.update(b"\0");
+        if recurse && !visited.insert(canonical) {
+            return Ok(());
+        }
+        let mut entries = match fs::read_dir(path) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type()?.is_symlink() {
+                hasher.update(b"compiler-loader-search-symlink\0");
+                hasher.update(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                );
+                hasher.update(b"\0");
+                hasher.update(fs::read_link(&path)?.as_os_str().as_encoded_bytes());
+                hasher.update(b"\0");
+            }
+            if recurse && path.is_dir() {
+                hash_directory(
+                    hasher,
+                    root,
+                    &path,
+                    recurse,
+                    normalize_directory_locations,
+                    visited,
+                )?;
+                continue;
+            }
+            let name = path.file_name().map(|name| name.to_string_lossy());
+            if !path.is_file()
+                || !name.is_some_and(|name| {
+                    name.ends_with(".dylib") || name.ends_with(".dll") || name.contains(".so")
+                })
+            {
+                continue;
+            }
+            hasher.update(b"compiler-loader-search-input\0");
+            hasher.update(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+            hasher.update(b"\0");
+            hasher.update(&fs::read(path)?);
+            hasher.update(b"\0");
+        }
+        Ok(())
+    }
+
+    hash_directory(
+        hasher,
+        path,
+        path,
+        cfg!(target_os = "linux"),
+        normalize_directory_locations,
+        &mut HashSet::new(),
+    )
+}
+
+fn hash_path_tree(
+    hasher: &mut blake3::Hasher,
+    root: &Path,
+    path: &Path,
+    excluded_path: Option<&Path>,
+    link_search_input: bool,
+) -> CargoResult<()> {
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if excluded_path.is_some_and(|excluded| path.starts_with(excluded))
+            || path.file_name() == Some(OsStr::new(".git"))
+            || (link_search_input && path.extension() == Some(OsStr::new("dSYM")))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            hash_path_tree(hasher, root, &path, excluded_path, link_search_input)?;
+        } else if path.is_file() {
+            hasher.update(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+            hasher.update(b"\0");
+            let bytes = fs::read(&path)?;
+            if link_search_input && path.extension() == Some(OsStr::new("a")) {
+                hasher.update(&normalize_ar_timestamps(&bytes));
+            } else {
+                hasher.update(&bytes);
+            }
+            hasher.update(b"\0");
+        }
+    }
+    Ok(())
+}
+
+fn normalize_ar_timestamps(bytes: &[u8]) -> Cow<'_, [u8]> {
+    const GLOBAL_HEADER: &[u8] = b"!<arch>\n";
+    const MEMBER_HEADER_LEN: usize = 60;
+
+    if !bytes.starts_with(GLOBAL_HEADER) {
+        return Cow::Borrowed(bytes);
+    }
+
+    let mut normalized = bytes.to_vec();
+    let mut offset = GLOBAL_HEADER.len();
+    while offset < normalized.len() {
+        let Some(header) = normalized.get_mut(offset..offset + MEMBER_HEADER_LEN) else {
+            return Cow::Borrowed(bytes);
+        };
+        if &header[58..] != b"`\n" {
+            return Cow::Borrowed(bytes);
+        }
+        let Some(size) = std::str::from_utf8(&header[48..58])
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        else {
+            return Cow::Borrowed(bytes);
+        };
+        header[16..28].fill(b'0');
+        offset += MEMBER_HEADER_LEN + size + (size % 2);
+    }
+    if offset != normalized.len() {
+        return Cow::Borrowed(bytes);
+    }
+    Cow::Owned(normalized)
+}
+
+fn restore_rlib_cache(
+    entry_root: &Path,
+    outputs: &[build_runner::OutputFile],
+    rustc_dep_info_loc: &Path,
+    message_cache_path: &Path,
+    rustc: &ProcessBuilder,
+    rustc_cwd: &Path,
+    pkg_root: &Path,
+    output_root: &Path,
+    identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+    loader_input_paths: &[(OsString, PathBuf)],
+    loader_inputs_digest: &blake3::Hash,
+    materialization: ArtifactCacheMaterialization,
+    max_size: u64,
+) -> CargoResult<bool> {
+    if !entry_root.exists() {
+        return Ok(false);
+    }
+    let cache_root = entry_root.parent().unwrap_or(entry_root);
+    let Some(_lock) = try_read_lock_rlib_cache_within_limit(cache_root, max_size)? else {
+        return Ok(false);
+    };
+    if !entry_root.exists() {
+        return Ok(false);
+    }
+    delay_rlib_cache_restore_for_tests()?;
+    if !identity_witness.is_current() {
+        debug!("not restoring artifact cache entry with compiler identity modified after lookup");
+        return Ok(false);
+    }
+    if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest {
+        debug!(
+            "not restoring artifact cache entry with compiler loader inputs modified after lookup"
+        );
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(entry_root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let entry = entry.path();
+        if !entry.is_dir()
+            || entry
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            || !entry.join("complete").exists()
+        {
+            continue;
+        }
+        match verify_rlib_cache_entry(&entry, outputs) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("rejecting corrupt artifact cache entry {}", entry.display());
+                continue;
+            }
+            Err(error) => {
+                debug!(
+                    "rejecting unreadable artifact cache entry {}: {error:#}",
+                    entry.display()
+                );
+                continue;
+            }
+        }
+        match verify_rlib_cache_inputs(&entry, rustc, rustc_cwd) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                debug!(
+                    "rejecting unreadable artifact cache inputs {}: {error:#}",
+                    entry.display()
+                );
+                continue;
+            }
+        }
+        let stored_files = entry.join("files");
+        for output in outputs {
+            let stored = stored_files.join(output.path.file_name().unwrap());
+            materialize_rlib_cache_file(&stored, &output.path, materialization)?;
+        }
+        paths::copy(&entry.join("compiler-messages"), message_cache_path)?;
+        let stored_dep_info = entry.join("rustc-dep-info");
+        if stored_dep_info.exists() {
+            let origin_pkg_root = paths::read(&entry.join("origin-pkg-root"))?;
+            let origin_target_profile_root =
+                paths::read(&entry.join("origin-target-profile-root"))?;
+            let target_profile_root = output_root.parent().unwrap_or(output_root);
+            let translated = paths::read(&stored_dep_info)?
+                .replace(origin_pkg_root.trim_end(), &pkg_root.to_string_lossy())
+                .replace(
+                    origin_target_profile_root.trim_end(),
+                    &target_profile_root.to_string_lossy(),
+                );
+            paths::write(rustc_dep_info_loc, translated.as_bytes())?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn materialize_rlib_cache_file(
+    stored: &Path,
+    output: &Path,
+    materialization: ArtifactCacheMaterialization,
+) -> CargoResult<()> {
+    match materialization {
+        ArtifactCacheMaterialization::Hardlink => {
+            #[cfg(unix)]
+            {
+                if output.exists() {
+                    paths::remove_file(output)?;
+                }
+                match fs::hard_link(stored, output) {
+                    Ok(()) => {
+                        debug!(
+                            "hardlinked cached artifact {} -> {}",
+                            stored.display(),
+                            output.display()
+                        );
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+                        paths::copy(stored, output)?;
+                        debug!(
+                            "copied cached artifact across filesystems {} -> {}",
+                            stored.display(),
+                            output.display()
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                paths::copy(stored, output)?;
+                debug!(
+                    "copied cached artifact on platform without protected hardlink rebuilds {} -> {}",
+                    stored.display(),
+                    output.display()
+                );
+            }
+        }
+        ArtifactCacheMaterialization::Copy => {
+            if output.exists() {
+                paths::remove_file(output)?;
+            }
+            paths::copy(stored, output)?;
+            debug!(
+                "copied cached artifact {} -> {}",
+                stored.display(),
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prepare_materialized_rlib_output_for_write(output: &Path) -> CargoResult<()> {
+    if !output.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if fs::metadata(output)?.nlink() > 1 {
+            paths::remove_file(output)?;
+            debug!(
+                "detached hardlinked cached artifact before rebuild {}",
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn store_rlib_cache(
+    entry_root: &Path,
+    outputs: &[build_runner::OutputFile],
+    rustc_dep_info_loc: &Path,
+    message_cache_path: &Path,
+    invocation_time: filetime::FileTime,
+    rustc_cwd: &Path,
+    pkg_root: &Path,
+    build_dir: &Path,
+    output_root: &Path,
+    identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+    loader_input_paths: &[(OsString, PathBuf)],
+    loader_inputs_digest: &blake3::Hash,
+    max_size: u64,
+) -> CargoResult<bool> {
+    if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
+        debug!("not storing artifact cache entry with generated build-directory inputs");
+        return Ok(false);
+    }
+    delay_rlib_cache_input_digest_for_tests()?;
+    if !identity_witness.is_current() {
+        debug!(
+            "not storing artifact cache entry with compiler identity modified during compilation"
+        );
+        return Ok(false);
+    }
+    if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest {
+        debug!(
+            "not storing artifact cache entry with compiler loader inputs modified during compilation"
+        );
+        return Ok(false);
+    }
+    let Some(inputs_digest) = rlib_cache_inputs_digest(rustc_dep_info_loc, rustc_cwd)? else {
+        debug!("not storing artifact cache entry with unreadable compiler-discovered inputs");
+        return Ok(false);
+    };
+    if rlib_cache_inputs_modified_since(rustc_dep_info_loc, rustc_cwd, invocation_time)? {
+        debug!("not storing artifact cache entry with inputs modified during compilation");
+        return Ok(false);
+    }
+    let cache_root = entry_root.parent().unwrap_or(entry_root);
+    let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
+        return Ok(false);
+    };
+    let mut cache_size = match recorded_rlib_cache_size(cache_root) {
+        Some(size) if size <= max_size => size,
+        Some(_) | None => reconcile_rlib_cache_size(cache_root, max_size, None)?,
+    };
+    paths::create_dir_all(entry_root)?;
+    let entry = entry_root.join(&inputs_digest);
+    if entry.exists() {
+        if entry.join("complete").exists()
+            && verify_rlib_cache_entry(&entry, outputs).unwrap_or(false)
+            && artifact_cache_entry_size(&entry).is_some_and(|size| size <= max_size)
+        {
+            return Ok(false);
+        }
+        mark_rlib_cache_size_dirty(cache_root)?;
+        quarantine_rlib_cache_entry(&entry)?;
+        cache_size = reconcile_rlib_cache_size(cache_root, max_size, None)?;
+    }
+    mark_rlib_cache_size_dirty(cache_root)?;
+    let staging = match staging_rlib_cache_entry(&entry) {
+        Ok(staging) => staging,
+        Err(error) => {
+            write_rlib_cache_size(cache_root, cache_size)?;
+            return Err(error);
+        }
+    };
+    let result = (|| -> CargoResult<bool> {
+        let files = staging.join("files");
+        paths::create_dir_all(&files)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only hook is intentionally outside user configuration"
+        )]
+        if std::env::var_os(ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS).is_some() {
+            return Err(internal(
+                "test-only artifact cache failure after staging".to_string(),
+            ));
+        }
+        let mut manifest = String::new();
+        for output in outputs {
+            if output.path.exists() {
+                let name = output.path.file_name().ok_or_else(|| {
+                    internal(format!(
+                        "artifact cache output has no filename: {}",
+                        output.path.display()
+                    ))
+                })?;
+                let stored = files.join(name);
+                paths::copy(&output.path, &stored)?;
+                append_rlib_cache_manifest(&mut manifest, &staging, &stored)?;
+            }
+        }
+        if rustc_dep_info_loc.exists() {
+            let stored = staging.join("rustc-dep-info");
+            paths::copy(rustc_dep_info_loc, &stored)?;
+            append_rlib_cache_manifest(&mut manifest, &staging, &stored)?;
+        }
+        let stored_messages = staging.join("compiler-messages");
+        if message_cache_path.exists() {
+            paths::copy(message_cache_path, &stored_messages)?;
+        } else {
+            paths::write(&stored_messages, b"")?;
+        }
+        append_rlib_cache_manifest(&mut manifest, &staging, &stored_messages)?;
+        paths::write(
+            staging.join("inputs.blake3"),
+            format!("{inputs_digest}\n").as_bytes(),
+        )?;
+        append_rlib_cache_manifest(&mut manifest, &staging, &staging.join("inputs.blake3"))?;
+        paths::write(
+            staging.join("origin-pkg-root"),
+            pkg_root.to_string_lossy().as_bytes(),
+        )?;
+        append_rlib_cache_manifest(&mut manifest, &staging, &staging.join("origin-pkg-root"))?;
+        paths::write(
+            staging.join("origin-target-profile-root"),
+            output_root
+                .parent()
+                .unwrap_or(output_root)
+                .to_string_lossy()
+                .as_bytes(),
+        )?;
+        append_rlib_cache_manifest(
+            &mut manifest,
+            &staging,
+            &staging.join("origin-target-profile-root"),
+        )?;
+        let manifest_path = staging.join("manifest.blake3");
+        paths::write(&manifest_path, manifest.as_bytes())?;
+        let manifest_digest = rlib_cache_digest(&manifest_path)?;
+        paths::write(
+            staging.join("complete"),
+            format!("{manifest_digest}\n").as_bytes(),
+        )?;
+        let entry_size = artifact_cache_entry_size(&staging).ok_or_else(|| {
+            internal(format!(
+                "failed to size artifact cache publication {}",
+                staging.display()
+            ))
+        })?;
+        if entry_size > max_size {
+            paths::remove_dir_all(&staging)?;
+            write_rlib_cache_size(cache_root, cache_size)?;
+            debug!(
+                "not storing artifact cache entry larger than configured maximum: {} > {}",
+                entry_size, max_size
+            );
+            return Ok(false);
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only hook is intentionally outside user configuration"
+        )]
+        let publish_delay = std::env::var_os(ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS);
+        if let Some(delay) =
+            publish_delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        match fs::rename(&staging, &entry) {
+            Ok(()) => {}
+            Err(_error) if entry.join("complete").exists() => {
+                paths::remove_dir_all(&staging)?;
+                reconcile_rlib_cache_size(cache_root, max_size, None)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        cache_size = cache_size.saturating_add(entry_size);
+        if cache_size > max_size {
+            reconcile_rlib_cache_size(cache_root, max_size, Some(&entry))?;
+        } else {
+            write_rlib_cache_size(cache_root, cache_size)?;
+        }
+        Ok(true)
+    })();
+    if result.is_err() && staging.exists() {
+        if let Err(error) = paths::remove_dir_all(&staging) {
+            debug!(
+                "failed to remove abandoned artifact cache publication {}: {error:#}",
+                staging.display()
+            );
+        } else if let Err(error) = write_rlib_cache_size(cache_root, cache_size) {
+            debug!(
+                "failed to restore artifact cache size state after removing {}: {error:#}",
+                staging.display()
+            );
+        }
+    }
+    result
+}
+
+fn verify_rlib_cache_entry(
+    entry: &Path,
+    outputs: &[build_runner::OutputFile],
+) -> CargoResult<bool> {
+    let manifest_path = entry.join("manifest.blake3");
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let complete_digest = paths::read(&entry.join("complete"))?;
+    if rlib_cache_digest(&manifest_path)? != complete_digest.trim() {
+        return Ok(false);
+    }
+    let manifest = paths::read(&manifest_path)?;
+    let expected = manifest
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect::<HashMap<_, _>>();
+    let mut required = vec![
+        entry.join("origin-pkg-root"),
+        entry.join("origin-target-profile-root"),
+        entry.join("inputs.blake3"),
+        entry.join("compiler-messages"),
+    ];
+    let dep_info = entry.join("rustc-dep-info");
+    if expected.contains_key("rustc-dep-info") {
+        required.push(dep_info);
+    }
+    for output in outputs {
+        let Some(name) = output.path.file_name() else {
+            return Ok(false);
+        };
+        required.push(entry.join("files").join(name));
+    }
+    for path in required {
+        let relative = path.strip_prefix(entry).unwrap_or(&path).to_string_lossy();
+        let Some(expected_digest) = expected.get(relative.as_ref()) else {
+            return Ok(false);
+        };
+        if !path.exists() || rlib_cache_digest(&path)? != *expected_digest {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verify_rlib_cache_inputs(
+    entry: &Path,
+    rustc: &ProcessBuilder,
+    rustc_cwd: &Path,
+) -> CargoResult<bool> {
+    let dep_info = entry.join("rustc-dep-info");
+    let Some(digest) = rlib_cache_inputs_digest_with_env(&dep_info, rustc_cwd, |key, _| {
+        rustc
+            .get_env(key)
+            .map(|value| value.to_string_lossy().into_owned())
+    })?
+    else {
+        return Ok(false);
+    };
+    Ok(paths::read(&entry.join("inputs.blake3"))?.trim() == digest)
+}
+
+fn rlib_cache_inputs_are_supported(
+    rustc_dep_info_loc: &Path,
+    rustc_cwd: &Path,
+    build_dir: &Path,
+    output_root: &Path,
+) -> CargoResult<bool> {
+    if !rustc_dep_info_loc.exists() {
+        return Ok(false);
+    }
+    let depinfo = fingerprint::parse_rustc_dep_info(rustc_dep_info_loc)?;
+    Ok(depinfo.files.keys().all(|path| {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            rustc_cwd.join(path)
+        };
+        !path.starts_with(build_dir) && !path.starts_with(output_root)
+    }))
+}
+
+fn rlib_cache_inputs_digest(
+    rustc_dep_info_loc: &Path,
+    rustc_cwd: &Path,
+) -> CargoResult<Option<String>> {
+    rlib_cache_inputs_digest_with_env(rustc_dep_info_loc, rustc_cwd, |_, value| value.clone())
+}
+
+fn rlib_cache_inputs_modified_since(
+    rustc_dep_info_loc: &Path,
+    rustc_cwd: &Path,
+    invocation_time: filetime::FileTime,
+) -> CargoResult<bool> {
+    let depinfo = fingerprint::parse_rustc_dep_info(rustc_dep_info_loc)?;
+    for file in depinfo.files.keys() {
+        let path = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            rustc_cwd.join(file)
+        };
+        let Ok(mtime) = paths::mtime(&path) else {
+            return Ok(true);
+        };
+        if mtime > invocation_time {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rlib_cache_inputs_digest_with_env(
+    rustc_dep_info_loc: &Path,
+    rustc_cwd: &Path,
+    mut env_value: impl FnMut(&str, &Option<String>) -> Option<String>,
+) -> CargoResult<Option<String>> {
+    if !rustc_dep_info_loc.exists() {
+        return Ok(None);
+    }
+    let depinfo = fingerprint::parse_rustc_dep_info(rustc_dep_info_loc)?;
+    let mut files = depinfo.files.keys().collect::<Vec<_>>();
+    files.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-inputs-v1\0");
+    for file in files {
+        let path = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            rustc_cwd.join(file)
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        hasher.update(file.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        let Ok(contents) = fs::read(path) else {
+            return Ok(None);
+        };
+        hasher.update(&contents);
+        hasher.update(b"\0");
+    }
+    let mut envs = depinfo.env.iter().collect::<Vec<_>>();
+    envs.sort_by_key(|(key, _)| key.as_str());
+    for (key, value) in envs {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = env_value(key, value) {
+            hasher.update(b"set\0");
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(b"unset\0");
+        }
+        hasher.update(b"\0");
+    }
+    Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
+fn delay_rlib_cache_input_digest_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let delay = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS);
+    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+        return Ok(());
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    std::thread::sleep(Duration::from_millis(delay));
+    Ok(())
+}
+
+fn delay_rlib_cache_restore_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let delay = std::env::var_os(ARTIFACT_CACHE_RESTORE_DELAY_MS_FOR_TESTS);
+    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+        return Ok(());
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    std::thread::sleep(Duration::from_millis(delay));
+    Ok(())
+}
+
+fn delay_rlib_cache_restore_admitted_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let delay = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS);
+    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+        return Ok(());
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    std::thread::sleep(Duration::from_millis(delay));
+    Ok(())
+}
+
+fn append_rlib_cache_manifest(manifest: &mut String, entry: &Path, path: &Path) -> CargoResult<()> {
+    let relative = path.strip_prefix(entry).unwrap_or(path).to_string_lossy();
+    let digest = rlib_cache_digest(path)?;
+    manifest.push_str(&relative);
+    manifest.push('\t');
+    manifest.push_str(&digest);
+    manifest.push('\n');
+    Ok(())
+}
+
+fn rlib_cache_digest(path: &Path) -> CargoResult<String> {
+    Ok(blake3::hash(&fs::read(path)?).to_hex().to_string())
+}
+
+fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
+    let key = entry.file_name().unwrap_or_default().to_string_lossy();
+    let sequence = ARTIFACT_CACHE_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging = entry.with_file_name(format!(
+        ".{key}.publishing-{}-{sequence}",
+        std::process::id()
+    ));
+    paths::create_dir_all(&staging)?;
+    Ok(staging)
+}
+
+fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
+    paths::create_dir_all(cache_root)?;
+    Filesystem::new(cache_root.to_path_buf())
+        .try_open_ro_shared_create(".cargo-artifact-cache-lock")
+}
+
+fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
+    paths::create_dir_all(cache_root)?;
+    Filesystem::new(cache_root.to_path_buf())
+        .try_open_rw_exclusive_create(".cargo-artifact-cache-lock")
+}
+
+fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let retain_transients_for_tests =
+        std::env::var_os(ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS).is_some();
+    let Ok(entry_roots) = fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry_root in entry_roots.flatten() {
+        if !entry_root.path().is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(entry_root.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with('.')
+                    && (name.contains(".publishing-") || name.contains(".rejected-"))
+            }) {
+                continue;
+            }
+            if retain_transients_for_tests {
+                debug!(
+                    "retaining abandoned artifact cache transient for test {}",
+                    path.display()
+                );
+                continue;
+            }
+            if let Err(error) = paths::remove_dir_all(&path) {
+                debug!(
+                    "failed to remove abandoned artifact cache transient {}: {error:#}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn recorded_rlib_cache_size(cache_root: &Path) -> Option<u64> {
+    paths::read(&cache_root.join(ARTIFACT_CACHE_SIZE_STATE))
+        .ok()?
+        .trim()
+        .strip_prefix(&format!("{ARTIFACT_CACHE_SIZE_STATE_VERSION} "))?
+        .parse()
+        .ok()
+}
+
+fn mark_rlib_cache_size_dirty(cache_root: &Path) -> CargoResult<()> {
+    paths::write_atomic(&cache_root.join(ARTIFACT_CACHE_SIZE_STATE), b"dirty\n")
+}
+
+fn rlib_cache_has_transients(cache_root: &Path) -> bool {
+    let Ok(entry_roots) = fs::read_dir(cache_root) else {
+        return true;
+    };
+    for entry_root in entry_roots {
+        let Ok(entry_root) = entry_root else {
+            return true;
+        };
+        if !entry_root.path().is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(entry_root.path()) else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if entry.path().file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with('.')
+                    && (name.contains(".publishing-") || name.contains(".rejected-"))
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn write_rlib_cache_size(cache_root: &Path, size: u64) -> CargoResult<()> {
+    if rlib_cache_has_transients(cache_root) {
+        return mark_rlib_cache_size_dirty(cache_root);
+    }
+    paths::write_atomic(
+        &cache_root.join(ARTIFACT_CACHE_SIZE_STATE),
+        format!("{ARTIFACT_CACHE_SIZE_STATE_VERSION} {size}\n").as_bytes(),
+    )
+}
+
+fn reconcile_rlib_cache_size(
+    cache_root: &Path,
+    max_size: u64,
+    retained_entry: Option<&Path>,
+) -> CargoResult<u64> {
+    cleanup_abandoned_rlib_cache_transients(cache_root);
+    let size = prune_rlib_cache_entries(cache_root, max_size, retained_entry);
+    write_rlib_cache_size(cache_root, size)?;
+    Ok(size)
+}
+
+fn try_read_lock_rlib_cache_within_limit(
+    cache_root: &Path,
+    max_size: u64,
+) -> CargoResult<Option<crate::util::FileLock>> {
+    let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
+        return Ok(None);
+    };
+    if recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+        delay_rlib_cache_restore_admitted_for_tests()?;
+        return Ok(Some(lock));
+    }
+    drop(lock);
+    let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
+        return Ok(None);
+    };
+    if !recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+        reconcile_rlib_cache_size(cache_root, max_size, None)?;
+    }
+    drop(_lock);
+    let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
+        return Ok(None);
+    };
+    if !recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+        return Ok(None);
+    }
+    delay_rlib_cache_restore_admitted_for_tests()?;
+    Ok(Some(lock))
+}
+
+fn prune_rlib_cache_entries(
+    cache_root: &Path,
+    max_size: u64,
+    retained_entry: Option<&Path>,
+) -> u64 {
+    let Ok(entry_roots) = fs::read_dir(cache_root) else {
+        return 0;
+    };
+    let mut completed = Vec::new();
+    let mut total_size = 0u64;
+    for entry_root in entry_roots.flatten() {
+        let entry_root = entry_root.path();
+        if !entry_root.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&entry_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir()
+                || path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                || !path.join("complete").exists()
+            {
+                continue;
+            }
+            let Some(size) = artifact_cache_entry_size(&path) else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            total_size = total_size.saturating_add(size);
+            completed.push((modified, size, path));
+        }
+    }
+    if total_size <= max_size {
+        return total_size;
+    }
+    completed.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in completed {
+        if total_size <= max_size {
+            break;
+        }
+        if retained_entry.is_some_and(|retained_entry| path == retained_entry) {
+            continue;
+        }
+        if paths::remove_dir_all(&path).is_ok() {
+            total_size = total_size.saturating_sub(size);
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+    total_size
+}
+
+fn artifact_cache_entry_size(path: &Path) -> Option<u64> {
+    let entries = fs::read_dir(path).ok()?;
+    let mut size = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            size = size.saturating_add(artifact_cache_entry_size(&path)?);
+        } else {
+            size = size.saturating_add(entry.metadata().ok()?.len());
+        }
+    }
+    Some(size)
+}
+
+fn quarantine_rlib_cache_entry(entry: &Path) -> CargoResult<()> {
+    let key = entry.file_name().unwrap_or_default().to_string_lossy();
+    let sequence = ARTIFACT_CACHE_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let rejected =
+        entry.with_file_name(format!(".{key}.rejected-{}-{sequence}", std::process::id()));
+    match fs::rename(entry, &rejected) {
+        Ok(()) => {
+            if let Err(error) = paths::remove_dir_all(&rejected) {
+                debug!(
+                    "failed to remove rejected artifact cache entry {}: {error:#}",
+                    rejected.display()
+                );
+            }
+            Ok(())
+        }
+        Err(_error) if !entry.exists() => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2593,34 +4598,45 @@ fn replay_output_cache(
 ) -> Work {
     let target = target.clone();
     Work::new(move |state| {
-        if !path.exists() {
-            // No cached output, probably didn't emit anything.
-            return Ok(());
-        }
-        // We sometimes have gigabytes of output from the compiler, so avoid
-        // loading it all into memory at once, as that can cause OOM where
-        // otherwise there would be none.
-        let file = paths::open(&path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut line = String::new();
-        loop {
-            let length = reader.read_line(&mut line)?;
-            if length == 0 {
-                break;
-            }
-            let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
-            on_stderr_line(
-                state,
-                trimmed,
-                package_id,
-                &manifest,
-                &target,
-                &mut output_options,
-            )?;
-            line.clear();
-        }
-        Ok(())
+        replay_output_cache_file(
+            state,
+            package_id,
+            &manifest,
+            &target,
+            &path,
+            &mut output_options,
+        )
     })
+}
+
+fn replay_output_cache_file(
+    state: &JobState<'_, '_>,
+    package_id: PackageId,
+    manifest: &ManifestErrorContext,
+    target: &Target,
+    path: &Path,
+    output_options: &mut OutputOptions,
+) -> CargoResult<()> {
+    if !path.exists() {
+        // No cached output, probably didn't emit anything.
+        return Ok(());
+    }
+    // We sometimes have gigabytes of output from the compiler, so avoid
+    // loading it all into memory at once, as that can cause OOM where
+    // otherwise there would be none.
+    let file = paths::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        let length = reader.read_line(&mut line)?;
+        if length == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
+        on_stderr_line(state, trimmed, package_id, manifest, target, output_options)?;
+        line.clear();
+    }
+    Ok(())
 }
 
 /// Provides a package name with descriptive target information,

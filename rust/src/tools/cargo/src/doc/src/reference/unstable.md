@@ -83,6 +83,7 @@ Each new feature described below should explain how to use it.
 * Output behavior
     * [artifact-dir](#artifact-dir) --- Adds a directory where artifacts are copied to.
     * [build-dir-new-layout](#build-dir-new-layout) --- Enables the new build-dir filesystem layout
+    * [artifact-cache](#artifact-cache) --- Reuses verified ordinary-library outputs from a shared cache.
     * [Different binary name](#different-binary-name) --- Assign a name to the built binary that is separate from the crate name.
     * [root-dir](#root-dir) --- Controls the root directory relative to which paths are printed
 * Compile behavior
@@ -500,6 +501,78 @@ that are uplifted into the target or artifact directories.
   }
 }
 ```
+
+## artifact-cache
+
+The `artifact-cache` feature reuses verified ordinary-library outputs across
+build directories through a shared content cache. Artifact restoration is
+currently supported only on macOS and Linux hosts. It is intentionally limited
+to non-proc-macro library builds without build scripts, compiler wrappers,
+explicitly configured compiler drivers, SBOM side outputs, profiling side
+outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc version
+identity overrides, profile-guided compiler inputs, arbitrary LLVM backend
+arguments, external codegen backend libraries, custom target specifications or
+target search paths, explicit sysroot overrides, Windows GNU-family targets
+whose raw-dylib support can invoke unmodeled `dlltool` programs, unmodeled
+unstable rustc options, unmodeled dynamic loader overrides, unmodeled
+dependency search paths, or unsupported native-link or extra-output inputs.
+Cache keys preserve source-location and a content identity for modeled
+Cargo-selected compiler paths, installed sysroot compiler and target library
+file identity, installed codegen backend contents, and compiler-visible
+dynamic library search inputs. Installed sysroot library identity follows ordinary
+toolchain publication metadata; overwriting a sysroot file's contents in place
+while preserving its identity, size, and modification time is outside this
+model, as is mutating installed toolchain files in place during an active Cargo
+invocation.
+For ordinary publication that replaces watched installed files or directory
+trees, file and directory identity metadata are included in the cache identity
+and rechecked before cache restoration and publication.
+Token-bearing dynamic library search paths, such as Linux `$ORIGIN` or macOS
+`@loader_path`, run normally without restoration rather than being interpreted
+for cache identity. Linux builds with nonempty `GLIBC_TUNABLES` also run
+without restoration because they can change dynamic library selection. Linux
+loader roots containing nested shared objects, including glibc
+hardware-capability candidates in configured or installed compiler loader
+roots, run without restoration because host capability selection may change
+which compiler library is loaded.
+Unmodeled compiler dispatch runs normally without restoration.
+Dependencies from a common source location can be shared across worktrees while
+separate local checkouts are rebuilt when
+compile-time paths can affect their output. The cache retains distinct verified
+variants for rustc-discovered file and environment inputs and replays cached
+compiler diagnostics when restoring an artifact. Artifacts are not published
+when tracked file inputs change during compilation, and unavailable cache
+storage falls back to ordinary compilation.
+
+Enable it with `-Zartifact-cache` and configure the shared directory:
+
+```toml
+[build]
+artifact-cache-dir = "/var/cache/cargo/artifacts"
+artifact-cache-materialization = "hardlink"
+artifact-cache-max-size = "10GB"
+```
+
+The cache directory must be trusted build-artifact storage. Entry hashes reject
+accidental corruption but do not authenticate artifacts supplied by another
+writer with access to that directory.
+
+`artifact-cache-materialization` accepts `hardlink` (the default) or `copy`.
+On macOS and Linux, hardlink materialization avoids duplicate filesystem
+allocation. Cargo detaches a restored hardlink before rebuilding that output,
+including after the cache feature is disabled, and automatically falls back to
+copying when the cache and build directory are on different filesystems.
+In `hardlink` mode, restored `.rlib` and `.rmeta` files share storage with the
+central cache. Tools outside Cargo must not mutate those restored files in
+place; use `copy` materialization for workflows that modify build artifacts
+after compilation.
+
+`artifact-cache-max-size` caps completed cache entries using oldest-first
+eviction and accepts human-readable sizes such as `"10GB"` or `"2GiB"`. The
+default is `"10GB"`. Individual entries larger than this limit are not
+published. Cargo allows concurrent restorations under shared cache locks and
+protects publication, size accounting, cleanup of aborted publications, and
+eviction with an exclusive cache lock.
 
 ## update-breaking
 

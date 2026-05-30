@@ -151,6 +151,11 @@ impl ProcessBuilder {
         self.wrappers.last().unwrap_or(&self.program)
     }
 
+    /// Gets all executables in the wrapped program invocation, outermost first.
+    pub fn get_programs(&self) -> impl Iterator<Item = &OsString> {
+        self.wrappers.iter().rev().chain(once(&self.program))
+    }
+
     /// Gets the program arg0.
     pub fn get_arg0(&self) -> Option<&OsStr> {
         self.arg0.as_deref()
@@ -158,12 +163,7 @@ impl ProcessBuilder {
 
     /// Gets the program arguments.
     pub fn get_args(&self) -> impl Iterator<Item = &OsString> {
-        self.wrappers
-            .iter()
-            .rev()
-            .chain(once(&self.program))
-            .chain(self.args.iter())
-            .skip(1) // Skip the main `program
+        self.get_programs().chain(self.args.iter()).skip(1) // Skip the main `program
     }
 
     /// Gets the current working directory for the process.
