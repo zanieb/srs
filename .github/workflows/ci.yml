@@ -123,6 +123,25 @@ jobs:
         working-directory: workloads/uv
         run: cargo +srs build --locked -p uv
 
+      - name: Test uv
+        working-directory: workloads/uv
+        run: |
+          ./target/debug/uv --version
+          ./target/debug/uvx --version
+          ./target/debug/uv generate-shell-completion bash >/dev/null
+          ./target/debug/uvx --generate-shell-completion bash >/dev/null
+
+          venv="${RUNNER_TEMP}/uv-srs-smoke-venv"
+          ./target/debug/uv venv \
+            --no-project \
+            --no-config \
+            --no-python-downloads \
+            --python "$(command -v python3)" \
+            --no-cache \
+            "${venv}"
+          "${venv}/bin/python" -c 'import sys; print(sys.version)'
+          ./target/debug/uv pip check --python "${venv}/bin/python"
+
       - uses: actions/checkout@v6
         with:
           repository: astral-sh/ruff
@@ -132,3 +151,19 @@ jobs:
       - name: Build Ruff and ty
         working-directory: workloads/ruff
         run: cargo +srs build --locked -p ruff -p ty
+
+      - name: Test Ruff and ty
+        working-directory: workloads/ruff
+        run: |
+          smoke_file="${RUNNER_TEMP}/srs-workload-smoke.py"
+          printf '%s\n' \
+            'def double(value: int) -> int:' \
+            '    return value * 2' \
+            '' \
+            'answer: int = double(21)' \
+            > "${smoke_file}"
+
+          ./target/debug/ruff --version
+          ./target/debug/ruff check --no-cache --isolated "${smoke_file}"
+          ./target/debug/ty --version
+          ./target/debug/ty check "${smoke_file}"
