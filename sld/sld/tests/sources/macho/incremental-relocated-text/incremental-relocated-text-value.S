@@ -14,8 +14,24 @@ _incremental_relocated_text_value:
     ret
     bl _incremental_relocated_text_helper
 
+.section __TEXT,__const
+.p2align 2
+#ifdef RETARGET
+.globl _incremental_relocated_text_target
+_incremental_relocated_text_target:
+    .long 42
+    .long 0
+#else
+    .long 0
+    .long 0
+#endif
+
 .section __DATA,__data
 .p2align 2
+#ifdef RETARGET
+    .long 0
+    .long 0
+#else
 #ifdef MOVE_TARGET
     .long 0
 #endif
@@ -24,4 +40,5 @@ _incremental_relocated_text_target:
     .long 42
 #ifndef MOVE_TARGET
     .long 0
+#endif
 #endif
