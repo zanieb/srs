@@ -8,6 +8,7 @@ use crate::file_writer::SizedOutput;
 use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
+use crate::incremental::DeferredMachOSymbolResolution;
 use crate::incremental::PreparedState;
 use crate::layout::FileLayout;
 use crate::layout::HeaderInfo;
@@ -872,6 +873,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     incremental: &PreparedState<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
+    record_macho_symbol_resolutions(layout, incremental)?;
     let existing_output_bytes_available = sized_output.existing_data_available();
     let chained_rebases = ChainedRebases::collect::<A>(layout)?;
     let symbol_section_indices = macho_section_indices(layout);
@@ -934,6 +936,57 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         write_code_signature(layout, sized_output)?;
     }
 
+    Ok(())
+}
+
+fn record_macho_symbol_resolutions<'data>(
+    layout: &MachOLayout<'data>,
+    incremental: &PreparedState<'data>,
+) -> Result {
+    if !incremental.records_relocations() || incremental.can_reuse_output() {
+        return Ok(());
+    }
+    let mut thunk_addresses_by_target = HashMap::<SymbolId, Vec<u64>>::new();
+    for block in &layout.thunk_block_addresses {
+        for (&symbol_id, &address) in block {
+            thunk_addresses_by_target
+                .entry(layout.symbol_db.definition(symbol_id))
+                .or_default()
+                .push(address);
+        }
+    }
+    for addresses in thunk_addresses_by_target.values_mut() {
+        addresses.sort_unstable();
+        addresses.dedup();
+    }
+    let mut resolutions = Vec::new();
+    for (name, &symbol_id) in layout.symbol_db.all_unversioned_symbols() {
+        let target_symbol_id = layout.symbol_db.definition(symbol_id);
+        let Some(resolution) = layout.merged_symbol_resolution(target_symbol_id) else {
+            continue;
+        };
+        resolutions.push(DeferredMachOSymbolResolution {
+            name: name.bytes(),
+            direct_value: (!layout.symbol_db.is_undefined(target_symbol_id)
+                && !resolution.flags.is_dynamic()
+                && !resolution.flags.is_ifunc())
+            .then_some(resolution.raw_value),
+            got_address: resolution
+                .format_specific
+                .got_address
+                .map(|address| address.get()),
+            stub_address: resolution
+                .format_specific
+                .stub_address
+                .map(|address| address.get()),
+            thunk_addresses: thunk_addresses_by_target
+                .get(&target_symbol_id)
+                .cloned()
+                .unwrap_or_default(),
+            target: macho_relocation_target_owner(layout, target_symbol_id)?,
+        });
+    }
+    incremental.record_macho_symbol_resolutions(resolutions);
     Ok(())
 }
 

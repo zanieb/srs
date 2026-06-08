@@ -53,7 +53,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v36";
+const STATE_VERSION: &str = "sld-incremental-state-v37";
+const STATE_VERSION_V36: &str = "sld-incremental-state-v36";
 const STATE_VERSION_V35: &str = "sld-incremental-state-v35";
 const STATE_VERSION_V34: &str = "sld-incremental-state-v34";
 const STATE_VERSION_V33: &str = "sld-incremental-state-v33";
@@ -93,7 +94,8 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const METADATA_UPDATE_FILE: &str = "metadata-update";
-const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v1";
+const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v2";
+const METADATA_UPDATE_VERSION_V1: &str = "sld-incremental-metadata-update-v1";
 const USER_STATE_DIR_ENV: &str = "SLD_STATE_DIR";
 const LOG_INCREMENTAL_LINK_OPTIONS_ENV: &str = "SLD_LOG_INCREMENTAL_LINK_OPTIONS";
 const LOG_INCREMENTAL_EXACT_ARGS_ENV: &str = "SLD_LOG_INCREMENTAL_EXACT_ARGS";
@@ -126,6 +128,8 @@ const SECTIONS_FILE_PREFIX: &str = "sections-";
 const COMPRESSED_SECTIONS_FILE_PREFIX: &str = "sections-zstd-";
 const PUBLISHING_SECTIONS_FILE: &str = "sections-publishing";
 const SECTIONS_COMPRESSION_LEVEL: i32 = 1;
+const COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX: &str = "macho-resolutions-zstd-";
+const MACHO_RESOLUTIONS_COMPRESSION_LEVEL: i32 = 1;
 const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
@@ -342,10 +346,12 @@ pub(crate) struct PreparedState<'data> {
     reusable_inputs: HashSet<String>,
     previous_sections: HashSet<SectionRecord>,
     previous_relocations: Vec<RelocationRecord>,
+    previous_macho_symbol_resolutions_file: Option<String>,
     previous_fdes: Vec<FdeRecord>,
     previous_dynamic_relocations: Vec<DynamicRelocationRecord>,
     current_sections: RecordBuffers<SectionRecord>,
     current_relocations: RecordBuffers<DeferredRelocationRecord<'data>>,
+    current_macho_symbol_resolutions: RecordBuffers<MachOSymbolResolutionRecord>,
     current_fdes: RecordBuffers<FdeRecord>,
     current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
     record_texts: RecordTextInterner,
@@ -400,9 +406,11 @@ struct PersistedState {
     input_files: Vec<FileState>,
     sections: Vec<SectionRecord>,
     relocations: Vec<RelocationRecord>,
+    macho_symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
     sections_file: Option<String>,
+    macho_symbol_resolutions_file: Option<String>,
     patch_records_file: Option<String>,
     patch_record_locations: Vec<PatchRecordLocation>,
     raw_patch_record_locations: Option<String>,
@@ -556,12 +564,31 @@ pub(crate) struct DeferredRelocationRecord<'data> {
     addend: i64,
 }
 
+pub(crate) struct DeferredMachOSymbolResolution<'data> {
+    pub(crate) name: &'data [u8],
+    pub(crate) direct_value: Option<u64>,
+    pub(crate) got_address: Option<u64>,
+    pub(crate) stub_address: Option<u64>,
+    pub(crate) thunk_addresses: Vec<u64>,
+    pub(crate) target: Option<(InputRef<'data>, object::SectionIndex, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationTargetRecord {
     input_file: SharedText,
     input: SharedText,
     section_index: u32,
     section_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct MachOSymbolResolutionRecord {
+    name: SharedText,
+    direct_value: Option<u64>,
+    got_address: Option<u64>,
+    stub_address: Option<u64>,
+    thunk_addresses: Vec<u64>,
+    target: Option<RelocationTargetRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -607,10 +634,12 @@ pub(crate) fn maybe_prepare<'data>(
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -682,6 +711,7 @@ pub(crate) fn maybe_prepare<'data>(
 
     let mut previous_sections = HashSet::new();
     let mut previous_relocations = Vec::new();
+    let mut previous_macho_symbol_resolutions_file = None;
     let mut previous_fdes = Vec::new();
     let mut previous_dynamic_relocations = Vec::new();
     if mode_needs_previous_sections(&mode) {
@@ -689,6 +719,7 @@ pub(crate) fn maybe_prepare<'data>(
             Ok(Some(previous)) => {
                 previous_sections = previous.sections.iter().cloned().collect();
                 previous_relocations = previous.relocations;
+                previous_macho_symbol_resolutions_file = previous.macho_symbol_resolutions_file;
                 previous_fdes = previous.fdes;
                 previous_dynamic_relocations = previous.dynamic_relocations;
             }
@@ -724,10 +755,12 @@ pub(crate) fn maybe_prepare<'data>(
         reusable_inputs,
         previous_sections,
         previous_relocations,
+        previous_macho_symbol_resolutions_file,
         previous_fdes,
         previous_dynamic_relocations,
         current_sections: RecordBuffers::default(),
         current_relocations: RecordBuffers::default(),
+        current_macho_symbol_resolutions: RecordBuffers::default(),
         current_fdes: RecordBuffers::default(),
         current_dynamic_relocations: RecordBuffers::default(),
         record_texts: RecordTextInterner::default(),
@@ -3292,6 +3325,11 @@ fn patch_changed_inputs(
     if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
         return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
     }
+    // Changed objects can move definitions that have no existing relocation record. Until the
+    // catalog is rematerialized from the patched generation, do not let a later added relocation
+    // reuse stale symbol or thunk addresses.
+    previous.macho_symbol_resolutions.clear();
+    previous.macho_symbol_resolutions_file = None;
     {
         timing_phase!("Persist changed incremental patch metadata");
         PersistedState {
@@ -3305,9 +3343,11 @@ fn patch_changed_inputs(
             input_files: previous.input_files,
             sections: previous.sections,
             relocations: previous.relocations,
+            macho_symbol_resolutions: previous.macho_symbol_resolutions,
             fdes: previous.fdes,
             dynamic_relocations: previous.dynamic_relocations,
             sections_file: previous.sections_file,
+            macho_symbol_resolutions_file: previous.macho_symbol_resolutions_file,
             patch_records_file: previous.patch_records_file,
             patch_record_locations: previous.patch_record_locations,
             raw_patch_record_locations: previous.raw_patch_record_locations,
@@ -4646,6 +4686,41 @@ impl<'data> PreparedState<'data> {
         self.current_relocations.extend(records);
     }
 
+    pub(crate) fn record_macho_symbol_resolutions(
+        &self,
+        resolutions: Vec<DeferredMachOSymbolResolution<'data>>,
+    ) {
+        if self.mode == IncrementalMode::Disabled {
+            return;
+        }
+        let records = resolutions
+            .into_iter()
+            .filter(|resolution| !resolution.name.is_empty())
+            .map(|resolution| {
+                let target = resolution
+                    .target
+                    .map(|(input, section_index, section_offset)| {
+                        let (input_file, input) = self.intern_input_texts(input);
+                        RelocationTargetRecord::new(
+                            input_file,
+                            input,
+                            section_index,
+                            section_offset,
+                        )
+                    });
+                MachOSymbolResolutionRecord {
+                    name: self.record_texts.intern(hex::encode(resolution.name)),
+                    direct_value: resolution.direct_value,
+                    got_address: resolution.got_address,
+                    stub_address: resolution.stub_address,
+                    thunk_addresses: resolution.thunk_addresses,
+                    target,
+                }
+            })
+            .collect();
+        self.current_macho_symbol_resolutions.extend(records);
+    }
+
     pub(crate) fn record_dynamic_relocation_with_output_info(
         &self,
         input: InputRef<'_>,
@@ -4736,7 +4811,15 @@ impl<'data> PreparedState<'data> {
             }
         };
 
-        let (sections, relocations, relocation_shards, fdes, dynamic_relocations) = {
+        let (
+            sections,
+            relocations,
+            relocation_shards,
+            macho_symbol_resolutions,
+            macho_symbol_resolutions_file,
+            fdes,
+            dynamic_relocations,
+        ) = {
             timing_phase!("Collect incremental records");
 
             let mut sections = self.current_sections.take_all();
@@ -4753,6 +4836,16 @@ impl<'data> PreparedState<'data> {
                 Vec::new()
             };
 
+            let mut macho_symbol_resolutions = self.current_macho_symbol_resolutions.take_all();
+            macho_symbol_resolutions.sort_unstable();
+            macho_symbol_resolutions.dedup();
+            let macho_symbol_resolutions_file =
+                if macho_symbol_resolutions.is_empty() && self.mode == IncrementalMode::Reuse {
+                    self.previous_macho_symbol_resolutions_file.clone()
+                } else {
+                    None
+                };
+
             let mut fdes = self.current_fdes.take_all();
             if fdes.is_empty() && self.mode == IncrementalMode::Reuse {
                 fdes.extend(self.previous_fdes.iter().cloned());
@@ -4767,6 +4860,8 @@ impl<'data> PreparedState<'data> {
                 sections,
                 relocations,
                 relocation_shards,
+                macho_symbol_resolutions,
+                macho_symbol_resolutions_file,
                 fdes,
                 dynamic_relocations,
             )
@@ -4815,9 +4910,11 @@ impl<'data> PreparedState<'data> {
             input_files,
             sections,
             relocations,
+            macho_symbol_resolutions,
             fdes,
             dynamic_relocations,
             sections_file: None,
+            macho_symbol_resolutions_file,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
@@ -5074,6 +5171,19 @@ impl PersistedState {
 
     fn read_metadata(state_dir: &Path) -> Result<Option<Self>> {
         Self::read_impl(state_dir, false, PatchSectionReadMode::PreserveRaw, false)
+    }
+
+    #[allow(dead_code)]
+    fn load_macho_symbol_resolutions(&mut self, state_dir: &Path) -> Result {
+        if !self.macho_symbol_resolutions.is_empty() {
+            return Ok(());
+        }
+        let Some(file_name) = self.macho_symbol_resolutions_file.as_deref() else {
+            return Ok(());
+        };
+        timing_phase!("Read incremental Mach-O resolutions");
+        self.macho_symbol_resolutions = read_macho_resolutions_sidecar(state_dir, file_name)?;
+        Ok(())
     }
 
     fn read_impl(
@@ -5357,7 +5467,7 @@ impl PersistedState {
         let version = lines
             .next()
             .context("Missing incremental metadata update header")?;
-        if version != METADATA_UPDATE_VERSION {
+        if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
             return Err(crate::error!(
                 "Unsupported incremental metadata update version `{version}`"
             ));
@@ -5365,6 +5475,9 @@ impl PersistedState {
         let _ = parse_link_start_line(lines.next())?;
         let _ = parse_content_line(lines.next(), "output")?;
         let _ = parse_build_id_hash_line(lines.next())?;
+        if version == METADATA_UPDATE_VERSION {
+            let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+        }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
             .context("Invalid incremental metadata update input count")?;
@@ -5444,6 +5557,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V36
             && version != STATE_VERSION_V35
             && version != STATE_VERSION_V34
             && version != STATE_VERSION_V33
@@ -5551,6 +5665,25 @@ impl PersistedState {
             input_files.push(parse_input_line(line, patch_section_mode)?);
         }
 
+        let macho_symbol_resolutions_file = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("macho-resolutions-file\t"))
+        {
+            let file = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+            if file == ABSENT_FIELD {
+                None
+            } else {
+                validate_macho_resolutions_file_name(file)?;
+                Some(file.to_owned())
+            }
+        } else if version == STATE_VERSION {
+            return Err(crate::error!(
+                "Missing Mach-O resolution sidecar in incremental state"
+            ));
+        } else {
+            None
+        };
+
         let mut sections_file = None;
         let mut patch_records_file = None;
         let mut patch_record_locations = Vec::new();
@@ -5559,6 +5692,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V36
             || version == STATE_VERSION_V35
             || version == STATE_VERSION_V34
             || version == STATE_VERSION_V33
@@ -5596,6 +5730,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V36
                     && version != STATE_VERSION_V35
                     && version != STATE_VERSION_V34
                     && version != STATE_VERSION_V33
@@ -5604,7 +5739,7 @@ impl PersistedState {
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -5685,9 +5820,11 @@ impl PersistedState {
             input_files,
             sections,
             relocations,
+            macho_symbol_resolutions: Vec::new(),
             fdes,
             dynamic_relocations,
             sections_file,
+            macho_symbol_resolutions_file,
             patch_records_file,
             patch_record_locations,
             raw_patch_record_locations,
@@ -5695,6 +5832,14 @@ impl PersistedState {
     }
 
     fn write(&self, state_dir: &Path) -> Result {
+        let macho_symbol_resolutions_file = if self.macho_symbol_resolutions.is_empty() {
+            self.macho_symbol_resolutions_file.clone()
+        } else {
+            Some(write_macho_resolutions_sidecar(
+                state_dir,
+                &self.macho_symbol_resolutions,
+            )?)
+        };
         let (sections_file, locations) = write_indexed_records_streaming(
             state_dir,
             &self.sections,
@@ -5708,11 +5853,19 @@ impl PersistedState {
             Some(&sections_file),
             &locations,
             None,
+            macho_symbol_resolutions_file.as_deref(),
         )
     }
 
     fn write_publishing_index(&self, state_dir: &Path) -> Result {
-        self.write_index_with_sections_files(state_dir, PUBLISHING_SECTIONS_FILE, None, &[], None)
+        self.write_index_with_sections_files(
+            state_dir,
+            PUBLISHING_SECTIONS_FILE,
+            None,
+            &[],
+            None,
+            self.macho_symbol_resolutions_file.as_deref(),
+        )
     }
 
     fn write_metadata_update(&self, state_dir: &Path) -> Result {
@@ -5766,6 +5919,7 @@ impl PersistedState {
             self.patch_records_file.as_deref(),
             &self.patch_record_locations,
             self.raw_patch_record_locations.as_deref(),
+            self.macho_symbol_resolutions_file.as_deref(),
         )
     }
 
@@ -5776,6 +5930,7 @@ impl PersistedState {
         patch_records_file: Option<&str>,
         patch_record_locations: &[PatchRecordLocation],
         raw_patch_record_locations: Option<&str>,
+        macho_symbol_resolutions_file: Option<&str>,
     ) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
@@ -5793,6 +5948,7 @@ impl PersistedState {
                 patch_records_file,
                 patch_record_locations,
                 raw_patch_record_locations,
+                macho_symbol_resolutions_file,
             ),
         )
         .with_context(|| format!("Failed to write incremental state `{}`", tmp_path.display()))?;
@@ -5836,8 +5992,10 @@ impl PersistedState {
         patch_records_file: Option<&str>,
         patch_record_locations: &[PatchRecordLocation],
         raw_patch_record_locations: Option<&str>,
+        macho_symbol_resolutions_file: Option<&str>,
     ) -> String {
-        let mut out = self.render_header_and_inputs();
+        let mut out = self
+            .render_header_and_inputs_with_macho_resolutions_file(macho_symbol_resolutions_file);
         if patch_records_file == Some(sections_file) {
             writeln!(&mut out, "indexed-sections-file\t{sections_file}").unwrap();
             render_patch_record_location_table(
@@ -5888,6 +6046,14 @@ impl PersistedState {
                 .map_or_else(|| ABSENT_FIELD.to_owned(), render_build_id_hash_state)
         )
         .unwrap();
+        writeln!(
+            &mut out,
+            "macho-resolutions-file\t{}",
+            self.macho_symbol_resolutions_file
+                .as_deref()
+                .unwrap_or(ABSENT_FIELD)
+        )
+        .unwrap();
         let mut input_indices = input_indices.to_vec();
         input_indices.sort_unstable();
         input_indices.dedup();
@@ -5911,7 +6077,17 @@ impl PersistedState {
         out
     }
 
+    #[cfg(test)]
     fn render_header_and_inputs(&self) -> String {
+        self.render_header_and_inputs_with_macho_resolutions_file(
+            self.macho_symbol_resolutions_file.as_deref(),
+        )
+    }
+
+    fn render_header_and_inputs_with_macho_resolutions_file(
+        &self,
+        macho_symbol_resolutions_file: Option<&str>,
+    ) -> String {
         let mut out = String::new();
         writeln!(&mut out, "{STATE_VERSION}").unwrap();
         writeln!(&mut out, "args\t{}", self.args_hash).unwrap();
@@ -5952,6 +6128,12 @@ impl PersistedState {
         for input in &self.input_files {
             writeln!(&mut out, "input\t{}", render_input_line_rest(input)).unwrap();
         }
+        writeln!(
+            &mut out,
+            "macho-resolutions-file\t{}",
+            macho_symbol_resolutions_file.unwrap_or(ABSENT_FIELD)
+        )
+        .unwrap();
         out
     }
 
@@ -5970,7 +6152,7 @@ impl PersistedState {
         let version = lines
             .next()
             .context("Missing incremental metadata update header")?;
-        if version != METADATA_UPDATE_VERSION {
+        if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
             return Err(crate::error!(
                 "Unsupported incremental metadata update version `{version}`"
             ));
@@ -5978,6 +6160,16 @@ impl PersistedState {
         self.link_start = parse_link_start_line(lines.next())?;
         self.output = parse_content_line(lines.next(), "output")?;
         self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
+        if version == METADATA_UPDATE_VERSION {
+            let file = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+            self.macho_symbol_resolutions_file = if file == ABSENT_FIELD {
+                None
+            } else {
+                validate_macho_resolutions_file_name(file)?;
+                Some(file.to_owned())
+            };
+            self.macho_symbol_resolutions.clear();
+        }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
             .context("Invalid incremental metadata update input count")?;
@@ -6418,6 +6610,231 @@ fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
         }
     }
     Ok(contents)
+}
+
+fn write_macho_resolutions_sidecar(
+    state_dir: &Path,
+    resolutions: &[MachOSymbolResolutionRecord],
+) -> Result<String> {
+    std::fs::create_dir_all(state_dir).with_context(|| {
+        format!(
+            "Failed to create incremental state directory `{}`",
+            state_dir.display()
+        )
+    })?;
+    let mut contents = String::new();
+    write_rendered_macho_symbol_resolutions(&mut contents, resolutions)
+        .expect("writing Mach-O resolutions to String should not fail");
+    let compressed =
+        zstd::stream::encode_all(contents.as_bytes(), MACHO_RESOLUTIONS_COMPRESSION_LEVEL)
+            .context("Failed to compress incremental Mach-O resolutions")?;
+    let file_name = compressed_macho_resolutions_sidecar_file_name(&compressed);
+    let path = state_dir.join(&file_name);
+    if !path.exists() {
+        let tmp_path = state_dir.join(format!("{file_name}.tmp"));
+        std::fs::write(&tmp_path, &compressed).with_context(|| {
+            format!(
+                "Failed to write incremental Mach-O resolutions `{}`",
+                tmp_path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to install incremental Mach-O resolutions `{}`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(file_name)
+}
+
+#[allow(dead_code)]
+fn read_macho_resolutions_sidecar(
+    state_dir: &Path,
+    file_name: &str,
+) -> Result<Vec<MachOSymbolResolutionRecord>> {
+    validate_macho_resolutions_file_name(file_name)?;
+    let path = state_dir.join(file_name);
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "Failed to read incremental Mach-O resolutions `{}`",
+            path.display()
+        )
+    })?;
+    let expected_name = compressed_macho_resolutions_sidecar_file_name(&bytes);
+    if file_name != expected_name {
+        return Err(crate::error!(
+            "Incremental Mach-O resolutions `{}` do not match their content hash",
+            path.display()
+        ));
+    }
+    let contents = zstd::stream::decode_all(bytes.as_slice()).with_context(|| {
+        format!(
+            "Failed to decompress incremental Mach-O resolutions `{}`",
+            path.display()
+        )
+    })?;
+    let contents =
+        std::str::from_utf8(&contents).context("Invalid UTF-8 in Mach-O resolution sidecar")?;
+    parse_macho_symbol_resolutions(contents.lines())
+}
+
+fn write_rendered_macho_symbol_resolutions(
+    mut out: &mut impl std::fmt::Write,
+    resolutions: &[MachOSymbolResolutionRecord],
+) -> std::fmt::Result {
+    let mut target_inputs = Vec::new();
+    let mut target_input_ids = HashMap::new();
+    for resolution in resolutions {
+        if let Some(target) = resolution.target.as_ref() {
+            add_section_input(
+                &mut target_inputs,
+                &mut target_input_ids,
+                target.input_file.as_str(),
+                target.input.as_str(),
+            );
+        }
+    }
+    writeln!(&mut out, "macho-resolution-inputs\t{}", target_inputs.len())?;
+    for (input_file, input) in target_inputs {
+        writeln!(&mut out, "macho-resolution-input\t{input_file}\t{input}")?;
+    }
+    writeln!(&mut out, "macho-resolutions\t{}", resolutions.len())?;
+    for resolution in resolutions {
+        let thunk_addresses = if resolution.thunk_addresses.is_empty() {
+            ABSENT_FIELD.to_owned()
+        } else {
+            resolution
+                .thunk_addresses
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (target_input_id, target_section_index, target_section_offset) = resolution
+            .target
+            .as_ref()
+            .map_or((None, None, None), |target| {
+                (
+                    Some(target_input_ids[&(target.input_file.as_str(), target.input.as_str())]),
+                    Some(target.section_index),
+                    Some(target.section_offset),
+                )
+            });
+        writeln!(
+            &mut out,
+            "macho-resolution\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            resolution.name,
+            OptionalRecordField(resolution.direct_value),
+            OptionalRecordField(resolution.got_address),
+            OptionalRecordField(resolution.stub_address),
+            thunk_addresses,
+            OptionalRecordField(target_input_id),
+            OptionalRecordField(target_section_index),
+            OptionalRecordField(target_section_offset),
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_macho_symbol_resolutions<'a>(
+    mut lines: impl Iterator<Item = &'a str>,
+) -> Result<Vec<MachOSymbolResolutionRecord>> {
+    let input_count: usize = parse_prefixed_line(lines.next(), "macho-resolution-inputs")?
+        .parse()
+        .context("Invalid Mach-O resolution input count")?;
+    let mut inputs = Vec::with_capacity(input_count);
+    for _ in 0..input_count {
+        let rest = parse_prefixed_line(lines.next(), "macho-resolution-input")?;
+        let (input_file, input) = rest
+            .split_once('\t')
+            .context("Malformed Mach-O resolution input")?;
+        inputs.push((SharedText::from(input_file), SharedText::from(input)));
+    }
+    let resolution_count: usize = parse_prefixed_line(lines.next(), "macho-resolutions")?
+        .parse()
+        .context("Invalid Mach-O resolution count")?;
+    let mut resolutions = Vec::with_capacity(resolution_count);
+    for _ in 0..resolution_count {
+        let rest = parse_prefixed_line(lines.next(), "macho-resolution")?;
+        let parts = rest.split('\t').collect::<Vec<_>>();
+        if parts.len() != 8 {
+            return Err(crate::error!("Malformed Mach-O resolution record"));
+        }
+        let parse_optional_u64 = |value: &str, field: &str| -> Result<Option<u64>> {
+            (value != ABSENT_FIELD)
+                .then(|| {
+                    value
+                        .parse()
+                        .with_context(|| format!("Invalid Mach-O resolution {field}"))
+                })
+                .transpose()
+        };
+        let direct_value = parse_optional_u64(parts[1], "direct value")?;
+        let got_address = parse_optional_u64(parts[2], "GOT address")?;
+        let stub_address = parse_optional_u64(parts[3], "stub address")?;
+        let thunk_addresses = if parts[4] == ABSENT_FIELD {
+            Vec::new()
+        } else {
+            parts[4]
+                .split(',')
+                .map(|address| {
+                    address
+                        .parse()
+                        .context("Invalid Mach-O resolution thunk address")
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let target =
+            if parts[5] == ABSENT_FIELD && parts[6] == ABSENT_FIELD && parts[7] == ABSENT_FIELD {
+                None
+            } else {
+                let input_id: usize = parts[5]
+                    .parse()
+                    .context("Invalid Mach-O resolution target input index")?;
+                let (input_file, input) = inputs
+                    .get(input_id)
+                    .context("Mach-O resolution target input index out of bounds")?;
+                Some(RelocationTargetRecord {
+                    input_file: input_file.clone(),
+                    input: input.clone(),
+                    section_index: parts[6]
+                        .parse()
+                        .context("Invalid Mach-O resolution target section index")?,
+                    section_offset: parts[7]
+                        .parse()
+                        .context("Invalid Mach-O resolution target section offset")?,
+                })
+            };
+        resolutions.push(MachOSymbolResolutionRecord {
+            name: SharedText::from(parts[0]),
+            direct_value,
+            got_address,
+            stub_address,
+            thunk_addresses,
+            target,
+        });
+    }
+    if lines.next().is_some() {
+        return Err(crate::error!(
+            "Unexpected trailing Mach-O resolution sidecar data"
+        ));
+    }
+    Ok(resolutions)
+}
+
+fn validate_macho_resolutions_file_name(file_name: &str) -> Result {
+    if !file_name.starts_with(COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX)
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || Path::new(file_name).is_absolute()
+    {
+        return Err(crate::error!(
+            "Invalid incremental Mach-O resolution sidecar name `{file_name}`"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_sections_file_name(file_name: &str) -> Result {
@@ -15819,6 +16236,13 @@ fn compressed_section_sidecar_file_name(contents: &[u8]) -> String {
     format!("{COMPRESSED_SECTIONS_FILE_PREFIX}{}", hash_bytes(contents))
 }
 
+fn compressed_macho_resolutions_sidecar_file_name(contents: &[u8]) -> String {
+    format!(
+        "{COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX}{}",
+        hash_bytes(contents)
+    )
+}
+
 fn args_hash(args: &impl platform::Args) -> String {
     hash_text(&format!("{args:?}"))
 }
@@ -16151,9 +16575,11 @@ mod tests {
                 .collect(),
             sections: Vec::new(),
             relocations: Vec::new(),
+            macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
+            macho_symbol_resolutions_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
@@ -17215,10 +17641,12 @@ mod tests {
                 reusable_inputs: HashSet::new(),
                 previous_sections: HashSet::new(),
                 previous_relocations: Vec::new(),
+                previous_macho_symbol_resolutions_file: None,
                 previous_fdes: Vec::new(),
                 previous_dynamic_relocations: Vec::new(),
                 current_sections: RecordBuffers::default(),
                 current_relocations: RecordBuffers::default(),
+                current_macho_symbol_resolutions: RecordBuffers::default(),
                 current_fdes: RecordBuffers::default(),
                 current_dynamic_relocations: RecordBuffers::default(),
                 record_texts: RecordTextInterner::default(),
@@ -21637,6 +22065,91 @@ mod tests {
     }
 
     #[test]
+    fn macho_symbol_resolutions_round_trip() {
+        let resolutions = vec![
+            MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode("_direct")),
+                direct_value: Some(0x1000),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: vec![0x1800],
+                target: Some(RelocationTargetRecord {
+                    input_file: SharedText::from(hex::encode("a.o")),
+                    input: SharedText::from(hex::encode("a.o")),
+                    section_index: 2,
+                    section_offset: 16,
+                }),
+            },
+            MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode("_import")),
+                direct_value: None,
+                got_address: Some(0x2000),
+                stub_address: Some(0x3000),
+                thunk_addresses: Vec::new(),
+                target: None,
+            },
+        ];
+        let mut rendered = String::new();
+        write_rendered_macho_symbol_resolutions(&mut rendered, &resolutions).unwrap();
+
+        assert_eq!(
+            parse_macho_symbol_resolutions(rendered.lines()).unwrap(),
+            resolutions
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn macho_symbol_resolutions_are_loaded_lazily_from_hashed_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state
+            .macho_symbol_resolutions
+            .push(MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode("_target")),
+                direct_value: Some(0x1000),
+                got_address: Some(0x2000),
+                stub_address: Some(0x3000),
+                thunk_addresses: vec![0x4000, 0x5000],
+                target: None,
+            });
+
+        state.write(dir.path()).unwrap();
+        let mut parsed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+
+        assert!(parsed.macho_symbol_resolutions.is_empty());
+        assert!(
+            parsed
+                .macho_symbol_resolutions_file
+                .as_deref()
+                .is_some_and(|file| file.starts_with(COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX))
+        );
+        parsed.load_macho_symbol_resolutions(dir.path()).unwrap();
+        assert_eq!(
+            parsed.macho_symbol_resolutions,
+            state.macho_symbol_resolutions
+        );
+    }
+
+    #[test]
+    fn v36_state_is_accepted_without_macho_resolution_sidecar() {
+        let rendered = state("args", b"output", &[("a.o", b"a")])
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V36, 1)
+            .lines()
+            .filter(|line| !line.starts_with("macho-resolutions-file\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert!(parsed.macho_symbol_resolutions.is_empty());
+        assert!(parsed.macho_symbol_resolutions_file.is_none());
+    }
+
+    #[test]
     fn persisted_state_round_trips_fde_records() {
         let mut state = state("args", b"output", &[("a.o", b"a")]);
         state.sections.push(section_record("a.o", 1, 100, 12));
@@ -22536,9 +23049,11 @@ mod tests {
             }],
             sections: Vec::new(),
             relocations: Vec::new(),
+            macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
+            macho_symbol_resolutions_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
@@ -22827,6 +23342,8 @@ mod tests {
             raw_sections: None,
         });
         state.sections.push(section_record("a.o", 1, 100, 8));
+        state.macho_symbol_resolutions_file =
+            Some(format!("{COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX}old"));
         state.write(dir.path()).unwrap();
         let base_index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
         let mut updated = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
@@ -22840,6 +23357,7 @@ mod tests {
             changed_nsec: 6,
         });
         updated.output = FileContentState::from_bytes(b"new-output");
+        updated.macho_symbol_resolutions_file = None;
         updated.input_files[0].content = FileContentState::from_bytes(b"aa");
         updated.input_files[0].patch = Some(FilePatchState {
             fingerprint: "new-patch-hash".to_owned(),
@@ -22874,6 +23392,7 @@ mod tests {
         assert!(metadata_update_path(dir.path()).exists());
         let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert_eq!(metadata.output, updated.output);
+        assert!(metadata.macho_symbol_resolutions_file.is_none());
         assert_eq!(
             metadata.input_files[0].content,
             updated.input_files[0].content
@@ -22897,6 +23416,34 @@ mod tests {
         let persisted = PersistedState::read(dir.path()).unwrap().unwrap();
         assert_eq!(persisted.input_files[0].patch, updated.input_files[0].patch);
         assert_eq!(persisted.sections, state.sections);
+        assert!(persisted.macho_symbol_resolutions_file.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn v1_metadata_update_preserves_macho_resolution_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        let file_name = format!("{COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX}old");
+        state.macho_symbol_resolutions_file = Some(file_name.clone());
+        state.write(dir.path()).unwrap();
+        let rendered = state
+            .render_metadata_update(&[0])
+            .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V1, 1)
+            .lines()
+            .filter(|line| !line.starts_with("macho-resolutions-file\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+        std::fs::write(metadata_update_path(dir.path()), rendered).unwrap();
+
+        let parsed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+
+        assert_eq!(
+            parsed.macho_symbol_resolutions_file.as_deref(),
+            Some(file_name.as_str())
+        );
     }
 
     #[test]
@@ -23088,6 +23635,7 @@ mod tests {
             Some("sections-patches"),
             std::slice::from_ref(&location),
             None,
+            None,
         );
         std::fs::write(dir.path().join(INDEX_FILE), &index).unwrap();
 
@@ -23269,7 +23817,7 @@ mod tests {
             hash: hash_bytes(sidecar.as_bytes()),
         };
         let index = state
-            .render_index(&file_name, Some(&file_name), &[location], None)
+            .render_index(&file_name, Some(&file_name), &[location], None, None)
             .replacen(STATE_VERSION, STATE_VERSION_V30, 1);
         std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
 
@@ -24255,9 +24803,11 @@ mod tests {
             }],
             sections: Vec::new(),
             relocations: Vec::new(),
+            macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
             sections_file: None,
+            macho_symbol_resolutions_file: None,
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
@@ -25075,10 +25625,12 @@ mod tests {
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
             previous_sections: [record].into_iter().collect(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -25118,10 +25670,12 @@ mod tests {
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -25153,10 +25707,12 @@ mod tests {
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -25203,10 +25759,12 @@ mod tests {
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -25270,10 +25828,12 @@ mod tests {
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
@@ -25412,10 +25972,12 @@ mod tests {
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
