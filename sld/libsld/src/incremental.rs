@@ -1653,16 +1653,6 @@ fn relocation_kind_info(
     file: &object::File<'_>,
     relocation_kind: u32,
 ) -> Option<RelocationKindInfo> {
-    if file.format() == object::BinaryFormat::MachO
-        && file.architecture() == object::Architecture::Aarch64
-    {
-        let relocation = decode_macho_aarch64_relocation_kind(relocation_kind)?;
-        return <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
-            relocation,
-        )
-        .ok();
-    }
-
     Some(match file.architecture() {
         object::Architecture::X86_64 => x86_64::relocation_from_raw(relocation_kind)?,
         object::Architecture::Aarch64 => aarch64::relocation_type_from_raw(relocation_kind)?,
@@ -1675,6 +1665,7 @@ fn relocation_kind_info(
 }
 
 const MACHO_AARCH64_RELOCATION_KIND_TAG: u32 = 0xa000_0000;
+#[cfg(test)]
 const MACHO_RELOCATION_KIND_TAG_MASK: u32 = 0xf000_0000;
 
 pub(crate) fn encode_macho_aarch64_relocation_kind(
@@ -1687,6 +1678,7 @@ pub(crate) fn encode_macho_aarch64_relocation_kind(
         | (u32::from(relocation.r_extern) << 7)
 }
 
+#[cfg(test)]
 fn decode_macho_aarch64_relocation_kind(kind: u32) -> Option<object::macho::RelocationInfo> {
     (kind & MACHO_RELOCATION_KIND_TAG_MASK == MACHO_AARCH64_RELOCATION_KIND_TAG).then_some(
         object::macho::RelocationInfo {
@@ -8071,6 +8063,10 @@ fn patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
         return Ok(Some(fingerprint));
     }
 
+    if let Some(fingerprint) = macho_object_patch_fingerprint(bytes, 0, &ranges) {
+        return Ok(Some((fingerprint.to_hex().to_string(), None)));
+    }
+
     let mut hasher = blake3::Hasher::new();
     let mut position = 0;
     for range in &ranges {
@@ -8179,10 +8175,13 @@ fn archive_patch_fingerprint_with_previous(
                     return Some((fingerprint, Some((*previous).clone())));
                 }
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(b"sld-archive-member-patch-fingerprint-v1");
-                hasher.update(&(data.len() as u64).to_le_bytes());
-                update_hash_with_ranges(&mut hasher, data, *data_offset, ranges);
-                let fingerprint = hasher.finalize();
+                let fingerprint = macho_object_patch_fingerprint(data, *data_offset, ranges)
+                    .unwrap_or_else(|| {
+                        hasher.update(b"sld-archive-member-patch-fingerprint-v1");
+                        hasher.update(&(data.len() as u64).to_le_bytes());
+                        update_hash_with_ranges(&mut hasher, data, *data_offset, ranges);
+                        hasher.finalize()
+                    });
                 let archive_member_patch_fingerprint =
                     rustc_object_digest.map(|rustc_object_digest| ArchiveMemberPatchFingerprint {
                         archive_member_index,
@@ -8219,6 +8218,205 @@ fn archive_patch_fingerprint_with_previous(
         (!archive_member_patch_fingerprints.is_empty())
             .then_some(archive_member_patch_fingerprints),
     )))
+}
+
+fn macho_object_patch_fingerprint(
+    bytes: &[u8],
+    file_offset: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> Option<blake3::Hash> {
+    let file = object::File::parse(bytes).ok()?;
+    if file.format() != object::BinaryFormat::MachO
+        || file.kind() != object::ObjectKind::Relocatable
+        || file.architecture() != object::Architecture::Aarch64
+        || !file.is_64()
+        || !file.is_little_endian()
+    {
+        return None;
+    }
+    let object::FileFlags::MachO { flags } = file.flags() else {
+        return None;
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sld-macho-object-patch-fingerprint-v1");
+    hasher.update(bytes.get(4..12)?);
+    hasher.update(&flags.to_le_bytes());
+
+    let sections = file.sections().collect::<Vec<_>>();
+    hasher.update(&(sections.len() as u64).to_le_bytes());
+    let mut has_masked_text = false;
+    for section in sections {
+        let segment_name = section.segment_name_bytes().ok().flatten()?;
+        let section_name = section.name_bytes().ok()?;
+        hash_length_prefixed(&mut hasher, segment_name);
+        hash_length_prefixed(&mut hasher, section_name);
+        let object::SectionFlags::MachO { flags } = section.flags() else {
+            return None;
+        };
+        hasher.update(&flags.to_le_bytes());
+        hasher.update(&section.align().to_le_bytes());
+
+        let data = section.data().ok()?;
+        let fully_masked = section.file_range().is_some_and(|(offset, size)| {
+            let Ok(offset) = usize::try_from(offset) else {
+                return false;
+            };
+            let Ok(size) = usize::try_from(size) else {
+                return false;
+            };
+            let Some(start) = file_offset.checked_add(offset) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(size) else {
+                return false;
+            };
+            size != 0
+                && ranges
+                    .iter()
+                    .any(|range| range.start <= start && range.end >= end)
+        });
+        has_masked_text |= fully_masked && section_name == b"__text";
+        hasher.update(&[u8::from(fully_masked)]);
+        if !fully_masked {
+            hasher.update(&section.size().to_le_bytes());
+            hasher.update(&(data.len() as u64).to_le_bytes());
+            let (data_offset, _) = section.file_range().unwrap_or_default();
+            let data_offset = file_offset.checked_add(usize::try_from(data_offset).ok()?)?;
+            update_hash_with_ranges(&mut hasher, data, data_offset, ranges);
+        }
+
+        let relocations = section.relocations().collect::<Vec<_>>();
+        hasher.update(&(relocations.len() as u64).to_le_bytes());
+        for (offset, relocation) in relocations {
+            hasher.update(&offset.to_le_bytes());
+            let object::RelocationFlags::MachO {
+                r_type,
+                r_pcrel,
+                r_length,
+            } = relocation.flags()
+            else {
+                return None;
+            };
+            hasher.update(&[r_type, u8::from(r_pcrel), r_length]);
+            hasher.update(&relocation.addend().to_le_bytes());
+            hasher.update(&[u8::from(relocation.has_implicit_addend())]);
+            hash_macho_relocation_target(&mut hasher, relocation.target())?;
+            match relocation.subtractor() {
+                Some(symbol) => {
+                    hasher.update(&[1]);
+                    hasher.update(&(symbol.0 as u64).to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+    }
+
+    let symbols = file.symbols().collect::<Vec<_>>();
+    hasher.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in symbols {
+        hash_length_prefixed(&mut hasher, symbol.name_bytes().ok()?);
+        hash_macho_symbol_section(&mut hasher, symbol.section())?;
+        let address = if let Some(section_index) = symbol.section_index() {
+            symbol
+                .address()
+                .checked_sub(file.section_by_index(section_index).ok()?.address())?
+        } else {
+            symbol.address()
+        };
+        hasher.update(&address.to_le_bytes());
+        hasher.update(&symbol.size().to_le_bytes());
+        hasher.update(&[
+            macho_symbol_kind_tag(symbol.kind())?,
+            macho_symbol_scope_tag(symbol.scope()),
+            u8::from(symbol.is_weak()),
+        ]);
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            return None;
+        };
+        hasher.update(&n_desc.to_le_bytes());
+    }
+
+    has_masked_text.then(|| hasher.finalize())
+}
+
+fn hash_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_macho_relocation_target(
+    hasher: &mut blake3::Hasher,
+    target: object::RelocationTarget,
+) -> Option<()> {
+    match target {
+        object::RelocationTarget::Symbol(symbol) => {
+            hasher.update(&[0]);
+            hasher.update(&(symbol.0 as u64).to_le_bytes());
+        }
+        object::RelocationTarget::Section(section) => {
+            hasher.update(&[1]);
+            hasher.update(&(section.0 as u64).to_le_bytes());
+        }
+        object::RelocationTarget::Absolute => {
+            hasher.update(&[2]);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn hash_macho_symbol_section(
+    hasher: &mut blake3::Hasher,
+    section: object::SymbolSection,
+) -> Option<()> {
+    match section {
+        object::SymbolSection::Unknown => {
+            hasher.update(&[0]);
+        }
+        object::SymbolSection::None => {
+            hasher.update(&[1]);
+        }
+        object::SymbolSection::Undefined => {
+            hasher.update(&[2]);
+        }
+        object::SymbolSection::Absolute => {
+            hasher.update(&[3]);
+        }
+        object::SymbolSection::Common => {
+            hasher.update(&[4]);
+        }
+        object::SymbolSection::Section(section) => {
+            hasher.update(&[5]);
+            hasher.update(&(section.0 as u64).to_le_bytes());
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn macho_symbol_kind_tag(kind: object::SymbolKind) -> Option<u8> {
+    Some(match kind {
+        object::SymbolKind::Unknown => 0,
+        object::SymbolKind::Text => 1,
+        object::SymbolKind::Data => 2,
+        object::SymbolKind::Section => 3,
+        object::SymbolKind::File => 4,
+        object::SymbolKind::Label => 5,
+        object::SymbolKind::Tls => 6,
+        _ => return None,
+    })
+}
+
+fn macho_symbol_scope_tag(scope: object::SymbolScope) -> u8 {
+    match scope {
+        object::SymbolScope::Unknown => 0,
+        object::SymbolScope::Compilation => 1,
+        object::SymbolScope::Linkage => 2,
+        object::SymbolScope::Dynamic => 3,
+    }
 }
 
 fn archive_member_patch_ranges_hash(
@@ -19514,6 +19712,212 @@ mod tests {
     }
 
     #[test]
+    fn macho_object_patch_fingerprint_ignores_serialization_layout_churn() {
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let grown = test_macho_object(b"\x01\x02\x03\x04\x09\x0a\x0b\x0c", b"\x05\x06\x07\x08", 0);
+        let changed_data =
+            test_macho_object(b"\x01\x02\x03\x04\x09\x0a\x0b\x0c", b"\x15\x06\x07\x08", 0);
+        let moved_data_symbol =
+            test_macho_object(b"\x01\x02\x03\x04\x09\x0a\x0b\x0c", b"\x05\x06\x07\x08", 1);
+        let mut different_cpu_subtype = previous.clone();
+        different_cpu_subtype[8] ^= 1;
+
+        let previous_text = test_macho_section_range(&previous, "__text");
+        let previous_data = test_macho_section_range(&previous, "__data");
+        let grown_text = test_macho_section_range(&grown, "__text");
+        let changed_data_text = test_macho_section_range(&changed_data, "__text");
+        let moved_data_symbol_text = test_macho_section_range(&moved_data_symbol, "__text");
+
+        assert_eq!(
+            macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
+            macho_object_patch_fingerprint(&grown, 0, &[grown_text]).unwrap()
+        );
+        assert_ne!(
+            macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
+            macho_object_patch_fingerprint(&changed_data, 0, &[changed_data_text]).unwrap()
+        );
+        assert_ne!(
+            macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
+            macho_object_patch_fingerprint(&moved_data_symbol, 0, &[moved_data_symbol_text])
+                .unwrap()
+        );
+        assert_ne!(
+            macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
+            macho_object_patch_fingerprint(&different_cpu_subtype, 0, &[previous_text]).unwrap()
+        );
+        assert!(
+            macho_object_patch_fingerprint(&previous, 0, &[previous_data]).is_none(),
+            "semantic normalization is scoped to text patches"
+        );
+    }
+
+    #[test]
+    fn archive_patch_fingerprint_allows_a_masked_macho_member_to_grow() {
+        let previous_object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let grown_object =
+            test_macho_object(b"\x01\x02\x03\x04\x09\x0a\x0b\x0c", b"\x05\x06\x07\x08", 0);
+        let changed_object =
+            test_macho_object(b"\x01\x02\x03\x04\x09\x0a\x0b\x0c", b"\x15\x06\x07\x08", 0);
+        let (previous, previous_text) = test_macho_archive(&previous_object);
+        let (grown, grown_text) = test_macho_archive(&grown_object);
+        let (changed, changed_text) = test_macho_archive(&changed_object);
+
+        assert_eq!(
+            archive_patch_fingerprint(&previous, &[previous_text]).unwrap(),
+            archive_patch_fingerprint(&grown, &[grown_text]).unwrap()
+        );
+        assert_ne!(
+            archive_patch_fingerprint(&previous, &[test_macho_archive(&previous_object).1])
+                .unwrap(),
+            archive_patch_fingerprint(&changed, &[changed_text]).unwrap()
+        );
+    }
+
+    fn test_macho_archive(object: &[u8]) -> (Vec<u8>, std::ops::Range<usize>) {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"crate-hash.cgu.old.rcgu.o".to_vec(), object.len() as u64),
+                object,
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let mut entries = ArchiveIterator::from_archive_bytes(&archive).unwrap();
+        let ArchiveEntry::Regular(member) = entries.next().unwrap().unwrap() else {
+            panic!("expected regular archive member");
+        };
+        let range = test_macho_section_range(member.entry_data, "__text");
+        let data_offset = member.data_offset;
+        (archive, data_offset + range.start..data_offset + range.end)
+    }
+
+    fn test_macho_section_range(bytes: &[u8], name: &str) -> std::ops::Range<usize> {
+        let file = object::File::parse(bytes).unwrap();
+        let section = file.section_by_name(name).unwrap();
+        let (offset, size) = section.file_range().unwrap();
+        offset as usize..(offset + size) as usize
+    }
+
+    fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const COMMANDS_SIZE: usize = SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        const DATA_OFFSET: usize = HEADER_SIZE + COMMANDS_SIZE;
+        const NLIST_64_SIZE: usize = 16;
+
+        let data_offset = DATA_OFFSET + text.len();
+        let symoff = (data_offset + data.len()).next_multiple_of(8);
+        let stroff = symoff + 2 * NLIST_64_SIZE;
+        let strings = b"\0_text\0_data\0";
+        let mut bytes = Vec::new();
+
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, COMMANDS_SIZE as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(&mut bytes, (SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE) as u32);
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, (text.len() + data.len()) as u64);
+        push_u64(&mut bytes, DATA_OFFSET as u64);
+        push_u64(&mut bytes, (text.len() + data.len()) as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, 0);
+
+        push_macho_section(
+            &mut bytes,
+            b"__text",
+            b"__TEXT",
+            0,
+            text.len(),
+            DATA_OFFSET,
+            object::macho::S_REGULAR
+                | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+        );
+        push_macho_section(
+            &mut bytes,
+            b"__data",
+            b"__DATA",
+            text.len() as u64,
+            data.len(),
+            data_offset,
+            object::macho::S_REGULAR,
+        );
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), DATA_OFFSET);
+        bytes.extend_from_slice(text);
+        bytes.extend_from_slice(data);
+        bytes.resize(symoff, 0);
+        push_macho_symbol(&mut bytes, 1, 1, 0);
+        push_macho_symbol(&mut bytes, 7, 2, text.len() as u64 + data_symbol_offset);
+        bytes.extend_from_slice(strings);
+        bytes
+    }
+
+    fn push_macho_section(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        segment: &[u8],
+        address: u64,
+        size: usize,
+        offset: usize,
+        flags: u32,
+    ) {
+        push_fixed_name(bytes, name);
+        push_fixed_name(bytes, segment);
+        push_u64(bytes, address);
+        push_u64(bytes, size as u64);
+        push_u32(bytes, offset as u32);
+        push_u32(bytes, 2);
+        push_u32(bytes, 0);
+        push_u32(bytes, 0);
+        push_u32(bytes, flags);
+        push_u32(bytes, 0);
+        push_u32(bytes, 0);
+        push_u32(bytes, 0);
+    }
+
+    fn push_macho_symbol(bytes: &mut Vec<u8>, name_offset: u32, section: u8, value: u64) {
+        push_u32(bytes, name_offset);
+        bytes.push(object::macho::N_SECT | object::macho::N_EXT);
+        bytes.push(section);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        push_u64(bytes, value);
+    }
+
+    fn push_fixed_name(bytes: &mut Vec<u8>, name: &[u8]) {
+        assert!(name.len() <= 16);
+        bytes.extend_from_slice(name);
+        bytes.resize(bytes.len() + 16 - name.len(), 0);
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
     fn unchanged_normalized_archive_patch_state_accepts_only_unlinked_churn() {
         let archive = |invocation: &[u8], metadata: &[u8], object: &[u8]| {
             let mut builder = ar::Builder::new(Vec::new());
@@ -23496,33 +23900,6 @@ mod tests {
         assert_eq!(decoded.r_length, relocation.r_length);
         assert_eq!(decoded.r_extern, relocation.r_extern);
         assert_eq!(decoded.r_type, relocation.r_type);
-    }
-
-    #[test]
-    fn recorded_macho_relocation_kind_uses_macho_decoder() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&object::macho::MH_MAGIC_64.to_le_bytes());
-        bytes.extend_from_slice(&object::macho::CPU_TYPE_ARM64.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&object::macho::MH_OBJECT.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        let file = object::File::parse(bytes.as_slice()).unwrap();
-        let kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
-            r_address: 0,
-            r_symbolnum: 0,
-            r_pcrel: true,
-            r_length: 2,
-            r_extern: true,
-            r_type: object::macho::ARM64_RELOC_BRANCH26,
-        });
-
-        let decoded = relocation_kind_info(&file, kind).expect("recorded relocation should decode");
-
-        assert!(matches!(decoded.size, RelocationSize::BitMasking(_)));
-        assert!(decoded.thunkable);
     }
 
     #[test]
