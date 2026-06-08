@@ -2041,6 +2041,14 @@ impl std::fmt::Display for SymbolId {
 
 impl<P: Platform> InternalSymDefInfo<'_, P> {
     pub(crate) fn section_id(self) -> Option<OutputSectionId> {
+        if self.section_if_present {
+            return None;
+        }
+
+        self.section_id_for_loading()
+    }
+
+    pub(crate) fn section_id_for_loading(self) -> Option<OutputSectionId> {
         match self.placement {
             SymbolPlacement::Undefined
             | SymbolPlacement::ForceUndefined

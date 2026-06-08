@@ -196,8 +196,14 @@ fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::MachO;
+    use super::SectionAttributes;
     use super::macho_eh_frame_fde_count;
     use super::macho_live_eh_frame_cies;
+    use super::macho_section_boundary_symbol;
+    use super::macho_section_boundary_symbol_matches;
+    use crate::alignment;
+    use crate::output_section_id::OutputSections;
+    use crate::output_section_id::SectionName;
     use crate::platform;
     use crate::platform::Symbol as _;
     use object::macho::N_SECT;
@@ -244,6 +250,48 @@ mod tests {
         assert!(sym.is_default_strippable(b"l_.str"));
         assert!(sym.is_default_strippable(b"l_.str.1"));
         assert!(!sym.is_default_strippable(b"_main"));
+    }
+
+    #[test]
+    fn resolves_macho_section_boundary_symbols() {
+        let mut output_sections = OutputSections::<MachO>::with_base_address(0x1_0000_0000);
+        let section_id =
+            output_sections.add_named_section(SectionName(b"_BOUNDARY"), alignment::MIN, None);
+        output_sections
+            .section_infos
+            .get_mut(section_id)
+            .section_attributes = SectionAttributes {
+            alloc: true,
+            writable: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            macho_section_boundary_symbol(b"section$start$__DATA$_BOUNDARY", &output_sections),
+            Some((Some(section_id), true))
+        );
+        assert_eq!(
+            macho_section_boundary_symbol(b"section$end$__DATA$_BOUNDARY", &output_sections),
+            Some((Some(section_id), false))
+        );
+        assert_eq!(
+            macho_section_boundary_symbol(b"section$start$__DATA$_MISSING", &output_sections),
+            Some((None, true))
+        );
+        assert_eq!(
+            macho_section_boundary_symbol(b"section$start$__TEXT$_BOUNDARY", &output_sections),
+            Some((Some(section_id), true))
+        );
+        assert!(macho_section_boundary_symbol_matches(
+            b"section$start$__DATA$_BOUNDARY",
+            section_id,
+            &output_sections
+        ));
+        assert!(!macho_section_boundary_symbol_matches(
+            b"section$start$__TEXT$_BOUNDARY",
+            section_id,
+            &output_sections
+        ));
     }
 }
 
@@ -1744,6 +1792,21 @@ impl platform::Platform for MachO {
             .hide();
     }
 
+    fn section_boundary_symbol(
+        name: &[u8],
+        output_sections: &crate::output_section_id::OutputSections<Self>,
+    ) -> Option<(Option<crate::output_section_id::OutputSectionId>, bool)> {
+        macho_section_boundary_symbol(name, output_sections)
+    }
+
+    fn section_boundary_symbol_matches(
+        name: &[u8],
+        section_id: crate::output_section_id::OutputSectionId,
+        output_sections: &crate::output_section_id::OutputSections<Self>,
+    ) -> bool {
+        macho_section_boundary_symbol_matches(name, section_id, output_sections)
+    }
+
     fn built_in_section_infos<'data>()
     -> Vec<crate::output_section_id::SectionOutputInfo<'data, Self>> {
         SECTION_DEFINITIONS
@@ -2306,6 +2369,70 @@ impl platform::Platform for MachO {
         // per file block (4 KiB) covered by the signature.
         Ok(record.file_offset.div_ceil(CS_BLOCK_SIZE) * CS_HASH_SIZE as usize)
     }
+}
+
+fn macho_section_boundary_symbol(
+    name: &[u8],
+    output_sections: &crate::output_section_id::OutputSections<MachO>,
+) -> Option<(Option<crate::output_section_id::OutputSectionId>, bool)> {
+    let (remainder, is_start) = if let Some(remainder) = name.strip_prefix(b"section$start$") {
+        (remainder, true)
+    } else {
+        (name.strip_prefix(b"section$end$")?, false)
+    };
+    let separator = remainder.iter().position(|byte| *byte == b'$')?;
+    let segment_name = remainder.get(..separator)?;
+    let section_name = remainder.get(separator + 1..)?;
+    if segment_name.is_empty()
+        || section_name.is_empty()
+        || segment_name.contains(&b'$')
+        || section_name.contains(&b'$')
+    {
+        return None;
+    }
+    let section_id = output_sections.section_id_by_name(SectionName(section_name));
+    Some((section_id, is_start))
+}
+
+fn macho_section_boundary_symbol_matches(
+    name: &[u8],
+    section_id: crate::output_section_id::OutputSectionId,
+    output_sections: &crate::output_section_id::OutputSections<MachO>,
+) -> bool {
+    let Some((remainder, _)) = name
+        .strip_prefix(b"section$start$")
+        .map(|remainder| (remainder, true))
+        .or_else(|| {
+            name.strip_prefix(b"section$end$")
+                .map(|remainder| (remainder, false))
+        })
+    else {
+        return false;
+    };
+    let Some(separator) = remainder.iter().position(|byte| *byte == b'$') else {
+        return false;
+    };
+    let Some(segment_name) = remainder.get(..separator) else {
+        return false;
+    };
+    macho_section_segment_name(section_id, output_sections) == Some(segment_name)
+}
+
+fn macho_section_segment_name(
+    section_id: crate::output_section_id::OutputSectionId,
+    output_sections: &crate::output_section_id::OutputSections<MachO>,
+) -> Option<&'static [u8]> {
+    [
+        (SegmentType::TextSections, SEG_TEXT.as_bytes()),
+        (SegmentType::DataSections, SEG_DATA.as_bytes()),
+        (SegmentType::DataConstSections, b"__DATA_CONST".as_slice()),
+    ]
+    .into_iter()
+    .find_map(|(segment_type, segment_name)| {
+        output_sections
+            .should_include_in_segment(section_id, ProgramSegmentDef { segment_type })
+            .then_some(segment_name)
+    })
 }
 
 #[cfg(target_os = "macos")]

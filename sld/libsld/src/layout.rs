@@ -1050,7 +1050,7 @@ impl<'data, P: Platform> SymbolRequestHandler<'data, P> for SyntheticSymbolsLayo
         let def_info =
             &self.internal_symbols.symbol_definitions[self.symbol_id_range.id_to_offset(symbol_id)];
 
-        if let Some(output_section_id) = def_info.section_id() {
+        if let Some(output_section_id) = def_info.section_id_for_loading() {
             // We've gotten a request to load a __start_ / __stop_ symbol, sent requests to load all
             // sections that would go into that section.
             let sections = resources.start_stop_sections.get(output_section_id);
@@ -3547,8 +3547,28 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
         return None;
     }
 
+    let optional_section_is_absent = def_info.section_if_present
+        && match def_info.placement {
+            SymbolPlacement::SectionStart(section_id) | SymbolPlacement::SectionEnd(section_id) => {
+                let section = resources.section_layouts.get(section_id);
+                !P::section_boundary_symbol_matches(
+                    def_info.name,
+                    section_id,
+                    resources.output_sections,
+                ) || (!resources.output_sections.will_emit_section(section_id)
+                    && section.file_size == 0
+                    && section.mem_size == 0)
+            }
+            _ => false,
+        };
+
     let raw_value = match def_info.placement {
         SymbolPlacement::Undefined | SymbolPlacement::ForceUndefined => 0,
+        SymbolPlacement::SectionStart(_) | SymbolPlacement::SectionEnd(_)
+            if optional_section_is_absent =>
+        {
+            0
+        }
         SymbolPlacement::SectionStart(section_id) => {
             resources.section_layouts.get(section_id).mem_offset
         }
@@ -3590,14 +3610,14 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
             .unwrap_or(default),
     };
 
-    Some(P::create_resolution(
-        resources
-            .symbol_db
-            .flags_for_symbol(resources.per_symbol_flags, symbol_id),
-        raw_value,
-        None,
-        memory_offsets,
-    ))
+    let mut flags = resources
+        .symbol_db
+        .flags_for_symbol(resources.per_symbol_flags, symbol_id);
+    if optional_section_is_absent {
+        flags |= ValueFlags::ABSOLUTE;
+    }
+
+    Some(P::create_resolution(flags, raw_value, None, memory_offsets))
 }
 
 /// Emits an undefined symbol error or warning if applicable.

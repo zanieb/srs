@@ -67,6 +67,7 @@ pub(crate) struct SyntheticSymbols {
 pub(crate) struct InternalSymDefInfo<'data, P: Platform> {
     pub(crate) symbol: P::SymtabEntry,
     pub(crate) placement: SymbolPlacement<'data>,
+    pub(crate) section_if_present: bool,
     #[debug("{:?}", String::from_utf8_lossy(name))]
     pub(crate) name: &'data [u8],
 }
@@ -223,9 +224,15 @@ impl<'data, P: Platform> InternalSymDefInfo<'data, P> {
     pub(crate) fn new(placement: SymbolPlacement<'data>, name: &'data [u8]) -> Self {
         Self {
             placement,
+            section_if_present: false,
             name,
             symbol: P::default_symtab_entry(),
         }
+    }
+
+    pub(crate) fn section_if_present(mut self) -> Self {
+        self.section_if_present = true;
+        self
     }
 
     pub(crate) fn with_hidden(self, hidden: bool) -> Self {

@@ -30,8 +30,8 @@ use object::read::macho::MachHeader;
 use object::read::macho::MachOFatFile32;
 use object::read::macho::MachOFatFile64;
 use object::read::macho::Nlist;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -48,9 +48,11 @@ pub struct MachOArgs {
 
     pub(crate) output: Arc<Path>,
     pub(crate) lib_search_path: Vec<Box<Path>>,
+    pending_linked_libraries: Vec<(usize, String)>,
+    pending_direct_dylib_symbols: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
     pub(crate) extra_dylib_paths: Vec<Vec<u8>>,
     pub(crate) weak_dylib_paths: BTreeSet<Vec<u8>>,
-    pub(crate) dylib_symbol_ordinals: HashMap<Vec<u8>, u8>,
+    pub(crate) dylib_symbol_ordinals: BTreeMap<Vec<u8>, u8>,
     pub(crate) install_name: Option<Vec<u8>>,
     pub(crate) sysroot: Option<PathBuf>,
     pub(crate) export_list_path: Option<PathBuf>,
@@ -91,9 +93,11 @@ impl Default for MachOArgs {
             is_dynamiclib: false,
             output: Arc::from(Path::new("a.out")),
             lib_search_path: Vec::new(),
+            pending_linked_libraries: Vec::new(),
+            pending_direct_dylib_symbols: BTreeMap::new(),
             extra_dylib_paths: Vec::new(),
             weak_dylib_paths: BTreeSet::new(),
-            dylib_symbol_ordinals: HashMap::new(),
+            dylib_symbol_ordinals: BTreeMap::new(),
             install_name: None,
             sysroot: None,
             export_list_path: None,
@@ -346,27 +350,88 @@ impl MachOArgs {
                 )?;
             }
             _ => {
-                self.warn_unsupported(&format!("-l{library}"))?;
+                self.pending_linked_libraries
+                    .push((self.extra_dylib_paths.len(), library.to_owned()));
             }
         }
         Ok(())
     }
 
-    fn add_direct_dylib(&mut self, path: &str) -> Result {
+    fn resolve_pending_linked_libraries(&mut self) -> Result {
+        let mut resolved_libraries = Vec::new();
+        for (dylib_index, library) in std::mem::take(&mut self.pending_linked_libraries) {
+            let dylib_name = format!("lib{library}.dylib");
+            let dylib_path = self
+                .lib_search_path
+                .iter()
+                .map(|directory| directory.join(&dylib_name))
+                .find(|path| path.is_file());
+            if let Some(path) = dylib_path {
+                resolved_libraries.push((dylib_index, path));
+            } else {
+                self.warn_unsupported(&format!("-l{library}"))?;
+            }
+        }
+        for (dylib_index, path) in resolved_libraries.into_iter().rev() {
+            self.add_direct_dylib(
+                path.to_str()
+                    .with_context(|| format!("non-UTF-8 dylib path `{}`", path.display()))?,
+                Some(dylib_index),
+            )?;
+        }
+        self.finalize_direct_dylib_symbols()?;
+        Ok(())
+    }
+
+    fn add_direct_dylib(&mut self, path: &str, dylib_index: Option<usize>) -> Result {
         self.common_mut().save_dir.handle_file(path);
 
         let metadata = read_direct_dylib_metadata(Path::new(path))?;
+        let path = path.as_bytes().to_vec();
+        self.pending_direct_dylib_symbols
+            .entry(path.clone())
+            .or_insert(metadata.exported_symbols);
         // Use the path that rustc/clang passed to us as the load command. Most dylibs also carry
         // an install name, but direct Rust dylib inputs often use @rpath install names and rely on
         // the driver environment to make the original path available at runtime.
-        let ordinal = self.add_dylib_path(path.as_bytes().to_vec(), DylibLoadKind::Regular)?;
-
-        for symbol_name in metadata.exported_symbols {
-            self.dylib_symbol_ordinals
-                .entry(symbol_name)
-                .or_insert(ordinal);
+        if let Some(dylib_index) = dylib_index {
+            self.insert_dylib_path(path, dylib_index);
+        } else {
+            self.add_dylib_path(path, DylibLoadKind::Regular)?;
         }
 
+        Ok(())
+    }
+
+    fn insert_dylib_path(&mut self, path: Vec<u8>, dylib_index: usize) {
+        self.weak_dylib_paths.remove(&path);
+        if let Some(existing_index) = self
+            .extra_dylib_paths
+            .iter()
+            .position(|existing| existing == &path)
+        {
+            if existing_index < dylib_index {
+                return;
+            }
+            self.extra_dylib_paths.remove(existing_index);
+        }
+        self.extra_dylib_paths
+            .insert(dylib_index.min(self.extra_dylib_paths.len()), path);
+    }
+
+    fn finalize_direct_dylib_symbols(&mut self) -> Result {
+        let pending_symbols = std::mem::take(&mut self.pending_direct_dylib_symbols);
+        for (index, path) in self.extra_dylib_paths.iter().enumerate() {
+            let Some(exported_symbols) = pending_symbols.get(path) else {
+                continue;
+            };
+            let ordinal = u8::try_from(index + 2).context("Mach-O dylib ordinal exceeds u8")?;
+            for symbol_name in exported_symbols {
+                self.dylib_symbol_ordinals
+                    .entry(symbol_name.clone())
+                    .or_insert(ordinal);
+            }
+        }
         Ok(())
     }
 }
@@ -387,12 +452,14 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         }
 
         if is_direct_dylib_arg(arg) {
-            args.add_direct_dylib(arg)?;
+            args.add_direct_dylib(arg, None)?;
             continue;
         }
 
         arg_parser.handle_argument(args, &mut modifier_stack, arg, &mut input)?;
     }
+
+    args.resolve_pending_linked_libraries()?;
 
     if !args.common.unrecognized_options.is_empty() {
         let options_list = args.common.unrecognized_options.join(", ");
@@ -1104,6 +1171,52 @@ mod tests {
     }
 
     #[test]
+    fn linked_library_finds_dylib_on_search_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let before_dylib = directory.path().join("libbefore.dylib");
+        let direct_dylib = directory.path().join("libdirect.dylib");
+        let after_dylib = directory.path().join("libafter.dylib");
+        std::fs::write(&before_dylib, synthetic_dylib_with_symbol(b"_before")).unwrap();
+        std::fs::write(&direct_dylib, synthetic_dylib_with_symbol(b"_direct")).unwrap();
+        std::fs::write(&after_dylib, synthetic_dylib_with_symbol(b"_after")).unwrap();
+        let search_path = format!("-L{}", directory.path().display());
+
+        let mut args = MachOArgs::default();
+        parse(
+            &mut args,
+            [
+                "-lbefore",
+                direct_dylib.to_str().unwrap(),
+                "-lafter",
+                search_path.as_str(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.extra_dylib_paths,
+            vec![
+                before_dylib.as_os_str().as_encoded_bytes().to_vec(),
+                direct_dylib.as_os_str().as_encoded_bytes().to_vec(),
+                after_dylib.as_os_str().as_encoded_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(
+            args.dylib_symbol_ordinals.get(b"_before".as_slice()),
+            Some(&2)
+        );
+        assert_eq!(
+            args.dylib_symbol_ordinals.get(b"_direct".as_slice()),
+            Some(&3)
+        );
+        assert_eq!(
+            args.dylib_symbol_ordinals.get(b"_after".as_slice()),
+            Some(&4)
+        );
+    }
+
+    #[test]
     fn non_incremental_links_unlink_existing_outputs_by_default() {
         let mut args = MachOArgs::default();
         args.common.incremental = false;
@@ -1225,6 +1338,27 @@ mod tests {
                 args.platform_version.minimum_os = encode_macho_version(13, 0, 0);
             })
         );
+    }
+
+    #[test]
+    fn macho_args_debug_orders_dylib_symbols_deterministically() {
+        let mut forward = MachOArgs::default();
+        forward
+            .dylib_symbol_ordinals
+            .insert(b"_lzma_code".to_vec(), 2);
+        forward
+            .dylib_symbol_ordinals
+            .insert(b"_lzma_end".to_vec(), 2);
+
+        let mut reverse = MachOArgs::default();
+        reverse
+            .dylib_symbol_ordinals
+            .insert(b"_lzma_end".to_vec(), 2);
+        reverse
+            .dylib_symbol_ordinals
+            .insert(b"_lzma_code".to_vec(), 2);
+
+        assert_eq!(format!("{forward:?}"), format!("{reverse:?}"));
     }
 
     #[test]
