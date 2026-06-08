@@ -1,10 +1,10 @@
 //#AbstractConfig:incremental-relocated-text-base
 //#Object:runtime.c
-//#Object:incremental-relocated-text-value.s
+//#Object:incremental-relocated-text-value.S
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
-//#TestIncrementalChangedInput:incremental-relocated-text-value.s.o
+//#TestIncrementalChangedInput:incremental-relocated-text-value.S.o
 //#TestIncrementalChangedSection:__text
 //#Config:stable-relocations:incremental-relocated-text-base
 //#RunEnabled:true
@@ -24,6 +24,13 @@
 //#TestIncrementalChangedSectionOffset:4
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:changed Mach-O text relocation bytes
+//#Config:moved-relocations:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DMOVE_RELOCATIONS=1
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:1
+//#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
 
