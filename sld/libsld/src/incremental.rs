@@ -1664,6 +1664,34 @@ fn relocation_kind_info(
     })
 }
 
+const MACHO_AARCH64_RELOCATION_KIND_TAG: u32 = 0xa000_0000;
+#[cfg(test)]
+const MACHO_RELOCATION_KIND_TAG_MASK: u32 = 0xf000_0000;
+
+pub(crate) fn encode_macho_aarch64_relocation_kind(
+    relocation: object::macho::RelocationInfo,
+) -> u32 {
+    MACHO_AARCH64_RELOCATION_KIND_TAG
+        | u32::from(relocation.r_type & 0xf)
+        | (u32::from(relocation.r_pcrel) << 4)
+        | (u32::from(relocation.r_length & 0x3) << 5)
+        | (u32::from(relocation.r_extern) << 7)
+}
+
+#[cfg(test)]
+fn decode_macho_aarch64_relocation_kind(kind: u32) -> Option<object::macho::RelocationInfo> {
+    (kind & MACHO_RELOCATION_KIND_TAG_MASK == MACHO_AARCH64_RELOCATION_KIND_TAG).then_some(
+        object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: kind & (1 << 4) != 0,
+            r_length: ((kind >> 5) & 0x3) as u8,
+            r_extern: kind & (1 << 7) != 0,
+            r_type: (kind & 0xf) as u8,
+        },
+    )
+}
+
 fn dedup_ranges(ranges: &mut Vec<std::ops::Range<usize>>) {
     ranges.sort_by_key(|range| (range.start, range.end));
     ranges.dedup_by(|left, right| left.start == right.start && left.end == right.end);
@@ -1700,11 +1728,20 @@ fn symbol_position_by_name(
         let Some(section_index) = symbol.section_index() else {
             return Ok(None);
         };
+        let section_offset = if file.format() == object::BinaryFormat::MachO {
+            let section_address = file.section_by_index(section_index)?.address();
+            symbol
+                .address()
+                .checked_sub(section_address)
+                .context("Mach-O symbol address precedes its section")?
+        } else {
+            symbol.address()
+        };
         let value_range = elf_symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
         return Ok(Some(SymbolPosition {
             section_index,
-            section_offset: symbol.address(),
+            section_offset,
             value_range,
         }));
     }
@@ -23428,6 +23465,29 @@ mod tests {
         assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 3));
         assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 5));
         assert!(section_size_allows_direct_patching(Some(b"__data"), 4, 5));
+    }
+
+    #[test]
+    fn macho_relocation_kind_round_trips_recorded_flags() {
+        let relocation = object::macho::RelocationInfo {
+            r_address: 0x1234,
+            r_symbolnum: 42,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+
+        let decoded =
+            decode_macho_aarch64_relocation_kind(encode_macho_aarch64_relocation_kind(relocation))
+                .expect("Mach-O AArch64 relocation kind should decode");
+
+        assert_eq!(decoded.r_address, 0);
+        assert_eq!(decoded.r_symbolnum, 0);
+        assert_eq!(decoded.r_pcrel, relocation.r_pcrel);
+        assert_eq!(decoded.r_length, relocation.r_length);
+        assert_eq!(decoded.r_extern, relocation.r_extern);
+        assert_eq!(decoded.r_type, relocation.r_type);
     }
 
     #[test]

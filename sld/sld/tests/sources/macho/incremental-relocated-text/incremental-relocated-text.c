@@ -14,6 +14,10 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedSymbolBytes:_incremental_relocated_text_value=0x40068052
+//#TestIncrementalStateContains:\t4\t2684354771\t0\t
+//#TestIncrementalStateContains:\t4\t2684354756\t0\t
+//#TestIncrementalStateContains:\t4\t2684354770\t0\t
+//#TestIncrementalStateContains:5f696e6372656d656e74616c5f72656c6f63617465645f746578745f746172676574
 //#Config:changed-relocation-word:incremental-relocated-text-base
 //#RunEnabled:false
 //#TestIncrementalUnsignedMachOOutput:true
