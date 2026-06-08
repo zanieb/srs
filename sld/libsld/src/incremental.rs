@@ -1520,7 +1520,8 @@ fn relocation_target_patches_for_input(
     let mut input_ranges = Vec::new();
     let mut output_patches = Vec::new();
     let mut output_symbols = Vec::new();
-    for relocation in relocations {
+    let mut macho_target_moves = Vec::new();
+    for (relocation_index, relocation) in relocations.iter_mut().enumerate() {
         let Some(target) = relocation.target.as_mut() else {
             continue;
         };
@@ -1572,6 +1573,45 @@ fn relocation_target_patches_for_input(
             )));
         };
         let delta = i128::from(current.section_offset) - i128::from(target.section_offset);
+        let previous_target_value = relocation.target_value;
+        let Some(target_value) = add_signed_delta_u64(previous_target_value, delta) else {
+            return Ok(Err(format!(
+                "relocation target value overflowed in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        if file.format() == object::BinaryFormat::MachO
+            && file.architecture() == object::Architecture::Aarch64
+            && let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind)
+        {
+            let rel_info =
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw_relocation,
+                )
+                .map_err(|error| {
+                    crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
+                })?;
+            if relocation.input_file != input.path {
+                return Ok(Err(format!(
+                    "cross-input Mach-O relocation target moved in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
+            let _ = rel_info;
+            macho_target_moves.push(MachORelocationTargetMove {
+                relocation_index,
+                current_section_offset: current.section_offset,
+                current_target_value: target_value,
+            });
+            output_symbols.push(RelocationTargetSymbolPatch {
+                target_name: target_name.to_owned(),
+                previous_target_value,
+                target_value,
+                allow_missing: true,
+            });
+            continue;
+        }
+
         let written_value = add_encoded_delta_u64(previous_written_value, delta);
         let Some(rel_info) = relocation_kind_info(&file, relocation.kind) else {
             return Ok(Err(format!(
@@ -1627,6 +1667,7 @@ fn relocation_target_patches_for_input(
             target_name: target_name.to_owned(),
             previous_target_value,
             target_value,
+            allow_missing: false,
         });
     }
     dedup_ranges(&mut input_ranges);
@@ -1634,6 +1675,7 @@ fn relocation_target_patches_for_input(
         input_ranges,
         output_patches,
         output_symbols,
+        macho_target_moves,
     }))
 }
 
@@ -1690,24 +1732,18 @@ fn decode_macho_aarch64_relocation_kind(kind: u32) -> Option<object::macho::Relo
     )
 }
 
-fn macho_aarch64_relocated_value_for_moved_place(
+fn macho_aarch64_relocated_value(
     r_type: u8,
-    previous_written_value: u64,
-    previous_place: u64,
-    current_place: u64,
+    target_value: u64,
+    addend: i64,
+    place: u64,
 ) -> Option<u64> {
+    let target_value = target_value.wrapping_add(addend as u64);
     Some(match r_type {
-        object::macho::ARM64_RELOC_BRANCH26 => previous_place
-            .wrapping_add(previous_written_value)
-            .wrapping_sub(current_place),
-        object::macho::ARM64_RELOC_PAGE21 => {
-            let previous_page = previous_place & !linker_utils::elf::PAGE_MASK_4KB;
-            let current_page = current_place & !linker_utils::elf::PAGE_MASK_4KB;
-            previous_page
-                .wrapping_add(previous_written_value)
-                .wrapping_sub(current_page)
-        }
-        object::macho::ARM64_RELOC_PAGEOFF12 => previous_written_value,
+        object::macho::ARM64_RELOC_BRANCH26 => target_value.wrapping_sub(place),
+        object::macho::ARM64_RELOC_PAGE21 => (target_value & !linker_utils::elf::PAGE_MASK_4KB)
+            .wrapping_sub(place & !linker_utils::elf::PAGE_MASK_4KB),
+        object::macho::ARM64_RELOC_PAGEOFF12 => target_value,
         _ => return None,
     })
 }
@@ -1757,7 +1793,7 @@ fn symbol_position_by_name(
         } else {
             symbol.address()
         };
-        let value_range = elf_symbol_value_field_range(bytes, symbol.index())
+        let value_range = symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
         return Ok(Some(SymbolPosition {
             section_index,
@@ -1777,8 +1813,13 @@ fn symbol_position_by_name_and_value(
 ) -> Result<std::result::Result<Option<SymbolPosition>, String>> {
     let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
     let mut matched_symbol = None;
+    let mut name_was_present = false;
     for symbol in file.symbols() {
-        if symbol.name_bytes()? != name || symbol.address() != value {
+        if symbol.name_bytes()? != name {
+            continue;
+        }
+        name_was_present = true;
+        if symbol.address() != value {
             continue;
         }
         if matched_symbol.is_some() {
@@ -1789,13 +1830,18 @@ fn symbol_position_by_name_and_value(
         let Some(section_index) = symbol.section_index() else {
             return Ok(Ok(None));
         };
-        let value_range = elf_symbol_value_field_range(bytes, symbol.index())
+        let value_range = symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
         matched_symbol = Some(SymbolPosition {
             section_index,
             section_offset: symbol.address(),
             value_range,
         });
+    }
+    if matched_symbol.is_none() && name_was_present {
+        return Ok(Err(
+            "output symbol value changed before incremental patch".to_owned()
+        ));
     }
     Ok(Ok(matched_symbol))
 }
@@ -1810,20 +1856,28 @@ fn output_symbol_value_patches(
 
     let file = object::File::parse(output)
         .context("Failed to parse output for incremental symbol value patching")?;
-    let mut values_by_previous_name_and_value = HashMap::<(&str, u64), u64>::new();
+    let mut values_by_previous_name_and_value = HashMap::<(&str, u64), (u64, bool)>::new();
     for symbol in symbols {
         let key = (symbol.target_name.as_str(), symbol.previous_target_value);
-        if let Some(previous) = values_by_previous_name_and_value.insert(key, symbol.target_value)
-            && previous != symbol.target_value
-        {
-            return Ok(Err(
-                "conflicting incremental symbol value patches".to_owned()
-            ));
+        match values_by_previous_name_and_value.entry(key) {
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert((symbol.target_value, symbol.allow_missing));
+            }
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != symbol.target_value {
+                    return Ok(Err(
+                        "conflicting incremental symbol value patches".to_owned()
+                    ));
+                }
+                entry.get_mut().1 &= symbol.allow_missing;
+            }
         }
     }
 
     let mut patches = Vec::with_capacity(values_by_previous_name_and_value.len());
-    for ((target_name, previous_target_value), target_value) in values_by_previous_name_and_value {
+    for ((target_name, previous_target_value), (target_value, allow_missing)) in
+        values_by_previous_name_and_value
+    {
         let symbol = symbol_position_by_name_and_value(
             output,
             0,
@@ -1833,6 +1887,7 @@ fn output_symbol_value_patches(
         )?;
         let symbol = match symbol {
             Ok(Some(symbol)) => symbol,
+            Ok(None) if allow_missing => continue,
             Ok(None) => {
                 return Ok(Err(
                     "missing output symbol for incremental value patch".to_owned()
@@ -2243,11 +2298,12 @@ fn patch_changed_inputs(
                     .transpose()?;
                 if let Some(previous_resolver) = previous_resolver.as_ref() {
                     match macho_text_relocation_replays_for_input(
-                        &mut previous.relocations,
+                        &previous.relocations,
                         input,
                         &matched_sections,
                         previous_resolver,
                         &current_resolver,
+                        &relocation_target_patches.macho_target_moves,
                     )? {
                         Ok(replays) => replays,
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -2471,7 +2527,7 @@ fn patch_changed_inputs(
                 }
             }
 
-            let patch_sections = if let Some(changed_sections) = matched_changed_sections {
+            let mut patch_sections = if let Some(changed_sections) = matched_changed_sections {
                 changed_sections
             } else {
                 let previous_bytes = {
@@ -2495,6 +2551,31 @@ fn patch_changed_inputs(
                     current_sections.clone()
                 }
             };
+            let moved_macho_relocations = relocation_target_patches
+                .macho_target_moves
+                .iter()
+                .map(|target_move| target_move.relocation_index)
+                .collect::<HashSet<_>>();
+            for replay in &macho_text_relocation_replays {
+                if !moved_macho_relocations.contains(&replay.relocation_index)
+                    || patch_sections.iter().any(|section| {
+                        section.input == replay.input
+                            && section.section_index == replay.section_index
+                    })
+                {
+                    continue;
+                }
+                let Some(section) = matched_sections.iter().find(|section| {
+                    section.current.input == replay.input
+                        && section.current.section_index == replay.section_index
+                }) else {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "missing Mach-O text section for moved target in `{}`",
+                        path.display()
+                    )));
+                };
+                patch_sections.push(section.current.clone());
+            }
             patched_section_count += patch_sections.len();
 
             let Some(mut resolved_patches) = ({
@@ -2520,6 +2601,7 @@ fn patch_changed_inputs(
                     &mut resolved_patches,
                     &macho_text_relocation_replays,
                     previous_output.get()?,
+                    &mut previous.relocations,
                 )
             {
                 return Ok(ChangedInputPatchResult::Unsupported(reason));
@@ -3371,6 +3453,14 @@ struct RelocationTargetPatches {
     input_ranges: Vec<std::ops::Range<usize>>,
     output_patches: Vec<SectionPatch>,
     output_symbols: Vec<RelocationTargetSymbolPatch>,
+    macho_target_moves: Vec<MachORelocationTargetMove>,
+}
+
+#[derive(Clone, Copy)]
+struct MachORelocationTargetMove {
+    relocation_index: usize,
+    current_section_offset: u64,
+    current_target_value: u64,
 }
 
 #[derive(Clone)]
@@ -3378,6 +3468,7 @@ struct RelocationTargetSymbolPatch {
     target_name: String,
     previous_target_value: u64,
     target_value: u64,
+    allow_missing: bool,
 }
 
 struct FdeRelocationPatch {
@@ -7235,13 +7326,18 @@ struct MachOTextRelocationContext {
 }
 
 struct MachOTextRelocationReplay {
+    relocation_index: usize,
     input: String,
     section_index: u32,
     previous_range: std::ops::Range<usize>,
     current_range: std::ops::Range<usize>,
+    r_type: u8,
     rel_info: RelocationKindInfo,
     previous_written_value: u64,
-    written_value: u64,
+    previous_target_value: u64,
+    current_target_value: u64,
+    current_target_section_offset: u64,
+    addend: i64,
 }
 
 fn macho_aarch64_text_relocation_contexts<'data>(
@@ -7348,13 +7444,19 @@ fn macho_relocation_instruction_shape(
 }
 
 fn macho_text_relocation_replays_for_input(
-    relocations: &mut [RelocationRecord],
+    relocations: &[RelocationRecord],
     input: &FileState,
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
     current_resolver: &PatchInputResolver<'_>,
+    target_moves: &[MachORelocationTargetMove],
 ) -> Result<std::result::Result<Vec<MachOTextRelocationReplay>, String>> {
     let mut replays = Vec::new();
+    let target_moves = target_moves
+        .iter()
+        .map(|target_move| (target_move.relocation_index, *target_move))
+        .collect::<HashMap<_, _>>();
+    let mut consumed_target_moves = HashSet::new();
     let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
         sections_by_input
@@ -7460,6 +7562,14 @@ fn macho_text_relocation_replays_for_input(
                 })
                 .collect::<Vec<_>>();
             relocation_indices.sort_by_key(|index| relocations[*index].relocation_offset);
+            let has_moved_target = relocation_indices
+                .iter()
+                .any(|index| target_moves.contains_key(index));
+            if patch_section.previous.data_hash == patch_section.current.data_hash
+                && !has_moved_target
+            {
+                continue;
+            }
             if previous_contexts.len() != current_contexts.len()
                 || previous_contexts.len() != relocation_indices.len()
             {
@@ -7474,7 +7584,7 @@ fn macho_text_relocation_replays_for_input(
                 .zip(&current_contexts)
                 .zip(relocation_indices)
             {
-                let relocation = &mut relocations[relocation_index];
+                let relocation = &relocations[relocation_index];
                 let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind)
                 else {
                     return Ok(Err(format!(
@@ -7540,44 +7650,51 @@ fn macho_text_relocation_replays_for_input(
                         display_hex_path(&input.path)
                     )));
                 };
-                let previous_place = relocation.output_offset;
-                let current_place = patch_section
-                    .current
-                    .output_offset
-                    .checked_add(current_context.range.start as u64)
-                    .ok_or_else(|| {
-                        crate::error!("Incremental Mach-O text relocation offset overflow")
-                    })?;
-                let Some(written_value) = macho_aarch64_relocated_value_for_moved_place(
-                    raw_relocation.r_type,
-                    previous_written_value,
-                    previous_place,
-                    current_place,
-                ) else {
-                    return Ok(Err(format!(
-                        "unsupported moved Mach-O text relocation in {}",
-                        display_hex_path(&input.path)
-                    )));
-                };
+                let target_move = target_moves.get(&relocation_index);
+                if target_move.is_some() {
+                    consumed_target_moves.insert(relocation_index);
+                }
 
                 replays.push(MachOTextRelocationReplay {
+                    relocation_index,
                     input: patch_section.current.input.clone(),
                     section_index: patch_section.current.section_index,
                     previous_range: previous_context.range.clone(),
                     current_range: current_context.range.clone(),
+                    r_type: raw_relocation.r_type,
                     rel_info,
                     previous_written_value,
-                    written_value,
+                    previous_target_value: relocation.target_value,
+                    current_target_value: target_move
+                        .map_or(relocation.target_value, |target_move| {
+                            target_move.current_target_value
+                        }),
+                    current_target_section_offset: target_move
+                        .and_then(|target_move| {
+                            relocation
+                                .target
+                                .as_ref()
+                                .map(|_| target_move.current_section_offset)
+                        })
+                        .or_else(|| {
+                            relocation
+                                .target
+                                .as_ref()
+                                .map(|target| target.section_offset)
+                        })
+                        .unwrap_or_default(),
+                    addend: relocation.addend,
                 });
-                relocation.input = patch_section.current.input.clone().into();
-                relocation.section_index = patch_section.current.section_index;
-                relocation.relocation_offset = current_context.range.start as u64;
-                relocation.output_offset = current_place;
-                relocation.written_value = Some(written_value);
             }
         }
     }
 
+    if consumed_target_moves.len() != target_moves.len() {
+        return Ok(Err(format!(
+            "missing Mach-O text relocation for moved target in {}",
+            display_hex_path(&input.path)
+        )));
+    }
     Ok(Ok(replays))
 }
 
@@ -7585,7 +7702,10 @@ fn apply_macho_text_relocation_replays(
     patches: &mut [ResolvedSectionPatch],
     replays: &[MachOTextRelocationReplay],
     previous_output: &[u8],
+    relocations: &mut [RelocationRecord],
 ) -> std::result::Result<(), String> {
+    let output_file = object::File::parse(previous_output)
+        .map_err(|error| format!("failed to parse previous Mach-O output: {error}"))?;
     for replay in replays {
         let Some(patch) = patches.iter_mut().find(|patch| {
             patch.section.input == replay.input
@@ -7616,6 +7736,35 @@ fn apply_macho_text_relocation_replays(
             return Err("previous Mach-O text relocation encoding changed".to_owned());
         }
 
+        let current_output_offset = patch
+            .section
+            .output_offset
+            .checked_add(replay.current_range.start as u64)
+            .ok_or_else(|| "current Mach-O text relocation offset overflowed".to_owned())?;
+        let previous_place =
+            macho_output_address_for_file_offset(&output_file, previous_start as u64).ok_or_else(
+                || "previous Mach-O text relocation has no output address".to_owned(),
+            )?;
+        let current_place =
+            macho_output_address_for_file_offset(&output_file, current_output_offset)
+                .ok_or_else(|| "current Mach-O text relocation has no output address".to_owned())?;
+        if macho_aarch64_relocated_value(
+            replay.r_type,
+            replay.previous_target_value,
+            replay.addend,
+            previous_place,
+        ) != Some(replay.previous_written_value)
+        {
+            return Err("previous Mach-O text relocation value changed".to_owned());
+        }
+        let Some(written_value) = macho_aarch64_relocated_value(
+            replay.r_type,
+            replay.current_target_value,
+            replay.addend,
+            current_place,
+        ) else {
+            return Err("unsupported moved Mach-O text relocation".to_owned());
+        };
         let current_bytes = patch
             .patch
             .data
@@ -7623,12 +7772,25 @@ fn apply_macho_text_relocation_replays(
             .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?;
         replay
             .rel_info
-            .write_to_buffer(replay.written_value, current_bytes)
+            .write_to_buffer(written_value, current_bytes)
             .map_err(|error| format!("failed to replay Mach-O text relocation: {error:#}"))?;
         patch
             .patch
             .preserve_ranges
             .retain(|range| range != &replay.current_range);
+
+        let relocation = relocations
+            .get_mut(replay.relocation_index)
+            .ok_or_else(|| "missing recorded Mach-O text relocation".to_owned())?;
+        relocation.input = replay.input.clone().into();
+        relocation.section_index = replay.section_index;
+        relocation.relocation_offset = replay.current_range.start as u64;
+        relocation.output_offset = current_output_offset;
+        relocation.written_value = Some(written_value);
+        relocation.target_value = replay.current_target_value;
+        if let Some(target) = relocation.target.as_mut() {
+            target.section_offset = replay.current_target_section_offset;
+        }
     }
 
     if patches.iter().any(|patch| {
@@ -7638,6 +7800,21 @@ fn apply_macho_text_relocation_replays(
         return Err("missing recorded Mach-O text relocation for replay".to_owned());
     }
     Ok(())
+}
+
+fn macho_output_address_for_file_offset(file: &object::File<'_>, file_offset: u64) -> Option<u64> {
+    for section in file.sections() {
+        let Some((section_file_offset, section_size)) = section.file_range() else {
+            continue;
+        };
+        let section_end = section_file_offset.checked_add(section_size)?;
+        if file_offset >= section_file_offset && file_offset < section_end {
+            return section
+                .address()
+                .checked_add(file_offset.checked_sub(section_file_offset)?);
+        }
+    }
+    None
 }
 
 fn section_size_allows_direct_patching(
@@ -8592,7 +8769,7 @@ fn macho_object_patch_fingerprint(
     };
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sld-macho-object-patch-fingerprint-v2");
+    hasher.update(b"sld-macho-object-patch-fingerprint-v3");
     hasher.update(bytes.get(4..12)?);
     hasher.update(&flags.to_le_bytes());
 
@@ -8674,14 +8851,24 @@ fn macho_object_patch_fingerprint(
     for symbol in symbols {
         hash_length_prefixed(&mut hasher, symbol.name_bytes().ok()?);
         hash_macho_symbol_section(&mut hasher, symbol.section())?;
-        let address = if let Some(section_index) = symbol.section_index() {
-            symbol
-                .address()
-                .checked_sub(file.section_by_index(section_index).ok()?.address())?
-        } else {
-            symbol.address()
-        };
-        hasher.update(&address.to_le_bytes());
+        let value_range = macho_symbol_value_field_range(bytes, symbol.index())
+            .map(|range| file_offset + range.start..file_offset + range.end);
+        let address_is_masked = value_range.is_some_and(|value_range| {
+            ranges
+                .iter()
+                .any(|range| range.start <= value_range.start && range.end >= value_range.end)
+        });
+        hasher.update(&[u8::from(address_is_masked)]);
+        if !address_is_masked {
+            let address = if let Some(section_index) = symbol.section_index() {
+                symbol
+                    .address()
+                    .checked_sub(file.section_by_index(section_index).ok()?.address())?
+            } else {
+                symbol.address()
+            };
+            hasher.update(&address.to_le_bytes());
+        }
         hasher.update(&symbol.size().to_le_bytes());
         hasher.update(&[
             macho_symbol_kind_tag(symbol.kind())?,
@@ -12197,6 +12384,51 @@ fn elf_section_headers(bytes: &[u8]) -> Option<Vec<ElfSectionHeader>> {
     Some(sections)
 }
 
+fn symbol_value_field_range(
+    bytes: &[u8],
+    symbol_index: object::SymbolIndex,
+) -> Option<std::ops::Range<usize>> {
+    elf_symbol_value_field_range(bytes, symbol_index)
+        .or_else(|| macho_symbol_value_field_range(bytes, symbol_index))
+}
+
+fn macho_symbol_value_field_range(
+    bytes: &[u8],
+    symbol_index: object::SymbolIndex,
+) -> Option<std::ops::Range<usize>> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0).ok()?;
+    let endian = header.endian().ok()?;
+    if endian != object::Endianness::Little {
+        return None;
+    }
+    let mut commands = header.load_commands(endian, bytes, 0).ok()?;
+    let mut symtab = None;
+    while let Some(command) = commands.next().ok()? {
+        let Some(command) = command.symtab().ok()? else {
+            continue;
+        };
+        if symtab.replace(command).is_some() {
+            return None;
+        }
+    }
+    let symtab = symtab?;
+    if symbol_index.0 >= symtab.nsyms.get(endian) as usize {
+        return None;
+    }
+
+    const ENTRY_SIZE: usize = std::mem::size_of::<object::macho::Nlist64<object::Endianness>>();
+    const VALUE_OFFSET: usize =
+        std::mem::offset_of!(object::macho::Nlist64<object::Endianness>, n_value);
+    let start = (symtab.symoff.get(endian) as usize)
+        .checked_add(symbol_index.0.checked_mul(ENTRY_SIZE)?)?
+        .checked_add(VALUE_OFFSET)?;
+    let end = start.checked_add(std::mem::size_of::<u64>())?;
+    bytes.get(start..end)?;
+    Some(start..end)
+}
+
 fn elf_symbol_value_field_range(
     bytes: &[u8],
     symbol_index: object::SymbolIndex,
@@ -15660,6 +15892,7 @@ mod tests {
                 target_name: hex::encode(b"duplicate"),
                 previous_target_value: 0x200,
                 target_value: 0x208,
+                allow_missing: false,
             }],
         )
         .unwrap()
@@ -15682,6 +15915,7 @@ mod tests {
                 target_name: hex::encode(b"missing"),
                 previous_target_value: 0x200,
                 target_value: 0x208,
+                allow_missing: false,
             }],
         )
         .unwrap();
@@ -15690,6 +15924,46 @@ mod tests {
             patches,
             Err(reason) if reason == "missing output symbol for incremental value patch"
         ));
+    }
+
+    #[test]
+    fn output_symbol_value_patches_reject_unexpected_existing_value_when_missing_is_allowed() {
+        let output = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[RelocationTargetSymbolPatch {
+                target_name: hex::encode(b"_data"),
+                previous_target_value: 8,
+                target_value: 12,
+                allow_missing: true,
+            }],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            patches,
+            Err(reason) if reason == "output symbol value changed before incremental patch"
+        ));
+    }
+
+    #[test]
+    fn output_symbol_value_patches_skip_absent_symbol_when_missing_is_allowed() {
+        let output = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[RelocationTargetSymbolPatch {
+                target_name: hex::encode(b"_stripped"),
+                previous_target_value: 8,
+                target_value: 12,
+                allow_missing: true,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(patches.is_empty());
     }
 
     #[test]
@@ -19990,6 +20264,10 @@ mod tests {
         let grown_text = test_macho_section_range(&grown, "__text");
         let changed_data_text = test_macho_section_range(&changed_data, "__text");
         let moved_data_symbol_text = test_macho_section_range(&moved_data_symbol, "__text");
+        let previous_data_symbol =
+            macho_symbol_value_field_range(&previous, object::SymbolIndex(1)).unwrap();
+        let moved_data_symbol_value =
+            macho_symbol_value_field_range(&moved_data_symbol, object::SymbolIndex(1)).unwrap();
 
         assert_eq!(
             macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
@@ -20001,8 +20279,26 @@ mod tests {
         );
         assert_ne!(
             macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
-            macho_object_patch_fingerprint(&moved_data_symbol, 0, &[moved_data_symbol_text])
-                .unwrap()
+            macho_object_patch_fingerprint(
+                &moved_data_symbol,
+                0,
+                &[moved_data_symbol_text.clone()],
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            macho_object_patch_fingerprint(
+                &previous,
+                0,
+                &[previous_text.clone(), previous_data_symbol]
+            )
+            .unwrap(),
+            macho_object_patch_fingerprint(
+                &moved_data_symbol,
+                0,
+                &[moved_data_symbol_text, moved_data_symbol_value]
+            )
+            .unwrap()
         );
         assert_ne!(
             macho_object_patch_fingerprint(&previous, 0, &[previous_text.clone()]).unwrap(),
@@ -20059,6 +20355,50 @@ mod tests {
         let section = file.section_by_name(name).unwrap();
         let (offset, size) = section.file_range().unwrap();
         offset as usize..(offset + size) as usize
+    }
+
+    #[test]
+    fn macho_symbol_value_ranges_follow_raw_nlist_indices() {
+        let mut bytes = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 1);
+        let first = macho_symbol_value_field_range(&bytes, object::SymbolIndex(0)).unwrap();
+        let second = macho_symbol_value_field_range(&bytes, object::SymbolIndex(1)).unwrap();
+
+        assert_eq!(&bytes[first.clone()], &0_u64.to_le_bytes());
+        assert_eq!(&bytes[second.clone()], &5_u64.to_le_bytes());
+
+        let first_entry = first.start - 8;
+        bytes[first_entry + 4] = object::macho::N_STAB;
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let symbols = file.symbols().collect::<Vec<_>>();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].index(), object::SymbolIndex(1));
+        assert_eq!(
+            macho_symbol_value_field_range(&bytes, symbols[0].index()),
+            Some(second)
+        );
+        assert!(macho_symbol_value_field_range(&bytes, object::SymbolIndex(2)).is_none());
+    }
+
+    #[test]
+    fn output_symbol_value_patches_macho_nlist64() {
+        let output = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let value_range = macho_symbol_value_field_range(&output, object::SymbolIndex(1)).unwrap();
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[RelocationTargetSymbolPatch {
+                target_name: hex::encode(b"_data"),
+                previous_target_value: 4,
+                target_value: 8,
+                allow_missing: true,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].output_offset, value_range.start as u64);
+        assert_eq!(patches[0].data, 8_u64.to_le_bytes());
     }
 
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
@@ -24166,45 +24506,27 @@ mod tests {
     }
 
     #[test]
-    fn moved_macho_page_relocation_recomputes_page_delta() {
-        let previous_place = 0x1ffcu64;
-        let current_place = 0x2000u64;
-        let previous_written_value = 0x3000u64;
-
+    fn macho_page_relocation_uses_target_and_place_pages() {
         assert_eq!(
-            macho_aarch64_relocated_value_for_moved_place(
-                object::macho::ARM64_RELOC_PAGE21,
-                previous_written_value,
-                previous_place,
-                current_place,
-            ),
-            Some(0x2000)
-        );
-        assert_ne!(
-            previous_written_value.wrapping_sub(current_place - previous_place),
-            0x2000
+            macho_aarch64_relocated_value(object::macho::ARM64_RELOC_PAGE21, 0x5000, 0, 0x2ffc,),
+            Some(0x3000)
         );
     }
 
     #[test]
-    fn moved_macho_branch_relocation_tracks_the_new_place() {
+    fn macho_branch_and_pageoff_relocations_use_full_values() {
         assert_eq!(
-            macho_aarch64_relocated_value_for_moved_place(
-                object::macho::ARM64_RELOC_BRANCH26,
-                0x3000,
-                0x1000,
-                0x1004,
-            ),
+            macho_aarch64_relocated_value(object::macho::ARM64_RELOC_BRANCH26, 0x4000, 0, 0x1004,),
             Some(0x2ffc)
         );
         assert_eq!(
-            macho_aarch64_relocated_value_for_moved_place(
+            macho_aarch64_relocated_value(
                 object::macho::ARM64_RELOC_PAGEOFF12,
+                0x1234_5000,
                 0x678,
-                0x1ffc,
-                0x2000,
+                0,
             ),
-            Some(0x678)
+            Some(0x1234_5678)
         );
     }
 
