@@ -31,6 +31,13 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:1
 //#TestIncrementalChangedRun:true
+//#Config:moved-target:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DMOVE_TARGET=1
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:2
+//#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
 

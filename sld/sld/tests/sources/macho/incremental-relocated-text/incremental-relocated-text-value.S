@@ -7,7 +7,7 @@ _incremental_relocated_text_value:
     nop
 #endif
     adrp x8, _incremental_relocated_text_target@PAGE
-    ldr wzr, [x8, _incremental_relocated_text_target@PAGEOFF]
+    ldr w0, [x8, _incremental_relocated_text_target@PAGEOFF]
 #ifndef MOVE_RELOCATIONS
     nop
 #endif
@@ -16,6 +16,12 @@ _incremental_relocated_text_value:
 
 .section __DATA,__data
 .p2align 2
+#ifdef MOVE_TARGET
+    .long 0
+#endif
 .globl _incremental_relocated_text_target
 _incremental_relocated_text_target:
     .long 42
+#ifndef MOVE_TARGET
+    .long 0
+#endif
