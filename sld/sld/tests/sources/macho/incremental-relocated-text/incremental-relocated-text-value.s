@@ -10,5 +10,6 @@ _incremental_relocated_text_value:
 
 .section __DATA,__data
 .p2align 2
+.globl _incremental_relocated_text_target
 _incremental_relocated_text_target:
     .long 42

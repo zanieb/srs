@@ -869,7 +869,7 @@ fn macho_addend(rel: RelocationInfo) -> i64 {
 pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     sized_output: &mut SizedOutput,
     layout: &MachOLayout<'data>,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
     let existing_output_bytes_available = sized_output.existing_data_available();
@@ -958,7 +958,7 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     _trace: &TraceOutput,
     symbol_writer: &mut MachOSymbolTableWriter<'_>,
     chained_rebases: &ChainedRebases,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -1329,7 +1329,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter<'_>,
     chained_rebases: &ChainedRebases,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -1435,7 +1435,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     chained_rebases: &ChainedRebases,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -1457,6 +1457,9 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let record_for_incremental_state = can_reuse_section_bytes
         || (reusable_section && section_name == b"__data")
         || (structurally_recordable_section && section_name == b"__text");
+    let record_text_relocations = structurally_recordable_section
+        && section_name == b"__text"
+        && incremental.records_relocations();
     let can_reuse_existing_bytes = existing_output_bytes_available && can_reuse_section_bytes;
 
     let written = write_section_raw(
@@ -1474,7 +1477,9 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     if written.reused {
         return Ok(());
     }
+    let section_output_offset = written.output_offset;
     let out = written.bytes;
+    let mut incremental_relocations = Vec::new();
 
     let section_address = object_layout.section_resolutions[section_index.0]
         .address()
@@ -1558,6 +1563,9 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         }
         apply_relocation::<A>(
             object_layout,
+            section_index,
+            input_offset,
+            section_output_offset,
             section_address,
             section_part_id,
             rel,
@@ -1565,6 +1573,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             layout,
             out,
             chained_rebases,
+            record_text_relocations.then_some(&mut incremental_relocations),
         )?;
         paired_addend = 0;
     }
@@ -1572,6 +1581,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         paired_subtractor.is_none(),
         "Mach-O ARM64_RELOC_SUBTRACTOR missing paired ARM64_RELOC_UNSIGNED"
     );
+    incremental.record_relocations(incremental_relocations);
 
     Ok(())
 }
@@ -1714,6 +1724,9 @@ fn read_relocation_addend(out: &[u8], offset: usize, size: RelocationSize) -> Re
 #[inline(always)]
 fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
+    section_index: object::SectionIndex,
+    source_relocation_offset: u64,
+    section_output_offset: Option<u64>,
     section_address: u64,
     section_part_id: part_id::PartId,
     rel: RelocationInfo,
@@ -1721,6 +1734,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
     out: &mut [u8],
     chained_rebases: &ChainedRebases,
+    incremental_relocations: Option<&mut Vec<crate::incremental::DeferredRelocationRecord<'data>>>,
 ) -> Result {
     let offset_in_section = u64::from(rel.r_address);
     let place = section_address + offset_in_section;
@@ -1734,6 +1748,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
 
     let rel_info = A::relocation_from_raw(rel)?;
     let (mut resolution, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
+    let target_resolution_value = resolution.raw_value;
     let implicit_addend = if rel.r_type == macho::ARM64_RELOC_UNSIGNED {
         read_relocation_addend(out, offset_in_section as usize, rel_info.size)?
     } else {
@@ -1806,6 +1821,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         }
         _ => todo!(),
     };
+    let mut used_thunk = false;
     if let Some(local_symbol_id) = local_symbol_id
         && let Some(thunked_value) = maybe_get_thunk_for_relocation::<A>(
             object_layout,
@@ -1818,6 +1834,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         )?
     {
         value = thunked_value;
+        used_thunk = true;
     }
     if let Some(import_index) = chained_rebases.bind_import_index(place) {
         value = encode_chained_bind(import_index, chained_rebases.next_stride(place)?)?;
@@ -1857,7 +1874,83 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             )
         })?;
 
+    if let Some(incremental_relocations) = incremental_relocations
+        && let Some(section_output_offset) = section_output_offset
+        && let Some(local_symbol_id) = local_symbol_id
+        && !used_thunk
+        && matches!(
+            rel.r_type,
+            macho::ARM64_RELOC_BRANCH26 | macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_PAGEOFF12
+        )
+    {
+        let target_symbol = layout.symbol_db.definition(local_symbol_id);
+        let target_symbol_id = u32::try_from(target_symbol.as_usize())
+            .context("Incremental Mach-O relocation target symbol ID overflow")?;
+        if let Some(record) = PreparedState::deferred_relocation_record(
+            object_layout.input,
+            section_index,
+            target_symbol_id,
+            source_relocation_offset,
+            section_output_offset + offset_in_section,
+            macho_relocation_record_size(&rel_info) as u64,
+            crate::incremental::encode_macho_aarch64_relocation_kind(rel),
+            paired_addend,
+            value,
+            target_resolution_value,
+            || {
+                Ok((
+                    layout
+                        .symbol_db
+                        .symbol_name(target_symbol)
+                        .ok()
+                        .and_then(|name| (!name.bytes().is_empty()).then(|| name.bytes())),
+                    macho_relocation_target_owner(layout, target_symbol)?,
+                ))
+            },
+        )? {
+            incremental_relocations.push(record);
+        }
+    }
+
     Ok(())
+}
+
+fn macho_relocation_record_size(rel_info: &linker_utils::elf::RelocationKindInfo) -> usize {
+    match rel_info.size {
+        RelocationSize::ByteSize(size) => size,
+        RelocationSize::BitMasking(mask) => mask.instruction.write_windows_size(),
+    }
+}
+
+fn macho_relocation_target_owner<'data>(
+    layout: &MachOLayout<'data>,
+    target_symbol_id: SymbolId,
+) -> Result<
+    Option<(
+        crate::input_data::InputRef<'data>,
+        object::SectionIndex,
+        u64,
+    )>,
+> {
+    let file_id = layout.symbol_db.file_id_for_symbol(target_symbol_id);
+    let FileLayout::Object(object) = layout.file_layout(file_id) else {
+        return Ok(None);
+    };
+    let symbol_index = target_symbol_id.to_input(object.symbol_id_range);
+    let symbol = object.object.symbol(symbol_index)?;
+    let Some(section_index) = object.object.symbol_section(symbol, symbol_index)? else {
+        return Ok(None);
+    };
+    let section_offset = object
+        .object
+        .symbol_offset_in_section(symbol, section_index)?;
+    let recorded_section_index = object::SectionIndex(
+        section_index
+            .0
+            .checked_add(1)
+            .context("Incremental Mach-O relocation target section index overflow")?,
+    );
+    Ok(Some((object.input, recorded_section_index, section_offset)))
 }
 
 fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
@@ -2890,6 +2983,7 @@ fn macho_image_offset(address: u64) -> Result<u32> {
 
 struct WrittenSection<'out> {
     bytes: &'out mut [u8],
+    output_offset: Option<u64>,
     reused: bool,
 }
 
@@ -2939,6 +3033,7 @@ fn write_section_raw<'out, 'data>(
         ) {
             return Ok(WrittenSection {
                 bytes: &mut [],
+                output_offset: Some(output_offset as u64),
                 reused: true,
             });
         }
@@ -2953,6 +3048,7 @@ fn write_section_raw<'out, 'data>(
                 padding.fill(0);
                 Ok(WrittenSection {
                     bytes: out,
+                    output_offset: Some(output_offset as u64),
                     reused: false,
                 })
             }
@@ -2987,6 +3083,7 @@ fn write_section_raw<'out, 'data>(
 
                 Ok(WrittenSection {
                     bytes: &mut out[..effective_size],
+                    output_offset: Some(output_offset as u64),
                     reused: false,
                 })
             }
@@ -2994,6 +3091,7 @@ fn write_section_raw<'out, 'data>(
     } else {
         Ok(WrittenSection {
             bytes: &mut [],
+            output_offset: None,
             reused: false,
         })
     }
