@@ -13995,7 +13995,9 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
         Ok(metadata) => metadata,
         Err(_) => return Ok(false),
     };
-    if !metadata.is_file() || metadata.permissions().readonly() {
+    if !metadata.is_file()
+        || (metadata.permissions().readonly() && !is_protected_stable_rustc_input(state_dir, path))
+    {
         return Ok(false);
     }
 
@@ -14041,7 +14043,9 @@ fn snapshot_loaded_input_file(
         Ok(metadata) => metadata,
         Err(_) => return Ok((false, should_hash.then(|| hash_bytes(bytes)), None)),
     };
-    if !metadata.is_file() || metadata.permissions().readonly() {
+    if !metadata.is_file()
+        || (metadata.permissions().readonly() && !is_protected_stable_rustc_input(state_dir, path))
+    {
         return Ok((false, should_hash.then(|| hash_bytes(bytes)), None));
     }
 
@@ -14214,6 +14218,13 @@ fn is_atomic_replacement_rust_input(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(".rcgu.o"))
+}
+
+fn is_protected_stable_rustc_input(state_dir: &Path, path: &Path) -> bool {
+    is_atomic_replacement_rust_input(path)
+        && path
+            .parent()
+            .is_some_and(|parent| parent == state_dir.join(STABLE_RUSTC_INPUT_DIR))
 }
 
 #[cfg(target_vendor = "apple")]
@@ -16054,6 +16065,47 @@ mod tests {
         );
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn changed_input_snapshots_accept_readonly_atomic_rust_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let stable_dir = state_dir.join(STABLE_RUSTC_INPUT_DIR);
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let input = stable_dir.join("crate.0123456789abcdef.rcgu.o");
+        std::fs::write(&input, b"changed").unwrap();
+        let mut permissions = std::fs::metadata(&input).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&input, permissions).unwrap();
+
+        assert_eq!(
+            snapshot_input_paths(&state_dir, [input.as_path()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &input)).unwrap(),
+            b"changed"
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn changed_input_snapshots_skip_readonly_atomic_rust_inputs_outside_stable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        std::fs::write(&input, b"changed").unwrap();
+        let mut permissions = std::fs::metadata(&input).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&input, permissions).unwrap();
+
+        assert_eq!(
+            snapshot_input_paths(&state_dir, [input.as_path()]).unwrap(),
+            0
+        );
+        assert!(!input_snapshot_path(&state_dir, &input).exists());
+    }
+
     #[test]
     fn rust_snapshot_hardlinks_only_atomic_replacement_artifacts() {
         assert!(is_atomic_replacement_rust_input(Path::new("libcrate.rlib")));
@@ -16109,8 +16161,13 @@ mod tests {
     fn deferred_hashing_uses_bytes_from_installed_rust_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
-        let input = dir.path().join("crate.0123456789abcdef.rcgu.o");
+        let stable_dir = state_dir.join(STABLE_RUSTC_INPUT_DIR);
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let input = stable_dir.join("crate.0123456789abcdef.rcgu.o");
         std::fs::write(&input, b"object").unwrap();
+        let mut permissions = std::fs::metadata(&input).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&input, permissions).unwrap();
         let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
         let mut input_files = vec![FileState {
             path: encode_path(&input),
