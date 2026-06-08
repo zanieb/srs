@@ -500,6 +500,21 @@ pub(crate) trait Platform:
         args: &Self::Args,
     );
 
+    fn section_boundary_symbol(
+        _name: &[u8],
+        _output_sections: &OutputSections<Self>,
+    ) -> Option<(Option<OutputSectionId>, bool)> {
+        None
+    }
+
+    fn section_boundary_symbol_matches(
+        _name: &[u8],
+        _section_id: OutputSectionId,
+        _output_sections: &OutputSections<Self>,
+    ) -> bool {
+        true
+    }
+
     fn built_in_section_infos<'data>()
     -> Vec<crate::output_section_id::SectionOutputInfo<'data, Self>>;
 

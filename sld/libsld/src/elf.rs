@@ -985,6 +985,7 @@ impl platform::Platform for Elf {
             },
             name: b"_TLS_MODULE_BASE_",
             symbol: elf_symbol,
+            section_if_present: false,
         });
     }
 

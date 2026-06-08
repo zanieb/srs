@@ -21,6 +21,7 @@ use crate::layout_rules::SectionRuleOutcome;
 use crate::layout_rules::SectionRules;
 use crate::output_section_id::CustomSectionDetails;
 use crate::output_section_id::InitFiniSectionDetail;
+use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::OutputSections;
 use crate::output_section_id::SectionName;
 use crate::parsing::InternalSymDefInfo;
@@ -923,9 +924,8 @@ fn load_symbol_named<'scope, 'data, P: Platform>(
 }
 
 /// Where there are multiple references to undefined symbols with the same name, pick one reference
-/// as the canonical one to which we'll refer. Where undefined symbols can be resolved to
-/// __start/__stop symbols that refer to the start or stop of a custom section, collect that
-/// information up and put it into `custom_start_stop_defs`.
+/// as the canonical one to which we'll refer. Where undefined symbols can be resolved to section
+/// boundary symbols, collect that information up and put it into `custom_start_stop_defs`.
 fn canonicalise_undefined_symbols<'data, P: Platform>(
     mut undefined_symbols: Vec<UndefinedSymbol<'data>>,
     output_sections: &OutputSections<P>,
@@ -965,7 +965,7 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
             PreHashedSymbolName::Unversioned(pre_hashed) => {
                 match name_to_id.entry(pre_hashed) {
                     hashbrown::hash_map::Entry::Vacant(entry) => {
-                        let symbol_id = allocate_start_stop_symbol_id(
+                        let symbol_id = allocate_section_boundary_symbol_id(
                             pre_hashed,
                             symbol_db,
                             per_symbol_flags,
@@ -1052,7 +1052,7 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
     }
 }
 
-fn allocate_start_stop_symbol_id<'data, P: Platform>(
+fn allocate_section_boundary_symbol_id<'data, P: Platform>(
     name: PreHashed<UnversionedSymbolName<'data>>,
     symbol_db: &mut SymbolDb<'data, P>,
     per_symbol_flags: &mut PerSymbolFlags,
@@ -1063,20 +1063,61 @@ fn allocate_start_stop_symbol_id<'data, P: Platform>(
 
     let (section_name, is_start) = if let Some(s) = symbol_name_bytes.strip_prefix(b"__start_") {
         (s, true)
-    } else {
-        let s = symbol_name_bytes.strip_prefix(b"__stop_")?;
+    } else if let Some(s) = symbol_name_bytes.strip_prefix(b"__stop_") {
         (s, false)
+    } else {
+        let (section_id, is_start) =
+            P::section_boundary_symbol(symbol_name_bytes, output_sections)?;
+        return allocate_section_boundary_symbol(
+            name,
+            section_id,
+            is_start,
+            true,
+            symbol_db,
+            per_symbol_flags,
+            custom_start_stop_defs,
+        );
     };
 
     let section_id = output_sections.custom_name_to_id(SectionName(section_name))?;
 
-    let def_info = if is_start {
-        InternalSymDefInfo::new(SymbolPlacement::SectionStart(section_id), name.bytes())
-    } else {
-        InternalSymDefInfo::new(SymbolPlacement::SectionEnd(section_id), name.bytes())
+    allocate_section_boundary_symbol(
+        name,
+        Some(section_id),
+        is_start,
+        false,
+        symbol_db,
+        per_symbol_flags,
+        custom_start_stop_defs,
+    )
+}
+
+fn allocate_section_boundary_symbol<'data, P: Platform>(
+    name: PreHashed<UnversionedSymbolName<'data>>,
+    section_id: Option<OutputSectionId>,
+    is_start: bool,
+    section_if_present: bool,
+    symbol_db: &mut SymbolDb<'data, P>,
+    per_symbol_flags: &mut PerSymbolFlags,
+    custom_start_stop_defs: &mut ResolvedSyntheticSymbols<'data, P>,
+) -> Option<SymbolId> {
+    let mut def_info = match (section_id, is_start) {
+        (Some(section_id), true) => {
+            InternalSymDefInfo::new(SymbolPlacement::SectionStart(section_id), name.bytes())
+        }
+        (Some(section_id), false) => {
+            InternalSymDefInfo::new(SymbolPlacement::SectionEnd(section_id), name.bytes())
+        }
+        (None, _) => InternalSymDefInfo::new(SymbolPlacement::DefsymAbsolute(0), name.bytes()),
     };
+    if section_if_present && section_id.is_some() {
+        def_info = def_info.section_if_present();
+    }
 
     let symbol_id = symbol_db.add_synthetic_symbol(per_symbol_flags, name, custom_start_stop_defs);
+    if section_id.is_none() {
+        per_symbol_flags.set_flag(symbol_id, ValueFlags::ABSOLUTE);
+    }
 
     custom_start_stop_defs.symbol_definitions.push(def_info);
 
