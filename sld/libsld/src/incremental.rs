@@ -1537,6 +1537,16 @@ fn relocation_target_patches_for_input(
         };
         let file = object::File::parse(input_bytes.bytes)
             .context("Failed to parse changed relocation target input")?;
+        if relocation.input_file == input.path
+            && relocation.input == target.input
+            && file.format() == object::BinaryFormat::MachO
+            && file.architecture() == object::Architecture::Aarch64
+            && decode_macho_aarch64_relocation_kind(relocation.kind).is_some()
+        {
+            // Same-object Mach-O targets must be resolved together with the current relocation
+            // site. Rust-generated local names can be reused for semantically different constants.
+            continue;
+        }
         let Some(current) = symbol_position_by_name(
             input_bytes.bytes,
             input_bytes.file_offset,
@@ -2160,7 +2170,7 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             }
-            let relocation_target_patches = {
+            let mut relocation_target_patches = {
                 timing_phase!("Resolve changed relocation targets");
                 match relocation_target_patches_for_input(&mut previous.relocations, input, &bytes)?
                 {
@@ -2168,7 +2178,6 @@ fn patch_changed_inputs(
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
             };
-            output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
             if input_has_records_requiring_previous_bytes(&previous, input) {
                 timing_phase!("Read previous incremental input snapshot");
                 previous_snapshot_bytes.get()?;
@@ -2303,7 +2312,7 @@ fn patch_changed_inputs(
                         &matched_sections,
                         previous_resolver,
                         &current_resolver,
-                        &relocation_target_patches.macho_target_moves,
+                        &mut relocation_target_patches,
                     )? {
                         Ok(replays) => replays,
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -2312,6 +2321,7 @@ fn patch_changed_inputs(
                     Vec::new()
                 }
             };
+            output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
             if args.should_validate_x86_64_elf_got_relaxation_contexts() {
                 let mut got_contexts_are_stable = {
                     timing_phase!("Validate changed ELF GOT contexts");
@@ -7434,6 +7444,37 @@ fn macho_relocation_target_identity(
     }
 }
 
+struct MachORelocationSymbolPosition {
+    name: Vec<u8>,
+    symbol_index: object::SymbolIndex,
+    section_index: object::SectionIndex,
+    section_offset: u64,
+}
+
+fn macho_relocation_symbol_position(
+    file: &object::File<'_>,
+    target: object::RelocationTarget,
+) -> Result<Option<MachORelocationSymbolPosition>> {
+    let object::RelocationTarget::Symbol(symbol_index) = target else {
+        return Ok(None);
+    };
+    let symbol = file.symbol_by_index(symbol_index)?;
+    let Some(section_index) = symbol.section_index() else {
+        return Ok(None);
+    };
+    let section = file.section_by_index(section_index)?;
+    let section_offset = symbol
+        .address()
+        .checked_sub(section.address())
+        .context("Mach-O relocation target precedes its section")?;
+    Ok(Some(MachORelocationSymbolPosition {
+        name: symbol.name_bytes()?.to_vec(),
+        symbol_index,
+        section_index,
+        section_offset,
+    }))
+}
+
 fn macho_relocation_instruction_shape(
     rel_info: RelocationKindInfo,
     bytes: &[u8; 4],
@@ -7449,14 +7490,18 @@ fn macho_text_relocation_replays_for_input(
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
     current_resolver: &PatchInputResolver<'_>,
-    target_moves: &[MachORelocationTargetMove],
+    target_patches: &mut RelocationTargetPatches,
 ) -> Result<std::result::Result<Vec<MachOTextRelocationReplay>, String>> {
     let mut replays = Vec::new();
-    let target_moves = target_moves
+    let target_moves = target_patches
+        .macho_target_moves
         .iter()
         .map(|target_move| (target_move.relocation_index, *target_move))
         .collect::<HashMap<_, _>>();
     let mut consumed_target_moves = HashSet::new();
+    let mut same_object_target_moves = Vec::new();
+    let mut target_input_ranges = Vec::new();
+    let mut target_output_symbols = Vec::new();
     let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
         sections_by_input
@@ -7565,11 +7610,6 @@ fn macho_text_relocation_replays_for_input(
             let has_moved_target = relocation_indices
                 .iter()
                 .any(|index| target_moves.contains_key(index));
-            if patch_section.previous.data_hash == patch_section.current.data_hash
-                && !has_moved_target
-            {
-                continue;
-            }
             if previous_contexts.len() != current_contexts.len()
                 || previous_contexts.len() != relocation_indices.len()
             {
@@ -7579,6 +7619,8 @@ fn macho_text_relocation_replays_for_input(
                 )));
             }
 
+            let replay_start = replays.len();
+            let mut section_has_moved_target = has_moved_target;
             for ((previous_context, current_context), relocation_index) in previous_contexts
                 .iter()
                 .zip(&current_contexts)
@@ -7618,6 +7660,90 @@ fn macho_text_relocation_replays_for_input(
                     )));
                 }
 
+                let same_object_target_move = if let Some(target) =
+                    relocation.target.as_ref().filter(|target| {
+                        target.input_file == input.path
+                            && target.input == patch_section.previous.input
+                            && relocation.input == target.input
+                    }) {
+                    let Some(previous_position) =
+                        macho_relocation_symbol_position(&previous_file, previous_context.target)?
+                    else {
+                        return Ok(Err(format!(
+                            "missing previous Mach-O text relocation target in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
+                    let Some(current_position) =
+                        macho_relocation_symbol_position(&current_file, current_context.target)?
+                    else {
+                        return Ok(Err(format!(
+                            "missing current Mach-O text relocation target in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
+                    let recorded_name = relocation
+                        .target_name
+                        .as_deref()
+                        .map(hex::decode)
+                        .transpose()
+                        .context("Malformed recorded Mach-O relocation target name")?;
+                    if recorded_name.as_deref() != Some(previous_position.name.as_slice())
+                        || previous_position.section_index.0 as u32 != target.section_index
+                        || previous_position.section_offset != target.section_offset
+                    {
+                        return Ok(Err(format!(
+                            "previous Mach-O text relocation target changed in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    }
+                    if let Some(value_range) = macho_symbol_value_field_range(
+                        current_input_bytes.bytes,
+                        current_position.symbol_index,
+                    ) {
+                        target_input_ranges.push(
+                            current_input_bytes.file_offset + value_range.start
+                                ..current_input_bytes.file_offset + value_range.end,
+                        );
+                    }
+                    let delta = i128::from(current_position.section_offset)
+                        - i128::from(previous_position.section_offset);
+                    let Some(current_target_value) =
+                        add_signed_delta_u64(relocation.target_value, delta)
+                    else {
+                        return Ok(Err(format!(
+                            "Mach-O text relocation target value overflowed in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
+                    let target_move = MachORelocationTargetMove {
+                        relocation_index,
+                        current_section_offset: current_position.section_offset,
+                        current_target_value,
+                    };
+                    if current_target_value != relocation.target_value
+                        || current_position.section_offset != target.section_offset
+                    {
+                        section_has_moved_target = true;
+                        same_object_target_moves.push(target_move);
+                        target_output_symbols.push(RelocationTargetSymbolPatch {
+                            target_name: relocation
+                                .target_name
+                                .as_deref()
+                                .context("Missing recorded Mach-O relocation target name")?
+                                .to_owned(),
+                            previous_target_value: relocation.target_value,
+                            target_value: current_target_value,
+                            allow_missing: true,
+                        });
+                        Some(target_move)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let rel_info =
                     <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
                         raw_relocation,
@@ -7654,6 +7780,7 @@ fn macho_text_relocation_replays_for_input(
                 if target_move.is_some() {
                     consumed_target_moves.insert(relocation_index);
                 }
+                let target_move = target_move.copied().or(same_object_target_move);
 
                 replays.push(MachOTextRelocationReplay {
                     relocation_index,
@@ -7686,6 +7813,11 @@ fn macho_text_relocation_replays_for_input(
                     addend: relocation.addend,
                 });
             }
+            if patch_section.previous.data_hash == patch_section.current.data_hash
+                && !section_has_moved_target
+            {
+                replays.truncate(replay_start);
+            }
         }
     }
 
@@ -7695,6 +7827,12 @@ fn macho_text_relocation_replays_for_input(
             display_hex_path(&input.path)
         )));
     }
+    target_patches
+        .macho_target_moves
+        .extend(same_object_target_moves);
+    target_patches.input_ranges.extend(target_input_ranges);
+    dedup_ranges(&mut target_patches.input_ranges);
+    target_patches.output_symbols.extend(target_output_symbols);
     Ok(Ok(replays))
 }
 

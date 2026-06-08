@@ -38,6 +38,13 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:2
 //#TestIncrementalChangedRun:true
+//#Config:retargeted-relocation:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DRETARGET=1
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:changed Mach-O text relocation target
+//#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
 
