@@ -1653,6 +1653,16 @@ fn relocation_kind_info(
     file: &object::File<'_>,
     relocation_kind: u32,
 ) -> Option<RelocationKindInfo> {
+    if file.format() == object::BinaryFormat::MachO
+        && file.architecture() == object::Architecture::Aarch64
+    {
+        let relocation = decode_macho_aarch64_relocation_kind(relocation_kind)?;
+        return <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+            relocation,
+        )
+        .ok();
+    }
+
     Some(match file.architecture() {
         object::Architecture::X86_64 => x86_64::relocation_from_raw(relocation_kind)?,
         object::Architecture::Aarch64 => aarch64::relocation_type_from_raw(relocation_kind)?,
@@ -1665,7 +1675,6 @@ fn relocation_kind_info(
 }
 
 const MACHO_AARCH64_RELOCATION_KIND_TAG: u32 = 0xa000_0000;
-#[cfg(test)]
 const MACHO_RELOCATION_KIND_TAG_MASK: u32 = 0xf000_0000;
 
 pub(crate) fn encode_macho_aarch64_relocation_kind(
@@ -1678,7 +1687,6 @@ pub(crate) fn encode_macho_aarch64_relocation_kind(
         | (u32::from(relocation.r_extern) << 7)
 }
 
-#[cfg(test)]
 fn decode_macho_aarch64_relocation_kind(kind: u32) -> Option<object::macho::RelocationInfo> {
     (kind & MACHO_RELOCATION_KIND_TAG_MASK == MACHO_AARCH64_RELOCATION_KIND_TAG).then_some(
         object::macho::RelocationInfo {
@@ -23488,6 +23496,33 @@ mod tests {
         assert_eq!(decoded.r_length, relocation.r_length);
         assert_eq!(decoded.r_extern, relocation.r_extern);
         assert_eq!(decoded.r_type, relocation.r_type);
+    }
+
+    #[test]
+    fn recorded_macho_relocation_kind_uses_macho_decoder() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::macho::MH_MAGIC_64.to_le_bytes());
+        bytes.extend_from_slice(&object::macho::CPU_TYPE_ARM64.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&object::macho::MH_OBJECT.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+
+        let decoded = relocation_kind_info(&file, kind).expect("recorded relocation should decode");
+
+        assert!(matches!(decoded.size, RelocationSize::BitMasking(_)));
+        assert!(decoded.thunkable);
     }
 
     #[test]
