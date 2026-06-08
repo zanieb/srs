@@ -1442,18 +1442,21 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
 ) -> Result {
     let relocations = object_layout.relocations(section_index)?;
     let section_header = object_layout.object.section(section_index)?;
-    let recordable_section = !layout.args().should_output_partial_object()
+    let structurally_recordable_section = !layout.args().should_output_partial_object()
         && object_layout
             .section_relax_deltas
             .get(section_index.0)
-            .is_none()
-        && !section.flags.needs_got()
-        && !section.flags.needs_plt();
-    let can_reuse_section_bytes = recordable_section && relocations.num_relocations() == 0;
-    // A relocated __data section cannot reuse emitted bytes directly, but recording it allows
-    // the incremental patch validator to admit narrow changed-input cases.
+            .is_none();
+    let reusable_section =
+        structurally_recordable_section && !section.flags.needs_got() && !section.flags.needs_plt();
+    let can_reuse_section_bytes = reusable_section && relocations.num_relocations() == 0;
+    let section_name = object_layout.object.section_name(section_header)?;
+    // Relocated data and text cannot reuse their input bytes directly. Recording their output
+    // ranges lets the incremental patch validator admit changes that preserve every relocation;
+    // text also needs records when its relocations require GOT or PLT entries.
     let record_for_incremental_state = can_reuse_section_bytes
-        || (recordable_section && object_layout.object.section_name(section_header)? == b"__data");
+        || (reusable_section && section_name == b"__data")
+        || (structurally_recordable_section && section_name == b"__text");
     let can_reuse_existing_bytes = existing_output_bytes_available && can_reuse_section_bytes;
 
     let written = write_section_raw(

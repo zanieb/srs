@@ -2174,6 +2174,37 @@ fn patch_changed_inputs(
                     )));
                 }
             }
+            let mut macho_text_relocation_words_are_stable =
+                matched_macho_text_relocation_words_are_stable(
+                    input.path.as_str(),
+                    &matched_sections,
+                    None,
+                    &current_resolver,
+                )?;
+            if !macho_text_relocation_words_are_stable {
+                let previous_bytes = {
+                    timing_phase!("Read previous incremental input snapshot");
+                    previous_snapshot_bytes.get()?
+                };
+                let previous_resolver = previous_bytes
+                    .map(|bytes| {
+                        PatchInputResolver::new(bytes, normalize_rust_archive_patch_inputs)
+                    })
+                    .transpose()?;
+                macho_text_relocation_words_are_stable =
+                    matched_macho_text_relocation_words_are_stable(
+                        input.path.as_str(),
+                        &matched_sections,
+                        previous_resolver.as_ref(),
+                        &current_resolver,
+                    )?;
+            }
+            if !macho_text_relocation_words_are_stable {
+                return Ok(ChangedInputPatchResult::Unsupported(format!(
+                    "changed Mach-O text relocation bytes in `{}`",
+                    path.display()
+                )));
+            }
             if args.should_validate_x86_64_elf_got_relaxation_contexts() {
                 let mut got_contexts_are_stable = {
                     timing_phase!("Validate changed ELF GOT contexts");
@@ -7104,14 +7135,18 @@ fn section_direct_patch_preserve_ranges<'data>(
             if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0
                 && section_name.is_some_and(|name| name.starts_with(b".debug_"))
     );
+    let is_macho_text = matches!(section.flags(), object::SectionFlags::MachO { .. })
+        && section_name == Some(b"__text".as_slice());
     if !(section_flags_allow_patching(section.flags()) || is_elf_debug_section)
         || !section_name.is_none_or(section_name_allows_direct_patching)
         || ((section_name == Some(b"__const".as_slice())
-            || section_name == Some(b"__cstring".as_slice())
-            || section_name == Some(b"__text".as_slice()))
+            || section_name == Some(b"__cstring".as_slice()))
             && section.relocations().next().is_some())
     {
         return None;
+    }
+    if is_macho_text && section.relocations().next().is_some() {
+        return macho_aarch64_text_relocation_ranges(file, section, section_data);
     }
     let required_relocation_offsets = if is_elf_debug_section {
         Some(relocation_offsets?)
@@ -7125,6 +7160,93 @@ fn section_direct_patch_preserve_ranges<'data>(
         section_data,
         dynamic_relocation_offsets,
         required_relocation_offsets,
+    )
+}
+
+#[derive(PartialEq, Eq)]
+struct MachOTextRelocationContext {
+    range: std::ops::Range<usize>,
+    r_type: u8,
+    r_pcrel: bool,
+    target: object::RelocationTarget,
+    subtractor: Option<object::SymbolIndex>,
+    addend: i64,
+    bytes: [u8; 4],
+}
+
+fn macho_aarch64_text_relocation_contexts<'data>(
+    file: &object::File<'data>,
+    section: &impl object::ObjectSection<'data>,
+    section_data: &[u8],
+) -> Option<Vec<MachOTextRelocationContext>> {
+    if file.architecture() != object::Architecture::Aarch64
+        || !matches!(section.flags(), object::SectionFlags::MachO { .. })
+        || section.name().ok() != Some("__text")
+    {
+        return None;
+    }
+
+    let mut contexts = Vec::new();
+    for (offset, relocation) in section.relocations() {
+        if relocation.kind() == object::RelocationKind::None {
+            continue;
+        }
+        let object::RelocationFlags::MachO {
+            r_type,
+            r_pcrel,
+            r_length: 2,
+        } = relocation.flags()
+        else {
+            return None;
+        };
+        if !matches!(
+            r_type,
+            object::macho::ARM64_RELOC_BRANCH26
+                | object::macho::ARM64_RELOC_PAGE21
+                | object::macho::ARM64_RELOC_PAGEOFF12
+        ) {
+            return None;
+        }
+        let start = usize::try_from(offset).ok()?;
+        if start % 4 != 0 {
+            return None;
+        }
+        let end = start.checked_add(4)?;
+        if end > section_data.len() {
+            return None;
+        }
+        let bytes = section_data.get(start..end)?.try_into().ok()?;
+        contexts.push(MachOTextRelocationContext {
+            range: start..end,
+            r_type,
+            r_pcrel,
+            target: relocation.target(),
+            subtractor: relocation.subtractor(),
+            addend: relocation.addend(),
+            bytes,
+        });
+    }
+    contexts.sort_by_key(|context| context.range.start);
+    let mut previous_end = 0;
+    for context in &contexts {
+        if context.range.start < previous_end {
+            return None;
+        }
+        previous_end = context.range.end;
+    }
+    Some(contexts)
+}
+
+fn macho_aarch64_text_relocation_ranges<'data>(
+    file: &object::File<'data>,
+    section: &impl object::ObjectSection<'data>,
+    section_data: &[u8],
+) -> Option<Vec<std::ops::Range<usize>>> {
+    Some(
+        macho_aarch64_text_relocation_contexts(file, section, section_data)?
+            .into_iter()
+            .map(|context| context.range)
+            .collect(),
     )
 }
 
@@ -8633,6 +8755,98 @@ fn matched_cstring_literal_boundaries_are_stable(
                     .context("Failed to read previous cstring patch section data")?,
                 current_data,
             ) {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn matched_macho_text_relocation_words_are_stable(
+    input_file_path: &str,
+    sections: &[MatchedPatchSection],
+    previous_resolver: Option<&PatchInputResolver<'_>>,
+    current_resolver: &PatchInputResolver<'_>,
+) -> Result<bool> {
+    let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
+    for section in sections {
+        sections_by_input
+            .entry(section.current.input.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    for (input_ref, sections) in sections_by_input {
+        let Some(current_input_bytes) = current_resolver.resolve(
+            input_file_path,
+            input_ref,
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(false);
+        };
+        let current_file = object::File::parse(current_input_bytes.bytes)
+            .context("Failed to parse current Mach-O text patch input")?;
+
+        for patch_section in sections {
+            let Some(current_index) = patch_section_index(&current_file, &patch_section.current)?
+            else {
+                return Ok(false);
+            };
+            let current_section = current_file
+                .section_by_index(current_index)
+                .context("Missing current Mach-O text patch section")?;
+            if current_file.architecture() != object::Architecture::Aarch64
+                || !matches!(current_section.flags(), object::SectionFlags::MachO { .. })
+                || current_section.name().ok() != Some("__text")
+                || current_section.relocations().next().is_none()
+            {
+                continue;
+            }
+            let current_data = current_section
+                .data()
+                .context("Failed to read current Mach-O text patch section data")?;
+            let Some(current_contexts) = macho_aarch64_text_relocation_contexts(
+                &current_file,
+                &current_section,
+                current_data,
+            ) else {
+                return Ok(false);
+            };
+
+            let Some(previous_resolver) = previous_resolver else {
+                return Ok(false);
+            };
+            let Some(previous_input_bytes) = previous_resolver.resolve(
+                input_file_path,
+                input_ref,
+                PatchInputLookup::MatchArchiveMember,
+            )?
+            else {
+                return Ok(false);
+            };
+            let previous_file = object::File::parse(previous_input_bytes.bytes)
+                .context("Failed to parse previous Mach-O text patch input")?;
+            let Some(previous_index) =
+                patch_section_index(&previous_file, &patch_section.previous)?
+            else {
+                return Ok(false);
+            };
+            let previous_section = previous_file
+                .section_by_index(previous_index)
+                .context("Missing previous Mach-O text patch section")?;
+            let previous_data = previous_section
+                .data()
+                .context("Failed to read previous Mach-O text patch section data")?;
+            let Some(previous_contexts) = macho_aarch64_text_relocation_contexts(
+                &previous_file,
+                &previous_section,
+                previous_data,
+            ) else {
+                return Ok(false);
+            };
+            if previous_contexts != current_contexts {
                 return Ok(false);
             }
         }
