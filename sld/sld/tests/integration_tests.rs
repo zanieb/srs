@@ -4793,7 +4793,7 @@ fn compiler_for_file(
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
         ),
-        "s" => (
+        "s" | "S" => (
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
         ),

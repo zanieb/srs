@@ -3,8 +3,14 @@
 .globl _incremental_relocated_text_value
 _incremental_relocated_text_value:
     .long 0x52800540
+#ifdef MOVE_RELOCATIONS
+    nop
+#endif
     adrp x8, _incremental_relocated_text_target@PAGE
     ldr wzr, [x8, _incremental_relocated_text_target@PAGEOFF]
+#ifndef MOVE_RELOCATIONS
+    nop
+#endif
     ret
     bl _incremental_relocated_text_helper
 
