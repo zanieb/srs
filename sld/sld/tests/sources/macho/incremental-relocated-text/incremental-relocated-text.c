@@ -1,6 +1,7 @@
 //#AbstractConfig:incremental-relocated-text-base
 //#Object:runtime.c
 //#Object:incremental-relocated-text-value.S
+//#Object:incremental-relocated-text-cross-input.S
 //#DiffEnabled:false
 //#TestIncremental:true
 //#TestIncrementalChanged:true
@@ -45,14 +46,25 @@
 //#TestIncrementalChangedExpectPatch:false
 //#TestIncrementalChangedFallbackReason:changed Mach-O text relocation target
 //#TestIncrementalChangedRun:true
+//#Config:moved-cross-input-targets:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DMOVE_CROSS_INPUT_TARGETS=1
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:2
+//#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
 
 extern int incremental_relocated_text_value(void);
+extern int incremental_cross_input_branch_value(void);
+extern int incremental_cross_input_page_value(void);
 
 int incremental_relocated_text_helper(void) { return 0; }
 
 void main(void) {
     int value = incremental_relocated_text_value();
-    exit_syscall(value == 42 || value == 50 ? 42 : 1);
+    int branch_value = incremental_cross_input_branch_value();
+    int page_value = incremental_cross_input_page_value();
+    exit_syscall((value == 42 || value == 50) && branch_value == 42 && page_value == 42 ? 42 : 1);
 }

@@ -1537,6 +1537,10 @@ fn relocation_target_patches_for_input(
         };
         let file = object::File::parse(input_bytes.bytes)
             .context("Failed to parse changed relocation target input")?;
+        let cross_input_macho_relocation = relocation.input_file != input.path
+            && file.format() == object::BinaryFormat::MachO
+            && file.architecture() == object::Architecture::Aarch64
+            && decode_macho_aarch64_relocation_kind(relocation.kind).is_some();
         if relocation.input_file == input.path
             && relocation.input == target.input
             && file.format() == object::BinaryFormat::MachO
@@ -1547,13 +1551,25 @@ fn relocation_target_patches_for_input(
             // site. Rust-generated local names can be reused for semantically different constants.
             continue;
         }
-        let Some(current) = symbol_position_by_name(
-            input_bytes.bytes,
-            input_bytes.file_offset,
-            &file,
-            target_name,
-        )?
-        else {
+        let current = if cross_input_macho_relocation {
+            match unique_symbol_position_by_name(
+                input_bytes.bytes,
+                input_bytes.file_offset,
+                &file,
+                target_name,
+            )? {
+                Ok(current) => current,
+                Err(reason) => return Ok(Err(reason)),
+            }
+        } else {
+            symbol_position_by_name(
+                input_bytes.bytes,
+                input_bytes.file_offset,
+                &file,
+                target_name,
+            )?
+        };
+        let Some(current) = current else {
             continue;
         };
         if let Some(value_range) = current.value_range {
@@ -1594,6 +1610,17 @@ fn relocation_target_patches_for_input(
             && file.architecture() == object::Architecture::Aarch64
             && let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind)
         {
+            if relocation.input_file != input.path
+                && !macho_aarch64_cross_input_relocation_is_supported(
+                    raw_relocation,
+                    relocation.size,
+                )
+            {
+                return Ok(Err(format!(
+                    "unsupported cross-input Mach-O relocation target patch in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
             let rel_info =
                 <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
                     raw_relocation,
@@ -1602,12 +1629,53 @@ fn relocation_target_patches_for_input(
                     crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
                 })?;
             if relocation.input_file != input.path {
-                return Ok(Err(format!(
-                    "cross-input Mach-O relocation target moved in {}",
-                    display_hex_path(&input.path)
-                )));
+                let Some(written_value) = macho_aarch64_relocated_value_after_target_move(
+                    raw_relocation.r_type,
+                    previous_written_value,
+                    previous_target_value,
+                    target_value,
+                    relocation.addend,
+                ) else {
+                    return Ok(Err(format!(
+                        "unsupported cross-input Mach-O relocation target patch in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                let Some(deferred_relocation) = deferred_instruction_relocation_patch(
+                    rel_info,
+                    previous_written_value,
+                    written_value,
+                ) else {
+                    return Ok(Err(format!(
+                        "unsupported cross-input Mach-O relocation instruction in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                let Ok(size) = usize::try_from(relocation.size) else {
+                    return Ok(Err(format!(
+                        "unsupported cross-input Mach-O relocation size in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                output_patches.push(SectionPatch {
+                    output_offset: relocation.output_offset,
+                    size: relocation.size,
+                    data: vec![0; size],
+                    deferred_relocation: Some(deferred_relocation),
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                });
+                relocation.written_value = Some(written_value);
+                relocation.target_value = target_value;
+                target.section_offset = current.section_offset;
+                output_symbols.push(RelocationTargetSymbolPatch {
+                    target_name: target_name.to_owned(),
+                    previous_target_value,
+                    target_value,
+                    allow_missing: true,
+                });
+                continue;
             }
-            let _ = rel_info;
             macho_target_moves.push(MachORelocationTargetMove {
                 relocation_index,
                 current_section_offset: current.section_offset,
@@ -1758,6 +1826,39 @@ fn macho_aarch64_relocated_value(
     })
 }
 
+fn macho_aarch64_cross_input_relocation_is_supported(
+    relocation: object::macho::RelocationInfo,
+    size: u64,
+) -> bool {
+    if size != 4 || relocation.r_length != 2 || !relocation.r_extern {
+        return false;
+    }
+    match relocation.r_type {
+        object::macho::ARM64_RELOC_BRANCH26 | object::macho::ARM64_RELOC_PAGE21 => {
+            relocation.r_pcrel
+        }
+        object::macho::ARM64_RELOC_PAGEOFF12 => !relocation.r_pcrel,
+        _ => false,
+    }
+}
+
+fn macho_aarch64_relocated_value_after_target_move(
+    r_type: u8,
+    previous_written_value: u64,
+    previous_target_value: u64,
+    current_target_value: u64,
+    addend: i64,
+) -> Option<u64> {
+    let previous_target_component =
+        macho_aarch64_relocated_value(r_type, previous_target_value, addend, 0)?;
+    let current_target_component =
+        macho_aarch64_relocated_value(r_type, current_target_value, addend, 0)?;
+    Some(
+        previous_written_value
+            .wrapping_add(current_target_component.wrapping_sub(previous_target_component)),
+    )
+}
+
 fn dedup_ranges(ranges: &mut Vec<std::ops::Range<usize>>) {
     ranges.sort_by_key(|range| (range.start, range.end));
     ranges.dedup_by(|left, right| left.start == right.start && left.end == right.end);
@@ -1812,6 +1913,42 @@ fn symbol_position_by_name(
         }));
     }
     Ok(None)
+}
+
+fn unique_symbol_position_by_name(
+    bytes: &[u8],
+    file_offset: usize,
+    file: &object::File<'_>,
+    encoded_name: &str,
+) -> Result<std::result::Result<Option<SymbolPosition>, String>> {
+    let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
+    let mut matched = None;
+    for symbol in file.symbols() {
+        if symbol.name_bytes()? != name {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        if matched.is_some() {
+            return Ok(Err(
+                "ambiguous cross-input Mach-O relocation target symbol".to_owned()
+            ));
+        }
+        let section_address = file.section_by_index(section_index)?.address();
+        let section_offset = symbol
+            .address()
+            .checked_sub(section_address)
+            .context("Mach-O symbol address precedes its section")?;
+        let value_range = symbol_value_field_range(bytes, symbol.index())
+            .map(|range| file_offset + range.start..file_offset + range.end);
+        matched = Some(SymbolPosition {
+            section_index,
+            section_offset,
+            value_range,
+        });
+    }
+    Ok(Ok(matched))
 }
 
 fn symbol_position_by_name_and_value(
@@ -3650,6 +3787,7 @@ fn materialize_deferred_relocation_patch(
     }
 
     let mut replayed_previous_output = previous_output.to_vec();
+    clear_deferred_relocation_bits(&mut replayed_previous_output, mask);
     deferred_relocation
         .rel_info
         .write_to_buffer(
@@ -3662,10 +3800,21 @@ fn materialize_deferred_relocation_patch(
     }
 
     data.copy_from_slice(previous_output);
+    clear_deferred_relocation_bits(data, mask);
     deferred_relocation
         .rel_info
         .write_to_buffer(deferred_relocation.written_value, data)
         .map_err(|error| format!("failed to encode deferred relocation patch: {error:#}"))
+}
+
+fn clear_deferred_relocation_bits(data: &mut [u8], mask: linker_utils::elf::BitMask) {
+    if data.len() != 4 {
+        return;
+    }
+    let preserved_bits = mask.instruction.bit_mask(mask.range);
+    for (byte, preserved) in data.iter_mut().zip(preserved_bits) {
+        *byte &= preserved;
+    }
 }
 
 struct DirectlyPatchedOutput {
@@ -24666,6 +24815,125 @@ mod tests {
             ),
             Some(0x1234_5678)
         );
+    }
+
+    #[test]
+    fn macho_cross_input_relocations_follow_target_moves() {
+        assert!(macho_aarch64_cross_input_relocation_is_supported(
+            object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            },
+            4,
+        ));
+        assert!(!macho_aarch64_cross_input_relocation_is_supported(
+            object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            },
+            4,
+        ));
+        assert_eq!(
+            macho_aarch64_relocated_value_after_target_move(
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x1000,
+                0x2000,
+                0x2004,
+                0,
+            ),
+            Some(0x1004)
+        );
+        assert_eq!(
+            macho_aarch64_relocated_value_after_target_move(
+                object::macho::ARM64_RELOC_PAGE21,
+                (-0x4000_i64) as u64,
+                0x1ffc,
+                0x2004,
+                0,
+            ),
+            Some((-0x3000_i64) as u64)
+        );
+        assert_eq!(
+            macho_aarch64_relocated_value_after_target_move(
+                object::macho::ARM64_RELOC_PAGEOFF12,
+                0x1ffc,
+                0x1ffc,
+                0x2004,
+                0,
+            ),
+            Some(0x2004)
+        );
+    }
+
+    #[test]
+    fn macho_cross_input_branch_patch_encodes_the_new_displacement() {
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                raw_relocation,
+            )
+            .unwrap();
+        let previous_output = [0xfd, 0xff, 0xff, 0x17];
+        let mut data = vec![0; previous_output.len()];
+
+        materialize_deferred_relocation_patch(
+            &mut data,
+            &previous_output,
+            DeferredRelocationPatch {
+                rel_info,
+                previous_written_value: (-12_i64) as u64,
+                written_value: (-8_i64) as u64,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(data, [0xfe, 0xff, 0xff, 0x17]);
+    }
+
+    #[test]
+    fn macho_cross_input_target_lookup_rejects_duplicate_defined_names() {
+        let mut bytes = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        const SYMTAB_COMMAND_OFFSET: usize = 32 + 72 + 2 * 80;
+        let symoff = u32::from_le_bytes(
+            bytes[SYMTAB_COMMAND_OFFSET + 8..SYMTAB_COMMAND_OFFSET + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let stroff = u32::from_le_bytes(
+            bytes[SYMTAB_COMMAND_OFFSET + 16..SYMTAB_COMMAND_OFFSET + 20]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let duplicate_symbol = bytes[symoff + 16..symoff + 32].to_vec();
+        bytes.splice(stroff..stroff, duplicate_symbol);
+        bytes[SYMTAB_COMMAND_OFFSET + 12..SYMTAB_COMMAND_OFFSET + 16]
+            .copy_from_slice(&3_u32.to_le_bytes());
+        bytes[SYMTAB_COMMAND_OFFSET + 16..SYMTAB_COMMAND_OFFSET + 20]
+            .copy_from_slice(&((stroff + 16) as u32).to_le_bytes());
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+
+        let result =
+            unique_symbol_position_by_name(&bytes, 0, &file, &hex::encode(b"_data")).unwrap();
+
+        assert!(matches!(
+            result,
+            Err(reason) if reason == "ambiguous cross-input Mach-O relocation target symbol"
+        ));
     }
 
     #[test]

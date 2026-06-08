@@ -14,6 +14,17 @@ _incremental_relocated_text_value:
     ret
     bl _incremental_relocated_text_helper
 
+#ifdef MOVE_CROSS_INPUT_TARGETS
+    nop
+#endif
+.globl _incremental_cross_input_function
+_incremental_cross_input_function:
+    mov w0, #42
+    ret
+#ifndef MOVE_CROSS_INPUT_TARGETS
+    nop
+#endif
+
 .section __TEXT,__const
 .p2align 2
 #ifdef RETARGET
@@ -41,4 +52,14 @@ _incremental_relocated_text_target:
 #ifndef MOVE_TARGET
     .long 0
 #endif
+#endif
+
+#ifdef MOVE_CROSS_INPUT_TARGETS
+    .long 0
+#endif
+.globl _incremental_cross_input_data_target
+_incremental_cross_input_data_target:
+    .long 42
+#ifndef MOVE_CROSS_INPUT_TARGETS
+    .long 0
 #endif
