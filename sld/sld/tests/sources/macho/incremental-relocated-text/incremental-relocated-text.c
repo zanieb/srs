@@ -53,6 +53,27 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:2
 //#TestIncrementalChangedRun:true
+//#Config:added-relocations:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DADD_RELOCATIONS=1
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:changed Mach-O text relocation count
+//#TestIncrementalChangedRun:true
+//#Config:removed-relocations:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DREMOVE_RELOCATIONS=1
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:changed Mach-O text relocation count
+//#TestIncrementalChangedRun:true
+//#Config:reordered-relocations:incremental-relocated-text-base
+//#RunEnabled:true
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalChangedCompArgs:-DREORDER_RELOCATIONS=1
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:changed Mach-O text relocation semantics
+//#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
 

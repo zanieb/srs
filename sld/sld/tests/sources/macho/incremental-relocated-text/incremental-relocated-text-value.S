@@ -3,6 +3,21 @@
 .globl _incremental_relocated_text_value
 _incremental_relocated_text_value:
     .long 0x52800540
+#ifdef REORDER_RELOCATIONS
+    stp x29, x30, [sp, #-16]!
+    bl _incremental_relocated_text_helper
+    ldp x29, x30, [sp], #16
+    adrp x8, _incremental_relocated_text_target@PAGE
+    ldr w0, [x8, _incremental_relocated_text_target@PAGEOFF]
+    nop
+    nop
+    ret
+#else
+#ifdef REMOVE_RELOCATIONS
+    nop
+    nop
+    nop
+#else
 #ifdef MOVE_RELOCATIONS
     nop
 #endif
@@ -11,8 +26,19 @@ _incremental_relocated_text_value:
 #ifndef MOVE_RELOCATIONS
     nop
 #endif
+#endif
+#ifdef ADD_RELOCATIONS
+    adrp x9, _incremental_relocated_text_extra_target@PAGE
+    ldr w9, [x9, _incremental_relocated_text_extra_target@PAGEOFF]
+    add w0, w0, w9
+#else
+    nop
+    nop
+    nop
+#endif
     ret
     bl _incremental_relocated_text_helper
+#endif
 
 #ifdef MOVE_CROSS_INPUT_TARGETS
     nop
@@ -63,3 +89,7 @@ _incremental_cross_input_data_target:
 #ifndef MOVE_CROSS_INPUT_TARGETS
     .long 0
 #endif
+
+.globl _incremental_relocated_text_extra_target
+_incremental_relocated_text_extra_target:
+    .long 8
