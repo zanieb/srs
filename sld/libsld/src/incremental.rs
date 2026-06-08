@@ -7073,9 +7073,10 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
 }
 
 pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
-    // Keep this Mach-O prototype to ordinary data and fixed-layout string literals; code,
-    // unwind, initializer, and other special sections need separate validation.
-    (!name.starts_with(b"__") || matches!(name, b"__data" | b"__const" | b"__cstring"))
+    // Keep Mach-O patching to ordinary data, fixed-layout string literals, and fixed-size
+    // relocation-free code. Unwind, initializer, and other special sections need separate
+    // validation.
+    (!name.starts_with(b"__") || matches!(name, b"__data" | b"__const" | b"__cstring" | b"__text"))
         && !matches!(name, b".init" | b".fini")
         && !name.starts_with(b".eh_frame")
         && !name.starts_with(b".init_array")
@@ -7106,7 +7107,8 @@ fn section_direct_patch_preserve_ranges<'data>(
     if !(section_flags_allow_patching(section.flags()) || is_elf_debug_section)
         || !section_name.is_none_or(section_name_allows_direct_patching)
         || ((section_name == Some(b"__const".as_slice())
-            || section_name == Some(b"__cstring".as_slice()))
+            || section_name == Some(b"__cstring".as_slice())
+            || section_name == Some(b"__text".as_slice()))
             && section.relocations().next().is_some())
     {
         return None;
@@ -7131,7 +7133,7 @@ fn section_size_allows_direct_patching(
     previous_input_size: u64,
     current_input_size: usize,
 ) -> bool {
-    section_name != Some(b"__cstring".as_slice())
+    (section_name != Some(b"__cstring".as_slice()) && section_name != Some(b"__text".as_slice()))
         || u64::try_from(current_input_size).is_ok_and(|size| size == previous_input_size)
 }
 
@@ -19915,6 +19917,7 @@ mod tests {
         assert!(section_name_allows_direct_patching(b"__data"));
         assert!(section_name_allows_direct_patching(b"__const"));
         assert!(section_name_allows_direct_patching(b"__cstring"));
+        assert!(section_name_allows_direct_patching(b"__text"));
         assert!(!section_name_allows_direct_patching(b".eh_frame"));
         assert!(!section_name_allows_direct_patching(b".eh_frame_hdr"));
         assert!(!section_name_allows_direct_patching(b".init"));
@@ -19925,7 +19928,6 @@ mod tests {
         assert!(!section_name_allows_direct_patching(b".preinit_array"));
         assert!(!section_name_allows_direct_patching(b".ctors"));
         assert!(!section_name_allows_direct_patching(b".dtors"));
-        assert!(!section_name_allows_direct_patching(b"__text"));
         assert!(!section_name_allows_direct_patching(b"__eh_frame"));
         assert!(!section_name_allows_direct_patching(b"__mod_init_func"));
     }
@@ -19938,6 +19940,7 @@ mod tests {
         assert!(!section_name_allows_incremental_padding(b"foo"));
         assert!(!section_name_allows_incremental_padding(b"bar"));
         assert!(!section_name_allows_incremental_padding(b"__cstring"));
+        assert!(!section_name_allows_incremental_padding(b"__text"));
         assert!(!section_name_allows_incremental_padding(b".init_array"));
         assert!(!section_name_allows_incremental_padding(b".eh_frame"));
     }
@@ -23196,7 +23199,7 @@ mod tests {
     }
 
     #[test]
-    fn cstring_patches_require_a_stable_input_size() {
+    fn fixed_layout_macho_patches_require_a_stable_input_size() {
         assert!(section_size_allows_direct_patching(
             Some(b"__cstring"),
             4,
@@ -23207,6 +23210,9 @@ mod tests {
             4,
             5
         ));
+        assert!(section_size_allows_direct_patching(Some(b"__text"), 4, 4));
+        assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 3));
+        assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 5));
         assert!(section_size_allows_direct_patching(Some(b"__data"), 4, 5));
     }
 
