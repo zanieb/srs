@@ -9756,9 +9756,13 @@ fn section_flags_allow_patching(flags: object::SectionFlags) -> bool {
 
 pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
     // Keep Mach-O patching to ordinary data, fixed-layout string literals, and fixed-size
-    // relocation-free code. Unwind, initializer, and other special sections need separate
-    // validation.
-    (!name.starts_with(b"__") || matches!(name, b"__data" | b"__const" | b"__cstring" | b"__text"))
+    // relocation-free code. Mach-O exception tables are admitted below only when they have no
+    // relocations; dependent unwind metadata is replaced separately.
+    (!name.starts_with(b"__")
+        || matches!(
+            name,
+            b"__data" | b"__const" | b"__cstring" | b"__text" | b"__gcc_except_tab"
+        ))
         && !matches!(name, b".init" | b".fini")
         && !name.starts_with(b".eh_frame")
         && !name.starts_with(b".init_array")
@@ -9791,10 +9795,13 @@ fn section_direct_patch_preserve_ranges<'data>(
         && section_name == Some(b"__text".as_slice());
     let is_macho_const = matches!(section.flags(), object::SectionFlags::MachO { .. })
         && section_name == Some(b"__const".as_slice());
+    let is_macho_exception_table = matches!(section.flags(), object::SectionFlags::MachO { .. })
+        && section_name == Some(b"__gcc_except_tab".as_slice());
     if !(section_flags_allow_patching(section.flags()) || is_elf_debug_section)
         || !section_name.is_none_or(section_name_allows_direct_patching)
         || ((section_name == Some(b"__cstring".as_slice())
-            || (section_name == Some(b"__const".as_slice()) && !is_macho_const))
+            || (section_name == Some(b"__const".as_slice()) && !is_macho_const)
+            || is_macho_exception_table)
             && section.relocations().next().is_some())
     {
         return None;
@@ -30557,6 +30564,66 @@ mod tests {
         assert_eq!(
             reason,
             "changed patch section __TEXT,__text needs 8 bytes but has 4 bytes of output capacity"
+        );
+    }
+
+    #[test]
+    fn relocation_free_macho_exception_table_can_be_directly_patched() {
+        let bytes = test_observed_049_macho_unwind_object(true);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let exception_table = file.section_by_name("__gcc_except_tab").unwrap();
+        assert!(exception_table.relocations().next().is_none());
+        let input = hex::encode("input.o");
+        let section = PatchSection {
+            input: input.clone(),
+            section_index: patch_section_record_index(&file, exception_table.index()).unwrap(),
+            section_name: Some("__TEXT,__gcc_except_tab".to_owned()),
+            input_size: exception_table.size(),
+            output_offset: 64,
+            output_size: exception_table.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+
+        let patches = resolved_patch_sections_for_input(&bytes, &input, [section])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].patch.data, exception_table.data().unwrap());
+        assert!(patches[0].patch.preserve_ranges.is_empty());
+
+        const MACHO_HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const RELOCATION_OFFSET_FIELD: usize = 56;
+        const RELOCATION_COUNT_FIELD: usize = 60;
+        let exception_table_header = MACHO_HEADER_SIZE + SEGMENT_COMMAND_SIZE + SECTION_SIZE;
+        let compact_unwind_header = exception_table_header + SECTION_SIZE;
+        let compact_unwind_relocation_offset = read_u32_le(
+            &bytes[compact_unwind_header + RELOCATION_OFFSET_FIELD
+                ..compact_unwind_header + RELOCATION_OFFSET_FIELD + 4],
+        )
+        .unwrap();
+        let mut relocated = bytes.clone();
+        relocated[exception_table_header + RELOCATION_OFFSET_FIELD
+            ..exception_table_header + RELOCATION_OFFSET_FIELD + 4]
+            .copy_from_slice(&compact_unwind_relocation_offset.to_le_bytes());
+        relocated[exception_table_header + RELOCATION_COUNT_FIELD
+            ..exception_table_header + RELOCATION_COUNT_FIELD + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        let relocated_file = object::File::parse(relocated.as_slice()).unwrap();
+        let relocated_exception_table = relocated_file.section_by_name("__gcc_except_tab").unwrap();
+        assert!(relocated_exception_table.relocations().next().is_some());
+        assert!(
+            section_direct_patch_preserve_ranges(
+                &relocated_file,
+                &relocated_exception_table,
+                relocated_exception_table.data().unwrap(),
+                None,
+                None,
+            )
+            .is_none()
         );
     }
 
