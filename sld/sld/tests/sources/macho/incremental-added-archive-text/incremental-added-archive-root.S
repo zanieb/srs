@@ -8,3 +8,8 @@ _incremental_added_archive_value:
     mov w0, #42
     ret
 #endif
+
+.section __TEXT,__const
+.p2align 2
+L_incremental_added_archive_reserve_seed:
+    .long 0
