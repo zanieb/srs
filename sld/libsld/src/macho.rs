@@ -27,6 +27,7 @@ use crate::output_section_id::OrderEvent;
 use crate::output_section_id::OutputOrderBuilder;
 use crate::output_section_id::SectionName;
 use crate::output_section_id::SectionOutputInfo;
+use crate::output_section_part_map::OutputSectionPartMap;
 use crate::part_id;
 use crate::platform;
 use crate::platform::Args as _;
@@ -80,7 +81,44 @@ use zerocopy::U64;
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
 
+#[derive(Debug)]
+pub(crate) struct EpilogueLayoutExt {
+    reserve_enabled: bool,
+    pub(crate) incremental_reserves: Option<OutputSectionPartMap<u64>>,
+}
+
 const LE: Endianness = Endianness::Little;
+
+fn incremental_reserve_sizes(
+    current_sizes: &OutputSectionPartMap<u64>,
+    padding_percent: u32,
+) -> Result<OutputSectionPartMap<u64>> {
+    let mut reserves = OutputSectionPartMap::with_size(current_sizes.num_parts());
+    if padding_percent == 0 {
+        return Ok(reserves);
+    }
+    for section_id in [
+        output_section_id::TEXT,
+        output_section_id::RODATA,
+        output_section_id::GCC_EXCEPT_TABLE,
+    ] {
+        for part_id in section_id.parts() {
+            let current_size = *current_sizes.get(part_id);
+            if current_size == 0 {
+                continue;
+            }
+            let alignment = part_id
+                .regular_alignment()
+                .context("Mach-O incremental reserve requires a regular output section")?;
+            let bytes = (u128::from(current_size) * u128::from(padding_percent)).div_ceil(100);
+            let alignment = u128::from(alignment.value());
+            let aligned = bytes.max(1).div_ceil(alignment) * alignment;
+            *reserves.get_mut(part_id) =
+                u64::try_from(aligned).context("Mach-O incremental reserve size overflowed u64")?;
+        }
+    }
+    Ok(reserves)
+}
 
 /// Mach-O uses a zero page for all 32bit addresses and thus we begin the memory
 /// offsets right after that (1GiB).
@@ -197,13 +235,18 @@ fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 mod tests {
     use super::MachO;
     use super::SectionAttributes;
+    use super::incremental_reserve_sizes;
     use super::macho_eh_frame_fde_count;
     use super::macho_live_eh_frame_cies;
     use super::macho_section_boundary_symbol;
     use super::macho_section_boundary_symbol_matches;
     use crate::alignment;
+    use crate::alignment::Alignment;
+    use crate::output_section_id;
     use crate::output_section_id::OutputSections;
     use crate::output_section_id::SectionName;
+    use crate::output_section_part_map::OutputSectionPartMap;
+    use crate::part_id;
     use crate::platform;
     use crate::platform::Symbol as _;
     use object::macho::N_SECT;
@@ -237,6 +280,38 @@ mod tests {
         let live_cies = macho_live_eh_frame_cies(&data, Some(&live_fdes)).unwrap();
 
         assert_eq!(live_cies, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn incremental_reserves_are_aligned_for_patchable_sections() {
+        let mut current_sizes = OutputSectionPartMap::with_size(part_id::NUM_BUILT_IN_PARTS);
+        let text = output_section_id::TEXT.part_id_with_alignment(Alignment { exponent: 2 });
+        let rodata = output_section_id::RODATA.part_id_with_alignment(Alignment { exponent: 3 });
+        let gcc_except =
+            output_section_id::GCC_EXCEPT_TABLE.part_id_with_alignment(Alignment { exponent: 2 });
+        let data = output_section_id::DATA.part_id_with_alignment(Alignment { exponent: 2 });
+        *current_sizes.get_mut(text) = 401;
+        *current_sizes.get_mut(rodata) = 800;
+        *current_sizes.get_mut(gcc_except) = 1;
+        *current_sizes.get_mut(data) = 100;
+
+        let reserves = incremental_reserve_sizes(&current_sizes, 10).unwrap();
+
+        assert_eq!(*reserves.get(text), 44);
+        assert_eq!(*reserves.get(rodata), 80);
+        assert_eq!(*reserves.get(gcc_except), 4);
+        assert_eq!(*reserves.get(data), 0);
+    }
+
+    #[test]
+    fn zero_incremental_padding_reserves_nothing() {
+        let mut current_sizes = OutputSectionPartMap::with_size(part_id::NUM_BUILT_IN_PARTS);
+        let text = output_section_id::TEXT.part_id_with_alignment(Alignment { exponent: 2 });
+        *current_sizes.get_mut(text) = 401;
+
+        let reserves = incremental_reserve_sizes(&current_sizes, 0).unwrap();
+
+        assert_eq!(*reserves.get(text), 0);
     }
 
     #[test]
@@ -1485,7 +1560,7 @@ impl platform::Platform for MachO {
     type RelocationInfo = object::macho::RelocationInfo;
     type NonAddressableIndexes = NonAddressableIndexes;
     type NonAddressableCounts = ();
-    type EpilogueLayoutExt = ();
+    type EpilogueLayoutExt = EpilogueLayoutExt;
     type GroupLayoutExt = ();
     type CommonGroupStateExt = ();
     type ArchIdentifier = ();
@@ -1919,6 +1994,12 @@ impl platform::Platform for MachO {
         output_kind: crate::output_kind::OutputKind,
         dynamic_symbol_definitions: &mut [crate::layout::DynamicSymbolDefinition<'_, Self>],
     ) -> Self::EpilogueLayoutExt {
+        EpilogueLayoutExt {
+            reserve_enabled: args.common.incremental
+                && args.common.incremental_padding_percent > 0
+                && output_kind.is_executable(),
+            incremental_reserves: None,
+        }
     }
 
     fn apply_non_addressable_indexes_epilogue(
@@ -1964,6 +2045,13 @@ impl platform::Platform for MachO {
         dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
         args: &Self::Args,
     ) -> crate::error::Result {
+        if !state.reserve_enabled {
+            return Ok(());
+        }
+        let reserves =
+            incremental_reserve_sizes(current_sizes, args.common.incremental_padding_percent)?;
+        extra_sizes.merge(&reserves);
+        state.incremental_reserves = Some(reserves);
         Ok(())
     }
 
@@ -1979,6 +2067,13 @@ impl platform::Platform for MachO {
             part_id::DYNSYM,
             dynamic_symbol_defs.len() as u64 * size_of::<SymtabEntry>() as u64,
         );
+        if let Some(reserves) = &epilogue_state.incremental_reserves {
+            for (part_index, &size) in reserves.parts.iter().enumerate() {
+                if size > 0 {
+                    memory_offsets.increment(part_id::PartId::from_usize(part_index), size);
+                }
+            }
+        }
         Ok(())
     }
 

@@ -53,7 +53,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v39";
+const STATE_VERSION: &str = "sld-incremental-state-v40";
+const STATE_VERSION_V39: &str = "sld-incremental-state-v39";
 const STATE_VERSION_V38: &str = "sld-incremental-state-v38";
 const STATE_VERSION_V37: &str = "sld-incremental-state-v37";
 const STATE_VERSION_V36: &str = "sld-incremental-state-v36";
@@ -351,11 +352,13 @@ pub(crate) struct PreparedState<'data> {
     previous_macho_symbol_resolutions_file: Option<String>,
     previous_fdes: Vec<FdeRecord>,
     previous_dynamic_relocations: Vec<DynamicRelocationRecord>,
+    previous_reserved_ranges: Vec<ReservedRangeRecord>,
     current_sections: RecordBuffers<SectionRecord>,
     current_relocations: RecordBuffers<DeferredRelocationRecord<'data>>,
     current_macho_symbol_resolutions: RecordBuffers<MachOSymbolResolutionRecord>,
     current_fdes: RecordBuffers<FdeRecord>,
     current_dynamic_relocations: RecordBuffers<DynamicRelocationRecord>,
+    current_reserved_ranges: RecordBuffers<ReservedRangeRecord>,
     record_texts: RecordTextInterner,
     reused_sections: AtomicUsize,
     prepared_fast_build_id_state: Mutex<Option<BuildIdHashStateAndTree>>,
@@ -411,6 +414,7 @@ struct PersistedState {
     macho_symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
     fdes: Vec<FdeRecord>,
     dynamic_relocations: Vec<DynamicRelocationRecord>,
+    reserved_ranges: Vec<ReservedRangeRecord>,
     sections_file: Option<String>,
     macho_symbol_resolutions_file: Option<String>,
     patch_records_file: Option<String>,
@@ -537,6 +541,14 @@ pub(crate) struct SectionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ReservedRangeRecord {
+    output_section_id: u32,
+    alignment_exponent: u8,
+    output_offset: u64,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RelocationRecord {
     target_symbol_id: u32,
     written_value: Option<u64>,
@@ -642,11 +654,13 @@ pub(crate) fn maybe_prepare<'data>(
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -719,6 +733,7 @@ pub(crate) fn maybe_prepare<'data>(
     let mut previous_macho_symbol_resolutions_file = None;
     let mut previous_fdes = Vec::new();
     let mut previous_dynamic_relocations = Vec::new();
+    let mut previous_reserved_ranges = Vec::new();
     if mode_needs_previous_sections(&mode) {
         match PersistedState::read(&state_dir) {
             Ok(Some(previous)) => {
@@ -727,6 +742,7 @@ pub(crate) fn maybe_prepare<'data>(
                 previous_macho_symbol_resolutions_file = previous.macho_symbol_resolutions_file;
                 previous_fdes = previous.fdes;
                 previous_dynamic_relocations = previous.dynamic_relocations;
+                previous_reserved_ranges = previous.reserved_ranges;
             }
             Ok(None) => {
                 mode = IncrementalMode::Relink {
@@ -763,11 +779,13 @@ pub(crate) fn maybe_prepare<'data>(
         previous_macho_symbol_resolutions_file,
         previous_fdes,
         previous_dynamic_relocations,
+        previous_reserved_ranges,
         current_sections: RecordBuffers::default(),
         current_relocations: RecordBuffers::default(),
         current_macho_symbol_resolutions: RecordBuffers::default(),
         current_fdes: RecordBuffers::default(),
         current_dynamic_relocations: RecordBuffers::default(),
+        current_reserved_ranges: RecordBuffers::default(),
         record_texts: RecordTextInterner::default(),
         reused_sections: AtomicUsize::new(0),
         prepared_fast_build_id_state: Mutex::new(None),
@@ -3536,6 +3554,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             macho_symbol_resolutions: previous.macho_symbol_resolutions,
             fdes: previous.fdes,
             dynamic_relocations: previous.dynamic_relocations,
+            reserved_ranges: previous.reserved_ranges,
             sections_file: previous.sections_file,
             macho_symbol_resolutions_file: previous.macho_symbol_resolutions_file,
             patch_records_file: previous.patch_records_file,
@@ -4855,6 +4874,24 @@ impl<'data> PreparedState<'data> {
             .push(generated_section_record(name, output_offset, size));
     }
 
+    pub(crate) fn record_reserved_range(
+        &self,
+        output_section_id: u32,
+        alignment_exponent: u8,
+        output_offset: u64,
+        size: u64,
+    ) {
+        if self.mode == IncrementalMode::Disabled || size == 0 {
+            return;
+        }
+        self.current_reserved_ranges.push(ReservedRangeRecord {
+            output_section_id,
+            alignment_exponent,
+            output_offset,
+            size,
+        });
+    }
+
     pub(crate) fn record_eh_frame_fde(
         &self,
         input: InputRef<'_>,
@@ -5090,6 +5127,7 @@ impl<'data> PreparedState<'data> {
             macho_symbol_resolutions_file,
             fdes,
             dynamic_relocations,
+            reserved_ranges,
         ) = {
             timing_phase!("Collect incremental records");
 
@@ -5127,6 +5165,13 @@ impl<'data> PreparedState<'data> {
                 dynamic_relocations.extend(self.previous_dynamic_relocations.iter().cloned());
             }
 
+            let mut reserved_ranges = self.current_reserved_ranges.take_all();
+            if reserved_ranges.is_empty() && self.mode == IncrementalMode::Reuse {
+                reserved_ranges.extend(self.previous_reserved_ranges.iter().cloned());
+            }
+            reserved_ranges.sort_unstable();
+            reserved_ranges.dedup();
+
             (
                 sections,
                 relocations,
@@ -5135,6 +5180,7 @@ impl<'data> PreparedState<'data> {
                 macho_symbol_resolutions_file,
                 fdes,
                 dynamic_relocations,
+                reserved_ranges,
             )
         };
 
@@ -5184,6 +5230,7 @@ impl<'data> PreparedState<'data> {
             macho_symbol_resolutions,
             fdes,
             dynamic_relocations,
+            reserved_ranges,
             sections_file: None,
             macho_symbol_resolutions_file,
             patch_records_file: None,
@@ -5827,6 +5874,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V39
             && version != STATE_VERSION_V38
             && version != STATE_VERSION_V37
             && version != STATE_VERSION_V36
@@ -5880,7 +5928,10 @@ impl PersistedState {
         } else {
             None
         };
-        if (version == STATE_VERSION || version == STATE_VERSION_V38) && link_options_hash.is_none()
+        if (version == STATE_VERSION
+            || version == STATE_VERSION_V39
+            || version == STATE_VERSION_V38)
+            && link_options_hash.is_none()
         {
             return Err(crate::error!(
                 "Missing incremental link-options hash in incremental state"
@@ -5894,7 +5945,10 @@ impl PersistedState {
         } else {
             None
         };
-        if (version == STATE_VERSION || version == STATE_VERSION_V38) && input_order_hash.is_none()
+        if (version == STATE_VERSION
+            || version == STATE_VERSION_V39
+            || version == STATE_VERSION_V38)
+            && input_order_hash.is_none()
         {
             return Err(crate::error!(
                 "Missing incremental input-order hash in incremental state"
@@ -5908,7 +5962,11 @@ impl PersistedState {
         } else {
             None
         };
-        if (version == STATE_VERSION || version == STATE_VERSION_V38) && sld_version.is_none() {
+        if (version == STATE_VERSION
+            || version == STATE_VERSION_V39
+            || version == STATE_VERSION_V38)
+            && sld_version.is_none()
+        {
             return Err(crate::error!("Missing sld version in incremental state"));
         }
         let link_start = if lines
@@ -5951,6 +6009,7 @@ impl PersistedState {
                 Some(file.to_owned())
             }
         } else if version == STATE_VERSION
+            || version == STATE_VERSION_V39
             || version == STATE_VERSION_V38
             || version == STATE_VERSION_V37
         {
@@ -5961,6 +6020,16 @@ impl PersistedState {
             None
         };
 
+        let reserved_ranges = if version == STATE_VERSION
+            && lines
+                .peek()
+                .is_some_and(|line| line.starts_with("reserves\t"))
+        {
+            parse_reserved_range_table(&mut lines, output.len)?
+        } else {
+            Vec::new()
+        };
+
         let mut sections_file = None;
         let mut patch_records_file = None;
         let mut patch_record_locations = Vec::new();
@@ -5969,6 +6038,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V39
             || version == STATE_VERSION_V38
             || version == STATE_VERSION_V37
             || version == STATE_VERSION_V36
@@ -6009,6 +6079,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V39
                     && version != STATE_VERSION_V38
                     && version != STATE_VERSION_V37
                     && version != STATE_VERSION_V36
@@ -6104,6 +6175,7 @@ impl PersistedState {
             macho_symbol_resolutions: Vec::new(),
             fdes,
             dynamic_relocations,
+            reserved_ranges,
             sections_file,
             macho_symbol_resolutions_file,
             patch_records_file,
@@ -6417,6 +6489,7 @@ impl PersistedState {
             macho_symbol_resolutions_file.unwrap_or(ABSENT_FIELD)
         )
         .unwrap();
+        render_reserved_range_table(&mut out, &self.reserved_ranges);
         out
     }
 
@@ -15123,6 +15196,99 @@ fn render_patch_record_location_table(
     }
 }
 
+fn parse_reserved_range_table<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    output_len: u64,
+) -> Result<Vec<ReservedRangeRecord>> {
+    let count: usize = parse_prefixed_line(lines.next(), "reserves")?
+        .parse()
+        .context("Invalid incremental reserve count")?;
+    if u64::try_from(count).map_or(true, |count| count > output_len) {
+        return Err(crate::error!(
+            "Incremental reserve count exceeds output size"
+        ));
+    }
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let rest = parse_prefixed_line(lines.next(), "reserve")?;
+        let mut parts = rest.split('\t');
+        let output_section_id: u32 = parts
+            .next()
+            .context("Malformed incremental reserve output section")?
+            .parse()
+            .context("Invalid incremental reserve output section")?;
+        let alignment_exponent: u8 = parts
+            .next()
+            .context("Malformed incremental reserve alignment")?
+            .parse()
+            .context("Invalid incremental reserve alignment")?;
+        let output_offset: u64 = parts
+            .next()
+            .context("Malformed incremental reserve output offset")?
+            .parse()
+            .context("Invalid incremental reserve output offset")?;
+        let size: u64 = parts
+            .next()
+            .context("Malformed incremental reserve size")?
+            .parse()
+            .context("Invalid incremental reserve size")?;
+        if parts.next().is_some() {
+            return Err(crate::error!("Malformed incremental reserve record"));
+        }
+        let alignment = crate::alignment::Alignment::from_exponent(alignment_exponent.into())
+            .context("Invalid incremental reserve alignment")?;
+        let end = output_offset
+            .checked_add(size)
+            .context("Incremental reserve range overflow")?;
+        if size == 0
+            || end > output_len
+            || output_offset != alignment.align_up(output_offset)
+            || size != alignment.align_up(size)
+        {
+            return Err(crate::error!("Invalid incremental reserve range"));
+        }
+        ranges.push(ReservedRangeRecord {
+            output_section_id,
+            alignment_exponent,
+            output_offset,
+            size,
+        });
+    }
+    validate_reserved_ranges(&ranges)?;
+    Ok(ranges)
+}
+
+fn validate_reserved_ranges(ranges: &[ReservedRangeRecord]) -> Result {
+    let mut sorted = ranges.iter().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|range| range.output_offset);
+    let mut previous_end = 0;
+    for range in sorted {
+        if range.output_offset < previous_end {
+            return Err(crate::error!("Incremental reserve ranges overlap"));
+        }
+        previous_end = range
+            .output_offset
+            .checked_add(range.size)
+            .context("Incremental reserve range overflow")?;
+    }
+    Ok(())
+}
+
+fn render_reserved_range_table(out: &mut String, ranges: &[ReservedRangeRecord]) {
+    if ranges.is_empty() {
+        return;
+    }
+    writeln!(out, "reserves\t{}", ranges.len()).unwrap();
+    for range in ranges {
+        writeln!(
+            out,
+            "reserve\t{}\t{}\t{}\t{}",
+            range.output_section_id, range.alignment_exponent, range.output_offset, range.size
+        )
+        .unwrap();
+    }
+}
+
 #[derive(Default)]
 struct CompactRecords {
     sections: Vec<SectionRecord>,
@@ -17852,6 +18018,7 @@ mod tests {
             macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
+            reserved_ranges: Vec::new(),
             sections_file: None,
             macho_symbol_resolutions_file: None,
             patch_records_file: None,
@@ -18931,11 +19098,13 @@ mod tests {
                 previous_macho_symbol_resolutions_file: None,
                 previous_fdes: Vec::new(),
                 previous_dynamic_relocations: Vec::new(),
+                previous_reserved_ranges: Vec::new(),
                 current_sections: RecordBuffers::default(),
                 current_relocations: RecordBuffers::default(),
                 current_macho_symbol_resolutions: RecordBuffers::default(),
                 current_fdes: RecordBuffers::default(),
                 current_dynamic_relocations: RecordBuffers::default(),
+                current_reserved_ranges: RecordBuffers::default(),
                 record_texts: RecordTextInterner::default(),
                 reused_sections: AtomicUsize::new(0),
                 prepared_fast_build_id_state: Mutex::new(None),
@@ -23990,6 +24159,68 @@ mod tests {
     }
 
     #[test]
+    fn persisted_state_round_trips_reserved_ranges() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![
+            ReservedRangeRecord {
+                output_section_id: 4,
+                alignment_exponent: 3,
+                output_offset: 16,
+                size: 8,
+            },
+            ReservedRangeRecord {
+                output_section_id: 5,
+                alignment_exponent: 2,
+                output_offset: 32,
+                size: 12,
+            },
+        ];
+
+        assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
+    }
+
+    #[test]
+    fn v39_state_is_accepted_without_reserved_ranges() {
+        let state = state("args", b"output", &[("a.o", b"a")]);
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V39, 1)
+            .lines()
+            .filter(|line| !line.starts_with("reserves\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn overlapping_reserved_ranges_are_rejected() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![
+            ReservedRangeRecord {
+                output_section_id: 4,
+                alignment_exponent: 2,
+                output_offset: 16,
+                size: 16,
+            },
+            ReservedRangeRecord {
+                output_section_id: 5,
+                alignment_exponent: 2,
+                output_offset: 28,
+                size: 8,
+            },
+        ];
+
+        let error = PersistedState::parse(&state.render()).unwrap_err();
+
+        assert!(error.to_string().contains("reserve ranges overlap"));
+    }
+
+    #[test]
     fn macho_symbol_resolutions_round_trip() {
         let resolutions = vec![
             MachOSymbolResolutionRecord {
@@ -25326,6 +25557,7 @@ mod tests {
             macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
+            reserved_ranges: Vec::new(),
             sections_file: None,
             macho_symbol_resolutions_file: None,
             patch_records_file: None,
@@ -27106,6 +27338,7 @@ mod tests {
             macho_symbol_resolutions: Vec::new(),
             fdes: Vec::new(),
             dynamic_relocations: Vec::new(),
+            reserved_ranges: Vec::new(),
             sections_file: None,
             macho_symbol_resolutions_file: None,
             patch_records_file: None,
@@ -27959,11 +28192,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -28004,11 +28239,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -28041,11 +28278,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -28093,11 +28332,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -28162,11 +28403,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),
@@ -28306,11 +28549,13 @@ mod tests {
             previous_macho_symbol_resolutions_file: None,
             previous_fdes: Vec::new(),
             previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
             current_sections: RecordBuffers::default(),
             current_relocations: RecordBuffers::default(),
             current_macho_symbol_resolutions: RecordBuffers::default(),
             current_fdes: RecordBuffers::default(),
             current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
             record_texts: RecordTextInterner::default(),
             reused_sections: AtomicUsize::new(0),
             prepared_fast_build_id_state: Mutex::new(None),

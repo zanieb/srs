@@ -132,6 +132,13 @@ impl PartId {
             self.output_section_id().min_alignment(output_sections)
         }
     }
+
+    pub(crate) fn regular_alignment(self) -> Option<Alignment> {
+        let offset = self.0.checked_sub(NUM_SINGLE_PART_SECTIONS)?;
+        Some(Alignment {
+            exponent: NUM_ALIGNMENTS as u8 - 1 - (offset % NUM_ALIGNMENTS as u32) as u8,
+        })
+    }
 }
 
 impl PartId {
