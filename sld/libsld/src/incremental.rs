@@ -3116,8 +3116,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let activated_archive_base_fingerprint_matches = activated_archive_base_fingerprint
                 .as_deref()
                 == Some(previous_patch.fingerprint.as_str());
-            let added_archive_base_diff_is_retired_symbols = if let Some(activation) =
-                &added_macho_archive_text_activation
+            let activated_archive_base_diff_is_retired_symbols = if (!replaced_archive_identifiers
+                .is_empty()
+                || !ignored_archive_identifiers.is_empty())
                 && !activated_archive_base_fingerprint_matches
                 && !macho_resolution_updates.retiring_names.is_empty()
             {
@@ -3132,7 +3133,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         input.path.as_str(),
                         &matched_sections,
                         &current_resolver,
-                        &activation.normalized_identifiers,
+                        &replaced_archive_identifiers,
+                        &replaced_archive_identifiers
+                            .iter()
+                            .chain(&ignored_archive_identifiers)
+                            .cloned()
+                            .collect::<Vec<_>>(),
                         &macho_resolution_updates.retiring_names,
                     )?
                 } else {
@@ -3142,14 +3148,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 false
             };
             if (added_macho_archive_text_activation.is_some()
+                || !replaced_archive_identifiers.is_empty())
                 && !activated_archive_base_fingerprint_matches
-                && !added_archive_base_diff_is_retired_symbols)
-                || macho_text_section_activation
-                    .as_ref()
-                    .is_some_and(|activation| {
-                        activation.normalized_archive_identifier.is_some()
-                            && !activated_archive_base_fingerprint_matches
-                    })
+                && !activated_archive_base_diff_is_retired_symbols
             {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed archive members outside activated Mach-O text members in `{}`",
@@ -12546,6 +12547,7 @@ fn archive_diff_allows_retired_macho_symbols(
     input_file_path: &str,
     matched_sections: &[MatchedPatchSection],
     current_resolver: &PatchInputResolver<'_>,
+    ignored_previous_identifiers: &[Vec<u8>],
     ignored_current_identifiers: &[Vec<u8>],
     retiring_names: &[SharedText],
 ) -> Result<bool> {
@@ -12557,8 +12559,11 @@ fn archive_diff_allows_retired_macho_symbols(
         .map(|name| hex::decode(name.as_str()))
         .collect::<std::result::Result<HashSet<_>, _>>()
         .context("Malformed deferred Mach-O symbol resolution name")?;
-    let Some(previous_definition_counts) =
-        archive_macho_defined_symbol_counts(previous_bytes, &[], &ignored_defined_symbols)?
+    let Some(previous_definition_counts) = archive_macho_defined_symbol_counts(
+        previous_bytes,
+        ignored_previous_identifiers,
+        &ignored_defined_symbols,
+    )?
     else {
         return Ok(false);
     };
@@ -12605,7 +12610,7 @@ fn archive_diff_allows_retired_macho_symbols(
     let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
         previous_bytes,
         &previous_ranges,
-        &[],
+        ignored_previous_identifiers,
         &ignored_defined_symbols,
     )?;
     let current_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
@@ -12654,7 +12659,8 @@ fn macho_object_semantic_patch_fingerprint(
     };
 
     let mut hasher = blake3::Hasher::new();
-    if ignored_defined_symbols.is_empty() {
+    let retirement_proof = !ignored_defined_symbols.is_empty();
+    if !retirement_proof {
         hasher.update(b"sld-macho-object-patch-fingerprint-v5");
     } else {
         hasher.update(b"sld-macho-object-retired-symbol-proof-v1");
@@ -12683,7 +12689,9 @@ fn macho_object_semantic_patch_fingerprint(
     hasher.update(&(sections.len() as u64).to_le_bytes());
     let mut has_masked_text = false;
     let mut has_masked_section = false;
+    let mut fully_masked_sections = HashSet::new();
     let mut masked_text_undefined_symbols = HashSet::new();
+    let mut hashed_relocation_symbols = HashSet::new();
     for section in sections {
         let segment_name = section.segment_name_bytes().ok().flatten()?;
         let section_name = section.name_bytes().ok()?;
@@ -12716,6 +12724,9 @@ fn macho_object_semantic_patch_fingerprint(
         });
         has_masked_section |= fully_masked;
         has_masked_text |= fully_masked && section_name == b"__text";
+        if fully_masked {
+            fully_masked_sections.insert(section.index());
+        }
         hasher.update(&[u8::from(fully_masked)]);
         if !fully_masked {
             hasher.update(&section.size().to_le_bytes());
@@ -12754,11 +12765,23 @@ fn macho_object_semantic_patch_fingerprint(
             hasher.update(&[r_type, u8::from(r_pcrel), r_length]);
             hasher.update(&relocation.addend().to_le_bytes());
             hasher.update(&[u8::from(relocation.has_implicit_addend())]);
-            hash_macho_relocation_target(&mut hasher, relocation.target())?;
+            if retirement_proof {
+                if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
+                    hashed_relocation_symbols.insert(symbol);
+                }
+                hash_macho_semantic_relocation_target(&mut hasher, &file, relocation.target())?;
+            } else {
+                hash_macho_relocation_target(&mut hasher, relocation.target())?;
+            }
             match relocation.subtractor() {
                 Some(symbol) => {
                     hasher.update(&[1]);
-                    hasher.update(&(symbol.0 as u64).to_le_bytes());
+                    if retirement_proof {
+                        hashed_relocation_symbols.insert(symbol);
+                        hash_macho_relocation_symbol(&mut hasher, &file, symbol)?;
+                    } else {
+                        hasher.update(&(symbol.0 as u64).to_le_bytes());
+                    }
                 }
                 None => {
                     hasher.update(&[0]);
@@ -12775,6 +12798,14 @@ fn macho_object_semantic_patch_fingerprint(
                 || symbol
                     .name_bytes()
                     .is_ok_and(|name| !ignored_defined_symbols.contains(name))
+        })
+        .filter(|symbol| {
+            !retirement_proof
+                || symbol.scope() != object::SymbolScope::Compilation
+                || symbol
+                    .section_index()
+                    .is_none_or(|section| !fully_masked_sections.contains(&section))
+                || hashed_relocation_symbols.contains(&symbol.index())
         })
         .filter(|symbol| {
             symbol
@@ -17450,6 +17481,59 @@ fn hash_macho_relocation_target(
         }
         _ => return None,
     }
+    Some(())
+}
+
+fn hash_macho_semantic_relocation_target(
+    hasher: &mut blake3::Hasher,
+    file: &object::File<'_>,
+    target: object::RelocationTarget,
+) -> Option<()> {
+    match target {
+        object::RelocationTarget::Symbol(symbol) => {
+            hasher.update(&[0]);
+            hash_macho_relocation_symbol(hasher, file, symbol)?;
+        }
+        object::RelocationTarget::Section(section) => {
+            hasher.update(&[1]);
+            let section = file.section_by_index(section).ok()?;
+            hash_length_prefixed(hasher, section.segment_name_bytes().ok().flatten()?);
+            hash_length_prefixed(hasher, section.name_bytes().ok()?);
+        }
+        object::RelocationTarget::Absolute => {
+            hasher.update(&[2]);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn hash_macho_relocation_symbol(
+    hasher: &mut blake3::Hasher,
+    file: &object::File<'_>,
+    symbol_index: object::SymbolIndex,
+) -> Option<()> {
+    let symbol = file.symbol_by_index(symbol_index).ok()?;
+    hash_length_prefixed(hasher, symbol.name_bytes().ok()?);
+    hash_macho_symbol_section(hasher, symbol.section())?;
+    let address = if let Some(section_index) = symbol.section_index() {
+        symbol
+            .address()
+            .checked_sub(file.section_by_index(section_index).ok()?.address())?
+    } else {
+        symbol.address()
+    };
+    hasher.update(&address.to_le_bytes());
+    hasher.update(&symbol.size().to_le_bytes());
+    hasher.update(&[
+        macho_symbol_kind_tag(symbol.kind())?,
+        macho_symbol_scope_tag(symbol.scope()),
+        u8::from(symbol.is_weak()),
+    ]);
+    let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+        return None;
+    };
+    hasher.update(&n_desc.to_le_bytes());
     Some(())
 }
 
