@@ -914,6 +914,16 @@ fn mode_needs_previous_sections(mode: &IncrementalMode) -> bool {
 }
 
 pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> Result<bool> {
+    maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
+        args,
+        rustc_work_product_provenance_enabled(),
+    )
+}
+
+fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
+    args: &impl platform::Args,
+    trust_rustc_link_content_digests: bool,
+) -> Result<bool> {
     if !args.common().incremental {
         return Ok(false);
     }
@@ -1000,7 +1010,6 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
     let mut checked_ambiguous_inputs = false;
-    let trust_rustc_link_content_digests = rustc_work_product_provenance_enabled();
     let input_checks = {
         timing_phase!("Check incremental fast-path input contents");
         previous
@@ -1083,7 +1092,34 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             )?;
             return Ok(false);
         }
-        let changed_input_indices = changed_inputs
+        let preclassified_unchanged_inputs =
+            preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+                args,
+                &previous,
+                &changed_inputs,
+                trust_rustc_link_content_digests,
+            );
+        apply_preclassified_unchanged_rustc_rlibs(&mut previous, &preclassified_unchanged_inputs);
+        if !preclassified_unchanged_inputs.is_empty() {
+            append_log(
+                &state_dir,
+                &format!(
+                    "classified {} unchanged Rust archive input file{} by rustc link-content digest before loading indexed records",
+                    preclassified_unchanged_inputs.len(),
+                    if preclassified_unchanged_inputs.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ),
+            )?;
+        }
+        let changed_inputs_to_patch = changed_inputs
+            .iter()
+            .filter(|(input_index, _)| !preclassified_unchanged_inputs.contains_key(input_index))
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed_input_indices = changed_inputs_to_patch
             .iter()
             .map(|(input_index, _)| *input_index)
             .collect::<HashSet<_>>();
@@ -1107,12 +1143,12 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 });
         let should_retry_with_full_state = should_filter_records;
         let mut attempted_filtered_records = false;
-        let changed_input_files = changed_inputs
+        let changed_input_files = changed_inputs_to_patch
             .iter()
             .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
             .collect::<HashSet<_>>();
         let should_start_with_filtered_records = should_filter_records
-            && changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs);
+            && changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs_to_patch);
         let result = if should_start_with_filtered_records {
             previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
             append_log(
@@ -1134,7 +1170,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::ChangedInputs,
-                &changed_inputs,
+                &changed_inputs_to_patch,
                 &metadata_update_input_indices,
             )?
         } else if should_filter_records {
@@ -1144,7 +1180,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::MetadataOnly,
-                &changed_inputs,
+                &changed_inputs_to_patch,
                 &metadata_update_input_indices,
             )?;
             if changed_input_patch_should_retry_with_filtered_records(&result) {
@@ -1166,6 +1202,10 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     &state_dir,
                     &mut previous,
                     &rewritten_inputs,
+                );
+                apply_preclassified_unchanged_rustc_rlibs(
+                    &mut previous,
+                    &preclassified_unchanged_inputs,
                 );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
@@ -1189,7 +1229,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     previous,
                     current_link_start.clone(),
                     ChangedInputRecordCoverage::ChangedInputs,
-                    &changed_inputs,
+                    &changed_inputs_to_patch,
                     &metadata_update_input_indices,
                 )?
             } else {
@@ -1214,7 +1254,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 previous,
                 current_link_start.clone(),
                 record_coverage,
-                &changed_inputs,
+                &changed_inputs_to_patch,
                 &metadata_update_input_indices,
             )?
         };
@@ -1237,13 +1277,17 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                         &mut full_previous,
                         &rewritten_inputs,
                     );
+                    apply_preclassified_unchanged_rustc_rlibs(
+                        &mut full_previous,
+                        &preclassified_unchanged_inputs,
+                    );
                     patch_changed_inputs(
                         args,
                         &state_dir,
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
-                        &changed_inputs,
+                        &changed_inputs_to_patch,
                         &metadata_update_input_indices,
                     )?
                 } else {
@@ -1268,13 +1312,17 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                         &mut full_previous,
                         &rewritten_inputs,
                     );
+                    apply_preclassified_unchanged_rustc_rlibs(
+                        &mut full_previous,
+                        &preclassified_unchanged_inputs,
+                    );
                     patch_changed_inputs(
                         args,
                         &state_dir,
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
-                        &changed_inputs,
+                        &changed_inputs_to_patch,
                         &metadata_update_input_indices,
                     )?
                 } else {
@@ -1749,6 +1797,47 @@ fn metadata_update_indices_for_inputs(
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+fn preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+    args: &impl platform::Args,
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+    trust_rustc_link_content_digests: bool,
+) -> HashMap<usize, FileContentState> {
+    if !trust_rustc_link_content_digests {
+        return HashMap::new();
+    }
+    let matches = {
+        timing_phase!("Preclassify unchanged rustc rlibs");
+        changed_inputs
+            .par_iter()
+            .filter_map(|(input_index, path)| {
+                if !can_reuse_rustc_link_content_digest(args, path) {
+                    return None;
+                }
+                let input = previous.input_files.get(*input_index)?;
+                previous_rustc_rlib_link_content_digest(input)?;
+                rustc_rlib_link_content_digest_matches_previous_path(input, path)
+                    .map(|content| (*input_index, content))
+            })
+            .collect::<Vec<_>>()
+    };
+    matches.into_iter().collect()
+}
+
+fn apply_preclassified_unchanged_rustc_rlibs(
+    previous: &mut PersistedState,
+    preclassified_unchanged_inputs: &HashMap<usize, FileContentState>,
+) {
+    for (input_index, input_content) in preclassified_unchanged_inputs {
+        let input = &mut previous.input_files[*input_index];
+        let rustc_link_content_digest =
+            previous_rustc_rlib_link_content_digest(input).map(str::to_owned);
+        input.content = input_content.clone();
+        input.snapshot_identity = None;
+        input.rustc_link_content_digest = rustc_link_content_digest;
+    }
 }
 
 fn refresh_rewritten_input_identities(
@@ -40933,6 +41022,111 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn preloading_preclassifies_recordful_rustc_rlib_before_reading_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let input = dir.path().join("libcrate.rlib");
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, b"object");
+        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, b"object");
+        std::fs::write(&output, vec![0; 128]).unwrap();
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        args.should_emit_code_signature = false;
+        let state_dir = state_dir_for_output(&output);
+        let mut previous = publishing_metadata_state(&args, &output, &input);
+        previous.input_files[0].rustc_link_content_digest = Some(digest.clone());
+        previous
+            .sections
+            .push(section_record(input.to_str().unwrap(), 1, 64, 8));
+        previous.write(&state_dir).unwrap();
+        let sections_file = PersistedState::read_metadata(&state_dir)
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        let previous_sections = std::fs::read(state_dir.join(&sections_file)).unwrap();
+
+        let replacement = dir.path().join("libcrate.replacement.rlib");
+        std::fs::write(&replacement, current_bytes).unwrap();
+        std::fs::rename(replacement, &input).unwrap();
+
+        assert!(
+            maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(&args, true)
+                .unwrap()
+        );
+
+        let updated = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        assert_eq!(
+            updated.input_files[0].rustc_link_content_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(
+            updated.input_files[0]
+                .content
+                .identity_matches_path(&input)
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(state_dir.join(&sections_file)).unwrap(),
+            previous_sections
+        );
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains(
+            "classified 1 unchanged Rust archive input file by rustc link-content digest before loading indexed records"
+        ));
+        assert!(log.contains("reused existing output before loading inputs"));
+        assert!(!log.contains("loaded records for"));
+        assert!(!log.contains("missing patch metadata"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preclassified_link_content_digest_rechecks_input_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("libcrate.rlib");
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, b"object");
+        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, b"object");
+        std::fs::write(&input, &previous_bytes).unwrap();
+        let mut previous = state(
+            "args",
+            b"output",
+            &[(input.to_str().unwrap(), &previous_bytes)],
+        );
+        previous.input_files[0].content = FileContentState::from_path(&input).unwrap();
+        previous.input_files[0].rustc_link_content_digest = Some(digest);
+
+        let replacement = dir.path().join("libcrate.replacement.rlib");
+        std::fs::write(&replacement, &current_bytes).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.should_emit_code_signature = false;
+        let preclassified = preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+            &args,
+            &previous,
+            &[(0, input.clone())],
+            true,
+        );
+        assert_eq!(preclassified.len(), 1);
+        apply_preclassified_unchanged_rustc_rlibs(&mut previous, &preclassified);
+
+        let second_replacement = dir.path().join("libcrate.second-replacement.rlib");
+        std::fs::write(&second_replacement, current_bytes).unwrap();
+        std::fs::rename(second_replacement, &input).unwrap();
+
+        let reason = input_identity_mismatch_reason(&previous.input_files)
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("input file changed while incremental fast path was running"));
+        assert!(reason.contains("libcrate.rlib"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn changed_link_content_digest_requires_patch_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
@@ -47037,7 +47231,7 @@ mod tests {
     }
 
     fn publishing_metadata_state(
-        args: &crate::args::elf::ElfArgs,
+        args: &impl platform::Args,
         output: &Path,
         input: &Path,
     ) -> PersistedState {
