@@ -35111,6 +35111,104 @@ mod tests {
     }
 
     #[test]
+    fn rematerialized_macho_target_reuses_unique_previous_member_alias() {
+        let output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let current_file = object::File::parse(output.as_slice()).unwrap();
+        let data = current_file.section_by_name("__data").unwrap();
+        let section_offset = 1;
+        let input_file = SharedText::from(hex::encode("lib.rlib"));
+        let current_input = hex::encode("current.o");
+        let previous_input = hex::encode("previous.o");
+        let current_target = RelocationTargetRecord {
+            input_file: input_file.clone(),
+            input: current_input.clone().into(),
+            section_index: data.index().0 as u32,
+            section_offset,
+        };
+        let previous_target = RelocationTargetRecord {
+            input_file,
+            input: previous_input.clone().into(),
+            section_index: current_target.section_index,
+            section_offset,
+        };
+        let mut relocation = relocation_record(
+            "reference.o",
+            1,
+            1,
+            None,
+            0x1000_4020,
+            None,
+            None,
+            0,
+            0,
+            4,
+            0,
+            0,
+        );
+        relocation.target = Some(previous_target.clone());
+
+        assert_eq!(
+            macho_output_address_for_current_target(
+                &output_file,
+                &current_file,
+                &[],
+                std::slice::from_ref(&relocation),
+                &[],
+                &current_target,
+                &previous_target,
+            ),
+            Some(0x1000_4020)
+        );
+
+        let mut conflicting = relocation.clone();
+        conflicting.target_value = 0x1000_4030;
+        assert_eq!(
+            macho_output_address_for_current_target(
+                &output_file,
+                &current_file,
+                &[],
+                &[relocation.clone(), conflicting],
+                &[],
+                &current_target,
+                &previous_target,
+            ),
+            None
+        );
+
+        let output_offset = data.file_range().unwrap().0;
+        let section = PatchSection {
+            input: current_input,
+            section_index: patch_section_record_index(&current_file, data.index()).unwrap(),
+            section_name: Some("__DATA,__data".to_owned()),
+            input_size: data.size(),
+            output_offset,
+            output_size: data.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+        let matched = MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_input,
+                ..section.clone()
+            },
+            current: section,
+        };
+        assert_eq!(
+            macho_output_address_for_current_target(
+                &output_file,
+                &current_file,
+                &[matched],
+                &[relocation],
+                &[],
+                &current_target,
+                &previous_target,
+            ),
+            Some(data.address() + section_offset)
+        );
+    }
+
+    #[test]
     fn rematerialized_macho_import_branch_reuses_recorded_stub() {
         let recorded_stub = 0x1000;
         let (previous_output, text_range, written_value) =
