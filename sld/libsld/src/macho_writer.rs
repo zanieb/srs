@@ -3036,7 +3036,7 @@ fn collect_object_unwind_info_entries<'data>(
     Ok(entries)
 }
 
-fn compact_unwind_dwarf_offset_hint(output_offset: u64) -> u32 {
+pub(crate) fn compact_unwind_dwarf_offset_hint(output_offset: u64) -> u32 {
     if output_offset <= u64::from(UNWIND_DWARF_OFFSET_MASK) {
         output_offset as u32
     } else {
