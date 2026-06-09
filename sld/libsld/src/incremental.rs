@@ -12819,11 +12819,15 @@ fn macho_object_semantic_patch_fingerprint(
         hash_macho_symbol_section(&mut hasher, symbol.section())?;
         let value_range = macho_symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
-        let address_is_masked = value_range.is_some_and(|value_range| {
-            ranges
-                .iter()
-                .any(|range| range.start <= value_range.start && range.end >= value_range.end)
-        });
+        let address_is_masked = retirement_proof
+            && symbol
+                .section_index()
+                .is_some_and(|section| fully_masked_sections.contains(&section))
+            || value_range.is_some_and(|value_range| {
+                ranges
+                    .iter()
+                    .any(|range| range.start <= value_range.start && range.end >= value_range.end)
+            });
         hasher.update(&[u8::from(address_is_masked)]);
         if !address_is_masked {
             let address = if let Some(section_index) = symbol.section_index() {
@@ -12847,7 +12851,8 @@ fn macho_object_semantic_patch_fingerprint(
         hasher.update(&n_desc.to_le_bytes());
     }
 
-    (has_masked_section && (!require_masked_text || has_masked_text)).then(|| hasher.finalize())
+    (retirement_proof || (has_masked_section && (!require_masked_text || has_masked_text)))
+        .then(|| hasher.finalize())
 }
 
 fn macho_section_symbols_fingerprint(
@@ -29931,6 +29936,83 @@ mod tests {
                 &ignored_text,
                 true,
             )
+        );
+    }
+
+    #[test]
+    fn retired_macho_symbol_proof_allows_shifted_survivors_and_unmasked_members() {
+        let mut previous = test_macho_object(&[0; 8], &[1; 4], 0);
+        let previous_survivor =
+            macho_symbol_value_field_range(&previous, object::SymbolIndex(1)).unwrap();
+        previous[previous_survivor.start - 3] = 1;
+        previous[previous_survivor].copy_from_slice(&4_u64.to_le_bytes());
+
+        let mut current = test_macho_object(&[0; 4], &[1; 4], 0);
+        let retired = macho_symbol_value_field_range(&current, object::SymbolIndex(0))
+            .unwrap()
+            .start
+            - 8;
+        current[retired + 4] = object::macho::N_STAB;
+        let current_survivor =
+            macho_symbol_value_field_range(&current, object::SymbolIndex(1)).unwrap();
+        current[current_survivor.start - 3] = 1;
+        current[current_survivor].copy_from_slice(&0_u64.to_le_bytes());
+
+        let untouched = test_macho_object(&[2; 4], &[3; 4], 0);
+        let archive = |changed: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, bytes) in [
+                (b"changed.o".as_slice(), changed),
+                (b"untouched.o".as_slice(), untouched.as_slice()),
+            ] {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        bytes,
+                    )
+                    .unwrap();
+            }
+            let bytes = builder.into_inner().unwrap();
+            let mut entries = ArchiveIterator::from_archive_bytes(&bytes).unwrap();
+            let ArchiveEntry::Regular(member) = entries.next().unwrap().unwrap() else {
+                panic!("expected regular archive member");
+            };
+            let text = test_macho_section_range(member.entry_data, "__text");
+            let data_offset = member.data_offset;
+            (bytes, data_offset + text.start..data_offset + text.end)
+        };
+        let (previous_archive, previous_text) = archive(&previous);
+        let (current_archive, current_text) = archive(&current);
+        let ignored = HashSet::from([b"_text".to_vec()]);
+
+        assert_eq!(
+            archive_retired_macho_symbols_proof_fingerprint(
+                &previous_archive,
+                &[previous_text],
+                &[],
+                &ignored,
+            )
+            .unwrap(),
+            archive_retired_macho_symbols_proof_fingerprint(
+                &current_archive,
+                &[current_text],
+                &[],
+                &ignored,
+            )
+            .unwrap(),
+        );
+        assert_ne!(
+            macho_object_patch_fingerprint(
+                &previous,
+                0,
+                &[test_macho_section_range(&previous, "__text")],
+            ),
+            macho_object_patch_fingerprint(
+                &current,
+                0,
+                &[test_macho_section_range(&current, "__text")],
+            ),
+            "ordinary patch fingerprints must retain symbol layout sensitivity",
         );
     }
 
