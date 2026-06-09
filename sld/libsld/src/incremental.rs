@@ -8503,18 +8503,26 @@ fn macho_text_relocation_target_candidates(
     target_name: Option<&str>,
     r_type: u8,
     target_value: u64,
+    previous_applied_target_value: Option<u64>,
 ) -> Vec<u64> {
     let resolution = target_name
         .and_then(|name| hex::decode(name).ok())
         .as_deref()
         .and_then(|name| macho_symbol_resolution_for_name(resolutions, name));
-    let mut candidates = vec![if r_type == object::macho::ARM64_RELOC_BRANCH26 {
+    let mut candidates = if r_type == object::macho::ARM64_RELOC_BRANCH26 {
+        previous_applied_target_value
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    candidates.push(if r_type == object::macho::ARM64_RELOC_BRANCH26 {
         resolution
             .and_then(|resolution| resolution.stub_address)
             .unwrap_or(target_value)
     } else {
         target_value
-    }];
+    });
     if r_type == object::macho::ARM64_RELOC_BRANCH26
         && let Some(resolution) = resolution
     {
@@ -8660,6 +8668,7 @@ fn rematerialized_macho_text_relocation_replay(
         target_name.as_deref(),
         current_context.r_type,
         current_target_value,
+        None,
     );
 
     let target_symbol_id = relocations
@@ -9238,6 +9247,15 @@ fn macho_text_relocation_replays_for_input(
                         display_hex_path(&input.path)
                     )));
                 }
+                let current_relocation_target_candidates = macho_text_relocation_target_candidates(
+                    resolutions,
+                    relocation.target_name.as_deref(),
+                    raw_relocation.r_type,
+                    current_target_value,
+                    target_move
+                        .is_none()
+                        .then_some(previous_applied_target_value),
+                );
 
                 replays.push(MachOTextRelocationReplay {
                     relocation_index: Some(relocation_index),
@@ -9252,12 +9270,7 @@ fn macho_text_relocation_replays_for_input(
                     previous_written_value: Some(previous_written_value),
                     previous_applied_target_value: Some(previous_applied_target_value),
                     current_target_value,
-                    current_relocation_target_candidates: macho_text_relocation_target_candidates(
-                        resolutions,
-                        relocation.target_name.as_deref(),
-                        raw_relocation.r_type,
-                        current_target_value,
-                    ),
+                    current_relocation_target_candidates,
                     current_target_section_offset: replay_target
                         .as_ref()
                         .map(|target| target.section_offset)
@@ -24007,6 +24020,57 @@ mod tests {
             parse_macho_symbol_resolutions(rendered.lines()).unwrap(),
             resolutions
         );
+    }
+
+    #[test]
+    fn macho_text_relocation_candidates_reuse_uncatalogued_import_stub() {
+        let place = 0x1_01b2_240c;
+        let direct_target = 0;
+        let recorded_stub = 0x1_0000_395c;
+        let candidates = macho_text_relocation_target_candidates(
+            &[],
+            Some(&hex::encode("_Unwind_Resume")),
+            object::macho::ARM64_RELOC_BRANCH26,
+            direct_target,
+            Some(recorded_stub),
+        );
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                raw_relocation,
+            )
+            .unwrap();
+        let selected = candidates.iter().copied().find(|target| {
+            let written_value =
+                macho_aarch64_relocated_value(raw_relocation.r_type, *target, 0, place).unwrap();
+            let mut instruction = 0x1400_0000_u32.to_le_bytes();
+            rel_info
+                .write_to_buffer(written_value, &mut instruction)
+                .is_ok()
+        });
+
+        assert_eq!(candidates, vec![recorded_stub, direct_target]);
+        assert_eq!(selected, Some(recorded_stub));
+    }
+
+    #[test]
+    fn macho_text_relocation_candidates_deduplicate_recorded_direct_target() {
+        let candidates = macho_text_relocation_target_candidates(
+            &[],
+            Some(&hex::encode("_target")),
+            object::macho::ARM64_RELOC_BRANCH26,
+            0x1000_1000,
+            Some(0x1000_1000),
+        );
+
+        assert_eq!(candidates, vec![0x1000_1000]);
     }
 
     fn rematerialized_macho_replay(
