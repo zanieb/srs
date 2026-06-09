@@ -494,6 +494,20 @@ struct MachOArchiveActivationState {
 enum MachOArchiveActivationKind {
     AddedMembers,
     ChangedDefinitions,
+    ChangedDefinitionsWithUnwind,
+}
+
+impl MachOArchiveActivationKind {
+    fn is_changed_definitions(self) -> bool {
+        matches!(
+            self,
+            Self::ChangedDefinitions | Self::ChangedDefinitionsWithUnwind
+        )
+    }
+
+    fn owns_changed_unwind(self) -> bool {
+        self == Self::ChangedDefinitionsWithUnwind
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3895,10 +3909,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             let mut macho_resolution_updates = {
                 timing_phase!("Refresh changed Mach-O symbol resolutions");
-                let owns_active_changed_definitions =
-                    retained_macho_archive_members.iter().any(|state| {
-                        state.kind == MachOArchiveActivationKind::ChangedDefinitions && state.active
-                    });
+                let owns_active_changed_definitions = retained_macho_archive_members
+                    .iter()
+                    .any(|state| state.kind.is_changed_definitions() && state.active);
                 match update_macho_symbol_resolutions_for_input(
                     &mut previous.macho_symbol_resolutions,
                     input,
@@ -4231,6 +4244,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     changed_macho_definition_activation
                         .as_ref()
                         .map_or(&[], |activation| activation.retired_names.as_slice()),
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .is_some_and(ChangedMachODefinitionActivation::owns_changed_unwind),
                 )? {
                     Ok(activation) => activation,
                     Err(reason) => {
@@ -4530,6 +4546,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             activation.current_unwind_input_ranges.iter().cloned()
                         }),
                 )
+                .chain(
+                    changed_macho_archive_unwind_activation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|activation| activation.current_input_ranges.iter().cloned()),
+                )
                 .collect::<Vec<_>>();
             let Some((mut fingerprint, mut archive_member_patch_fingerprints)) = ({
                 timing_phase!("Fingerprint changed patch input");
@@ -4595,6 +4617,36 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         let definition_activation = changed_macho_definition_activation
                             .as_ref()
                             .expect("checked above");
+                        let previous_unwind_input_ranges = added_macho_archive_text_activation
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|activation| {
+                                activation.previous_unwind_input_ranges.iter().cloned()
+                            })
+                            .chain(
+                                changed_macho_archive_unwind_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.previous_input_ranges.iter().cloned()
+                                    }),
+                            )
+                            .collect::<Vec<_>>();
+                        let current_unwind_input_ranges = added_macho_archive_text_activation
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|activation| {
+                                activation.current_unwind_input_ranges.iter().cloned()
+                            })
+                            .chain(
+                                changed_macho_archive_unwind_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.current_input_ranges.iter().cloned()
+                                    }),
+                            )
+                            .collect::<Vec<_>>();
                         archive_diff_allows_changed_macho_symbols(
                             previous_bytes,
                             &bytes,
@@ -4607,18 +4659,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 .chain(&ignored_archive_identifiers)
                                 .cloned()
                                 .collect::<Vec<_>>(),
-                            added_macho_archive_text_activation
-                                .as_ref()
-                                .map_or(&[], |activation| {
-                                    activation.previous_unwind_input_ranges.as_slice()
-                                }),
-                            added_macho_archive_text_activation
-                                .as_ref()
-                                .map_or(&[], |activation| {
-                                    activation.current_unwind_input_ranges.as_slice()
-                                }),
+                            &previous_unwind_input_ranges,
+                            &current_unwind_input_ranges,
                             &definition_activation.added_names,
                             &definition_activation.retired_names,
+                            changed_macho_archive_unwind_activation.is_some(),
                         )?
                     } else {
                         false
@@ -5085,6 +5130,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     .flat_map(|activation| {
                                         activation.current_unwind_input_ranges.iter().cloned()
                                     }),
+                            )
+                            .chain(
+                                changed_macho_archive_unwind_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.current_input_ranges.iter().cloned()
+                                    }),
                             ),
                         normalize_rust_archive_patch_inputs,
                     )?
@@ -5100,6 +5153,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.symbol_table_patches))
                 .unwrap_or_default();
+            if let (Some(definition_activation), Some(unwind_activation)) = (
+                changed_macho_definition_activation.as_mut(),
+                changed_macho_archive_unwind_activation.as_ref(),
+            ) && !definition_activation.owns_changed_unwind()
+            {
+                if let Err(reason) = definition_activation.attach_changed_unwind_transaction(
+                    &unwind_activation.patches,
+                    previous_output.get()?,
+                ) {
+                    return Ok(ChangedInputPatchResult::Unsupported(reason));
+                }
+            }
             let changed_macho_definition_patches = changed_macho_definition_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.output_patches))
@@ -5290,7 +5355,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 "changed Mach-O definition ownership moved".to_owned(),
                             ));
                         };
-                        if stored.kind != MachOArchiveActivationKind::ChangedDefinitions {
+                        if !stored.kind.is_changed_definitions() {
                             return Ok(ChangedInputPatchResult::Unsupported(
                                 "changed Mach-O definition ownership changed kind".to_owned(),
                             ));
@@ -5299,8 +5364,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     }
                     MachOArchiveActivationStateUpdate::Add(state) => {
                         if macho_archive_members.iter().any(|stored| {
-                            stored.kind == MachOArchiveActivationKind::ChangedDefinitions
-                                && stored.members == state.members
+                            stored.kind.is_changed_definitions() && stored.members == state.members
                         }) {
                             return Ok(ChangedInputPatchResult::Unsupported(
                                 "changed Mach-O definition already has retained ownership"
@@ -7006,6 +7070,69 @@ struct ChangedMachODefinitionActivation {
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
 
+impl ChangedMachODefinitionActivation {
+    fn owns_changed_unwind(&self) -> bool {
+        self.state_updates.iter().any(|update| match update {
+            MachOArchiveActivationStateUpdate::Replace(_, state)
+            | MachOArchiveActivationStateUpdate::Add(state) => state.kind.owns_changed_unwind(),
+        })
+    }
+
+    fn attach_changed_unwind_transaction(
+        &mut self,
+        patches: &[SectionPatch],
+        previous_output: &[u8],
+    ) -> std::result::Result<(), String> {
+        if patches.is_empty() {
+            return Err("changed Mach-O unwind transaction has no output patches".to_owned());
+        }
+        let mut candidate = None;
+        for update in &mut self.state_updates {
+            let MachOArchiveActivationStateUpdate::Add(state) = update else {
+                continue;
+            };
+            if state.kind != MachOArchiveActivationKind::ChangedDefinitions {
+                continue;
+            }
+            if candidate.replace(state).is_some() {
+                return Err(
+                    "changed Mach-O unwind spans multiple new definition transactions".to_owned(),
+                );
+            }
+        }
+        let Some(state) = candidate else {
+            return Err(
+                "changed Mach-O unwind has no new definition ownership transaction".to_owned(),
+            );
+        };
+        let forward_patches = patches
+            .iter()
+            .map(|patch| stored_output_patch(patch, previous_output))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rollback_patches = forward_patches
+            .iter()
+            .map(|patch| {
+                let start = usize::try_from(patch.output_offset)
+                    .map_err(|_| "Mach-O unwind rollback offset is too large".to_owned())?;
+                let end = start
+                    .checked_add(patch.data.len())
+                    .ok_or_else(|| "Mach-O unwind rollback range overflowed".to_owned())?;
+                let data = previous_output
+                    .get(start..end)
+                    .ok_or_else(|| "Mach-O unwind rollback patch is outside output".to_owned())?;
+                Ok(StoredOutputPatch {
+                    output_offset: patch.output_offset,
+                    data: data.to_vec(),
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        state.kind = MachOArchiveActivationKind::ChangedDefinitionsWithUnwind;
+        state.forward_patches.extend(forward_patches);
+        state.rollback_patches.extend(rollback_patches);
+        Ok(())
+    }
+}
+
 enum MachOArchiveActivationStateUpdate {
     Replace(usize, MachOArchiveActivationState),
     Add(MachOArchiveActivationState),
@@ -7040,6 +7167,8 @@ struct ChangedMachOArchiveUnwindMembers {
 
 struct ChangedMachOArchiveUnwindActivation {
     patches: Vec<SectionPatch>,
+    previous_input_ranges: Vec<std::ops::Range<usize>>,
+    current_input_ranges: Vec<std::ops::Range<usize>>,
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
 
@@ -16173,11 +16302,43 @@ fn archive_macho_semantic_patch_proof_fingerprint(
     ignored_identifiers: &[Vec<u8>],
     ignored_defined_symbols: &HashSet<Vec<u8>>,
 ) -> Result<Option<blake3::Hash>> {
+    archive_macho_semantic_patch_proof_fingerprint_with_options(
+        bytes,
+        ranges,
+        ignored_identifiers,
+        ignored_defined_symbols,
+        false,
+    )
+}
+
+fn archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+) -> Result<Option<blake3::Hash>> {
+    archive_macho_semantic_patch_proof_fingerprint_with_options(
+        bytes,
+        ranges,
+        ignored_identifiers,
+        ignored_defined_symbols,
+        true,
+    )
+}
+
+fn archive_macho_semantic_patch_proof_fingerprint_with_options(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+    ignore_masked_unwind_sections: bool,
+) -> Result<Option<blake3::Hash>> {
     let Some(members) = archive_macho_semantic_patch_proof_members(
         bytes,
         ranges,
         ignored_identifiers,
         ignored_defined_symbols,
+        ignore_masked_unwind_sections,
     )?
     else {
         return Ok(None);
@@ -16198,6 +16359,7 @@ fn archive_macho_semantic_patch_proof_members(
     ranges: &[std::ops::Range<usize>],
     ignored_identifiers: &[Vec<u8>],
     ignored_defined_symbols: &HashSet<Vec<u8>>,
+    ignore_masked_unwind_sections: bool,
 ) -> Result<Option<Vec<(Vec<u8>, blake3::Hash)>>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
@@ -16216,11 +16378,49 @@ fn archive_macho_semantic_patch_proof_members(
         {
             continue;
         }
+        let mut ignored_sections = HashSet::new();
+        if ignore_masked_unwind_sections {
+            let Ok(file) = object::File::parse(content.entry_data) else {
+                return Ok(None);
+            };
+            for section in file.sections() {
+                let segment_name = section.segment_name_bytes()?.unwrap_or_default();
+                let section_name = section.name_bytes()?;
+                if !matches!(
+                    (segment_name, section_name),
+                    (b"__LD", b"__compact_unwind") | (b"__TEXT", b"__eh_frame")
+                ) {
+                    continue;
+                }
+                let Some((offset, size)) = section.file_range() else {
+                    continue;
+                };
+                let Ok(offset) = usize::try_from(offset) else {
+                    continue;
+                };
+                let Ok(size) = usize::try_from(size) else {
+                    continue;
+                };
+                let Some(start) = content.data_offset.checked_add(offset) else {
+                    continue;
+                };
+                let Some(end) = start.checked_add(size) else {
+                    continue;
+                };
+                if size != 0
+                    && ranges
+                        .iter()
+                        .any(|range| range.start <= start && range.end >= end)
+                {
+                    ignored_sections.insert(section.index());
+                }
+            }
+        }
         let Some(member_hash) = macho_object_semantic_patch_fingerprint(
             content.entry_data,
             content.data_offset,
             ranges,
-            &HashSet::new(),
+            &ignored_sections,
             ignored_defined_symbols,
             true,
         ) else {
@@ -16243,6 +16443,7 @@ fn archive_diff_allows_changed_macho_symbols(
     current_extra_ranges: &[std::ops::Range<usize>],
     added_names: &[SharedText],
     retiring_names: &[SharedText],
+    ignore_masked_unwind_sections: bool,
 ) -> Result<bool> {
     if added_names.is_empty() && retiring_names.is_empty() {
         return Ok(false);
@@ -16319,18 +16520,36 @@ fn archive_diff_allows_changed_macho_symbols(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
-        previous_bytes,
-        &previous_ranges,
-        ignored_previous_identifiers,
-        &ignored_defined_symbols,
-    )?;
-    let current_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
-        current_bytes,
-        &current_ranges,
-        ignored_current_identifiers,
-        &ignored_defined_symbols,
-    )?;
+    let previous_fingerprint = if ignore_masked_unwind_sections {
+        archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
+            previous_bytes,
+            &previous_ranges,
+            ignored_previous_identifiers,
+            &ignored_defined_symbols,
+        )?
+    } else {
+        archive_macho_semantic_patch_proof_fingerprint(
+            previous_bytes,
+            &previous_ranges,
+            ignored_previous_identifiers,
+            &ignored_defined_symbols,
+        )?
+    };
+    let current_fingerprint = if ignore_masked_unwind_sections {
+        archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
+            current_bytes,
+            &current_ranges,
+            ignored_current_identifiers,
+            &ignored_defined_symbols,
+        )?
+    } else {
+        archive_macho_semantic_patch_proof_fingerprint(
+            current_bytes,
+            &current_ranges,
+            ignored_current_identifiers,
+            &ignored_defined_symbols,
+        )?
+    };
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
 
@@ -17699,6 +17918,7 @@ fn changed_macho_archive_unwind_activation(
     reserved_ranges: &[ReservedRangeRecord],
     added_definition_names: &[SharedText],
     retired_definition_names: &[SharedText],
+    reuse_owned_output: bool,
 ) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for changed unwind metadata")?;
@@ -17737,11 +17957,20 @@ fn changed_macho_archive_unwind_activation(
             &changed.current_input_ranges,
             added_definition_names,
             retired_definition_names,
+            true,
         )?;
     if !allows_unwind_only && !allows_unwind_and_definitions {
         return Ok(Err(
             "changed Mach-O archive member differs outside text and unwind metadata".to_owned(),
         ));
+    }
+    if reuse_owned_output {
+        return Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
+            patches: Vec::new(),
+            previous_input_ranges: changed.previous_input_ranges,
+            current_input_ranges: changed.current_input_ranges,
+            remaining_reserved_ranges: reserved_ranges.to_vec(),
+        })));
     }
 
     let selected_indices = (0..changed.members.len()).collect::<Vec<_>>();
@@ -17765,6 +17994,8 @@ fn changed_macho_archive_unwind_activation(
     };
     Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
         patches: activation.patches,
+        previous_input_ranges: changed.previous_input_ranges,
+        current_input_ranges: changed.current_input_ranges,
         remaining_reserved_ranges,
     })))
 }
@@ -18504,7 +18735,7 @@ fn changed_macho_definition_activation(
     let mut remaining_reserved_ranges = reserved_ranges.to_vec();
 
     for (index, state) in states.iter().enumerate() {
-        if state.kind != MachOArchiveActivationKind::ChangedDefinitions || !state.active {
+        if !state.kind.is_changed_definitions() || !state.active {
             continue;
         }
         let names = state
@@ -18557,7 +18788,7 @@ fn changed_macho_definition_activation(
         added_names.extend(names.iter().cloned());
         let mut dormant_index = None;
         for (index, state) in states.iter().enumerate() {
-            if state.kind != MachOArchiveActivationKind::ChangedDefinitions
+            if !state.kind.is_changed_definitions()
                 || state.active
                 || state.members.as_slice() != std::slice::from_ref(&identity)
             {
@@ -27832,6 +28063,9 @@ fn render_macho_archive_member_states(states: &[MachOArchiveActivationState]) ->
                 match state.kind {
                     MachOArchiveActivationKind::AddedMembers => "members",
                     MachOArchiveActivationKind::ChangedDefinitions => "definitions",
+                    MachOArchiveActivationKind::ChangedDefinitionsWithUnwind => {
+                        "definitions-unwind"
+                    }
                 }
             );
             let mut relocations = String::new();
@@ -27957,6 +28191,7 @@ fn parse_macho_archive_member_states(
             let kind = match kind {
                 "members" => MachOArchiveActivationKind::AddedMembers,
                 "definitions" => MachOArchiveActivationKind::ChangedDefinitions,
+                "definitions-unwind" => MachOArchiveActivationKind::ChangedDefinitionsWithUnwind,
                 _ => {
                     return Err(crate::error!(
                         "Invalid incremental Mach-O archive state kind"
@@ -27972,7 +28207,10 @@ fn parse_macho_archive_member_states(
         };
         let identifiers = match kind {
             MachOArchiveActivationKind::AddedMembers => &mut member_identifiers,
-            MachOArchiveActivationKind::ChangedDefinitions => &mut definition_identifiers,
+            MachOArchiveActivationKind::ChangedDefinitions
+            | MachOArchiveActivationKind::ChangedDefinitionsWithUnwind => {
+                &mut definition_identifiers
+            }
         };
         let members = encoded_members
             .split(',')
@@ -28011,7 +28249,7 @@ fn parse_macho_archive_member_states(
             .map(|member| member.normalized_identifier.clone())
             .collect::<HashSet<_>>();
         if (kind == MachOArchiveActivationKind::AddedMembers && sections.is_empty())
-            || (kind == MachOArchiveActivationKind::ChangedDefinitions && !sections.is_empty())
+            || (kind.is_changed_definitions() && !sections.is_empty())
             || sections.iter().any(|section| {
                 parse_patch_input_ref(input_file, &section.input)
                     .ok()
@@ -28061,7 +28299,7 @@ fn parse_macho_archive_member_states(
         .context("Invalid UTF-8 in incremental Mach-O archive rollback resolutions")?;
         let rollback_symbol_resolutions =
             parse_macho_symbol_resolutions(rollback_resolution_contents.lines())?;
-        if kind == MachOArchiveActivationKind::ChangedDefinitions
+        if kind.is_changed_definitions()
             && (members.len() != 1
                 || !relocation_records.relocations.is_empty()
                 || symbol_resolutions.is_empty()
@@ -38916,6 +39154,7 @@ mod tests {
             &reserves,
             &[],
             &[],
+            false,
         )
         .unwrap()
         .unwrap()
@@ -38991,6 +39230,7 @@ mod tests {
             &activation.remaining_reserved_ranges,
             &[],
             &[],
+            false,
         )
         .unwrap()
         .unwrap()
@@ -39053,6 +39293,7 @@ mod tests {
             &reserves,
             &[],
             &[],
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -45422,6 +45663,26 @@ mod tests {
 
         assert!(rendered.contains(&hex::encode("definitions|")));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+
+        let mut unwind_state = state.clone();
+        let ownership = &mut unwind_state.input_files[0]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members[0];
+        ownership.kind = MachOArchiveActivationKind::ChangedDefinitionsWithUnwind;
+        ownership.forward_patches.push(StoredOutputPatch {
+            output_offset: 512,
+            data: vec![5, 6, 7, 8],
+        });
+        ownership.rollback_patches.push(StoredOutputPatch {
+            output_offset: 512,
+            data: vec![0; 4],
+        });
+        let rendered = unwind_state.render();
+
+        assert!(rendered.contains(&hex::encode("definitions-unwind|")));
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), unwind_state);
     }
 
     #[test]
