@@ -33360,7 +33360,7 @@ mod tests {
                 .collect(),
         };
         let members = vec![
-            member(&[b"_first"], &[b"_second"]),
+            member(&[b"_first", b"_first_alias"], &[b"_second"]),
             member(&[b"_second"], &[b"_third"]),
             member(&[b"_third"], &[]),
             member(&[b"_unused"], &[]),
@@ -33388,6 +33388,14 @@ mod tests {
             selected_added_macho_archive_member_indices(
                 &members,
                 &definitions,
+                vec![b"_first_alias".to_vec()],
+            ),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            selected_added_macho_archive_member_indices(
+                &members,
+                &definitions,
                 vec![b"_unused".to_vec()],
             ),
             vec![3]
@@ -33399,6 +33407,53 @@ mod tests {
                 vec![b"_missing".to_vec()],
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn added_macho_archive_member_parses_multiple_text_definitions() {
+        let mut object = test_macho_object_with_data_section_name(&[0; 8], &[0; 4], 0, b"__const");
+        let strings = b"\0_text\0_data\0";
+        let string_offset = object
+            .windows(strings.len())
+            .position(|window| window == strings)
+            .unwrap();
+        let symbol_offset =
+            string_offset - 2 * std::mem::size_of::<object::macho::Nlist64<object::Endianness>>();
+        let second_symbol =
+            symbol_offset + std::mem::size_of::<object::macho::Nlist64<object::Endianness>>();
+        object[second_symbol + 5] = 1;
+        object[second_symbol + 8..second_symbol + 16].copy_from_slice(&4_u64.to_le_bytes());
+
+        let member = added_macho_archive_text_member(
+            "input.o",
+            PatchInputBytes {
+                bytes: &object,
+                file_offset: 0,
+                archive_identifier: None,
+            },
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            member.definitions,
+            vec![
+                AddedMachOArchiveDefinition {
+                    name: b"_data".to_vec(),
+                    offset: 4,
+                    desc: 0,
+                    private_external: false,
+                },
+                AddedMachOArchiveDefinition {
+                    name: b"_text".to_vec(),
+                    offset: 0,
+                    desc: 0,
+                    private_external: false,
+                },
+            ]
         );
     }
 
