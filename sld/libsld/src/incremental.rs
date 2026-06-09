@@ -14725,6 +14725,12 @@ struct AddedMachOArchiveUnwindActivation {
     patches: Vec<SectionPatch>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MachOUnwindFunctionIdentity {
+    function_offset: u32,
+    length: u32,
+}
+
 struct AddedMachOArchiveEhFrameBlock {
     member_index: usize,
     input_offset: usize,
@@ -15108,6 +15114,85 @@ fn added_macho_archive_unwind_ranges_overlap(
     let left_end = left_start.saturating_add(left_length.max(1));
     let right_end = right_start.saturating_add(right_length.max(1));
     left_start < right_end && right_start < left_end
+}
+
+fn merge_macho_unwind_info_entries(
+    existing_entries: Vec<crate::macho_writer::UnwindInfoEntry>,
+    retired_entries: &[MachOUnwindFunctionIdentity],
+    mut added_entries: Vec<crate::macho_writer::UnwindInfoEntry>,
+) -> std::result::Result<Vec<crate::macho_writer::UnwindInfoEntry>, String> {
+    let retired = retired_entries.iter().copied().collect::<HashSet<_>>();
+    if retired.len() != retired_entries.len() {
+        return Err("replacement Mach-O unwind entries contain a duplicate identity".to_owned());
+    }
+
+    let mut retired_matches = HashMap::with_capacity(retired.len());
+    let mut retained_entries = Vec::with_capacity(existing_entries.len() + added_entries.len());
+    for existing in existing_entries
+        .into_iter()
+        .filter(|entry| entry.encoding != 0)
+    {
+        let identity = MachOUnwindFunctionIdentity {
+            function_offset: existing.function_offset,
+            length: existing.length,
+        };
+        if retired.contains(&identity) {
+            *retired_matches.entry(identity).or_insert(0usize) += 1;
+            continue;
+        }
+        if retired.iter().any(|retired| {
+            added_macho_archive_unwind_ranges_overlap(
+                existing.function_offset,
+                existing.length,
+                retired.function_offset,
+                retired.length,
+            )
+        }) {
+            return Err(
+                "replacement Mach-O unwind identity partially overlaps an existing live entry"
+                    .to_owned(),
+            );
+        }
+        retained_entries.push(existing);
+    }
+    if retired
+        .iter()
+        .any(|identity| retired_matches.get(identity) != Some(&1))
+    {
+        return Err(
+            "replacement Mach-O unwind identity does not match exactly one live entry".to_owned(),
+        );
+    }
+
+    added_entries.sort_by_key(|entry| entry.function_offset);
+    if added_entries.windows(2).any(|pair| {
+        added_macho_archive_unwind_ranges_overlap(
+            pair[0].function_offset,
+            pair[0].length,
+            pair[1].function_offset,
+            pair[1].length,
+        )
+    }) {
+        return Err("replacement Mach-O unwind entries overlap or are duplicated".to_owned());
+    }
+    for added in &added_entries {
+        if retained_entries.iter().any(|existing| {
+            added_macho_archive_unwind_ranges_overlap(
+                existing.function_offset,
+                existing.length,
+                added.function_offset,
+                added.length,
+            )
+        }) {
+            return Err(
+                "replacement Mach-O unwind entry overlaps an existing live entry".to_owned(),
+            );
+        }
+    }
+
+    retained_entries.extend(added_entries);
+    retained_entries.sort_by_key(|entry| entry.function_offset);
+    Ok(retained_entries)
 }
 
 fn allocate_added_macho_archive_eh_frame_range(
@@ -15632,8 +15717,7 @@ fn added_macho_archive_unwind_activation(
     let unwind_info_data = unwind_info_section
         .data()
         .context("Failed to read previous Mach-O __unwind_info section")?;
-    let mut existing_entries = match crate::macho_writer::parse_macho_unwind_info(unwind_info_data)
-    {
+    let existing_entries = match crate::macho_writer::parse_macho_unwind_info(unwind_info_data) {
         Ok(entries) => entries,
         Err(error) => {
             return Ok(Err(format!(
@@ -15641,22 +15725,11 @@ fn added_macho_archive_unwind_activation(
             )));
         }
     };
-    existing_entries.retain(|entry| entry.encoding != 0);
-    for added in &added_entries {
-        if existing_entries.iter().any(|existing| {
-            added_macho_archive_unwind_ranges_overlap(
-                existing.function_offset,
-                existing.length,
-                added.function_offset,
-                added.length,
-            )
-        }) {
-            return Ok(Err(
-                "added Mach-O unwind entry overlaps an existing live entry".to_owned(),
-            ));
-        }
-    }
-    existing_entries.extend(added_entries);
+    let existing_entries =
+        match merge_macho_unwind_info_entries(existing_entries, &[], added_entries) {
+            Ok(entries) => entries,
+            Err(reason) => return Ok(Err(reason)),
+        };
 
     let text_section_index =
         match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__text") {
@@ -31777,6 +31850,84 @@ mod tests {
             )
             .unwrap_err()
             .contains("no existing GOT resolution")
+        );
+    }
+
+    #[test]
+    fn replacement_macho_unwind_entries_require_exact_owned_ranges() {
+        let entry = |function_offset, length, encoding| crate::macho_writer::UnwindInfoEntry {
+            function_offset,
+            length,
+            encoding,
+            personality_offset: None,
+            lsda_offset: None,
+        };
+        let previous = vec![
+            entry(0x100, 0x20, ADDED_MACHO_UNWIND_MODE_DWARF),
+            entry(0x120, 0xe0, 0),
+            entry(0x200, 0x30, 0x0200_0000),
+        ];
+        let retired = MachOUnwindFunctionIdentity {
+            function_offset: 0x100,
+            length: 0x20,
+        };
+        let replacement = entry(0x100, 0x28, 0x0400_0000);
+
+        assert_eq!(
+            merge_macho_unwind_info_entries(previous.clone(), &[retired], vec![replacement])
+                .unwrap(),
+            vec![replacement, previous[2]],
+        );
+        assert!(
+            merge_macho_unwind_info_entries(
+                previous.clone(),
+                &[MachOUnwindFunctionIdentity {
+                    function_offset: 0x100,
+                    length: 0x18,
+                }],
+                vec![replacement],
+            )
+            .unwrap_err()
+            .contains("partially overlaps"),
+        );
+        assert!(
+            merge_macho_unwind_info_entries(
+                previous.clone(),
+                &[MachOUnwindFunctionIdentity {
+                    function_offset: 0x180,
+                    length: 0x10,
+                }],
+                vec![replacement],
+            )
+            .unwrap_err()
+            .contains("does not match exactly one"),
+        );
+        assert!(
+            merge_macho_unwind_info_entries(
+                previous.clone(),
+                &[retired, retired],
+                vec![replacement],
+            )
+            .unwrap_err()
+            .contains("duplicate identity"),
+        );
+        assert!(
+            merge_macho_unwind_info_entries(
+                vec![previous[0], previous[0], previous[2]],
+                &[retired],
+                vec![replacement],
+            )
+            .unwrap_err()
+            .contains("does not match exactly one"),
+        );
+        assert!(
+            merge_macho_unwind_info_entries(
+                previous,
+                &[retired],
+                vec![entry(0x1f0, 0x20, 0x0400_0000)],
+            )
+            .unwrap_err()
+            .contains("overlaps an existing live entry"),
         );
     }
 
