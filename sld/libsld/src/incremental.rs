@@ -15522,6 +15522,13 @@ fn relocation_target_ranges_for_input_with_lookup<'a>(
                         && !raw.r_pcrel
                         && raw.r_length == 3
                 })
+                && patch_section_object_index(&file, record.section_index)
+                    .ok()
+                    .and_then(|section_index| file.section_by_index(section_index).ok())
+                    .is_some_and(|section| {
+                        section.name().ok() == Some("__const")
+                            && section.segment_name().ok().flatten() == Some("__DATA")
+                    })
             {
                 continue;
             }
@@ -27021,7 +27028,6 @@ mod tests {
 
     #[test]
     fn current_macho_target_ranges_exclude_chained_data_targets() {
-        let bytes = test_macho_object(b"\x1f\x20\x03\xd5", b"\0\0\0\0", 0);
         let input = "input.o";
         let target = Some((input, 2, 0));
         let text = relocation_record(
@@ -27067,22 +27073,58 @@ mod tests {
             0,
         );
         let input_file_path = hex::encode(input);
+        let data_bytes = test_macho_object(b"\x1f\x20\x03\xd5", b"\0\0\0\0", 0);
+        let data_const_bytes = test_macho_object_with_data_section_name(
+            b"\x1f\x20\x03\xd5",
+            b"\0\0\0\0",
+            0,
+            b"__const",
+        );
 
         assert_eq!(
-            relocation_target_ranges_for_current_records(&bytes, &input_file_path, [&text, &data])
-                .unwrap()
-                .len(),
+            relocation_target_ranges_for_current_records(
+                &data_const_bytes,
+                &input_file_path,
+                [&text, &data],
+            )
+            .unwrap()
+            .len(),
             1
         );
         assert!(
-            relocation_target_ranges_for_current_records(&bytes, &input_file_path, [&data])
+            relocation_target_ranges_for_current_records(
+                &data_const_bytes,
+                &input_file_path,
+                [&data],
+            )
+            .unwrap()
+            .is_empty(),
+        );
+        assert_eq!(
+            relocation_target_ranges_for_current_records(&data_bytes, &input_file_path, [&data],)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
         );
     }
 
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
-        test_macho_object_with_optional_debug(text, data, None, data_symbol_offset)
+        test_macho_object_with_data_section_name(text, data, data_symbol_offset, b"__data")
+    }
+
+    fn test_macho_object_with_data_section_name(
+        text: &[u8],
+        data: &[u8],
+        data_symbol_offset: u64,
+        data_section_name: &[u8],
+    ) -> Vec<u8> {
+        test_macho_object_with_optional_debug_and_data_section_name(
+            text,
+            data,
+            None,
+            data_symbol_offset,
+            data_section_name,
+        )
     }
 
     fn test_macho_object_with_debug(
@@ -27099,6 +27141,22 @@ mod tests {
         data: &[u8],
         debug: Option<&[u8]>,
         data_symbol_offset: u64,
+    ) -> Vec<u8> {
+        test_macho_object_with_optional_debug_and_data_section_name(
+            text,
+            data,
+            debug,
+            data_symbol_offset,
+            b"__data",
+        )
+    }
+
+    fn test_macho_object_with_optional_debug_and_data_section_name(
+        text: &[u8],
+        data: &[u8],
+        debug: Option<&[u8]>,
+        data_symbol_offset: u64,
+        data_section_name: &[u8],
     ) -> Vec<u8> {
         const HEADER_SIZE: usize = 32;
         const SEGMENT_COMMAND_SIZE: usize = 72;
@@ -27155,7 +27213,7 @@ mod tests {
         );
         push_macho_section(
             &mut bytes,
-            b"__data",
+            data_section_name,
             b"__DATA",
             text.len() as u64,
             data.len(),
