@@ -12323,26 +12323,28 @@ fn archive_patch_fingerprint_with_previous(
             }
             Some(digests)
         });
-    let previous_archive_member_patch_fingerprints = previous_archive_member_patch_fingerprints
-        .map(|fingerprints| {
-            fingerprints
-                .iter()
-                .map(|fingerprint| (fingerprint.archive_member_index, fingerprint))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let previous_archive_member_patch_fingerprints =
+        previous_archive_member_patch_fingerprints.unwrap_or_default();
+    let mut previous_fingerprints_by_identifier =
+        HashMap::with_capacity(previous_archive_member_patch_fingerprints.len());
+    for fingerprint in previous_archive_member_patch_fingerprints {
+        if previous_fingerprints_by_identifier
+            .insert(fingerprint.identifier.as_slice(), fingerprint)
+            .is_some()
+        {
+            previous_fingerprints_by_identifier.clear();
+            break;
+        }
+    }
     let mut replacement_fingerprints = HashMap::with_capacity(replaced_identifiers.len());
     for identifier in replaced_identifiers {
-        let mut matches = previous_archive_member_patch_fingerprints
-            .values()
-            .filter(|fingerprint| fingerprint.identifier == *identifier);
-        let Some(fingerprint) = matches.next() else {
+        let Some(fingerprint) = previous_fingerprints_by_identifier.get(identifier.as_slice())
+        else {
             return Ok(None);
         };
-        if matches.next().is_some()
-            || replacement_fingerprints
-                .insert(identifier.as_slice(), fingerprint)
-                .is_some()
+        if replacement_fingerprints
+            .insert(identifier.as_slice(), *fingerprint)
+            .is_some()
         {
             return Ok(None);
         }
@@ -12373,17 +12375,18 @@ fn archive_patch_fingerprint_with_previous(
                     .and_then(|digests| digests.get(identifier.as_slice()));
                 // A raw producer digest cannot replace the output-specific patch
                 // fingerprint. It can only prove that a prior constituent remains
-                // valid when the member position and masked ranges also match.
+                // valid when its identity, size, and masked ranges also match.
                 if let Some(rustc_object_digest) = rustc_object_digest
                     && let Some(previous) =
-                        previous_archive_member_patch_fingerprints.get(&archive_member_index)
-                    && previous.identifier == *identifier
+                        previous_fingerprints_by_identifier.get(identifier.as_slice())
                     && previous.data_len == data.len()
                     && previous.ranges_hash == ranges_hash
                     && previous.rustc_object_digest == *rustc_object_digest
                     && let Some(fingerprint) = parse_blake3_hex_digest(&previous.fingerprint)
                 {
-                    return Some((fingerprint, Some((*previous).clone())));
+                    let mut refreshed = (*previous).clone();
+                    refreshed.archive_member_index = archive_member_index;
+                    return Some((fingerprint, Some(refreshed)));
                 }
                 let mut hasher = blake3::Hasher::new();
                 let fingerprint = macho_object_patch_fingerprint(data, *data_offset, ranges)
