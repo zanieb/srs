@@ -1084,9 +1084,8 @@ fn write_incremental_reserves(
             .split_off_mut(..allocation_size)
             .context("Insufficient space allocated to Mach-O incremental reserve")?;
         reserve.fill(0);
-        let alignment = part_id
-            .regular_alignment()
-            .context("Mach-O incremental reserve uses a non-regular output section")?;
+        let alignment = crate::macho::incremental_reserve_alignment(part_id)
+            .context("Mach-O incremental reserve uses an unsupported output section")?;
         incremental.record_reserved_range(
             part_id.output_section_id().as_usize() as u32,
             alignment.exponent,

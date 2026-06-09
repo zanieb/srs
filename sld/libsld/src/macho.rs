@@ -117,7 +117,34 @@ fn incremental_reserve_sizes(
                 u64::try_from(aligned).context("Mach-O incremental reserve size overflowed u64")?;
         }
     }
+    for part_id in [part_id::SYMTAB_GLOBAL, part_id::STRTAB] {
+        let current_size = *current_sizes.get(part_id);
+        if current_size == 0 {
+            continue;
+        }
+        let alignment = incremental_reserve_alignment(part_id)
+            .context("Mach-O incremental reserve requires a supported output section")?;
+        let bytes = (u128::from(current_size) * u128::from(padding_percent)).div_ceil(100);
+        let alignment = u128::from(alignment.value());
+        let aligned = bytes.max(1).div_ceil(alignment) * alignment;
+        *reserves.get_mut(part_id) =
+            u64::try_from(aligned).context("Mach-O incremental reserve size overflowed u64")?;
+    }
     Ok(reserves)
+}
+
+pub(crate) fn incremental_reserve_alignment(
+    part_id: crate::part_id::PartId,
+) -> Option<crate::alignment::Alignment> {
+    part_id.regular_alignment().or_else(|| {
+        if part_id == crate::part_id::SYMTAB_GLOBAL {
+            Some(crate::alignment::SYMTAB_ENTRY)
+        } else if part_id == crate::part_id::STRTAB {
+            Some(crate::alignment::Alignment { exponent: 0 })
+        } else {
+            None
+        }
+    })
 }
 
 /// Mach-O uses a zero page for all 32bit addresses and thus we begin the memory
@@ -294,6 +321,8 @@ mod tests {
         *current_sizes.get_mut(rodata) = 800;
         *current_sizes.get_mut(gcc_except) = 1;
         *current_sizes.get_mut(data) = 100;
+        *current_sizes.get_mut(part_id::SYMTAB_GLOBAL) = 160;
+        *current_sizes.get_mut(part_id::STRTAB) = 100;
 
         let reserves = incremental_reserve_sizes(&current_sizes, 10).unwrap();
 
@@ -301,6 +330,8 @@ mod tests {
         assert_eq!(*reserves.get(rodata), 80);
         assert_eq!(*reserves.get(gcc_except), 4);
         assert_eq!(*reserves.get(data), 0);
+        assert_eq!(*reserves.get(part_id::SYMTAB_GLOBAL), 16);
+        assert_eq!(*reserves.get(part_id::STRTAB), 10);
     }
 
     #[test]
