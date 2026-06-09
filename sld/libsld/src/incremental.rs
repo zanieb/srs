@@ -34098,6 +34098,47 @@ mod tests {
     }
 
     #[test]
+    fn archive_patch_fingerprint_reuses_shifted_unchanged_rustc_members() {
+        let unchanged_digest = "a".repeat(blake3::OUT_LEN * 2);
+        let added_digest = "b".repeat(blake3::OUT_LEN * 2);
+        let unchanged_identifier = b"crate.cgu.0.old.rcgu.o";
+        let added_identifier = b"crate.cgu.added.old.rcgu.o";
+        let (previous, _) = rustc_rlib_with_raw_object_manifest(&[(
+            unchanged_identifier,
+            unchanged_digest.as_str(),
+            b"object",
+        )]);
+        let (current, _) = rustc_rlib_with_raw_object_manifest(&[
+            (added_identifier, added_digest.as_str(), b"added"),
+            (unchanged_identifier, unchanged_digest.as_str(), b"mutant"),
+        ]);
+        let (previous_fingerprint, previous_members) =
+            archive_patch_fingerprint_with_previous(&previous, &[], None, true, &[], &[])
+                .unwrap()
+                .unwrap();
+        let ignored = [archive_member_patch_identifier(added_identifier)];
+        let (current_fingerprint, current_members) = archive_patch_fingerprint_with_previous(
+            &current,
+            &[],
+            previous_members.as_deref(),
+            true,
+            &ignored,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(previous_fingerprint, current_fingerprint);
+        let current_members = current_members.unwrap();
+        assert_eq!(current_members.len(), 1);
+        assert_eq!(current_members[0].archive_member_index, 2);
+        assert_eq!(
+            current_members[0].identifier,
+            archive_member_patch_identifier(unchanged_identifier)
+        );
+    }
+
+    #[test]
     fn rustc_rlib_link_content_digest_reads_metadata_archive_member() {
         let archive = |digest: &str| {
             let mut metadata = b"encoded metadata".to_vec();
