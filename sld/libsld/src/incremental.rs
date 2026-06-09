@@ -3904,6 +3904,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     "changed input needs complete Mach-O text relocation records".to_owned(),
                 ));
             }
+            let mut macho_reserved_thunk_patches = Vec::new();
+            let remaining_reserved_ranges =
+                if let Some(activation) = added_macho_archive_text_activation.as_mut() {
+                    &mut activation.remaining_reserved_ranges
+                } else if let Some(activation) = macho_text_section_activation.as_mut() {
+                    &mut activation.remaining_reserved_ranges
+                } else {
+                    &mut previous.reserved_ranges
+                };
             if (!macho_text_relocation_replays.replays.is_empty()
                 || !macho_text_relocation_replays
                     .rematerialized_sections
@@ -3913,9 +3922,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &macho_text_relocation_replays,
                     previous_output.get()?,
                     &mut previous.relocations,
+                    &mut previous.macho_symbol_resolutions,
+                    remaining_reserved_ranges,
+                    &mut macho_reserved_thunk_patches,
                 )
             {
                 return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
+            if !macho_reserved_thunk_patches.is_empty() {
+                previous.macho_symbol_resolutions.sort_unstable();
+                previous.macho_symbol_resolutions.dedup();
+                previous.macho_symbol_resolutions_file = None;
             }
             if !macho_text_relocation_replays.replays.is_empty() {
                 previous.relocations.sort_unstable();
@@ -4085,6 +4102,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .map(|activation| std::mem::take(&mut activation.auxiliary_patches))
                 .unwrap_or_default();
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
+            patched_section_count += macho_reserved_thunk_patches.len();
             patched_section_count += macho_text_auxiliary_patches.len();
             patched_section_count += dynamic_relocation_patches.len();
             patched_section_count += relocation_addend_patches.output_patches.len();
@@ -4135,6 +4153,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(relocation_addend_patches.output_patches)
                     .chain(relocation_target_patches.output_patches)
                     .chain(macho_forwarding_thunk_patches.patches)
+                    .chain(macho_reserved_thunk_patches)
                     .chain(macho_text_auxiliary_patches)
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .chain(added_macho_archive_symbol_table_patches)
@@ -11828,11 +11847,129 @@ fn allocate_macho_text_thunk(
     }
 }
 
+fn allocate_reserved_macho_text_thunk(
+    reserved_ranges: &mut Vec<ReservedRangeRecord>,
+    output_file: &object::File<'_>,
+    previous_output: &[u8],
+    replay: &MachOTextRelocationReplay,
+    current_place: u64,
+    current_bytes: &[u8],
+    thunk_size: usize,
+) -> std::result::Result<Option<(u64, SectionPatch)>, String> {
+    if replay.r_type != object::macho::ARM64_RELOC_BRANCH26 || replay.chained_rebase_value.is_some()
+    {
+        return Ok(None);
+    }
+    let output_section_id = u32::try_from(crate::output_section_id::TEXT.as_usize())
+        .map_err(|_| "Mach-O text output section ID does not fit u32".to_owned())?;
+    let thunk_size =
+        u64::try_from(thunk_size).map_err(|_| "Mach-O text thunk size is too large".to_owned())?;
+    let mut candidates = Vec::new();
+    for (range_index, range) in reserved_ranges.iter().enumerate() {
+        if range.output_section_id != output_section_id || range.alignment_exponent < 2 {
+            continue;
+        }
+        let alignment = crate::alignment::Alignment::from_exponent(range.alignment_exponent.into())
+            .map_err(|_| "invalid Mach-O text thunk reserve alignment".to_owned())?;
+        let allocation_size = thunk_size
+            .checked_add(alignment.mask())
+            .map(|size| alignment.align_down(size))
+            .ok_or_else(|| "Mach-O text thunk reserve allocation overflowed".to_owned())?;
+        if range.size < allocation_size {
+            continue;
+        }
+        let output_end = range
+            .output_offset
+            .checked_add(allocation_size)
+            .ok_or_else(|| "Mach-O text thunk reserve range overflowed".to_owned())?;
+        let output_start = usize::try_from(range.output_offset)
+            .map_err(|_| "Mach-O text thunk reserve offset does not fit usize".to_owned())?;
+        let output_end = usize::try_from(output_end)
+            .map_err(|_| "Mach-O text thunk reserve end does not fit usize".to_owned())?;
+        let Some(previous_bytes) = previous_output.get(output_start..output_end) else {
+            return Err("Mach-O text thunk reserve is outside the previous output".to_owned());
+        };
+        if previous_bytes.iter().any(|byte| *byte != 0) {
+            continue;
+        }
+        let Some(thunk_address) =
+            macho_output_address_for_file_offset(output_file, range.output_offset)
+        else {
+            continue;
+        };
+        if !macho_aarch64_thunk_target_is_reachable(thunk_address, replay.current_target_value) {
+            continue;
+        }
+        let Some(relocated_value) =
+            macho_aarch64_relocated_value(replay.r_type, thunk_address, 0, current_place)
+        else {
+            continue;
+        };
+        let mut relocated = current_bytes.to_vec();
+        if replay
+            .rel_info
+            .write_to_buffer(relocated_value, &mut relocated)
+            .is_err()
+        {
+            continue;
+        }
+        candidates.push((
+            range_index,
+            allocation_size,
+            thunk_address,
+            current_place.abs_diff(thunk_address),
+            range.output_offset,
+        ));
+    }
+    let Some((range_index, allocation_size, thunk_address, _, output_offset)) = candidates
+        .into_iter()
+        .min_by_key(|(_, allocation_size, _, distance, output_offset)| {
+            (*allocation_size, *distance, *output_offset)
+        })
+    else {
+        return Ok(None);
+    };
+
+    let range = &mut reserved_ranges[range_index];
+    range.output_offset = range
+        .output_offset
+        .checked_add(allocation_size)
+        .ok_or_else(|| "Mach-O text thunk reserve offset overflowed".to_owned())?;
+    range.size -= allocation_size;
+    if range.size == 0 {
+        reserved_ranges.swap_remove(range_index);
+    }
+    reserved_ranges.sort_unstable();
+    validate_reserved_ranges(reserved_ranges)
+        .map_err(|error| format!("invalid Mach-O text thunk reserves: {error:#?}"))?;
+
+    let mut data = vec![0; thunk_size as usize];
+    <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+        thunk_address,
+        replay.current_target_value,
+        &mut data,
+    );
+    Ok(Some((
+        thunk_address,
+        SectionPatch {
+            output_offset,
+            size: allocation_size,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        },
+    )))
+}
+
 fn apply_macho_text_relocation_replays(
     patches: &mut [ResolvedSectionPatch],
     replays: &MachOTextRelocationReplays,
     previous_output: &[u8],
     relocations: &mut Vec<RelocationRecord>,
+    resolutions: &mut [MachOSymbolResolutionRecord],
+    reserved_ranges: &mut Vec<ReservedRangeRecord>,
+    reserved_thunk_patches: &mut Vec<SectionPatch>,
 ) -> std::result::Result<(), String> {
     let output_file = object::File::parse(previous_output)
         .map_err(|error| format!("failed to parse previous Mach-O output: {error}"))?;
@@ -11967,6 +12104,19 @@ fn apply_macho_text_relocation_replays(
                         .then_some(*address)
                 }),
         );
+        let resolution_index = if replay.r_type == object::macho::ARM64_RELOC_BRANCH26
+            && replay.target_is_global
+            && let Some(target_name) = replay.target_name.as_deref()
+        {
+            macho_symbol_resolution_index_for_name(resolutions, target_name)?.filter(|index| {
+                resolutions[*index].direct_value == Some(replay.current_target_value)
+            })
+        } else {
+            None
+        };
+        if let Some(resolution_index) = resolution_index {
+            candidates.extend_from_slice(&resolutions[resolution_index].thunk_addresses);
+        }
         let mut seen = HashSet::new();
         candidates.retain(|candidate| seen.insert(*candidate));
         let mut selected = None;
@@ -12033,6 +12183,43 @@ fn apply_macho_text_relocation_replays(
                     range,
                 ));
                 selected = Some((thunk_address, written_value, relocated));
+            }
+        }
+        if selected.is_none()
+            && let Some(resolution_index) = resolution_index
+        {
+            let current_bytes = patch
+                .patch
+                .data
+                .get(replay.current_range.clone())
+                .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?
+                .to_vec();
+            if let Some((thunk_address, thunk_patch)) = allocate_reserved_macho_text_thunk(
+                reserved_ranges,
+                &output_file,
+                previous_output,
+                replay,
+                current_place,
+                &current_bytes,
+                thunk_size,
+            )? {
+                let relocated_value =
+                    macho_aarch64_relocated_value(replay.r_type, thunk_address, 0, current_place)
+                        .ok_or_else(|| "Mach-O text thunk branch value overflowed".to_owned())?;
+                let mut relocated = current_bytes;
+                replay
+                    .rel_info
+                    .write_to_buffer(relocated_value, &mut relocated)
+                    .map_err(|error| {
+                        format!("failed to encode reserved Mach-O text thunk branch: {error:#}")
+                    })?;
+                let thunk_addresses = &mut resolutions[resolution_index].thunk_addresses;
+                thunk_addresses.push(thunk_address);
+                thunk_addresses.sort_unstable();
+                thunk_addresses.dedup();
+                reserved_thunk_patches.push(thunk_patch);
+                candidates.push(thunk_address);
+                selected = Some((thunk_address, relocated_value, relocated));
             }
         }
         let Some((applied_target_value, written_value, relocated)) = selected else {
@@ -38633,6 +38820,9 @@ mod tests {
             &replays,
             &previous_output,
             &mut relocations,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -38692,6 +38882,9 @@ mod tests {
             &mut patches,
             &replays,
             &previous_output,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -38780,6 +38973,9 @@ mod tests {
             &replays,
             &previous_output,
             &mut relocations,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -38832,11 +39028,178 @@ mod tests {
             &next_replays,
             &next_previous_output,
             &mut relocations,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
         assert_eq!(&next_patches[0].patch.data[4..], expected_thunk);
         assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
+    }
+
+    #[test]
+    fn macho_text_relocation_replay_allocates_persistent_reserved_branch_thunk() {
+        let previous_output = test_macho_object(&[0; 64], b"\x01\x02\x03\x04", 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let text_range = test_macho_section_range(&previous_output, "__text");
+        let input = "crate-hash.cgu.rcgu.o";
+        let target_name = "_target";
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("libarchive.rlib")),
+            input: SharedText::from(hex::encode("target.rcgu.o")),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let place =
+            macho_output_address_for_file_offset(&output_file, text_range.start as u64).unwrap();
+        let target_value = place + 200 * 1024 * 1024;
+        let mut replay =
+            rematerialized_macho_replay(input, target_name, target_value, target.clone());
+        replay.r_type = object::macho::ARM64_RELOC_BRANCH26;
+        replay.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        replay.rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                object::macho::RelocationInfo {
+                    r_address: 0,
+                    r_symbolnum: 0,
+                    r_pcrel: true,
+                    r_length: 2,
+                    r_extern: true,
+                    r_type: object::macho::ARM64_RELOC_BRANCH26,
+                },
+            )
+            .unwrap();
+        replay.current_target_value = target_value;
+        replay.current_relocation_target_candidates = vec![target_value];
+        let replays = MachOTextRelocationReplays {
+            replays: vec![replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut patches = vec![ResolvedSectionPatch {
+            section: PatchSection {
+                input: hex::encode(input),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: text_range.start as u64,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 4,
+                data: 0x1400_0000_u32.to_le_bytes().to_vec(),
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+        let reserve_offset = (text_range.start + 16).next_multiple_of(16) as u64;
+        let mut reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+            alignment_exponent: 4,
+            output_offset: reserve_offset,
+            size: 32,
+        }];
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode(target_name)),
+            direct_value: Some(target_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(target),
+        }];
+        let mut relocations = Vec::new();
+        let mut reserved_thunk_patches = Vec::new();
+
+        apply_macho_text_relocation_replays(
+            &mut patches,
+            &replays,
+            &previous_output,
+            &mut relocations,
+            &mut resolutions,
+            &mut reserved_ranges,
+            &mut reserved_thunk_patches,
+        )
+        .unwrap();
+
+        let thunk_address =
+            macho_output_address_for_file_offset(&output_file, reserve_offset).unwrap();
+        assert_eq!(resolutions[0].thunk_addresses, vec![thunk_address]);
+        assert_eq!(
+            reserved_ranges,
+            vec![ReservedRangeRecord {
+                output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+                alignment_exponent: 4,
+                output_offset: reserve_offset + 16,
+                size: 16,
+            }]
+        );
+        assert_eq!(reserved_thunk_patches.len(), 1);
+        assert_eq!(reserved_thunk_patches[0].output_offset, reserve_offset);
+        assert_eq!(reserved_thunk_patches[0].size, 16);
+        let mut expected_thunk = vec![0; 12];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            target_value,
+            &mut expected_thunk,
+        );
+        assert_eq!(reserved_thunk_patches[0].data, expected_thunk);
+        assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
+
+        let mut expected_branch = 0x1400_0000_u32.to_le_bytes();
+        replays.replays[0]
+            .rel_info
+            .write_to_buffer(thunk_address - place, &mut expected_branch)
+            .unwrap();
+        assert_eq!(patches[0].patch.data, expected_branch);
+
+        let mut next_replay = replays.replays[0].clone();
+        next_replay.relocation_index = Some(0);
+        next_replay.current_relocation_target_candidates = vec![target_value];
+        let next_replays = MachOTextRelocationReplays {
+            replays: vec![next_replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut next_patches = vec![ResolvedSectionPatch {
+            section: patches[0].section.clone(),
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 4,
+                data: 0x1400_0000_u32.to_le_bytes().to_vec(),
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+        let mut next_reserved_thunk_patches = Vec::new();
+
+        apply_macho_text_relocation_replays(
+            &mut next_patches,
+            &next_replays,
+            &previous_output,
+            &mut relocations,
+            &mut resolutions,
+            &mut reserved_ranges,
+            &mut next_reserved_thunk_patches,
+        )
+        .unwrap();
+
+        assert!(next_reserved_thunk_patches.is_empty());
+        assert_eq!(resolutions[0].thunk_addresses, vec![thunk_address]);
+        assert_eq!(next_patches[0].patch.data, expected_branch);
         assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
     }
 
