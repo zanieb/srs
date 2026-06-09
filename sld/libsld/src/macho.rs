@@ -111,11 +111,8 @@ fn incremental_reserve_sizes(
             }
             let alignment = incremental_reserve_alignment(part_id)
                 .context("Mach-O incremental reserve requires a supported output section")?;
-            let bytes = (u128::from(current_size) * u128::from(padding_percent)).div_ceil(100);
-            let alignment = u128::from(alignment.value());
-            let aligned = bytes.max(1).div_ceil(alignment) * alignment;
             *reserves.get_mut(part_id) =
-                u64::try_from(aligned).context("Mach-O incremental reserve size overflowed u64")?;
+                incremental_reserve_allocation_size(current_size, padding_percent, alignment)?;
         }
     }
     for part_id in [part_id::SYMTAB_GLOBAL, part_id::STRTAB] {
@@ -125,13 +122,24 @@ fn incremental_reserve_sizes(
         }
         let alignment = incremental_reserve_alignment(part_id)
             .context("Mach-O incremental reserve requires a supported output section")?;
-        let bytes = (u128::from(current_size) * u128::from(padding_percent)).div_ceil(100);
-        let alignment = u128::from(alignment.value());
-        let aligned = bytes.max(1).div_ceil(alignment) * alignment;
         *reserves.get_mut(part_id) =
-            u64::try_from(aligned).context("Mach-O incremental reserve size overflowed u64")?;
+            incremental_reserve_allocation_size(current_size, padding_percent, alignment)?;
     }
     Ok(reserves)
+}
+
+fn incremental_reserve_allocation_size(
+    current_size: u64,
+    padding_percent: u32,
+    alignment: crate::alignment::Alignment,
+) -> Result<u64> {
+    let alignment = u128::from(alignment.value());
+    let current_size = u128::from(current_size);
+    let requested = (current_size * u128::from(padding_percent)).div_ceil(100);
+    let aligned_reserve = requested.max(1).div_ceil(alignment) * alignment;
+    let aligned_start = current_size.div_ceil(alignment) * alignment;
+    u64::try_from(aligned_start - current_size + aligned_reserve)
+        .context("Mach-O incremental reserve size overflowed u64")
 }
 
 pub(crate) fn incremental_reserve_alignment(
@@ -329,17 +337,18 @@ mod tests {
         *current_sizes.get_mut(rodata) = 800;
         *current_sizes.get_mut(gcc_except) = 1;
         *current_sizes.get_mut(data) = 100;
-        *current_sizes.get_mut(eh_frame) = 72;
+        *current_sizes.get_mut(eh_frame) = 76;
         *current_sizes.get_mut(part_id::SYMTAB_GLOBAL) = 160;
         *current_sizes.get_mut(part_id::STRTAB) = 100;
 
         let reserves = incremental_reserve_sizes(&current_sizes, 10).unwrap();
 
-        assert_eq!(*reserves.get(text), 44);
+        assert_eq!(*reserves.get(text), 47);
         assert_eq!(*reserves.get(rodata), 80);
-        assert_eq!(*reserves.get(gcc_except), 4);
+        assert_eq!(*reserves.get(gcc_except), 7);
         assert_eq!(*reserves.get(data), 12);
-        assert_eq!(*reserves.get(eh_frame), 8);
+        // Four bytes align the reserve start, followed by eight usable bytes.
+        assert_eq!(*reserves.get(eh_frame), 12);
         assert_eq!(*reserves.get(part_id::SYMTAB_GLOBAL), 16);
         assert_eq!(*reserves.get(part_id::STRTAB), 10);
     }

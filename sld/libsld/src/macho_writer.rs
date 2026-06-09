@@ -719,6 +719,7 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::aligned_incremental_reserve_range;
     use super::chained_fixup_page_count;
     use super::chained_fixup_slot_is_file_backed;
     use super::compact_unwind_dwarf_offset_hint;
@@ -728,6 +729,7 @@ mod tests {
     use super::rewrite_compacted_macho_eh_frame_cie_pointers;
     use super::section_may_contain_data_fixup;
     use super::sorted_ranges_contain;
+    use crate::alignment::Alignment;
     use crate::macho::MACHO_START_MEM_ADDRESS;
     use linker_utils::relaxation::SectionRelaxDeltas;
 
@@ -799,6 +801,21 @@ mod tests {
             0x10e24
         );
         assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
+    }
+
+    #[test]
+    fn incremental_reserve_record_skips_leading_alignment_padding() {
+        let alignment = Alignment { exponent: 3 };
+
+        assert_eq!(
+            aligned_incremental_reserve_range(100, 12, alignment).unwrap(),
+            (104, 8)
+        );
+        assert_eq!(
+            aligned_incremental_reserve_range(104, 8, alignment).unwrap(),
+            (104, 8)
+        );
+        assert!(aligned_incremental_reserve_range(100, 4, alignment).is_err());
     }
 
     #[test]
@@ -1086,14 +1103,35 @@ fn write_incremental_reserves(
         reserve.fill(0);
         let alignment = crate::macho::incremental_reserve_alignment(part_id)
             .context("Mach-O incremental reserve uses an unsupported output section")?;
+        let (aligned_output_offset, usable_size) =
+            aligned_incremental_reserve_range(output_offset as u64, size, alignment)?;
         incremental.record_reserved_range(
             part_id.output_section_id().as_usize() as u32,
             alignment.exponent,
-            output_offset as u64,
-            size,
+            aligned_output_offset,
+            usable_size,
         );
     }
     Ok(())
+}
+
+fn aligned_incremental_reserve_range(
+    output_offset: u64,
+    allocation_size: u64,
+    alignment: crate::alignment::Alignment,
+) -> Result<(u64, u64)> {
+    let aligned_output_offset = alignment.align_up(output_offset);
+    let leading_padding = aligned_output_offset
+        .checked_sub(output_offset)
+        .context("Mach-O incremental reserve alignment underflow")?;
+    let usable_size = allocation_size
+        .checked_sub(leading_padding)
+        .context("Mach-O incremental reserve is smaller than its leading padding")?;
+    ensure!(
+        usable_size > 0 && usable_size & alignment.mask() == 0,
+        "Mach-O incremental reserve has no aligned usable range"
+    );
+    Ok((aligned_output_offset, usable_size))
 }
 
 fn write_prelude<'data, A: Arch<Platform = MachO>>(
