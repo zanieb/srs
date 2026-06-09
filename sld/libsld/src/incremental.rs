@@ -11817,7 +11817,21 @@ fn apply_macho_text_relocation_replays(
             }
         }
         let Some((applied_target_value, written_value, relocated)) = selected else {
-            return Err("no reachable target for Mach-O text relocation".to_owned());
+            let candidates = replay
+                .current_relocation_target_candidates
+                .iter()
+                .map(|candidate| format!("{candidate:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "no reachable target for Mach-O text relocation in {} section {} offset {}: \
+                 type {}, place {current_place:#x}, target {:#x}, candidates [{candidates}]",
+                display_hex_text(&replay.input),
+                replay.section_index,
+                replay.current_range.start,
+                replay.r_type,
+                replay.current_target_value,
+            ));
         };
         current_bytes.copy_from_slice(&relocated);
         patch
@@ -38404,6 +38418,69 @@ mod tests {
         assert_eq!(
             relocations[0].output_offset,
             current_text_range.start as u64
+        );
+    }
+
+    #[test]
+    fn macho_text_relocation_replay_reports_unreachable_target_context() {
+        let previous_output = test_macho_object(b"\0\0\0\0", b"\x01\x02\x03\x04", 0);
+        let text_range = test_macho_section_range(&previous_output, "__text");
+        let input = "crate-hash.cgu.rcgu.o";
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("libarchive.rlib")),
+            input: SharedText::from(hex::encode(input)),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let target_value = 0x20_0000_0000;
+        let replay = rematerialized_macho_replay(input, "_target", target_value, target);
+        let expected_place = macho_output_address_for_file_offset(
+            &object::File::parse(&*previous_output).unwrap(),
+            text_range.start as u64,
+        )
+        .unwrap();
+        let replays = MachOTextRelocationReplays {
+            replays: vec![replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut patches = vec![ResolvedSectionPatch {
+            section: PatchSection {
+                input: hex::encode(input),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: text_range.start as u64,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 4,
+                data: vec![0; 4],
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+
+        let reason = apply_macho_text_relocation_replays(
+            &mut patches,
+            &replays,
+            &previous_output,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            reason,
+            format!(
+                "no reachable target for Mach-O text relocation in {input} section 1 offset 0: \
+                 type {}, place {expected_place:#x}, target {target_value:#x}, candidates \
+                 [{target_value:#x}]",
+                object::macho::ARM64_RELOC_PAGE21,
+            )
         );
     }
 
