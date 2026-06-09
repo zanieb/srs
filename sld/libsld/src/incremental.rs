@@ -97,7 +97,8 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const METADATA_UPDATE_FILE: &str = "metadata-update";
-const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v2";
+const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v3";
+const METADATA_UPDATE_VERSION_V2: &str = "sld-incremental-metadata-update-v2";
 const METADATA_UPDATE_VERSION_V1: &str = "sld-incremental-metadata-update-v1";
 const USER_STATE_DIR_ENV: &str = "SLD_STATE_DIR";
 const LOG_INCREMENTAL_LINK_OPTIONS_ENV: &str = "SLD_LOG_INCREMENTAL_LINK_OPTIONS";
@@ -544,6 +545,12 @@ pub(crate) struct SectionRecord {
 struct ReservedRangeRecord {
     output_section_id: u32,
     alignment_exponent: u8,
+    output_offset: u64,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReservedRangeAllocation {
     output_offset: u64,
     size: u64,
 }
@@ -5483,6 +5490,65 @@ impl CurrentState {
 }
 
 impl PersistedState {
+    fn allocate_reserved_range(
+        &mut self,
+        output_section_id: u32,
+        alignment_exponent: u8,
+        size: u64,
+    ) -> Result<Option<ReservedRangeAllocation>> {
+        if size == 0 {
+            return Ok(None);
+        }
+        validate_reserved_ranges(&self.reserved_ranges)?;
+        crate::alignment::Alignment::from_exponent(alignment_exponent.into())
+            .context("Invalid incremental reserve allocation alignment")?;
+        let Some((range_index, allocation_size)) = self
+            .reserved_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(range_index, range)| {
+                if range.output_section_id != output_section_id
+                    || range.alignment_exponent != alignment_exponent
+                {
+                    return None;
+                }
+                let alignment =
+                    crate::alignment::Alignment::from_exponent(range.alignment_exponent.into())
+                        .ok()?;
+                let allocation_size = size
+                    .checked_add(alignment.mask())
+                    .map(|size| alignment.align_down(size))?;
+                (range.size >= allocation_size).then_some((
+                    range_index,
+                    allocation_size,
+                    range.alignment_exponent,
+                    range.output_offset,
+                ))
+            })
+            .min_by_key(|(_, _, _, output_offset)| *output_offset)
+            .map(|(range_index, allocation_size, _, _)| (range_index, allocation_size))
+        else {
+            return Ok(None);
+        };
+
+        let range = &mut self.reserved_ranges[range_index];
+        let allocation = ReservedRangeAllocation {
+            output_offset: range.output_offset,
+            size: allocation_size,
+        };
+        range.output_offset = range
+            .output_offset
+            .checked_add(allocation_size)
+            .context("Incremental reserve allocation offset overflow")?;
+        range.size -= allocation_size;
+        if range.size == 0 {
+            self.reserved_ranges.swap_remove(range_index);
+        }
+        self.reserved_ranges.sort_unstable();
+        validate_reserved_ranges(&self.reserved_ranges)?;
+        Ok(Some(allocation))
+    }
+
     fn read(state_dir: &Path) -> Result<Option<Self>> {
         Self::read_impl(state_dir, true, PatchSectionReadMode::Parse, true)
     }
@@ -5538,6 +5604,9 @@ impl PersistedState {
             state.dynamic_relocations = records.dynamic_relocations;
         }
         state.apply_metadata_update(state_dir, patch_section_mode)?;
+        if load_sections {
+            validate_reserved_ranges_against_sections(&state.reserved_ranges, &state.sections)?;
+        }
         Ok(Some(state))
     }
 
@@ -5784,16 +5853,22 @@ impl PersistedState {
         let version = lines
             .next()
             .context("Missing incremental metadata update header")?;
-        if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
+        if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V2
+            && version != METADATA_UPDATE_VERSION_V1
+        {
             return Err(crate::error!(
                 "Unsupported incremental metadata update version `{version}`"
             ));
         }
         let _ = parse_link_start_line(lines.next())?;
-        let _ = parse_content_line(lines.next(), "output")?;
+        let output = parse_content_line(lines.next(), "output")?;
         let _ = parse_build_id_hash_line(lines.next())?;
-        if version == METADATA_UPDATE_VERSION {
+        if version == METADATA_UPDATE_VERSION || version == METADATA_UPDATE_VERSION_V2 {
             let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+        }
+        if version == METADATA_UPDATE_VERSION {
+            let _ = parse_reserved_range_table(&mut lines, output.len)?;
         }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
@@ -6160,6 +6235,7 @@ impl PersistedState {
         if lines.next().is_some() {
             return Err(crate::error!("Unexpected trailing incremental state data"));
         }
+        validate_reserved_ranges_against_sections(&reserved_ranges, &sections)?;
 
         Ok(Self {
             args_hash,
@@ -6409,6 +6485,7 @@ impl PersistedState {
                 .unwrap_or(ABSENT_FIELD)
         )
         .unwrap();
+        render_required_reserved_range_table(&mut out, &self.reserved_ranges);
         let mut input_indices = input_indices.to_vec();
         input_indices.sort_unstable();
         input_indices.dedup();
@@ -6508,7 +6585,10 @@ impl PersistedState {
         let version = lines
             .next()
             .context("Missing incremental metadata update header")?;
-        if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
+        if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V2
+            && version != METADATA_UPDATE_VERSION_V1
+        {
             return Err(crate::error!(
                 "Unsupported incremental metadata update version `{version}`"
             ));
@@ -6516,7 +6596,7 @@ impl PersistedState {
         self.link_start = parse_link_start_line(lines.next())?;
         self.output = parse_content_line(lines.next(), "output")?;
         self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
-        if version == METADATA_UPDATE_VERSION {
+        if version == METADATA_UPDATE_VERSION || version == METADATA_UPDATE_VERSION_V2 {
             let file = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
             self.macho_symbol_resolutions_file = if file == ABSENT_FIELD {
                 None
@@ -6525,6 +6605,9 @@ impl PersistedState {
                 Some(file.to_owned())
             };
             self.macho_symbol_resolutions.clear();
+        }
+        if version == METADATA_UPDATE_VERSION {
+            self.reserved_ranges = parse_reserved_range_table(&mut lines, self.output.len)?;
         }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
@@ -15242,8 +15325,8 @@ fn parse_reserved_range_table<'a>(
             .context("Incremental reserve range overflow")?;
         if size == 0
             || end > output_len
-            || output_offset != alignment.align_up(output_offset)
-            || size != alignment.align_up(size)
+            || output_offset & alignment.mask() != 0
+            || size & alignment.mask() != 0
         {
             return Err(crate::error!("Invalid incremental reserve range"));
         }
@@ -15263,6 +15346,14 @@ fn validate_reserved_ranges(ranges: &[ReservedRangeRecord]) -> Result {
     sorted.sort_unstable_by_key(|range| range.output_offset);
     let mut previous_end = 0;
     for range in sorted {
+        let alignment = crate::alignment::Alignment::from_exponent(range.alignment_exponent.into())
+            .context("Invalid incremental reserve alignment")?;
+        if range.size == 0
+            || range.output_offset & alignment.mask() != 0
+            || range.size & alignment.mask() != 0
+        {
+            return Err(crate::error!("Invalid incremental reserve range"));
+        }
         if range.output_offset < previous_end {
             return Err(crate::error!("Incremental reserve ranges overlap"));
         }
@@ -15274,10 +15365,38 @@ fn validate_reserved_ranges(ranges: &[ReservedRangeRecord]) -> Result {
     Ok(())
 }
 
+fn validate_reserved_ranges_against_sections(
+    ranges: &[ReservedRangeRecord],
+    sections: &[SectionRecord],
+) -> Result {
+    for range in ranges {
+        let range_end = range
+            .output_offset
+            .checked_add(range.size)
+            .context("Incremental reserve range overflow")?;
+        for section in sections {
+            let section_end = section
+                .output_offset
+                .checked_add(section.size)
+                .context("Incremental section range overflow")?;
+            if range.output_offset < section_end && section.output_offset < range_end {
+                return Err(crate::error!(
+                    "Incremental reserve range overlaps a section record"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn render_reserved_range_table(out: &mut String, ranges: &[ReservedRangeRecord]) {
     if ranges.is_empty() {
         return;
     }
+    render_required_reserved_range_table(out, ranges);
+}
+
+fn render_required_reserved_range_table(out: &mut String, ranges: &[ReservedRangeRecord]) {
     writeln!(out, "reserves\t{}", ranges.len()).unwrap();
     for range in ranges {
         writeln!(
@@ -17540,16 +17659,22 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
     let version = lines
         .next()
         .context("Missing incremental metadata update header")?;
-    if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
+    if version != METADATA_UPDATE_VERSION
+        && version != METADATA_UPDATE_VERSION_V2
+        && version != METADATA_UPDATE_VERSION_V1
+    {
         return Err(crate::error!(
             "Unsupported incremental metadata update version `{version}`"
         ));
     }
     let _ = parse_link_start_line(lines.next())?;
-    let _ = parse_content_line(lines.next(), "output")?;
+    let output = parse_content_line(lines.next(), "output")?;
     let _ = parse_build_id_hash_line(lines.next())?;
-    if version == METADATA_UPDATE_VERSION {
+    if version == METADATA_UPDATE_VERSION || version == METADATA_UPDATE_VERSION_V2 {
         let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+    }
+    if version == METADATA_UPDATE_VERSION {
+        let _ = parse_reserved_range_table(&mut lines, output.len)?;
     }
     let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
         .parse()
@@ -24221,6 +24346,217 @@ mod tests {
     }
 
     #[test]
+    fn reserved_ranges_overlapping_sections_are_rejected() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 16, 8));
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 20,
+            size: 8,
+        }];
+
+        let error = PersistedState::parse(&state.render()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reserve range overlaps a section record")
+        );
+    }
+
+    #[test]
+    fn reserved_range_allocation_is_exact_part_first_fit() {
+        let output = [0; 96];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![
+            ReservedRangeRecord {
+                output_section_id: 4,
+                alignment_exponent: 2,
+                output_offset: 64,
+                size: 16,
+            },
+            ReservedRangeRecord {
+                output_section_id: 5,
+                alignment_exponent: 2,
+                output_offset: 16,
+                size: 16,
+            },
+            ReservedRangeRecord {
+                output_section_id: 4,
+                alignment_exponent: 3,
+                output_offset: 32,
+                size: 16,
+            },
+            ReservedRangeRecord {
+                output_section_id: 4,
+                alignment_exponent: 2,
+                output_offset: 48,
+                size: 8,
+            },
+        ];
+
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 48,
+                size: 8,
+            })
+        );
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 9).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 64,
+                size: 12,
+            })
+        );
+        assert_eq!(
+            state.allocate_reserved_range(4, 3, 8).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 32,
+                size: 8,
+            })
+        );
+        assert_eq!(
+            state.reserved_ranges,
+            vec![
+                ReservedRangeRecord {
+                    output_section_id: 4,
+                    alignment_exponent: 2,
+                    output_offset: 76,
+                    size: 4,
+                },
+                ReservedRangeRecord {
+                    output_section_id: 4,
+                    alignment_exponent: 3,
+                    output_offset: 40,
+                    size: 8,
+                },
+                ReservedRangeRecord {
+                    output_section_id: 5,
+                    alignment_exponent: 2,
+                    output_offset: 16,
+                    size: 16,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_reserved_range_allocation_does_not_mutate_state() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 16,
+            size: 8,
+        }];
+        let previous = state.reserved_ranges.clone();
+
+        assert_eq!(state.allocate_reserved_range(4, 2, 9).unwrap(), None);
+        assert_eq!(state.allocate_reserved_range(4, 3, 8).unwrap(), None);
+        assert_eq!(state.allocate_reserved_range(5, 2, 8).unwrap(), None);
+        assert_eq!(state.allocate_reserved_range(4, 2, 0).unwrap(), None);
+        assert_eq!(state.reserved_ranges, previous);
+
+        state.reserved_ranges[0].alignment_exponent = 3;
+        let previous = state.reserved_ranges.clone();
+        assert_eq!(state.allocate_reserved_range(4, 2, 8).unwrap(), None);
+        assert_eq!(state.reserved_ranges, previous);
+    }
+
+    #[test]
+    fn reserved_range_allocations_chain_and_exhaust_the_arena() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 16,
+            size: 16,
+        }];
+
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 1).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 16,
+                size: 4,
+            })
+        );
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 20,
+                size: 8,
+            })
+        );
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 4).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 28,
+                size: 4,
+            })
+        );
+        assert!(state.reserved_ranges.is_empty());
+        assert_eq!(state.allocate_reserved_range(4, 2, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn reserved_range_allocation_survives_state_round_trip() {
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 32,
+            size: 16,
+        }];
+
+        assert_eq!(
+            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 32,
+                size: 8,
+            })
+        );
+        let mut parsed = PersistedState::parse(&state.render()).unwrap();
+        assert_eq!(
+            parsed.allocate_reserved_range(4, 2, 8).unwrap(),
+            Some(ReservedRangeAllocation {
+                output_offset: 40,
+                size: 8,
+            })
+        );
+        assert!(parsed.reserved_ranges.is_empty());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn indexed_state_rejects_reserved_ranges_overlapping_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = [0; 64];
+        let mut state = state("args", &output, &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 16, 8));
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 20,
+            size: 8,
+        }];
+        state.write(dir.path()).unwrap();
+
+        let error = PersistedState::read(dir.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reserve range overlaps a section record")
+        );
+    }
+
+    #[test]
     fn macho_symbol_resolutions_round_trip() {
         let resolutions = vec![
             MachOSymbolResolutionRecord {
@@ -25950,6 +26286,34 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn v2_metadata_update_preserves_index_reserved_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", &[0; 16], &[("a.o", b"a")]);
+        state.reserved_ranges = vec![ReservedRangeRecord {
+            output_section_id: 4,
+            alignment_exponent: 2,
+            output_offset: 8,
+            size: 8,
+        }];
+        state.write(dir.path()).unwrap();
+        let rendered = state
+            .render_metadata_update(&[0])
+            .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V2, 1)
+            .lines()
+            .filter(|line| !line.starts_with("reserves\t") && !line.starts_with("reserve\t"))
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+        std::fs::write(metadata_update_path(dir.path()), rendered).unwrap();
+
+        let parsed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+
+        assert_eq!(parsed.reserved_ranges, state.reserved_ranges);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn v1_metadata_update_preserves_macho_resolution_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a")]);
@@ -25960,7 +26324,11 @@ mod tests {
             .render_metadata_update(&[0])
             .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V1, 1)
             .lines()
-            .filter(|line| !line.starts_with("macho-resolutions-file\t"))
+            .filter(|line| {
+                !line.starts_with("macho-resolutions-file\t")
+                    && !line.starts_with("reserves\t")
+                    && !line.starts_with("reserve\t")
+            })
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
