@@ -147,6 +147,10 @@ pub(crate) fn incremental_reserve_alignment(
     })
 }
 
+fn epilogue_advances_incremental_reserve(part_id: crate::part_id::PartId) -> bool {
+    !matches!(part_id, part_id::SYMTAB_GLOBAL | part_id::STRTAB)
+}
+
 /// Mach-O uses a zero page for all 32bit addresses and thus we begin the memory
 /// offsets right after that (1GiB).
 pub(crate) const MACHO_START_MEM_ADDRESS: u64 = 0x1_0000_0000;
@@ -343,6 +347,19 @@ mod tests {
         let reserves = incremental_reserve_sizes(&current_sizes, 0).unwrap();
 
         assert_eq!(*reserves.get(text), 0);
+    }
+
+    #[test]
+    fn common_group_advances_incremental_symbol_table_reserves() {
+        let text = output_section_id::TEXT.part_id_with_alignment(Alignment { exponent: 2 });
+
+        assert!(!super::epilogue_advances_incremental_reserve(
+            part_id::SYMTAB_GLOBAL
+        ));
+        assert!(!super::epilogue_advances_incremental_reserve(
+            part_id::STRTAB
+        ));
+        assert!(super::epilogue_advances_incremental_reserve(text));
     }
 
     #[test]
@@ -2100,8 +2117,9 @@ impl platform::Platform for MachO {
         );
         if let Some(reserves) = &epilogue_state.incremental_reserves {
             for (part_index, &size) in reserves.parts.iter().enumerate() {
-                if size > 0 {
-                    memory_offsets.increment(part_id::PartId::from_usize(part_index), size);
+                let part_id = part_id::PartId::from_usize(part_index);
+                if size > 0 && epilogue_advances_incremental_reserve(part_id) {
+                    memory_offsets.increment(part_id, size);
                 }
             }
         }
