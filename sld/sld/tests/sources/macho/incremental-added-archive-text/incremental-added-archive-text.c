@@ -3,7 +3,7 @@
 //#Archive:incremental-added-archive-root.S
 //#RunEnabled:true
 //#DiffEnabled:false
-//#SldExtraLinkArgs:--incremental-padding-percent=100
+//#SldExtraLinkArgs:--incremental-padding-percent=300
 //#TestIncremental:true
 //#TestIncrementalCompareFull:false
 //#TestIncrementalPrivateSignedMachOOutput:true
@@ -16,6 +16,7 @@
 //#TestIncrementalChangedPatchedSectionCount:3
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
+//#TestIncrementalChangedSymbolBytes:_incremental_added_archive_extra_second=0xc0028052
 
 #include "../common/runtime.h"
 

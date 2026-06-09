@@ -2765,7 +2765,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     current_sections.push(activation.section.clone());
                 }
             }
-            let added_macho_archive_text_activation =
+            let mut added_macho_archive_text_activation =
                 if let Some(added_identifiers) = added_archive_member_identifiers.as_deref() {
                     match added_macho_archive_text_activations(
                         &bytes,
@@ -3224,6 +3224,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 };
                 current_sections = resolved_sections;
             }
+            let added_macho_archive_symbol_table_patches = added_macho_archive_text_activation
+                .as_mut()
+                .map(|activation| std::mem::take(&mut activation.symbol_table_patches))
+                .unwrap_or_default();
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
             patched_section_count += dynamic_relocation_patches.len();
             patched_section_count += relocation_addend_patches.output_patches.len();
@@ -3274,6 +3278,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(relocation_addend_patches.output_patches)
                     .chain(relocation_target_patches.output_patches)
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
+                    .chain(added_macho_archive_symbol_table_patches)
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
                 input_fde_add_candidates,
@@ -4731,12 +4736,12 @@ struct MachOTextSectionActivation {
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
 
-#[derive(Debug)]
 struct AddedMachOArchiveTextActivations {
     normalized_identifiers: Vec<Vec<u8>>,
     sections: Vec<PatchSection>,
     records: Vec<SectionRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    symbol_table_patches: Vec<SectionPatch>,
     relocation_replays: Vec<MachOTextRelocationReplay>,
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
@@ -4749,6 +4754,8 @@ struct AddedMachOArchiveTextMember {
     alignment_exponent: u8,
     definition_name: Vec<u8>,
     definition_offset: u64,
+    definition_desc: u16,
+    definition_private_external: bool,
     referenced_names: Vec<Vec<u8>>,
 }
 
@@ -11935,6 +11942,17 @@ fn added_macho_archive_text_activations(
             target: Some(target),
         });
     }
+    let symbol_table_patches = match added_macho_symbol_table_patches(
+        previous_output,
+        &output_file,
+        &members,
+        &selected_indices,
+        &symbol_resolutions,
+        &mut remaining_reserved_ranges,
+    )? {
+        Ok(patches) => patches,
+        Err(reason) => return Ok(Err(reason)),
+    };
 
     let mut combined_resolutions = resolutions.to_vec();
     combined_resolutions.extend(symbol_resolutions.iter().cloned());
@@ -11960,9 +11978,152 @@ fn added_macho_archive_text_activations(
         sections,
         records,
         symbol_resolutions,
+        symbol_table_patches,
         relocation_replays,
         remaining_reserved_ranges,
     }))
+}
+
+fn added_macho_symbol_table_patches(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    members: &[AddedMachOArchiveTextMember],
+    selected_indices: &[usize],
+    resolutions: &[MachOSymbolResolutionRecord],
+    remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
+) -> Result<std::result::Result<Vec<SectionPatch>, String>> {
+    let Some(text_section) = output_file.sections().find(|section| {
+        section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+            && section.name_bytes().ok() == Some(b"__text".as_slice())
+    }) else {
+        return Ok(Err(
+            "previous Mach-O output has no __TEXT,__text section".to_owned()
+        ));
+    };
+    let text_section_index = u8::try_from(text_section.index().0)
+        .context("Mach-O text output section index exceeds u8")?;
+    let Some(string_table_offset) = macho_string_table_offset(previous_output) else {
+        return Ok(Err(
+            "previous Mach-O output has no usable symbol string table".to_owned(),
+        ));
+    };
+    let symbol_output_section_id =
+        u32::try_from(crate::output_section_id::SYMTAB_GLOBAL.as_usize())
+            .context("Mach-O symbol table output section ID exceeds u32")?;
+    let string_output_section_id = u32::try_from(crate::output_section_id::STRTAB.as_usize())
+        .context("Mach-O string table output section ID exceeds u32")?;
+    let symbol_entry_size = u64::try_from(std::mem::size_of::<
+        object::macho::Nlist64<object::Endianness>,
+    >())
+    .context("Mach-O symbol table entry size exceeds u64")?;
+    let mut patches = Vec::with_capacity(selected_indices.len() * 2);
+
+    for (&member_index, resolution) in selected_indices.iter().zip(resolutions) {
+        let member = &members[member_index];
+        let Some(value) = resolution.direct_value else {
+            return Ok(Err(
+                "added Mach-O archive member definition has no direct value".to_owned(),
+            ));
+        };
+        if output_file.symbols().any(|symbol| {
+            symbol
+                .name_bytes()
+                .is_ok_and(|name| name == member.definition_name.as_slice())
+        }) {
+            return Ok(Err(
+                "added Mach-O archive member definition already exists in output".to_owned(),
+            ));
+        }
+        let Some(symbol_allocation) = allocate_reserved_range(
+            remaining_reserved_ranges,
+            symbol_output_section_id,
+            crate::alignment::SYMTAB_ENTRY.exponent,
+            symbol_entry_size,
+        )?
+        else {
+            return Ok(Err(
+                "insufficient incremental reserve for added Mach-O symbol table entry".to_owned(),
+            ));
+        };
+        let string_size = u64::try_from(member.definition_name.len() + 1)
+            .context("Added Mach-O symbol name is too large")?;
+        let Some(string_allocation) = allocate_reserved_range(
+            remaining_reserved_ranges,
+            string_output_section_id,
+            0,
+            string_size,
+        )?
+        else {
+            return Ok(Err(
+                "insufficient incremental reserve for added Mach-O symbol name".to_owned(),
+            ));
+        };
+        let string_index = string_allocation
+            .output_offset
+            .checked_sub(string_table_offset)
+            .and_then(|offset| u32::try_from(offset).ok());
+        let Some(string_index) = string_index else {
+            return Ok(Err(
+                "added Mach-O symbol name is outside the string table".to_owned()
+            ));
+        };
+
+        let mut entry = Vec::with_capacity(symbol_entry_size as usize);
+        entry.extend_from_slice(&string_index.to_le_bytes());
+        let mut symbol_type = object::macho::N_SECT | object::macho::N_EXT;
+        if member.definition_private_external {
+            symbol_type |= object::macho::N_PEXT;
+        }
+        entry.push(symbol_type);
+        entry.push(text_section_index);
+        entry.extend_from_slice(&member.definition_desc.to_le_bytes());
+        entry.extend_from_slice(&value.to_le_bytes());
+        debug_assert_eq!(entry.len() as u64, symbol_entry_size);
+        patches.push(SectionPatch {
+            output_offset: symbol_allocation.output_offset,
+            size: symbol_allocation.size,
+            data: entry,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+
+        let mut name = member.definition_name.clone();
+        name.push(0);
+        patches.push(SectionPatch {
+            output_offset: string_allocation.output_offset,
+            size: string_allocation.size,
+            data: name,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+    Ok(Ok(patches))
+}
+
+fn macho_string_table_offset(bytes: &[u8]) -> Option<u64> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0).ok()?;
+    let endian = header.endian().ok()?;
+    if endian != object::Endianness::Little {
+        return None;
+    }
+    let mut commands = header.load_commands(endian, bytes, 0).ok()?;
+    let mut string_table_offset = None;
+    while let Some(command) = commands.next().ok()? {
+        let Some(command) = command.symtab().ok()? else {
+            continue;
+        };
+        if string_table_offset
+            .replace(u64::from(command.stroff.get(endian)))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    string_table_offset
 }
 
 fn added_macho_archive_text_member(
@@ -12039,10 +12200,20 @@ fn added_macho_archive_text_member(
             ));
         }
         if symbol.is_global() {
+            let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+                return Ok(Err(
+                    "added Mach-O archive member definition has non-Mach-O flags".to_owned(),
+                ));
+            };
             if symbol.is_weak()
                 || name.is_empty()
                 || definition
-                    .replace((name.to_vec(), symbol.address()))
+                    .replace((
+                        name.to_vec(),
+                        symbol.address(),
+                        n_desc,
+                        symbol.scope() == object::SymbolScope::Linkage,
+                    ))
                     .is_some()
             {
                 return Ok(Err(
@@ -12058,7 +12229,9 @@ fn added_macho_archive_text_member(
             ));
         }
     }
-    let Some((definition_name, definition_address)) = definition else {
+    let Some((definition_name, definition_address, definition_desc, definition_private_external)) =
+        definition
+    else {
         return Ok(Err(
             "added Mach-O archive member has no strong global definition".to_owned(),
         ));
@@ -12124,6 +12297,8 @@ fn added_macho_archive_text_member(
         alignment_exponent: alignment.exponent,
         definition_name,
         definition_offset,
+        definition_desc,
+        definition_private_external,
         referenced_names,
     }))
 }
@@ -25474,6 +25649,8 @@ mod tests {
             alignment_exponent: 0,
             definition_name: definition.to_vec(),
             definition_offset: 0,
+            definition_desc: 0,
+            definition_private_external: false,
             referenced_names: references
                 .iter()
                 .map(|reference| reference.to_vec())
