@@ -8372,8 +8372,22 @@ fn macho_text_relocation_target_candidates(
     {
         candidates.extend_from_slice(&resolution.thunk_addresses);
     }
-    candidates.dedup();
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(*candidate));
     candidates
+}
+
+fn macho_aarch64_applied_target_addend(
+    r_type: u8,
+    target_value: u64,
+    applied_target_value: u64,
+    addend: i64,
+) -> i64 {
+    if r_type == object::macho::ARM64_RELOC_BRANCH26 && applied_target_value != target_value {
+        0
+    } else {
+        addend
+    }
 }
 
 fn rematerialized_macho_text_relocation_replay(
@@ -9186,7 +9200,12 @@ fn apply_macho_text_relocation_replays(
             if macho_aarch64_relocated_value(
                 replay.r_type,
                 previous_applied_target_value,
-                replay.addend,
+                macho_aarch64_applied_target_addend(
+                    replay.r_type,
+                    replay.current_target_value,
+                    previous_applied_target_value,
+                    replay.addend,
+                ),
                 previous_place,
             ) != Some(previous_written_value)
             {
@@ -9203,7 +9222,12 @@ fn apply_macho_text_relocation_replays(
             let Some(written_value) = macho_aarch64_relocated_value(
                 replay.r_type,
                 *target_value,
-                replay.addend,
+                macho_aarch64_applied_target_addend(
+                    replay.r_type,
+                    replay.current_target_value,
+                    *target_value,
+                    replay.addend,
+                ),
                 current_place,
             ) else {
                 continue;
@@ -18040,6 +18064,17 @@ mod tests {
         )
     }
 
+    fn current_relocation_as_v37_line(line: &str) -> String {
+        let Some(rest) = line.strip_prefix("reloc3\t") else {
+            return line.to_owned();
+        };
+        let fields = rest.split('\t').collect::<Vec<_>>();
+        let mut fields_without_applied_target = Vec::with_capacity(fields.len() - 1);
+        fields_without_applied_target.extend_from_slice(&fields[..10]);
+        fields_without_applied_target.extend_from_slice(&fields[11..]);
+        format!("reloc2\t{}", fields_without_applied_target.join("\t"))
+    }
+
     fn current_relocation_as_v24_line(line: &str) -> String {
         let Some(rest) = line.strip_prefix("reloc3\t") else {
             return line.to_owned();
@@ -23156,14 +23191,48 @@ mod tests {
             1,
             -4,
         ));
+        state.relocations[0].applied_target_value = Some(0x9abc);
 
         let rendered = state.render();
 
         assert!(rendered.contains("\nrelocs\t1\n"));
         assert!(rendered.contains(
-            "\nreloc3\t0\t1\t42\t8\t300\t8\t1\t-4\t22136\t4660\t-\t746172676574\t0\t2\t16\n"
+            "\nreloc3\t0\t1\t42\t8\t300\t8\t1\t-4\t22136\t4660\t39612\t746172676574\t0\t2\t16\n"
         ));
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn v37_relocation_records_are_accepted_without_applied_target_value() {
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            42,
+            Some(0x5678),
+            0x1234,
+            Some("target"),
+            Some(("a.o", 2, 16)),
+            8,
+            300,
+            8,
+            1,
+            -4,
+        ));
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V37, 1)
+            .lines()
+            .map(current_relocation_as_v37_line)
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed.relocations, state.relocations);
+        assert_eq!(parsed.relocations[0].applied_target_value, None);
     }
 
     #[test]
@@ -26341,6 +26410,37 @@ mod tests {
                 0,
             ),
             Some(0x1234_5678)
+        );
+    }
+
+    #[test]
+    fn macho_indirect_branch_targets_ignore_symbol_addends() {
+        assert_eq!(
+            macho_aarch64_applied_target_addend(
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x4000,
+                0x4000,
+                4,
+            ),
+            4
+        );
+        assert_eq!(
+            macho_aarch64_applied_target_addend(
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x4000,
+                0x8000,
+                4,
+            ),
+            0
+        );
+        assert_eq!(
+            macho_aarch64_applied_target_addend(
+                object::macho::ARM64_RELOC_PAGEOFF12,
+                0x4000,
+                0x8000,
+                4,
+            ),
+            4
         );
     }
 
