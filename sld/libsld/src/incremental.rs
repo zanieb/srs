@@ -959,6 +959,13 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     if sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version).is_some() {
         return Ok(false);
     }
+    if previous.needs_indexed_macho_resolution_migration() {
+        append_log(
+            &state_dir,
+            "incremental fast path unavailable before loading inputs: indexed records need Mach-O resolution migration",
+        )?;
+        return Ok(false);
+    }
     let retained_output_to_restore = if args.should_retain_output_snapshot()
         && !args.output().try_exists().unwrap_or(false)
     {
@@ -8006,6 +8013,12 @@ fn allocate_reserved_range(
 }
 
 impl PersistedState {
+    fn needs_indexed_macho_resolution_migration(&self) -> bool {
+        self.patch_records_file.is_some()
+            && self.macho_symbol_resolutions_file.is_some()
+            && self.indexed_macho_symbol_resolutions_file.is_none()
+    }
+
     fn read(state_dir: &Path) -> Result<Option<Self>> {
         Self::read_impl(state_dir, true, PatchSectionReadMode::Parse, true)
     }
@@ -8925,19 +8938,30 @@ impl PersistedState {
     }
 
     fn write(&self, state_dir: &Path) -> Result {
-        let macho_symbol_resolutions_file = if self.macho_symbol_resolutions.is_empty() {
+        let loaded_macho_symbol_resolutions;
+        let macho_symbol_resolutions = if self.macho_symbol_resolutions.is_empty()
+            && let Some(file_name) = self.macho_symbol_resolutions_file.as_deref()
+        {
+            loaded_macho_symbol_resolutions = read_macho_resolutions_sidecar(state_dir, file_name)?;
+            loaded_macho_symbol_resolutions.as_slice()
+        } else {
+            self.macho_symbol_resolutions.as_slice()
+        };
+        let macho_symbol_resolutions_file = if macho_symbol_resolutions.is_empty() {
+            self.macho_symbol_resolutions_file.clone()
+        } else if self.macho_symbol_resolutions.is_empty() {
             self.macho_symbol_resolutions_file.clone()
         } else {
             Some(write_macho_resolutions_sidecar(
                 state_dir,
-                &self.macho_symbol_resolutions,
+                macho_symbol_resolutions,
             )?)
         };
         let (sections_file, locations) = write_indexed_records_streaming(
             state_dir,
             &self.sections,
             &self.relocations,
-            &self.macho_symbol_resolutions,
+            macho_symbol_resolutions,
             &self.fdes,
             &self.dynamic_relocations,
         )?;
@@ -8947,6 +8971,7 @@ impl PersistedState {
             Some(&sections_file),
             &locations,
             None,
+            macho_symbol_resolutions_file.as_deref(),
             macho_symbol_resolutions_file.as_deref(),
         )
     }
@@ -8959,6 +8984,7 @@ impl PersistedState {
             &[],
             None,
             self.macho_symbol_resolutions_file.as_deref(),
+            None,
         )
     }
 
@@ -9134,6 +9160,7 @@ impl PersistedState {
             &self.patch_record_locations,
             self.raw_patch_record_locations.as_deref(),
             self.macho_symbol_resolutions_file.as_deref(),
+            self.indexed_macho_symbol_resolutions_file.as_deref(),
         )
     }
 
@@ -9145,6 +9172,7 @@ impl PersistedState {
         patch_record_locations: &[PatchRecordLocation],
         raw_patch_record_locations: Option<&str>,
         macho_symbol_resolutions_file: Option<&str>,
+        indexed_macho_symbol_resolutions_file: Option<&str>,
     ) -> Result {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
@@ -9163,6 +9191,7 @@ impl PersistedState {
                 patch_record_locations,
                 raw_patch_record_locations,
                 macho_symbol_resolutions_file,
+                indexed_macho_symbol_resolutions_file,
             ),
         )
         .with_context(|| format!("Failed to write incremental state `{}`", tmp_path.display()))?;
@@ -9207,9 +9236,12 @@ impl PersistedState {
         patch_record_locations: &[PatchRecordLocation],
         raw_patch_record_locations: Option<&str>,
         macho_symbol_resolutions_file: Option<&str>,
+        indexed_macho_symbol_resolutions_file: Option<&str>,
     ) -> String {
-        let mut out = self
-            .render_header_and_inputs_with_macho_resolutions_file(macho_symbol_resolutions_file);
+        let mut out = self.render_header_and_inputs_with_macho_resolutions_files(
+            macho_symbol_resolutions_file,
+            indexed_macho_symbol_resolutions_file,
+        );
         if patch_records_file == Some(sections_file) {
             writeln!(&mut out, "indexed-sections-file\t{sections_file}").unwrap();
             render_patch_record_location_table(
@@ -9311,14 +9343,16 @@ impl PersistedState {
 
     #[cfg(test)]
     fn render_header_and_inputs(&self) -> String {
-        self.render_header_and_inputs_with_macho_resolutions_file(
+        self.render_header_and_inputs_with_macho_resolutions_files(
             self.macho_symbol_resolutions_file.as_deref(),
+            self.indexed_macho_symbol_resolutions_file.as_deref(),
         )
     }
 
-    fn render_header_and_inputs_with_macho_resolutions_file(
+    fn render_header_and_inputs_with_macho_resolutions_files(
         &self,
         macho_symbol_resolutions_file: Option<&str>,
+        indexed_macho_symbol_resolutions_file: Option<&str>,
     ) -> String {
         let mut out = String::new();
         writeln!(&mut out, "{STATE_VERSION}").unwrap();
@@ -9366,10 +9400,10 @@ impl PersistedState {
             macho_symbol_resolutions_file.unwrap_or(ABSENT_FIELD)
         )
         .unwrap();
-        if let Some(macho_symbol_resolutions_file) = macho_symbol_resolutions_file {
+        if let Some(indexed_macho_symbol_resolutions_file) = indexed_macho_symbol_resolutions_file {
             writeln!(
                 &mut out,
-                "indexed-macho-resolutions-file\t{macho_symbol_resolutions_file}"
+                "indexed-macho-resolutions-file\t{indexed_macho_symbol_resolutions_file}"
             )
             .unwrap();
         }
@@ -43898,6 +43932,45 @@ mod tests {
         assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn v44_indexed_records_require_macho_resolution_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state
+            .macho_symbol_resolutions
+            .push(MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode("_target")),
+                direct_value: Some(0x1000),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(RelocationTargetRecord {
+                    input_file: SharedText::from(hex::encode("a.o")),
+                    input: SharedText::from(hex::encode("a.o")),
+                    section_index: 1,
+                    section_offset: 0,
+                }),
+            });
+        state.write(dir.path()).unwrap();
+
+        let current = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        let current_metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert!(!current_metadata.needs_indexed_macho_resolution_migration());
+        let legacy = current
+            .replacen(STATE_VERSION, STATE_VERSION_V44, 1)
+            .lines()
+            .filter(|line| !line.starts_with("indexed-macho-resolutions-file\t"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.path().join(INDEX_FILE), legacy).unwrap();
+
+        let legacy_metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert!(legacy_metadata.needs_indexed_macho_resolution_migration());
+    }
+
     #[test]
     fn v43_state_version_is_accepted() {
         let state = state("args", b"output", &[("a.o", b"a")]);
@@ -44810,7 +44883,7 @@ mod tests {
         });
         state.sections.push(section_record("a.o", 1, 100, 8));
         state.macho_symbol_resolutions_file =
-            Some(format!("{COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX}old"));
+            Some(write_macho_resolutions_sidecar(dir.path(), &[]).unwrap());
         state.write(dir.path()).unwrap();
         let base_index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
         let mut updated = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
@@ -44948,9 +45021,7 @@ mod tests {
         let base_sections = std::fs::read(dir.path().join(&base_sections_file)).unwrap();
 
         let mut updated = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
-        updated
-            .load_macho_symbol_resolutions(dir.path())
-            .unwrap();
+        updated.load_macho_symbol_resolutions(dir.path()).unwrap();
         updated
             .sections
             .retain(|record| record.input_file != hex::encode("a.o"));
@@ -45264,7 +45335,7 @@ mod tests {
     fn v1_metadata_update_preserves_macho_resolution_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a")]);
-        let file_name = format!("{COMPRESSED_MACHO_RESOLUTIONS_FILE_PREFIX}old");
+        let file_name = write_macho_resolutions_sidecar(dir.path(), &[]).unwrap();
         state.macho_symbol_resolutions_file = Some(file_name.clone());
         state.write(dir.path()).unwrap();
         let rendered = state
@@ -45693,6 +45764,47 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn reused_state_rebuilds_indexed_macho_resolutions_from_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: SharedText::from(hex::encode("a.o")),
+                input: SharedText::from(hex::encode("a.o")),
+                section_index: 1,
+                section_offset: 4,
+            }),
+        };
+        state.macho_symbol_resolutions.push(resolution.clone());
+        state.write(dir.path()).unwrap();
+
+        let mut reused = PersistedState::read(dir.path()).unwrap().unwrap();
+        reused.macho_symbol_resolutions.clear();
+        reused.write(dir.path()).unwrap();
+
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let path = dir
+            .path()
+            .join(metadata.macho_symbol_resolutions_file.as_ref().unwrap());
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&path, contents).unwrap();
+        let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
+        metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap();
+
+        assert_eq!(metadata.macho_symbol_resolutions, vec![resolution]);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn selective_record_read_rejects_stale_indexed_macho_resolutions() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a")]);
@@ -45739,6 +45851,20 @@ mod tests {
             metadata.macho_symbol_resolutions[0].direct_value,
             Some(0x2000)
         );
+
+        metadata.write_index(dir.path()).unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert_ne!(
+            metadata.indexed_macho_symbol_resolutions_file,
+            metadata.macho_symbol_resolutions_file
+        );
+        metadata
+            .read_records_for_input_files(dir.path(), &input_files)
+            .unwrap();
+        assert_eq!(
+            metadata.macho_symbol_resolutions[0].direct_value,
+            Some(0x2000)
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -45756,6 +45882,7 @@ mod tests {
             "sections-records",
             Some("sections-patches"),
             std::slice::from_ref(&location),
+            None,
             None,
             None,
         );
@@ -45939,7 +46066,7 @@ mod tests {
             hash: hash_bytes(sidecar.as_bytes()),
         };
         let index = state
-            .render_index(&file_name, Some(&file_name), &[location], None, None)
+            .render_index(&file_name, Some(&file_name), &[location], None, None, None)
             .replacen(STATE_VERSION, STATE_VERSION_V30, 1);
         std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
 
