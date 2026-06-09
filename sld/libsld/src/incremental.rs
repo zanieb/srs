@@ -9459,6 +9459,7 @@ fn macho_output_address_for_current_target(
     relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
     target: &RelocationTargetRecord,
+    previous_target: &RelocationTargetRecord,
 ) -> Option<u64> {
     if let Some(value) = macho_output_address_for_current_section_offset(
         output_file,
@@ -9473,12 +9474,18 @@ fn macho_output_address_for_current_target(
     unique_macho_target_value(
         relocations
             .iter()
-            .filter(|relocation| relocation.target.as_ref() == Some(target))
+            .filter(|relocation| {
+                relocation.target.as_ref() == Some(target)
+                    || relocation.target.as_ref() == Some(previous_target)
+            })
             .map(|relocation| relocation.target_value)
             .chain(
                 resolutions
                     .iter()
-                    .filter(|resolution| resolution.target.as_ref() == Some(target))
+                    .filter(|resolution| {
+                        resolution.target.as_ref() == Some(target)
+                            || resolution.target.as_ref() == Some(previous_target)
+                    })
                     .filter_map(|resolution| resolution.direct_value),
             ),
     )
@@ -9727,6 +9734,12 @@ fn rematerialized_macho_text_relocation_replay(
                     section_index: section_index.0 as u32,
                     section_offset,
                 };
+                let previous_target = RelocationTargetRecord {
+                    input_file: current_target.input_file.clone(),
+                    input: patch_section.previous.input.clone().into(),
+                    section_index: current_target.section_index,
+                    section_offset,
+                };
                 let Some(value) = macho_output_address_for_current_target(
                     output_file,
                     current_file,
@@ -9734,9 +9747,13 @@ fn rematerialized_macho_text_relocation_replay(
                     relocations,
                     resolutions,
                     &current_target,
+                    &previous_target,
                 ) else {
                     return Ok(Err(format!(
-                        "could not resolve current Mach-O text relocation target in {}",
+                        "could not resolve current Mach-O text relocation target {} in section {} \
+                         at offset {section_offset} in {}",
+                        display_hex_text(&hex::encode(&name)),
+                        section_index.0,
                         display_hex_path(&input.path)
                     )));
                 };
@@ -9790,6 +9807,12 @@ fn rematerialized_macho_text_relocation_replay(
                 section_index: section_index.0 as u32,
                 section_offset: 0,
             };
+            let previous_target = RelocationTargetRecord {
+                input_file: current_target.input_file.clone(),
+                input: patch_section.previous.input.clone().into(),
+                section_index: current_target.section_index,
+                section_offset: 0,
+            };
             let Some(value) = macho_output_address_for_current_target(
                 output_file,
                 current_file,
@@ -9797,9 +9820,11 @@ fn rematerialized_macho_text_relocation_replay(
                 relocations,
                 resolutions,
                 &current_target,
+                &previous_target,
             ) else {
                 return Ok(Err(format!(
-                    "could not resolve current Mach-O text relocation section in {}",
+                    "could not resolve current Mach-O text relocation section {} in {}",
+                    section_index.0,
                     display_hex_path(&input.path)
                 )));
             };
