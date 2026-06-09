@@ -20,6 +20,7 @@ use linker_utils::x86_64;
 use memmap2::MmapOptions;
 use object::Object as _;
 use object::ObjectSection as _;
+use object::ObjectSegment as _;
 use object::ObjectSymbol as _;
 use rayon::iter::IndexedParallelIterator as _;
 use rayon::iter::IntoParallelIterator as _;
@@ -2052,6 +2053,7 @@ fn macho_aarch64_relocated_value(
 ) -> Option<u64> {
     let target_value = target_value.wrapping_add(addend as u64);
     Some(match r_type {
+        object::macho::ARM64_RELOC_UNSIGNED => target_value,
         object::macho::ARM64_RELOC_BRANCH26 => target_value.wrapping_sub(place),
         object::macho::ARM64_RELOC_PAGE21 => (target_value & !linker_utils::elf::PAGE_MASK_4KB)
             .wrapping_sub(place & !linker_utils::elf::PAGE_MASK_4KB),
@@ -2796,6 +2798,33 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 previous.sections_file = None;
                 current_sections.extend(activation.sections.iter().cloned());
             }
+            let stable_relocation_count = previous.relocations.len();
+            if let Some(activation) = &mut added_macho_archive_text_activation {
+                if !records_complete {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive member needs complete relocation records".to_owned(),
+                    ));
+                }
+                for (replay_index, record) in
+                    std::mem::take(&mut activation.provisional_relocations)
+                {
+                    let relocation_index = previous.relocations.len();
+                    let Some(replay) = activation.relocation_replays.get_mut(replay_index) else {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "added Mach-O archive relocation replay index is invalid".to_owned(),
+                        ));
+                    };
+                    replay.relocation_index = Some(relocation_index);
+                    previous.relocations.push(record);
+                }
+                if activation
+                    .relocation_replays
+                    .iter()
+                    .any(|replay| replay.chained_rebase_output_offset.is_some())
+                {
+                    previous.sections_file = None;
+                }
+            }
             if args.should_validate_macho_cstring_patches() {
                 let mut boundaries_are_stable = matched_cstring_literal_boundaries_are_stable(
                     input.path.as_str(),
@@ -2838,7 +2867,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     })
                     .transpose()?;
                 if let Some(previous_resolver) = previous_resolver.as_ref() {
-                    match macho_text_relocation_replays_for_input(
+                    let replays = match macho_text_relocation_replays_for_input(
                         &previous.relocations,
                         &mut previous.macho_symbol_resolutions,
                         input,
@@ -2851,7 +2880,26 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )? {
                         Ok(replays) => replays,
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                    };
+                    match validate_macho_data_relocations_are_stable(
+                        &mut previous.relocations[..stable_relocation_count],
+                        input,
+                        &matched_sections,
+                        previous_resolver,
+                        &current_resolver,
+                        previous_output.get()?,
+                        &relocation_target_patches.macho_target_moves,
+                    )? {
+                        Ok(changed) => {
+                            if changed {
+                                previous.sections_file = None;
+                            }
+                        }
+                        Err(reason) => {
+                            return Ok(ChangedInputPatchResult::Unsupported(reason));
+                        }
                     }
+                    replays
                 } else {
                     MachOTextRelocationReplays {
                         replays: Vec::new(),
@@ -3203,6 +3251,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 return Ok(ChangedInputPatchResult::Unsupported(reason));
             }
             if !macho_text_relocation_replays.replays.is_empty() {
+                previous.relocations.sort_unstable();
+                previous.relocations.dedup();
                 previous.sections_file = None;
             }
             if !matched_from_snapshot {
@@ -3227,6 +3277,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let added_macho_archive_symbol_table_patches = added_macho_archive_text_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.symbol_table_patches))
+                .unwrap_or_default();
+            let added_macho_archive_chained_fixup_patches = added_macho_archive_text_activation
+                .as_mut()
+                .map(|activation| std::mem::take(&mut activation.chained_fixup_patches))
                 .unwrap_or_default();
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
             patched_section_count += dynamic_relocation_patches.len();
@@ -3279,6 +3333,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(relocation_target_patches.output_patches)
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .chain(added_macho_archive_symbol_table_patches)
+                    .chain(added_macho_archive_chained_fixup_patches)
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
                 input_fde_add_candidates,
@@ -4742,7 +4797,9 @@ struct AddedMachOArchiveTextActivations {
     records: Vec<SectionRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
     symbol_table_patches: Vec<SectionPatch>,
+    chained_fixup_patches: Vec<SectionPatch>,
     relocation_replays: Vec<MachOTextRelocationReplay>,
+    provisional_relocations: Vec<(usize, RelocationRecord)>,
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
 
@@ -4764,6 +4821,7 @@ struct AddedMachOArchiveSection {
     data_hash: String,
     data_size: u64,
     alignment_exponent: u8,
+    relocations: Vec<MachODataRelocationContext>,
 }
 
 enum NormalizedRustArchivePatchState {
@@ -8754,16 +8812,26 @@ fn section_direct_patch_preserve_ranges<'data>(
     );
     let is_macho_text = matches!(section.flags(), object::SectionFlags::MachO { .. })
         && section_name == Some(b"__text".as_slice());
+    let is_macho_const = matches!(section.flags(), object::SectionFlags::MachO { .. })
+        && section_name == Some(b"__const".as_slice());
     if !(section_flags_allow_patching(section.flags()) || is_elf_debug_section)
         || !section_name.is_none_or(section_name_allows_direct_patching)
-        || ((section_name == Some(b"__const".as_slice())
-            || section_name == Some(b"__cstring".as_slice()))
+        || ((section_name == Some(b"__cstring".as_slice())
+            || (section_name == Some(b"__const".as_slice()) && !is_macho_const))
             && section.relocations().next().is_some())
     {
         return None;
     }
     if is_macho_text && section.relocations().next().is_some() {
         return macho_aarch64_text_relocation_ranges(file, section, section_data);
+    }
+    if is_macho_const && section.relocations().next().is_some() {
+        return macho_aarch64_data_relocation_ranges(
+            file,
+            section,
+            section_data,
+            relocation_offsets,
+        );
     }
     let required_relocation_offsets = if is_elf_debug_section {
         Some(relocation_offsets?)
@@ -8791,6 +8859,13 @@ struct MachOTextRelocationContext {
     bytes: [u8; 4],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MachODataRelocationContext {
+    range: std::ops::Range<usize>,
+    target: object::RelocationTarget,
+    addend: i64,
+}
+
 #[derive(Debug, Clone)]
 struct MachOTextRelocationReplay {
     relocation_index: Option<usize>,
@@ -8812,6 +8887,8 @@ struct MachOTextRelocationReplay {
     target_is_global: bool,
     target: Option<RelocationTargetRecord>,
     addend: i64,
+    chained_rebase_output_offset: Option<u64>,
+    chained_rebase_value: Option<u64>,
 }
 
 struct MachOTextRelocationReplays {
@@ -8883,6 +8960,58 @@ fn macho_aarch64_text_relocation_contexts<'data>(
     Some(contexts)
 }
 
+fn macho_aarch64_data_relocation_contexts<'data>(
+    file: &object::File<'data>,
+    section: &impl object::ObjectSection<'data>,
+    section_data: &[u8],
+) -> Option<Vec<MachODataRelocationContext>> {
+    if file.architecture() != object::Architecture::Aarch64
+        || !matches!(section.flags(), object::SectionFlags::MachO { .. })
+        || section.name().ok() != Some("__const")
+        || section.segment_name().ok().flatten() != Some("__DATA")
+    {
+        return None;
+    }
+
+    let mut contexts = Vec::new();
+    for (offset, relocation) in section.relocations() {
+        if relocation.kind() == object::RelocationKind::None {
+            continue;
+        }
+        let object::RelocationFlags::MachO {
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            r_pcrel: false,
+            r_length: 3,
+        } = relocation.flags()
+        else {
+            return None;
+        };
+        if relocation.subtractor().is_some() {
+            return None;
+        }
+        let start = usize::try_from(offset).ok()?;
+        if start % 8 != 0 {
+            return None;
+        }
+        let end = start.checked_add(8)?;
+        let bytes: [u8; 8] = section_data.get(start..end)?.try_into().ok()?;
+        contexts.push(MachODataRelocationContext {
+            range: start..end,
+            target: relocation.target(),
+            addend: i64::from_le_bytes(bytes).wrapping_add(relocation.addend()),
+        });
+    }
+    contexts.sort_by_key(|context| context.range.start);
+    let mut previous_end = 0;
+    for context in &contexts {
+        if context.range.start < previous_end {
+            return None;
+        }
+        previous_end = context.range.end;
+    }
+    Some(contexts)
+}
+
 fn macho_aarch64_text_relocation_ranges<'data>(
     file: &object::File<'data>,
     section: &impl object::ObjectSection<'data>,
@@ -8894,6 +9023,24 @@ fn macho_aarch64_text_relocation_ranges<'data>(
             .map(|context| context.range)
             .collect(),
     )
+}
+
+fn macho_aarch64_data_relocation_ranges<'data>(
+    file: &object::File<'data>,
+    section: &impl object::ObjectSection<'data>,
+    section_data: &[u8],
+    required_relocation_offsets: Option<&HashSet<u64>>,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let contexts = macho_aarch64_data_relocation_contexts(file, section, section_data)?;
+    let required = required_relocation_offsets?;
+    if contexts.len() != required.len()
+        || contexts
+            .iter()
+            .any(|context| !required.contains(&(context.range.start as u64)))
+    {
+        return None;
+    }
+    Some(contexts.into_iter().map(|context| context.range).collect())
 }
 
 fn macho_relocation_target_identity(
@@ -8943,6 +9090,41 @@ fn macho_relocation_symbol_position(
         section_index,
         section_offset,
     }))
+}
+
+struct MachODataRelocationTargetPosition {
+    section_index: object::SectionIndex,
+    section_offset: u64,
+}
+
+fn macho_data_relocation_target_position(
+    file: &object::File<'_>,
+    target: object::RelocationTarget,
+) -> Result<Option<MachODataRelocationTargetPosition>> {
+    match target {
+        object::RelocationTarget::Symbol(symbol_index) => {
+            let symbol = file.symbol_by_index(symbol_index)?;
+            let Some(section_index) = symbol.section_index() else {
+                return Ok(None);
+            };
+            let section = file.section_by_index(section_index)?;
+            let section_offset = symbol
+                .address()
+                .checked_sub(section.address())
+                .context("Mach-O data relocation target precedes its section")?;
+            Ok(Some(MachODataRelocationTargetPosition {
+                section_index,
+                section_offset,
+            }))
+        }
+        object::RelocationTarget::Section(section_index) => {
+            Ok(Some(MachODataRelocationTargetPosition {
+                section_index,
+                section_offset: 0,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn macho_relocation_instruction_shape(
@@ -9318,6 +9500,8 @@ fn rematerialized_macho_text_relocation_replay(
         target_is_global,
         target,
         addend: current_context.addend,
+        chained_rebase_output_offset: None,
+        chained_rebase_value: None,
     }))
 }
 
@@ -9904,6 +10088,8 @@ fn macho_text_relocation_replays_for_input(
                     target_is_global: false,
                     target: replay_target,
                     addend: relocation.addend,
+                    chained_rebase_output_offset: None,
+                    chained_rebase_value: None,
                 });
             }
             if patch_section.previous.data_hash == patch_section.current.data_hash
@@ -9949,6 +10135,325 @@ fn macho_text_relocation_replays_for_input(
         rematerialized_sections,
         symbol_resolutions_changed,
     }))
+}
+
+fn validate_macho_data_relocations_are_stable(
+    relocations: &mut [RelocationRecord],
+    input: &FileState,
+    matched_sections: &[MatchedPatchSection],
+    previous_resolver: &PatchInputResolver<'_>,
+    current_resolver: &PatchInputResolver<'_>,
+    previous_output: &[u8],
+    target_moves: &[MachORelocationTargetMove],
+) -> Result<std::result::Result<bool, String>> {
+    let output_file = object::File::parse(previous_output)
+        .context("Failed to parse previous Mach-O output for data relocation validation")?;
+    let target_move_indices = target_moves
+        .iter()
+        .map(|target_move| target_move.relocation_index)
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
+    for section in matched_sections {
+        sections_by_input
+            .entry(section.current.input.as_str())
+            .or_default()
+            .push(section);
+    }
+
+    for (current_input_ref, sections) in sections_by_input {
+        let Some(current_input_bytes) = current_resolver.resolve(
+            input.path.as_str(),
+            current_input_ref,
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(Err(format!(
+                "could not resolve current Mach-O data patch input in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let current_file = object::File::parse(current_input_bytes.bytes)
+            .context("Failed to parse current Mach-O data relocation input")?;
+
+        for patch_section in sections {
+            let Some(current_index) = patch_section_index(&current_file, &patch_section.current)?
+            else {
+                return Ok(Err(format!(
+                    "missing current Mach-O data patch section in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            let current_section = current_file
+                .section_by_index(current_index)
+                .context("Missing current Mach-O data relocation section")?;
+
+            let Some(previous_input_bytes) = previous_resolver.resolve(
+                input.path.as_str(),
+                patch_section.previous.input.as_str(),
+                PatchInputLookup::MatchArchiveMember,
+            )?
+            else {
+                return Ok(Err(format!(
+                    "could not resolve previous Mach-O data patch input in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            let previous_file = object::File::parse(previous_input_bytes.bytes)
+                .context("Failed to parse previous Mach-O data relocation input")?;
+            let Some(previous_index) =
+                patch_section_index(&previous_file, &patch_section.previous)?
+            else {
+                return Ok(Err(format!(
+                    "missing previous Mach-O data patch section in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            let previous_section = previous_file
+                .section_by_index(previous_index)
+                .context("Missing previous Mach-O data relocation section")?;
+            let mut relocation_indices = relocations
+                .iter()
+                .enumerate()
+                .filter_map(|(index, relocation)| {
+                    let raw = decode_macho_aarch64_relocation_kind(relocation.kind)?;
+                    (relocation.input_file == input.path
+                        && relocation.input == patch_section.previous.input
+                        && relocation.section_index == patch_section.previous.section_index
+                        && raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                        && !raw.r_pcrel
+                        && raw.r_length == 3)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            relocation_indices.sort_by_key(|index| relocations[*index].relocation_offset);
+            // Newly activated sections are present in `matched_sections` before their
+            // provisional relocation records are materialized. Only validate sections
+            // with persisted relocation state; direct patch eligibility separately
+            // rejects unrecorded Mach-O data relocations.
+            if relocation_indices.is_empty() {
+                continue;
+            }
+            let previous_is_data_const = previous_section.name().ok() == Some("__const")
+                && previous_section.segment_name().ok().flatten() == Some("__DATA");
+            let current_is_data_const = current_section.name().ok() == Some("__const")
+                && current_section.segment_name().ok().flatten() == Some("__DATA");
+            if !previous_is_data_const && !current_is_data_const {
+                continue;
+            }
+            if previous_file.architecture() != object::Architecture::Aarch64
+                || current_file.architecture() != object::Architecture::Aarch64
+                || !matches!(previous_section.flags(), object::SectionFlags::MachO { .. })
+                || !matches!(current_section.flags(), object::SectionFlags::MachO { .. })
+                || !previous_is_data_const
+                || !current_is_data_const
+            {
+                return Ok(Err(format!(
+                    "changed Mach-O data relocation section kind in {}",
+                    display_hex_path(&input.path),
+                )));
+            }
+            let previous_data = previous_section
+                .data()
+                .context("Failed to read previous Mach-O data relocation section")?;
+            let current_data = current_section
+                .data()
+                .context("Failed to read current Mach-O data relocation section")?;
+            let Some(previous_contexts) = macho_aarch64_data_relocation_contexts(
+                &previous_file,
+                &previous_section,
+                previous_data,
+            ) else {
+                return Ok(Err(format!(
+                    "unsupported previous Mach-O data relocations in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            let Some(current_contexts) = macho_aarch64_data_relocation_contexts(
+                &current_file,
+                &current_section,
+                current_data,
+            ) else {
+                return Ok(Err(format!(
+                    "unsupported current Mach-O data relocations in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            if !macho_data_relocation_layout_is_stable(
+                previous_contexts.len(),
+                current_contexts.len(),
+                relocation_indices.len(),
+                matched_patch_section_preserves_relocation_record_locations(patch_section),
+            ) {
+                return Ok(Err(format!(
+                    "changed Mach-O data relocation layout in {}: previous={}, current={}, \
+                     records={}, input={}, section={}",
+                    display_hex_path(&input.path),
+                    previous_contexts.len(),
+                    current_contexts.len(),
+                    relocation_indices.len(),
+                    display_hex_text(&patch_section.previous.input),
+                    patch_section.previous.section_index,
+                )));
+            }
+
+            for ((previous_context, current_context), relocation_index) in previous_contexts
+                .iter()
+                .zip(&current_contexts)
+                .zip(relocation_indices)
+            {
+                if target_move_indices.contains(&relocation_index) {
+                    return Ok(Err(format!(
+                        "moved Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                let relocation = &mut relocations[relocation_index];
+                let previous_identity =
+                    macho_relocation_target_identity(&previous_file, previous_context.target)?;
+                let current_identity =
+                    macho_relocation_target_identity(&current_file, current_context.target)?;
+                if !macho_data_relocation_semantics_are_stable(
+                    previous_context,
+                    current_context,
+                    relocation,
+                    &previous_identity,
+                    &current_identity,
+                ) {
+                    return Ok(Err(format!(
+                        "changed Mach-O data relocation semantics in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                let Some(previous_target) =
+                    macho_data_relocation_target_position(&previous_file, previous_context.target)?
+                else {
+                    return Ok(Err(format!(
+                        "unsupported previous Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                let Some(current_target) =
+                    macho_data_relocation_target_position(&current_file, current_context.target)?
+                else {
+                    return Ok(Err(format!(
+                        "unsupported current Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                let previous_target_section_index =
+                    patch_section_record_index(&previous_file, previous_target.section_index)?;
+                let current_target_section_index =
+                    patch_section_record_index(&current_file, current_target.section_index)?;
+                let Some(target_section) = matched_sections.iter().find(|section| {
+                    section.previous.input == patch_section.previous.input
+                        && section.previous.section_index == previous_target_section_index
+                        && section.current.input == patch_section.current.input
+                        && section.current.section_index == current_target_section_index
+                }) else {
+                    return Ok(Err(format!(
+                        "missing Mach-O data relocation target section in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                if previous_target.section_offset != current_target.section_offset
+                    || target_section.previous.output_offset != target_section.current.output_offset
+                {
+                    return Ok(Err(format!(
+                        "moved Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                let expected_target = RelocationTargetRecord {
+                    input_file: input.path.clone().into(),
+                    input: patch_section.previous.input.clone().into(),
+                    section_index: previous_target_section_index,
+                    section_offset: previous_target.section_offset,
+                };
+                if relocation.target.as_ref() != Some(&expected_target) {
+                    return Ok(Err(format!(
+                        "previous Mach-O data relocation target changed in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                let Some(target_address) = macho_output_address_for_file_offset(
+                    &output_file,
+                    target_section
+                        .current
+                        .output_offset
+                        .checked_add(current_target.section_offset)
+                        .context("Mach-O data relocation target output offset overflow")?,
+                ) else {
+                    return Ok(Err(format!(
+                        "Mach-O data relocation target has no output address in {}",
+                        display_hex_path(&input.path)
+                    )));
+                };
+                if target_address != relocation.target_value
+                    || relocation.applied_target_value != Some(relocation.target_value)
+                {
+                    return Ok(Err(format!(
+                        "Mach-O data relocation target value changed in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+                let current_output_offset = patch_section
+                    .current
+                    .output_offset
+                    .checked_add(current_context.range.start as u64)
+                    .context("Mach-O data relocation output offset overflow")?;
+                if relocation.output_offset != current_output_offset {
+                    return Ok(Err(format!(
+                        "moved Mach-O data relocation field in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
+
+                if relocation.input != patch_section.current.input
+                    || relocation.section_index != patch_section.current.section_index
+                    || relocation
+                        .target
+                        .as_ref()
+                        .is_none_or(|target| target.input != patch_section.current.input)
+                {
+                    relocation.input = patch_section.current.input.clone().into();
+                    relocation.section_index = patch_section.current.section_index;
+                    let target = relocation.target.as_mut().unwrap();
+                    target.input = patch_section.current.input.clone().into();
+                    target.section_index = current_target_section_index;
+                    target.section_offset = current_target.section_offset;
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(Ok(changed))
+}
+
+fn macho_data_relocation_semantics_are_stable(
+    previous_context: &MachODataRelocationContext,
+    current_context: &MachODataRelocationContext,
+    relocation: &RelocationRecord,
+    previous_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+    current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+) -> bool {
+    previous_context.range == current_context.range
+        && previous_context.range.start as u64 == relocation.relocation_offset
+        && previous_context.addend == current_context.addend
+        && previous_context.addend == relocation.addend
+        && previous_identity.is_some()
+        && previous_identity == current_identity
+}
+
+fn macho_data_relocation_layout_is_stable(
+    previous_context_count: usize,
+    current_context_count: usize,
+    relocation_record_count: usize,
+    preserves_record_locations: bool,
+) -> bool {
+    previous_context_count == current_context_count
+        && previous_context_count == relocation_record_count
+        && preserves_record_locations
 }
 
 fn apply_macho_text_relocation_replays(
@@ -10035,7 +10540,7 @@ fn apply_macho_text_relocation_replays(
             .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?;
         let mut selected = None;
         for target_value in &replay.current_relocation_target_candidates {
-            let Some(written_value) = macho_aarch64_relocated_value(
+            let Some(relocated_value) = macho_aarch64_relocated_value(
                 replay.r_type,
                 *target_value,
                 macho_aarch64_applied_target_addend(
@@ -10048,6 +10553,7 @@ fn apply_macho_text_relocation_replays(
             ) else {
                 continue;
             };
+            let written_value = replay.chained_rebase_value.unwrap_or(relocated_value);
             let mut relocated = current_bytes.to_vec();
             if replay
                 .rel_info
@@ -11977,7 +12483,7 @@ fn added_macho_archive_text_activations(
     let mut combined_resolutions = resolutions.to_vec();
     combined_resolutions.extend(symbol_resolutions.iter().cloned());
     combined_resolutions.sort_unstable();
-    let relocation_replays = match added_macho_archive_text_relocation_replays(
+    let mut relocation_replays = match added_macho_archive_text_relocation_replays(
         current_bytes,
         input_file_path,
         &members,
@@ -11987,6 +12493,14 @@ fn added_macho_archive_text_activations(
         &combined_resolutions,
     )? {
         Ok(replays) => replays,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let (chained_fixup_patches, provisional_relocations) = match added_macho_chained_fixup_patches(
+        previous_output,
+        &output_file,
+        &mut relocation_replays,
+    ) {
+        Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
 
@@ -11999,7 +12513,9 @@ fn added_macho_archive_text_activations(
         records,
         symbol_resolutions,
         symbol_table_patches,
+        chained_fixup_patches,
         relocation_replays,
+        provisional_relocations,
         remaining_reserved_ranges,
     }))
 }
@@ -12146,6 +12662,570 @@ fn macho_string_table_offset(bytes: &[u8]) -> Option<u64> {
     string_table_offset
 }
 
+const MACHO_CHAINED_PTR_FORMAT_64_OFFSET: u16 = 6;
+const MACHO_CHAINED_PTR_START_NONE: u16 = 0xffff;
+const MACHO_CHAINED_PTR_NEXT_SHIFT: u32 = 51;
+const MACHO_CHAINED_PTR_NEXT_MASK: u64 = 0xfff << MACHO_CHAINED_PTR_NEXT_SHIFT;
+const MACHO_DATA_SEGMENT_CHAIN_INDEX: usize = 2;
+
+#[derive(Clone, Copy, Debug)]
+struct MachOChainedFixupSlot {
+    address: u64,
+    output_offset: u64,
+    value: u64,
+}
+
+struct MachOChainedFixupPlan {
+    page_starts: Vec<u16>,
+    existing_values: Vec<(u64, u64)>,
+    new_values: Vec<(usize, u64)>,
+}
+
+fn plan_macho_chained_fixup_slots(
+    old_slots: &[MachOChainedFixupSlot],
+    new_slots: &[(u64, u64, usize)],
+    data_address: u64,
+    data_size: u64,
+) -> std::result::Result<MachOChainedFixupPlan, String> {
+    let data_end = data_address
+        .checked_add(data_size)
+        .ok_or_else(|| "Mach-O __DATA address range overflowed".to_owned())?;
+    let mut slots = old_slots
+        .iter()
+        .map(|slot| (slot.address, None))
+        .collect::<Vec<_>>();
+    for &(address, target, replay_index) in new_slots {
+        if address < data_address || address.checked_add(8).is_none_or(|end| end > data_end) {
+            return Err("added Mach-O chained rebase is outside __DATA".to_owned());
+        }
+        if !address.is_multiple_of(8) {
+            return Err("added Mach-O chained rebase is not 8-byte aligned".to_owned());
+        }
+        if slots.iter().any(|(slot, _)| *slot == address) {
+            return Err("added Mach-O chained rebase overlaps an existing slot".to_owned());
+        }
+        slots.push((address, Some((target, replay_index))));
+    }
+    slots.sort_by_key(|(address, _)| *address);
+
+    let page_count = usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
+        .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
+    let mut page_starts = vec![MACHO_CHAINED_PTR_START_NONE; page_count];
+    let mut existing_values = Vec::new();
+    let mut new_values = Vec::new();
+    for (slot_index, (address, new_slot)) in slots.iter().enumerate() {
+        let offset_in_segment = address - data_address;
+        let page_index = usize::try_from(offset_in_segment / crate::macho::MACHO_PAGE_SIZE)
+            .map_err(|_| "Mach-O chained fixup page index is too large".to_owned())?;
+        let offset_in_page = offset_in_segment % crate::macho::MACHO_PAGE_SIZE;
+        if page_starts[page_index] == MACHO_CHAINED_PTR_START_NONE {
+            page_starts[page_index] = u16::try_from(offset_in_page)
+                .map_err(|_| "Mach-O chained fixup page start exceeds u16".to_owned())?;
+        }
+        let next_stride = if let Some((next, _)) = slots.get(slot_index + 1).filter(|(next, _)| {
+            (*next - data_address) / crate::macho::MACHO_PAGE_SIZE == page_index as u64
+        }) {
+            let distance = next
+                .checked_sub(*address)
+                .ok_or_else(|| "Mach-O chained fixup slots are not ordered".to_owned())?;
+            if !distance.is_multiple_of(4) {
+                return Err("Mach-O chained fixup slots are not 4-byte aligned".to_owned());
+            }
+            distance / 4
+        } else {
+            0
+        };
+        if next_stride >= 0x1000 {
+            return Err("Mach-O chained fixup next stride is invalid".to_owned());
+        }
+        if let Some((target, replay_index)) = new_slot {
+            new_values.push((
+                *replay_index,
+                encode_incremental_macho_chained_rebase(*target, next_stride)?,
+            ));
+        } else {
+            let old = old_slots
+                .iter()
+                .find(|slot| slot.address == *address)
+                .ok_or_else(|| "missing previous Mach-O chained fixup slot".to_owned())?;
+            let value = (old.value & !MACHO_CHAINED_PTR_NEXT_MASK)
+                | (next_stride << MACHO_CHAINED_PTR_NEXT_SHIFT);
+            if value != old.value {
+                existing_values.push((old.output_offset, value));
+            }
+        }
+    }
+    Ok(MachOChainedFixupPlan {
+        page_starts,
+        existing_values,
+        new_values,
+    })
+}
+
+fn macho_chained_fixup_table_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0).ok()?;
+    let endian = header.endian().ok()?;
+    if endian != object::Endianness::Little {
+        return None;
+    }
+    let mut commands = header.load_commands(endian, bytes, 0).ok()?;
+    let mut range = None;
+    while let Some(command) = commands.next().ok()? {
+        if command.cmd() != object::macho::LC_DYLD_CHAINED_FIXUPS {
+            continue;
+        }
+        let command = command
+            .data::<object::macho::LinkeditDataCommand<object::Endianness>>()
+            .ok()?;
+        let start = usize::try_from(command.dataoff.get(endian)).ok()?;
+        let size = usize::try_from(command.datasize.get(endian)).ok()?;
+        let end = start.checked_add(size)?;
+        bytes.get(start..end)?;
+        if range.replace(start..end).is_some() {
+            return None;
+        }
+    }
+    range
+}
+
+fn macho_chained_fixup_data_segment(
+    output_file: &object::File<'_>,
+) -> Option<(u64, u64, u64, u64)> {
+    let mut matches = output_file.segments().filter_map(|segment| {
+        (segment.name_bytes().ok().flatten() == Some(b"__DATA".as_slice())).then(|| {
+            let (file_offset, file_size) = segment.file_range();
+            (segment.address(), segment.size(), file_offset, file_size)
+        })
+    });
+    let segment = matches.next()?;
+    matches.next().is_none().then_some(segment)
+}
+
+fn read_macho_chained_fixup_slots(
+    previous_output: &[u8],
+    table: &[u8],
+    data_address: u64,
+    data_size: u64,
+    data_file_offset: u64,
+    data_file_size: u64,
+) -> std::result::Result<Vec<MachOChainedFixupSlot>, String> {
+    let read_u16 = |offset: usize| {
+        table
+            .get(offset..offset + 2)
+            .and_then(read_u16_le)
+            .ok_or_else(|| "Mach-O chained fixup table is truncated".to_owned())
+    };
+    let read_u32 = |offset: usize| {
+        table
+            .get(offset..offset + 4)
+            .and_then(read_u32_le)
+            .ok_or_else(|| "Mach-O chained fixup table is truncated".to_owned())
+    };
+    if read_u32(0)? != 0 {
+        return Err("unsupported Mach-O chained fixup version".to_owned());
+    }
+    let starts_offset = usize::try_from(read_u32(4)?)
+        .map_err(|_| "Mach-O chained fixup starts offset is too large".to_owned())?;
+    let segment_count = usize::try_from(read_u32(starts_offset)?)
+        .map_err(|_| "Mach-O chained fixup segment count is too large".to_owned())?;
+    if segment_count != crate::macho::DEFAULT_SEGMENT_COUNT {
+        return Err("unsupported Mach-O chained fixup segment count".to_owned());
+    }
+    for segment_index in 0..segment_count {
+        let segment_offset_location = starts_offset
+            .checked_add(4 * (segment_index + 1))
+            .ok_or_else(|| "Mach-O chained fixup segment offset overflowed".to_owned())?;
+        let segment_offset = read_u32(segment_offset_location)?;
+        if segment_index != MACHO_DATA_SEGMENT_CHAIN_INDEX && segment_offset != 0 {
+            return Err("unsupported Mach-O chained fixups outside __DATA".to_owned());
+        }
+    }
+    let segment_offset_location = starts_offset
+        .checked_add(4 * (MACHO_DATA_SEGMENT_CHAIN_INDEX + 1))
+        .ok_or_else(|| "Mach-O chained fixup segment offset overflowed".to_owned())?;
+    let segment_offset = usize::try_from(read_u32(segment_offset_location)?)
+        .map_err(|_| "Mach-O chained fixup segment offset is too large".to_owned())?;
+    if segment_offset == 0 {
+        return Ok(Vec::new());
+    }
+    let segment_start = starts_offset
+        .checked_add(segment_offset)
+        .ok_or_else(|| "Mach-O chained fixup segment range overflowed".to_owned())?;
+    let segment_info_size = usize::try_from(read_u32(segment_start)?)
+        .map_err(|_| "Mach-O chained fixup segment size is too large".to_owned())?;
+    let segment_end = segment_start
+        .checked_add(segment_info_size)
+        .ok_or_else(|| "Mach-O chained fixup segment range overflowed".to_owned())?;
+    if segment_end > table.len() {
+        return Err("Mach-O chained fixup segment extends past its table".to_owned());
+    }
+    if read_u16(segment_start + 4)? != crate::macho::MACHO_PAGE_SIZE as u16
+        || read_u16(segment_start + 6)? != MACHO_CHAINED_PTR_FORMAT_64_OFFSET
+    {
+        return Err("unsupported Mach-O chained fixup page or pointer format".to_owned());
+    }
+    let segment_runtime_offset = table
+        .get(segment_start + 8..segment_start + 16)
+        .and_then(read_u64_le)
+        .ok_or_else(|| "Mach-O chained fixup segment is truncated".to_owned())?;
+    if segment_runtime_offset
+        != data_address
+            .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
+            .ok_or_else(|| "Mach-O __DATA segment precedes the image base".to_owned())?
+    {
+        return Err("Mach-O chained fixup __DATA segment offset changed".to_owned());
+    }
+    let page_count = usize::from(read_u16(segment_start + 20)?);
+    let expected_page_count =
+        usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
+            .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
+    if page_count != expected_page_count {
+        return Err("Mach-O chained fixup page count changed".to_owned());
+    }
+    let page_starts_offset = segment_start + 22;
+    if page_starts_offset
+        .checked_add(page_count * 2)
+        .is_none_or(|end| end > segment_end)
+    {
+        return Err("Mach-O chained fixup page starts are truncated".to_owned());
+    }
+
+    let mut slots = Vec::new();
+    let mut seen = HashSet::new();
+    for page_index in 0..page_count {
+        let page_start = read_u16(page_starts_offset + page_index * 2)?;
+        if page_start == MACHO_CHAINED_PTR_START_NONE {
+            continue;
+        }
+        if page_start & 0x8000 != 0
+            || !page_start.is_multiple_of(4)
+            || u64::from(page_start) >= crate::macho::MACHO_PAGE_SIZE
+        {
+            return Err("unsupported Mach-O chained fixup page start".to_owned());
+        }
+        let page_base = u64::try_from(page_index)
+            .ok()
+            .and_then(|index| index.checked_mul(crate::macho::MACHO_PAGE_SIZE))
+            .ok_or_else(|| "Mach-O chained fixup page offset overflowed".to_owned())?;
+        let mut offset_in_segment = page_base
+            .checked_add(u64::from(page_start))
+            .ok_or_else(|| "Mach-O chained fixup slot offset overflowed".to_owned())?;
+        loop {
+            if offset_in_segment >= data_size
+                || offset_in_segment
+                    .checked_add(8)
+                    .is_none_or(|end| end > data_file_size)
+                || offset_in_segment / crate::macho::MACHO_PAGE_SIZE
+                    != u64::try_from(page_index).unwrap()
+            {
+                return Err("Mach-O chained fixup slot is outside __DATA".to_owned());
+            }
+            let output_offset = data_file_offset
+                .checked_add(offset_in_segment)
+                .ok_or_else(|| "Mach-O chained fixup file offset overflowed".to_owned())?;
+            let start = usize::try_from(output_offset)
+                .map_err(|_| "Mach-O chained fixup file offset is too large".to_owned())?;
+            let value = previous_output
+                .get(start..start + 8)
+                .and_then(read_u64_le)
+                .ok_or_else(|| "Mach-O chained fixup slot is outside the output".to_owned())?;
+            let address = data_address
+                .checked_add(offset_in_segment)
+                .ok_or_else(|| "Mach-O chained fixup address overflowed".to_owned())?;
+            if !seen.insert(address) {
+                return Err("Mach-O chained fixup chain contains a cycle".to_owned());
+            }
+            slots.push(MachOChainedFixupSlot {
+                address,
+                output_offset,
+                value,
+            });
+            let next = (value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT;
+            if next == 0 {
+                break;
+            }
+            offset_in_segment = offset_in_segment
+                .checked_add(next * 4)
+                .ok_or_else(|| "Mach-O chained fixup next offset overflowed".to_owned())?;
+        }
+    }
+    slots.sort_by_key(|slot| slot.address);
+    Ok(slots)
+}
+
+fn encode_incremental_macho_chained_rebase(
+    target: u64,
+    next_stride: u64,
+) -> std::result::Result<u64, String> {
+    let high8 = target >> 56;
+    let address = target & ((1 << 56) - 1);
+    let runtime_offset = address
+        .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
+        .ok_or_else(|| format!("cannot encode Mach-O chained rebase target {target:#x}"))?;
+    if runtime_offset >= (1 << 36) || next_stride >= 0x1000 {
+        return Err("Mach-O chained rebase value exceeds its encoded range".to_owned());
+    }
+    Ok(runtime_offset | (high8 << 36) | (next_stride << MACHO_CHAINED_PTR_NEXT_SHIFT))
+}
+
+fn write_macho_chained_fixup_u16(
+    table: &mut [u8],
+    offset: usize,
+    value: u16,
+) -> std::result::Result<(), String> {
+    let bytes = table
+        .get_mut(offset..offset + 2)
+        .ok_or_else(|| "Mach-O chained fixup table is too small".to_owned())?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_macho_chained_fixup_u32(
+    table: &mut [u8],
+    offset: usize,
+    value: u32,
+) -> std::result::Result<(), String> {
+    let bytes = table
+        .get_mut(offset..offset + 4)
+        .ok_or_else(|| "Mach-O chained fixup table is too small".to_owned())?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_macho_chained_fixup_u64(
+    table: &mut [u8],
+    offset: usize,
+    value: u64,
+) -> std::result::Result<(), String> {
+    let bytes = table
+        .get_mut(offset..offset + 8)
+        .ok_or_else(|| "Mach-O chained fixup table is too small".to_owned())?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn added_macho_chained_fixup_patches(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    replays: &mut [MachOTextRelocationReplay],
+) -> std::result::Result<(Vec<SectionPatch>, Vec<(usize, RelocationRecord)>), String> {
+    let new_replay_indices = replays
+        .iter()
+        .enumerate()
+        .filter_map(|(index, replay)| replay.chained_rebase_output_offset.map(|_| index))
+        .collect::<Vec<_>>();
+    if new_replay_indices.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let table_range = macho_chained_fixup_table_range(previous_output)
+        .ok_or_else(|| "previous Mach-O output has no usable chained fixup table".to_owned())?;
+    let previous_table = previous_output
+        .get(table_range.clone())
+        .ok_or_else(|| "previous Mach-O chained fixup table is out of bounds".to_owned())?;
+    let Some((data_address, data_size, data_file_offset, data_file_size)) =
+        macho_chained_fixup_data_segment(output_file)
+    else {
+        return Err("previous Mach-O output has no unique __DATA segment".to_owned());
+    };
+    let old_slots = read_macho_chained_fixup_slots(
+        previous_output,
+        previous_table,
+        data_address,
+        data_size,
+        data_file_offset,
+        data_file_size,
+    )?;
+    let mut new_slots = Vec::with_capacity(new_replay_indices.len());
+    for &replay_index in &new_replay_indices {
+        let replay = &replays[replay_index];
+        let output_offset = replay.chained_rebase_output_offset.unwrap();
+        let offset_in_segment = output_offset
+            .checked_sub(data_file_offset)
+            .ok_or_else(|| "added Mach-O chained rebase precedes __DATA".to_owned())?;
+        if offset_in_segment
+            .checked_add(8)
+            .is_none_or(|end| end > data_file_size || end > data_size)
+        {
+            return Err("added Mach-O chained rebase is outside __DATA".to_owned());
+        }
+        let address = data_address
+            .checked_add(offset_in_segment)
+            .ok_or_else(|| "added Mach-O chained rebase address overflowed".to_owned())?;
+        let target = macho_aarch64_relocated_value(
+            object::macho::ARM64_RELOC_UNSIGNED,
+            replay.current_target_value,
+            replay.addend,
+            0,
+        )
+        .ok_or_else(|| "could not resolve added Mach-O chained rebase target".to_owned())?;
+        new_slots.push((address, target, replay_index));
+    }
+    let plan = plan_macho_chained_fixup_slots(&old_slots, &new_slots, data_address, data_size)?;
+    let page_count = plan.page_starts.len();
+    let mut patches = Vec::new();
+    for (output_offset, value) in plan.existing_values {
+        patches.push(SectionPatch {
+            output_offset,
+            size: 8,
+            data: value.to_le_bytes().to_vec(),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+    for (replay_index, value) in plan.new_values {
+        replays[replay_index].chained_rebase_value = Some(value);
+    }
+
+    let read_table_u32 = |offset: usize| {
+        previous_table
+            .get(offset..offset + 4)
+            .and_then(read_u32_le)
+            .ok_or_else(|| "Mach-O chained fixup table is truncated".to_owned())
+    };
+    if read_table_u32(0)? != 0
+        || read_table_u32(4)? != 32
+        || read_table_u32(20)? != 1
+        || read_table_u32(24)? != 0
+    {
+        return Err("unsupported Mach-O chained fixup table encoding".to_owned());
+    }
+    let old_imports_offset = usize::try_from(read_table_u32(8)?)
+        .map_err(|_| "Mach-O chained fixup imports offset is too large".to_owned())?;
+    let old_symbols_offset = usize::try_from(read_table_u32(12)?)
+        .map_err(|_| "Mach-O chained fixup symbols offset is too large".to_owned())?;
+    let imports_count = usize::try_from(read_table_u32(16)?)
+        .map_err(|_| "Mach-O chained fixup import count is too large".to_owned())?;
+    let imports_size = imports_count
+        .checked_mul(4)
+        .ok_or_else(|| "Mach-O chained fixup imports size overflowed".to_owned())?;
+    let old_imports = previous_table
+        .get(old_imports_offset..old_imports_offset + imports_size)
+        .ok_or_else(|| "Mach-O chained fixup imports are out of bounds".to_owned())?;
+    if old_symbols_offset < old_imports_offset + imports_size
+        || old_symbols_offset >= previous_table.len()
+    {
+        return Err("Mach-O chained fixup symbol strings are out of bounds".to_owned());
+    }
+    let old_symbols = &previous_table[old_symbols_offset..];
+    let mut symbol_strings_size = 1usize;
+    for import in old_imports.chunks_exact(4) {
+        let import = u32::from_le_bytes(import.try_into().unwrap());
+        let name_offset = usize::try_from((import >> 9) & 0x7f_ffff)
+            .map_err(|_| "Mach-O chained import name offset is too large".to_owned())?;
+        let name = old_symbols
+            .get(name_offset..)
+            .and_then(|bytes| bytes.iter().position(|byte| *byte == 0).map(|end| end + 1))
+            .ok_or_else(|| "Mach-O chained import name is unterminated".to_owned())?;
+        symbol_strings_size = symbol_strings_size.max(name_offset + name);
+    }
+    let symbol_strings = old_symbols
+        .get(..symbol_strings_size)
+        .ok_or_else(|| "Mach-O chained import strings are out of bounds".to_owned())?;
+
+    let starts_offset = 32usize;
+    let starts_size = 4 * (crate::macho::DEFAULT_SEGMENT_COUNT + 1);
+    let segment_offset = starts_size.next_multiple_of(8);
+    let segment_size = (22 + page_count * 2).next_multiple_of(8);
+    let segment_start = starts_offset + segment_offset;
+    let imports_offset = segment_start + segment_size;
+    let symbols_offset = imports_offset + imports_size;
+    let required_size = symbols_offset
+        .checked_add(symbol_strings.len())
+        .ok_or_else(|| "Mach-O chained fixup table size overflowed".to_owned())?;
+    if required_size > previous_table.len() {
+        return Err("Mach-O chained fixup table allocation is too small".to_owned());
+    }
+    let mut table = vec![0; previous_table.len()];
+    write_macho_chained_fixup_u32(&mut table, 0, 0)?;
+    write_macho_chained_fixup_u32(&mut table, 4, starts_offset as u32)?;
+    write_macho_chained_fixup_u32(&mut table, 8, imports_offset as u32)?;
+    write_macho_chained_fixup_u32(&mut table, 12, symbols_offset as u32)?;
+    write_macho_chained_fixup_u32(&mut table, 16, imports_count as u32)?;
+    write_macho_chained_fixup_u32(&mut table, 20, 1)?;
+    write_macho_chained_fixup_u32(&mut table, 24, 0)?;
+    write_macho_chained_fixup_u32(
+        &mut table,
+        starts_offset,
+        crate::macho::DEFAULT_SEGMENT_COUNT as u32,
+    )?;
+    write_macho_chained_fixup_u32(
+        &mut table,
+        starts_offset + 4 * (MACHO_DATA_SEGMENT_CHAIN_INDEX + 1),
+        segment_offset as u32,
+    )?;
+    write_macho_chained_fixup_u32(&mut table, segment_start, segment_size as u32)?;
+    write_macho_chained_fixup_u16(
+        &mut table,
+        segment_start + 4,
+        crate::macho::MACHO_PAGE_SIZE as u16,
+    )?;
+    write_macho_chained_fixup_u16(
+        &mut table,
+        segment_start + 6,
+        MACHO_CHAINED_PTR_FORMAT_64_OFFSET,
+    )?;
+    write_macho_chained_fixup_u64(
+        &mut table,
+        segment_start + 8,
+        data_address
+            .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
+            .ok_or_else(|| "Mach-O __DATA segment precedes the image base".to_owned())?,
+    )?;
+    write_macho_chained_fixup_u32(&mut table, segment_start + 16, 0)?;
+    write_macho_chained_fixup_u16(
+        &mut table,
+        segment_start + 20,
+        u16::try_from(page_count)
+            .map_err(|_| "Mach-O chained fixup page count exceeds u16".to_owned())?,
+    )?;
+    for (page_index, page_start) in plan.page_starts.into_iter().enumerate() {
+        write_macho_chained_fixup_u16(&mut table, segment_start + 22 + page_index * 2, page_start)?;
+    }
+    table[imports_offset..imports_offset + imports_size].copy_from_slice(old_imports);
+    table[symbols_offset..symbols_offset + symbol_strings.len()].copy_from_slice(symbol_strings);
+    patches.push(SectionPatch {
+        output_offset: table_range.start as u64,
+        size: table.len() as u64,
+        data: table,
+        deferred_relocation: None,
+        preserve_ranges: Vec::new(),
+        adjustments: Vec::new(),
+    });
+
+    let provisional_relocations = new_replay_indices
+        .into_iter()
+        .map(|replay_index| {
+            let replay = &replays[replay_index];
+            let written_value = replay
+                .chained_rebase_value
+                .expect("new chained rebase must be encoded");
+            (
+                replay_index,
+                RelocationRecord {
+                    target_symbol_id: replay.target_symbol_id,
+                    written_value: Some(written_value),
+                    target_value: replay.current_target_value,
+                    applied_target_value: Some(replay.current_target_value),
+                    target_name: replay.target_name.clone(),
+                    target: replay.target.clone(),
+                    input_file: replay.input_file.clone(),
+                    input: replay.input.clone().into(),
+                    section_index: replay.section_index,
+                    relocation_offset: replay.current_range.start as u64,
+                    output_offset: replay.chained_rebase_output_offset.unwrap(),
+                    size: 8,
+                    kind: replay.kind,
+                    addend: replay.addend,
+                },
+            )
+        })
+        .collect();
+    Ok((patches, provisional_relocations))
+}
+
 fn added_macho_archive_output_section_id(
     segment_name: &[u8],
     section_name: &[u8],
@@ -12205,12 +13285,26 @@ fn added_macho_archive_text_member(
             if data.is_empty() {
                 continue;
             }
-            if section_name != b"__text" && section.relocations().next().is_some() {
+            let relocations = if section.relocations().next().is_none() {
+                Vec::new()
+            } else if segment_name == b"__DATA" && section_name == b"__const" {
+                let Some(relocations) =
+                    macho_aarch64_data_relocation_contexts(&file, &section, data)
+                else {
+                    return Ok(Err(
+                        "added Mach-O archive member has unsupported __DATA,__const relocations"
+                            .to_owned(),
+                    ));
+                };
+                relocations
+            } else if section_name == b"__text" {
+                Vec::new()
+            } else {
                 return Ok(Err(
                     "added Mach-O archive member has unsupported auxiliary section relocations"
                         .to_owned(),
                 ));
-            }
+            };
             let alignment = crate::alignment::Alignment::new(section.align().max(1))
                 .context("Invalid added Mach-O archive member section alignment")?;
             let section_index = patch_section_record_index(&file, section.index())?;
@@ -12229,6 +13323,7 @@ fn added_macho_archive_text_member(
                 data_hash: hash_bytes(data),
                 data_size,
                 alignment_exponent: alignment.exponent,
+                relocations,
             });
         } else if segment_name.is_some_and(|name| name.starts_with(b"__DWARF"))
             || flags & object::macho::S_ATTR_DEBUG != 0
@@ -12625,7 +13720,156 @@ fn added_macho_archive_text_relocation_replays(
                 target_is_global,
                 target,
                 addend: context.addend,
+                chained_rebase_output_offset: None,
+                chained_rebase_value: None,
             });
+        }
+
+        for source_section in &member.sections {
+            if source_section.relocations.is_empty() {
+                continue;
+            }
+            let section_index = patch_section_object_index(&file, source_section.section_index)?;
+            let Some(source_patch_section) = sections.iter().find(|section| {
+                section.input == member.input
+                    && section.section_index == source_section.section_index
+            }) else {
+                return Ok(Err(
+                    "added Mach-O data relocation source section was not allocated".to_owned(),
+                ));
+            };
+            for context in &source_section.relocations {
+                let raw_relocation = object::macho::RelocationInfo {
+                    r_address: 0,
+                    r_symbolnum: 0,
+                    r_pcrel: false,
+                    r_length: 3,
+                    r_extern: matches!(context.target, object::RelocationTarget::Symbol(_)),
+                    r_type: object::macho::ARM64_RELOC_UNSIGNED,
+                };
+                let rel_info = <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::
+                    relocation_from_raw(raw_relocation)
+                    .map_err(|error| {
+                        crate::error!(
+                            "Failed to decode added Mach-O data relocation: {error:#?}"
+                        )
+                    })?;
+                let mut target_name = None;
+                let mut target_is_global = false;
+                let target;
+                let current_target_value = match context.target {
+                    object::RelocationTarget::Symbol(symbol_index) => {
+                        let symbol = file.symbol_by_index(symbol_index)?;
+                        let Some(target_section_index) = symbol.section_index() else {
+                            return Ok(Err(
+                                "added Mach-O data relocation targets a non-local symbol"
+                                    .to_owned(),
+                            ));
+                        };
+                        let name = symbol.name_bytes()?.to_vec();
+                        if !name.is_empty() {
+                            target_name = Some(SharedText::from(hex::encode(&name)));
+                            target_is_global = symbol.is_global();
+                        }
+                        let target_section_record_index =
+                            patch_section_record_index(&file, target_section_index)?;
+                        let Some(target_patch_section) = sections.iter().find(|section| {
+                            section.input == member.input
+                                && section.section_index == target_section_record_index
+                        }) else {
+                            return Ok(Err(
+                                "added Mach-O data relocation targets an unallocated local section"
+                                    .to_owned(),
+                            ));
+                        };
+                        let target_section = file.section_by_index(target_section_index)?;
+                        let target_offset = symbol
+                            .address()
+                            .checked_sub(target_section.address())
+                            .context("Added Mach-O data relocation target precedes its section")?;
+                        target = Some(RelocationTargetRecord {
+                            input_file: input_file_path.into(),
+                            input: member.input.clone().into(),
+                            section_index: target_patch_section.section_index,
+                            section_offset: target_offset,
+                        });
+                        let Some(target_section_address) = macho_output_address_for_file_offset(
+                            &output_file,
+                            target_patch_section.output_offset,
+                        ) else {
+                            return Ok(Err(
+                                "added Mach-O data relocation target has no output address"
+                                    .to_owned(),
+                            ));
+                        };
+                        target_section_address
+                            .checked_add(target_offset)
+                            .context("Added Mach-O data relocation target address overflow")?
+                    }
+                    object::RelocationTarget::Section(target_section_index) => {
+                        let target_section_record_index =
+                            patch_section_record_index(&file, target_section_index)?;
+                        let Some(target_patch_section) = sections.iter().find(|section| {
+                            section.input == member.input
+                                && section.section_index == target_section_record_index
+                        }) else {
+                            return Ok(Err(
+                                "added Mach-O data relocation targets an unallocated local section"
+                                    .to_owned(),
+                            ));
+                        };
+                        target = Some(RelocationTargetRecord {
+                            input_file: input_file_path.into(),
+                            input: member.input.clone().into(),
+                            section_index: target_patch_section.section_index,
+                            section_offset: 0,
+                        });
+                        macho_output_address_for_file_offset(
+                            &output_file,
+                            target_patch_section.output_offset,
+                        )
+                        .context("Added Mach-O data relocation target has no output address")?
+                    }
+                    _ => {
+                        return Ok(Err(
+                            "unsupported added Mach-O data relocation target".to_owned()
+                        ));
+                    }
+                };
+                let output_offset = source_patch_section
+                    .output_offset
+                    .checked_add(context.range.start as u64)
+                    .context("Added Mach-O data relocation output offset overflow")?;
+                replays.push(MachOTextRelocationReplay {
+                    relocation_index: None,
+                    input_file: input_file_path.into(),
+                    input: member.input.clone(),
+                    section_index: source_section.section_index,
+                    previous_range: None,
+                    current_range: context.range.clone(),
+                    r_type: object::macho::ARM64_RELOC_UNSIGNED,
+                    kind: encode_macho_aarch64_relocation_kind(raw_relocation),
+                    rel_info,
+                    previous_written_value: None,
+                    previous_applied_target_value: None,
+                    current_target_value,
+                    current_relocation_target_candidates: vec![current_target_value],
+                    current_target_section_offset: target
+                        .as_ref()
+                        .map_or(0, |target| target.section_offset),
+                    target_symbol_id: 0,
+                    target_name,
+                    target_is_global,
+                    target,
+                    addend: context.addend,
+                    chained_rebase_output_offset: Some(output_offset),
+                    chained_rebase_value: None,
+                });
+            }
+            debug_assert_eq!(
+                patch_section_object_index(&file, source_section.section_index)?,
+                section_index
+            );
         }
     }
     Ok(Ok(replays))
@@ -25254,6 +26498,283 @@ mod tests {
         assert_eq!(patches[0].data, 8_u64.to_le_bytes());
     }
 
+    fn test_macho_chained_fixup_table(page_start: u16) -> Vec<u8> {
+        let mut table = vec![0; 128];
+        let starts_offset = 32;
+        let segment_offset = 24;
+        let segment_start = starts_offset + segment_offset;
+        write_macho_chained_fixup_u32(&mut table, 0, 0).unwrap();
+        write_macho_chained_fixup_u32(&mut table, 4, starts_offset as u32).unwrap();
+        write_macho_chained_fixup_u32(
+            &mut table,
+            starts_offset,
+            crate::macho::DEFAULT_SEGMENT_COUNT as u32,
+        )
+        .unwrap();
+        write_macho_chained_fixup_u32(
+            &mut table,
+            starts_offset + 4 * (MACHO_DATA_SEGMENT_CHAIN_INDEX + 1),
+            segment_offset as u32,
+        )
+        .unwrap();
+        write_macho_chained_fixup_u32(&mut table, segment_start, 24).unwrap();
+        write_macho_chained_fixup_u16(
+            &mut table,
+            segment_start + 4,
+            crate::macho::MACHO_PAGE_SIZE as u16,
+        )
+        .unwrap();
+        write_macho_chained_fixup_u16(
+            &mut table,
+            segment_start + 6,
+            MACHO_CHAINED_PTR_FORMAT_64_OFFSET,
+        )
+        .unwrap();
+        write_macho_chained_fixup_u64(&mut table, segment_start + 8, 0x4000).unwrap();
+        write_macho_chained_fixup_u16(&mut table, segment_start + 20, 1).unwrap();
+        write_macho_chained_fixup_u16(&mut table, segment_start + 22, page_start).unwrap();
+        table
+    }
+
+    #[test]
+    fn macho_chained_fixup_slots_follow_next_strides() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let data_file_offset = 0x100;
+        let mut output = vec![0; data_file_offset + crate::macho::MACHO_PAGE_SIZE as usize];
+        let first = encode_incremental_macho_chained_rebase(data_address + 0x100, 4).unwrap();
+        let second = encode_incremental_macho_chained_rebase(data_address + 0x200, 0).unwrap();
+        output[data_file_offset + 0x20..data_file_offset + 0x28]
+            .copy_from_slice(&first.to_le_bytes());
+        output[data_file_offset + 0x30..data_file_offset + 0x38]
+            .copy_from_slice(&second.to_le_bytes());
+
+        let slots = read_macho_chained_fixup_slots(
+            &output,
+            &test_macho_chained_fixup_table(0x20),
+            data_address,
+            crate::macho::MACHO_PAGE_SIZE,
+            data_file_offset as u64,
+            crate::macho::MACHO_PAGE_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| (slot.address, slot.output_offset, slot.value))
+                .collect::<Vec<_>>(),
+            vec![
+                (data_address + 0x20, (data_file_offset + 0x20) as u64, first),
+                (
+                    data_address + 0x30,
+                    (data_file_offset + 0x30) as u64,
+                    second
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn macho_chained_fixup_slots_reject_multi_start_pages() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let output = vec![0; 0x100 + crate::macho::MACHO_PAGE_SIZE as usize];
+
+        assert_eq!(
+            read_macho_chained_fixup_slots(
+                &output,
+                &test_macho_chained_fixup_table(0x8020),
+                data_address,
+                crate::macho::MACHO_PAGE_SIZE,
+                0x100,
+                crate::macho::MACHO_PAGE_SIZE,
+            )
+            .unwrap_err(),
+            "unsupported Mach-O chained fixup page start"
+        );
+    }
+
+    #[test]
+    fn macho_chained_fixup_slots_reject_other_segments() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let output = vec![0; 0x100 + crate::macho::MACHO_PAGE_SIZE as usize];
+        let mut table = test_macho_chained_fixup_table(MACHO_CHAINED_PTR_START_NONE);
+        write_macho_chained_fixup_u32(&mut table, 32 + 4, 24).unwrap();
+
+        assert_eq!(
+            read_macho_chained_fixup_slots(
+                &output,
+                &table,
+                data_address,
+                crate::macho::MACHO_PAGE_SIZE,
+                0x100,
+                crate::macho::MACHO_PAGE_SIZE,
+            )
+            .unwrap_err(),
+            "unsupported Mach-O chained fixups outside __DATA"
+        );
+    }
+
+    #[test]
+    fn macho_chained_rebase_preserves_high8_and_next_stride() {
+        let target = (0x80 << 56) | (crate::macho::MACHO_START_MEM_ADDRESS + 0x1234);
+        let encoded = encode_incremental_macho_chained_rebase(target, 7).unwrap();
+
+        assert_eq!(encoded & ((1 << 36) - 1), 0x1234);
+        assert_eq!((encoded >> 36) & 0xff, 0x80);
+        assert_eq!(
+            (encoded & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT,
+            7
+        );
+    }
+
+    #[test]
+    fn macho_chained_fixup_plan_inserts_before_between_and_after_existing_slots() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let bind_payload = (1 << 63) | 0x12345;
+        let old_slots = vec![
+            MachOChainedFixupSlot {
+                address: data_address + 0x20,
+                output_offset: 0x120,
+                value: bind_payload | (8 << MACHO_CHAINED_PTR_NEXT_SHIFT),
+            },
+            MachOChainedFixupSlot {
+                address: data_address + 0x40,
+                output_offset: 0x140,
+                value: encode_incremental_macho_chained_rebase(data_address + 0x200, 0).unwrap(),
+            },
+        ];
+        let plan = plan_macho_chained_fixup_slots(
+            &old_slots,
+            &[
+                (data_address + 0x10, data_address + 0x310, 10),
+                (data_address + 0x30, data_address + 0x330, 30),
+                (data_address + 0x50, data_address + 0x350, 50),
+            ],
+            data_address,
+            crate::macho::MACHO_PAGE_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(plan.page_starts, vec![0x10]);
+        assert_eq!(plan.existing_values.len(), 2);
+        assert_eq!(plan.existing_values[0].0, 0x120);
+        assert_eq!(
+            plan.existing_values[0].1 & !MACHO_CHAINED_PTR_NEXT_MASK,
+            bind_payload
+        );
+        assert_eq!(
+            (plan.existing_values[0].1 & MACHO_CHAINED_PTR_NEXT_MASK)
+                >> MACHO_CHAINED_PTR_NEXT_SHIFT,
+            4
+        );
+        assert_eq!(plan.existing_values[1].0, 0x140);
+        assert_eq!(
+            plan.existing_values[1].1 & !MACHO_CHAINED_PTR_NEXT_MASK,
+            old_slots[1].value & !MACHO_CHAINED_PTR_NEXT_MASK
+        );
+        assert_eq!(
+            (plan.existing_values[1].1 & MACHO_CHAINED_PTR_NEXT_MASK)
+                >> MACHO_CHAINED_PTR_NEXT_SHIFT,
+            4
+        );
+        assert_eq!(
+            plan.new_values
+                .iter()
+                .map(|(index, value)| (
+                    *index,
+                    (value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT
+                ))
+                .collect::<Vec<_>>(),
+            vec![(10, 4), (30, 4), (50, 0)]
+        );
+    }
+
+    #[test]
+    fn macho_chained_fixup_plan_starts_an_empty_page() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let plan = plan_macho_chained_fixup_slots(
+            &[],
+            &[(
+                data_address + crate::macho::MACHO_PAGE_SIZE + 0x18,
+                data_address + 0x300,
+                7,
+            )],
+            data_address,
+            crate::macho::MACHO_PAGE_SIZE * 2,
+        )
+        .unwrap();
+
+        assert_eq!(plan.page_starts, vec![MACHO_CHAINED_PTR_START_NONE, 0x18]);
+        assert!(plan.existing_values.is_empty());
+        assert_eq!(plan.new_values.len(), 1);
+        assert_eq!(plan.new_values[0].0, 7);
+        assert_eq!(
+            (plan.new_values[0].1 & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT,
+            0
+        );
+    }
+
+    #[test]
+    fn macho_data_relocation_semantics_reject_changed_addend_or_target() {
+        let previous = MachODataRelocationContext {
+            range: 8..16,
+            target: object::RelocationTarget::Section(object::SectionIndex(2)),
+            addend: 12,
+        };
+        let mut current = previous.clone();
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            1,
+            Some(0),
+            0,
+            None,
+            Some(("input.o", 2, 0)),
+            8,
+            0,
+            8,
+            0,
+            12,
+        );
+        let identity = Some((Vec::new(), Some(object::SectionIndex(2))));
+
+        assert!(macho_data_relocation_semantics_are_stable(
+            &previous,
+            &current,
+            &relocation,
+            &identity,
+            &identity,
+        ));
+
+        current.addend += 1;
+        assert!(!macho_data_relocation_semantics_are_stable(
+            &previous,
+            &current,
+            &relocation,
+            &identity,
+            &identity,
+        ));
+
+        current.addend = previous.addend;
+        let changed_identity = Some((Vec::new(), Some(object::SectionIndex(3))));
+        assert!(!macho_data_relocation_semantics_are_stable(
+            &previous,
+            &current,
+            &relocation,
+            &identity,
+            &changed_identity,
+        ));
+    }
+
+    #[test]
+    fn macho_data_relocation_layout_rejects_added_or_removed_relocations() {
+        assert!(macho_data_relocation_layout_is_stable(1, 1, 1, true));
+        assert!(!macho_data_relocation_layout_is_stable(1, 0, 1, true));
+        assert!(!macho_data_relocation_layout_is_stable(0, 1, 0, true));
+        assert!(!macho_data_relocation_layout_is_stable(1, 1, 0, true));
+        assert!(!macho_data_relocation_layout_is_stable(1, 1, 1, false));
+    }
+
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
         test_macho_object_with_optional_debug(text, data, None, data_symbol_offset)
     }
@@ -27844,6 +29365,8 @@ mod tests {
             target_is_global: true,
             target: Some(target),
             addend: 0,
+            chained_rebase_output_offset: None,
+            chained_rebase_value: None,
         }
     }
 
