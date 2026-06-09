@@ -2308,6 +2308,7 @@ fn patch_changed_inputs(
                 previous_output.get()?,
                 &previous.sections,
                 &previous.relocations,
+                &previous.macho_symbol_resolutions,
                 &previous.fdes,
                 &previous.dynamic_relocations,
                 args.should_normalize_rust_archive_patch_inputs(),
@@ -7726,6 +7727,7 @@ where
             input_relocation_targets
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
+            &[],
             input_fdes.map(Vec::as_slice).unwrap_or_default(),
             true,
         )?;
@@ -7746,6 +7748,7 @@ fn current_patch_state(
     dynamic_relocations: &[&DynamicRelocationRecord],
     relocations: &[&RelocationRecord],
     relocation_targets: &[&RelocationRecord],
+    macho_symbol_resolutions: &[&MachOSymbolResolutionRecord],
     fdes: &[&FdeRecord],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<Option<FilePatchState>> {
@@ -7773,6 +7776,14 @@ fn current_patch_state(
         input_file_path,
         relocation_targets.iter().copied(),
     )?;
+    let Some(macho_symbol_resolution_ranges) = macho_symbol_resolution_ranges_for_current_records(
+        bytes,
+        input_file_path,
+        macho_symbol_resolutions.iter().copied(),
+    )?
+    else {
+        return Ok(None);
+    };
     let fde_relocation_ranges =
         fde_patch_input_ranges_for_current_records(bytes, input_file_path, fdes.iter().copied())?;
     Ok(patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_patch_fingerprints(
@@ -7784,6 +7795,7 @@ fn current_patch_state(
             .filter_map(|patch| patch.input_range.clone())
             .chain(relocation_addend_ranges)
             .chain(relocation_target_ranges)
+            .chain(macho_symbol_resolution_ranges)
             .chain(fde_relocation_ranges),
         normalize_rust_archive_patch_inputs,
     )?
@@ -7814,6 +7826,7 @@ fn current_patch_state_from_snapshot(
     output: &[u8],
     sections: &[SectionRecord],
     relocations: &[RelocationRecord],
+    macho_symbol_resolutions: &[MachOSymbolResolutionRecord],
     fdes: &[FdeRecord],
     dynamic_relocations: &[DynamicRelocationRecord],
     normalize_rust_archive_patch_inputs: bool,
@@ -7842,6 +7855,15 @@ fn current_patch_state_from_snapshot(
                 .is_some_and(|target| target.input_file == input.path)
         })
         .collect::<Vec<_>>();
+    let macho_symbol_resolutions = macho_symbol_resolutions
+        .iter()
+        .filter(|resolution| {
+            resolution
+                .target
+                .as_ref()
+                .is_some_and(|target| target.input_file == input.path)
+        })
+        .collect::<Vec<_>>();
     let fdes = fdes
         .iter()
         .filter(|record| record.input_file == input.path)
@@ -7854,6 +7876,7 @@ fn current_patch_state_from_snapshot(
         &dynamic_relocations,
         &input_relocations,
         &relocation_targets,
+        &macho_symbol_resolutions,
         &fdes,
         normalize_rust_archive_patch_inputs,
     )
@@ -11821,6 +11844,48 @@ fn relocation_target_ranges_for_current_records<'a>(
         records,
         PatchInputLookup::CurrentRecordedRange,
     )
+}
+
+fn macho_symbol_resolution_ranges_for_current_records<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    resolutions: impl IntoIterator<Item = &'a MachOSymbolResolutionRecord>,
+) -> Result<Option<Vec<std::ops::Range<usize>>>> {
+    let mut ranges = Vec::new();
+    for resolution in resolutions {
+        let Some(target) = resolution
+            .target
+            .as_ref()
+            .filter(|target| target.input_file == input_file_path)
+        else {
+            continue;
+        };
+        let Some(input_bytes) = patch_input_bytes_with_lookup(
+            bytes,
+            input_file_path,
+            target.input.as_str(),
+            PatchInputLookup::CurrentRecordedRange,
+        )?
+        else {
+            return Ok(None);
+        };
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse incremental Mach-O symbol catalog input")?;
+        let current = match unique_symbol_position_by_name(
+            input_bytes.bytes,
+            input_bytes.file_offset,
+            &file,
+            resolution.name.as_str(),
+        )? {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if let Some(value_range) = current.value_range {
+            ranges.push(value_range);
+        }
+    }
+    dedup_ranges(&mut ranges);
+    Ok(Some(ranges))
 }
 
 fn relocation_target_ranges_for_input_with_lookup<'a>(
@@ -21889,6 +21954,88 @@ mod tests {
     }
 
     #[test]
+    fn current_patch_state_masks_macho_symbol_catalog_values() {
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let current = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 1);
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("input.o");
+        let input_ref = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let input = encode_path(&input_file.filename);
+        let sections = [
+            SectionRecord::new(input_ref, object::SectionIndex(0), 64, 4),
+            SectionRecord::new(input_ref, object::SectionIndex(1), 128, 4),
+        ];
+        let sections = sections.iter().collect::<Vec<_>>();
+        let mut output = vec![0; 132];
+        output[64..68].copy_from_slice(b"\x01\x02\x03\x04");
+        output[128..132].copy_from_slice(b"\x05\x06\x07\x08");
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: SharedText::from(input.clone()),
+                input: SharedText::from(input.clone()),
+                section_index: 2,
+                section_offset: 0,
+            }),
+        };
+        let previous_patch = current_patch_state(
+            &previous,
+            &input,
+            &output,
+            &sections,
+            &[],
+            &[],
+            &[],
+            &[&resolution],
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let input_state = FileState {
+            path: input.clone(),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            patch: None,
+        };
+        let mut current_resolutions = vec![resolution];
+        let updates = update_macho_symbol_resolutions_for_input(
+            &mut current_resolutions,
+            &input_state,
+            &current,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(updates.changed);
+        let current_fingerprint = patch_fingerprint_with_extra_ranges(
+            &current,
+            &input,
+            previous_patch.sections.iter().map(|section| PatchSection {
+                input: section.input.clone(),
+                section_index: section.section_index,
+                section_name: section.section_name.clone(),
+                input_size: section.input_size,
+                output_offset: section.output_offset,
+                output_size: section.output_size,
+                data_hash: section.data_hash.clone(),
+                cstring_nul_boundaries_hash: section.cstring_nul_boundaries_hash.clone(),
+            }),
+            updates.input_ranges,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(previous_patch.fingerprint, current_fingerprint);
+    }
+
+    #[test]
     fn archive_patch_fingerprint_allows_a_masked_macho_member_to_grow() {
         let previous_object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
         let grown_object =
@@ -24197,6 +24344,7 @@ mod tests {
             &previous,
             &output,
             &sections,
+            &[],
             &[],
             &[],
             &[],
