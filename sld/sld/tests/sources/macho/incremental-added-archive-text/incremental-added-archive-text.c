@@ -12,8 +12,8 @@
 //#TestIncrementalChangedCompArgs:-DACTIVATE_ADDED_MEMBER=1
 //#TestIncrementalChangedAddedArchiveMember:aaa_incremental_added_archive.1.changed.rcgu.o=incremental-added-archive-extra.S
 //#TestIncrementalChangedAddedArchiveMember:zzz_incremental_added_archive.2.changed.rcgu.o=incremental-added-archive-extra-second.S
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:multiple Mach-O archive members were added
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:3
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 
