@@ -745,10 +745,41 @@ pub(crate) fn maybe_prepare<'data>(
 
     current.log_mode(&mode)?;
 
-    let reusable_inputs = previous_metadata
+    let mut reusable_inputs = previous_metadata
         .as_ref()
         .map(|previous| reusable_input_files(&current.input_files, &previous.input_files))
         .unwrap_or_default();
+    if mode_needs_previous_sections(&mode)
+        && rustc_work_product_provenance_enabled()
+        && let Some(previous) = previous_metadata.as_ref()
+    {
+        match reusable_changed_rust_archive_section_aliases(
+            &state_dir,
+            file_loader,
+            &current.input_files,
+            &previous.input_files,
+            &previous_sections,
+        ) {
+            Ok((aliases, inputs)) => {
+                if !aliases.is_empty() {
+                    append_log(
+                        &state_dir,
+                        &format!(
+                            "prepared {} unchanged Rust archive member section{} for relink reuse",
+                            aliases.len(),
+                            if aliases.len() == 1 { "" } else { "s" },
+                        ),
+                    )?;
+                    previous_sections.extend(aliases);
+                    reusable_inputs.extend(inputs);
+                }
+            }
+            Err(error) => append_log(
+                &state_dir,
+                &format!("Rust archive member relink reuse unavailable: {error:?}"),
+            )?,
+        }
+    }
     let retained_output_to_restore = matches!(mode, IncrementalMode::Reuse)
         .then_some(retained_output_to_restore)
         .flatten();
@@ -5405,6 +5436,104 @@ fn reusable_input_files(current: &[FileState], previous: &[FileState]) -> HashSe
         .filter(|file| previous_by_path.get(file.path.as_str()) == Some(&&file.content))
         .map(|file| file.path.clone())
         .collect()
+}
+
+fn reusable_changed_rust_archive_section_aliases(
+    state_dir: &Path,
+    file_loader: &FileLoader<'_>,
+    current: &[FileState],
+    previous: &[FileState],
+    previous_sections: &HashSet<SectionRecord>,
+) -> Result<(Vec<SectionRecord>, HashSet<String>)> {
+    let loaded_by_path = file_loader
+        .loaded_files
+        .iter()
+        .map(|input| (encode_path(&input.filename), *input))
+        .collect::<HashMap<_, _>>();
+    let previous_by_path = previous
+        .iter()
+        .map(|input| (input.path.as_str(), input))
+        .collect::<HashMap<_, _>>();
+    let mut aliases = Vec::new();
+    let mut reusable_inputs = HashSet::new();
+
+    for current_input in current {
+        let Some(previous_input) = previous_by_path.get(current_input.path.as_str()) else {
+            continue;
+        };
+        if current_input.content == previous_input.content {
+            continue;
+        }
+        let path = decode_path(&current_input.path)?;
+        if path.extension().is_none_or(|extension| extension != "rlib") {
+            continue;
+        }
+        let Some(loaded) = loaded_by_path.get(&current_input.path) else {
+            continue;
+        };
+        let Some(previous_bytes) = read_verified_input_snapshot(state_dir, previous_input)? else {
+            continue;
+        };
+        let current_aliases = reusable_rust_archive_section_aliases(
+            &current_input.path,
+            &previous_bytes,
+            loaded.full_data(),
+            previous_sections,
+        )?;
+        if current_aliases.is_empty() {
+            continue;
+        }
+        aliases.extend(current_aliases);
+        reusable_inputs.insert(current_input.path.clone());
+    }
+
+    Ok((aliases, reusable_inputs))
+}
+
+fn reusable_rust_archive_section_aliases(
+    input_file: &str,
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    previous_sections: &HashSet<SectionRecord>,
+) -> Result<Vec<SectionRecord>> {
+    let Some(previous_digests) = normalized_rustc_rlib_raw_object_digests(previous_bytes) else {
+        return Ok(Vec::new());
+    };
+    let Some(current_digests) = normalized_rustc_rlib_raw_object_digests(current_bytes) else {
+        return Ok(Vec::new());
+    };
+    let current_resolver = PatchInputResolver::new(current_bytes, true)?;
+    let mut aliases = Vec::new();
+
+    for previous_section in previous_sections {
+        if previous_section.input_file != input_file {
+            continue;
+        }
+        let Some(parsed) = parse_patch_input_ref(input_file, &previous_section.input)? else {
+            continue;
+        };
+        let identifier = archive_member_patch_identifier(&parsed.identifier);
+        let Some(previous_digest) = previous_digests.get(&identifier) else {
+            continue;
+        };
+        if current_digests.get(&identifier) != Some(previous_digest) {
+            continue;
+        }
+        let Some(current_input) = current_resolver.resolve(
+            input_file,
+            &previous_section.input,
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            continue;
+        };
+        let mut alias = previous_section.clone();
+        alias.input =
+            resolved_patch_input_ref(input_file, &previous_section.input, current_input)?.into();
+        aliases.push(alias);
+    }
+
+    Ok(aliases)
 }
 
 impl CurrentState {
@@ -10064,6 +10193,32 @@ fn rustc_rlib_raw_object_digests_from_wrapper<'data, R: object::read::ReadRef<'d
     let file = object::File::parse(data).ok()?;
     let section = file.section_by_name(RUSTC_RLIB_LINK_METADATA_SECTION)?;
     decode_rustc_rlib_raw_object_digests(section.data().ok()?)
+}
+
+fn normalized_rustc_rlib_raw_object_digests(bytes: &[u8]) -> Option<HashMap<Vec<u8>, String>> {
+    let archive = ArchiveIterator::from_archive_bytes(bytes).ok()?;
+    let mut raw_object_digests = None;
+    for entry in archive {
+        let ArchiveEntry::Regular(content) = entry.ok()? else {
+            return None;
+        };
+        if content.ident.as_slice() != RUSTC_RLIB_LINK_METADATA_MEMBER {
+            continue;
+        }
+        if raw_object_digests.is_some() {
+            return None;
+        }
+        raw_object_digests = rustc_rlib_raw_object_digests_from_wrapper(content.entry_data);
+    }
+
+    let mut normalized = HashMap::new();
+    for object in raw_object_digests? {
+        let identifier = archive_member_patch_identifier(&object.identifier);
+        if normalized.insert(identifier, object.digest).is_some() {
+            return None;
+        }
+    }
+    Some(normalized)
 }
 
 fn decode_rustc_rlib_raw_object_digests(metadata: &[u8]) -> Option<Vec<RustcRlibRawObjectDigest>> {
@@ -23093,6 +23248,112 @@ mod tests {
             decode_rustc_rlib_link_content_digest(&metadata),
             Some("c".repeat(blake3::OUT_LEN * 2))
         );
+    }
+
+    #[test]
+    fn changed_rust_archive_reuses_only_unchanged_member_sections() {
+        let archive = |objects: &[(&[u8], &str, &[u8])]| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(objects.len() as u64).to_le_bytes());
+            for (identifier, digest, _) in objects {
+                payload.extend_from_slice(&(identifier.len() as u64).to_le_bytes());
+                payload.extend_from_slice(identifier);
+                payload.extend_from_slice(digest.as_bytes());
+            }
+            let mut metadata = b"encoded metadata".to_vec();
+            metadata.extend_from_slice(RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX);
+            metadata.extend_from_slice(&payload);
+            metadata.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+            let metadata = rmeta_link_wrapper_elf(&metadata);
+
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(
+                        RUSTC_RLIB_LINK_METADATA_MEMBER.to_vec(),
+                        metadata.len() as u64,
+                    ),
+                    metadata.as_slice(),
+                )
+                .unwrap();
+            for (identifier, _, data) in objects {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), data.len() as u64),
+                        *data,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let digest_a = "a".repeat(blake3::OUT_LEN * 2);
+        let digest_b = "b".repeat(blake3::OUT_LEN * 2);
+        let digest_c = "c".repeat(blake3::OUT_LEN * 2);
+        let digest_d = "d".repeat(blake3::OUT_LEN * 2);
+        let previous = archive(&[
+            (
+                b"crate.unchanged.old.rcgu.o",
+                digest_a.as_str(),
+                b"unchanged",
+            ),
+            (b"crate.changed.old.rcgu.o", digest_b.as_str(), b"previous"),
+        ]);
+        let current = archive(&[
+            (b"crate.added.new.rcgu.o", digest_c.as_str(), b"added"),
+            (
+                b"crate.unchanged.new.rcgu.o",
+                digest_a.as_str(),
+                b"unchanged",
+            ),
+            (b"crate.changed.new.rcgu.o", digest_d.as_str(), b"current"),
+        ]);
+        let input_file = hex::encode("libcrate.rlib");
+        let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
+        let previous_input_ref = |identifier: &[u8]| {
+            let mut input_ref = b"libcrate.rlib".to_vec();
+            input_ref.push(0);
+            input_ref.extend_from_slice(identifier);
+            input_ref.extend_from_slice(b"\00:1");
+            let encoded = hex::encode(input_ref);
+            let input = previous_resolver
+                .resolve(&input_file, &encoded, PatchInputLookup::MatchArchiveMember)
+                .unwrap()
+                .unwrap();
+            resolved_patch_input_ref(&input_file, &encoded, input).unwrap()
+        };
+        let unchanged = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input_ref(b"crate.unchanged.old.rcgu.o").into(),
+            section_index: 3,
+            output_offset: 64,
+            size: 16,
+        };
+        let changed = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input_ref(b"crate.changed.old.rcgu.o").into(),
+            section_index: 4,
+            output_offset: 80,
+            size: 16,
+        };
+
+        let aliases = reusable_rust_archive_section_aliases(
+            &input_file,
+            &previous,
+            &current,
+            &[unchanged.clone(), changed].into_iter().collect(),
+        )
+        .unwrap();
+
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].section_index, unchanged.section_index);
+        assert_eq!(aliases[0].output_offset, unchanged.output_offset);
+        assert_eq!(aliases[0].size, unchanged.size);
+        let parsed = parse_patch_input_ref(&input_file, &aliases[0].input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.identifier, b"crate.unchanged.new.rcgu.o".as_slice());
+        assert_ne!(aliases[0].input, unchanged.input);
     }
 
     #[test]
