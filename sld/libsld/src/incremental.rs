@@ -15214,7 +15214,7 @@ fn rustc_rlib_link_content_digest_matches_previous_path(
         }
         for member in archive.members() {
             let member = member.ok()?;
-            if member.name() != RUSTC_RLIB_LINK_METADATA_MEMBER {
+            if trim_archive_member_nul_padding(member.name()) != RUSTC_RLIB_LINK_METADATA_MEMBER {
                 continue;
             }
             let (offset, size) = member.file_range();
@@ -15238,6 +15238,14 @@ fn rustc_rlib_link_content_digest_matches_previous_path(
         }
         None
     }
+}
+
+fn trim_archive_member_nul_padding(name: &[u8]) -> &[u8] {
+    let end = name
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    &name[..end]
 }
 
 fn rustc_rlib_link_content_digest_value_matches_previous(
@@ -41276,7 +41284,7 @@ mod tests {
 
         assert_eq!(
             rustc_rlib_link_content_digest(&previous),
-            Some(previous_digest)
+            Some(previous_digest.clone())
         );
         assert!(rustc_rlib_link_content_digest_matches_previous(
             &input, &previous
@@ -41295,6 +41303,37 @@ mod tests {
 
         std::fs::write(&path, &current).unwrap();
         assert!(rustc_rlib_link_content_digest_matches_previous_path(&input, &path).is_none());
+
+        let padded_bsd_archive = {
+            let mut metadata = b"encoded metadata".to_vec();
+            metadata.extend_from_slice(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX);
+            metadata.extend_from_slice(previous_digest.as_bytes());
+            metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+            let metadata = rmeta_link_wrapper_elf(&metadata);
+            let member_name = [RUSTC_RLIB_LINK_METADATA_MEMBER, b"\0\0"].concat();
+            let member_size = member_name.len() + metadata.len();
+            let mut archive = b"!<arch>\n".to_vec();
+            let mut append_field = |value: &[u8], width: usize| {
+                archive.extend_from_slice(value);
+                archive.resize(archive.len() + width - value.len(), b' ');
+            };
+            append_field(b"#1/16", 16);
+            append_field(b"0", 12);
+            append_field(b"0", 6);
+            append_field(b"0", 6);
+            append_field(b"100644", 8);
+            append_field(member_size.to_string().as_bytes(), 10);
+            archive.extend_from_slice(b"`\n");
+            archive.extend_from_slice(&member_name);
+            archive.extend_from_slice(&metadata);
+            if member_size % 2 != 0 {
+                archive.push(b'\n');
+            }
+            archive
+        };
+        std::fs::write(&path, &padded_bsd_archive).unwrap();
+        let content = rustc_rlib_link_content_digest_matches_previous_path(&input, &path).unwrap();
+        assert_eq!(content.len, padded_bsd_archive.len() as u64);
     }
 
     fn rustc_rlib_with_link_content_digest(
