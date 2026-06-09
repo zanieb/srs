@@ -1900,9 +1900,11 @@ fn update_macho_symbol_resolutions_for_input(
     resolutions: &mut [MachOSymbolResolutionRecord],
     input: &FileState,
     bytes: &[u8],
+    allow_added_archive_retirement: bool,
 ) -> Result<std::result::Result<MachOSymbolResolutionUpdates, String>> {
     let mut input_ranges = Vec::new();
     let mut output_symbols = Vec::new();
+    let mut retiring_names = Vec::new();
     let mut changed = false;
     for resolution in resolutions {
         let Some(target) = resolution
@@ -1931,6 +1933,15 @@ fn update_macho_symbol_resolutions_for_input(
         )? {
             Ok(Some(current)) => current,
             Ok(None) => {
+                if allow_added_archive_retirement
+                    && resolution.direct_value.is_some()
+                    && resolution.got_address.is_none()
+                    && resolution.stub_address.is_none()
+                    && resolution.thunk_addresses.is_empty()
+                {
+                    retiring_names.push(resolution.name.clone());
+                    continue;
+                }
                 return Ok(Err(format!(
                     "missing Mach-O symbol catalog target in {}",
                     display_hex_path(&input.path)
@@ -1984,10 +1995,17 @@ fn update_macho_symbol_resolutions_for_input(
         target.section_offset = current.section_offset;
         changed = true;
     }
+    retiring_names.sort_unstable();
+    if retiring_names.windows(2).any(|names| names[0] == names[1]) {
+        return Ok(Err(
+            "ambiguous missing Mach-O symbol catalog target".to_owned()
+        ));
+    }
     dedup_ranges(&mut input_ranges);
     Ok(Ok(MachOSymbolResolutionUpdates {
         input_ranges,
         output_symbols,
+        retiring_names,
         changed,
     }))
 }
@@ -2633,6 +2651,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &mut previous.macho_symbol_resolutions,
                     input,
                     &bytes,
+                    added_archive_member_identifiers.is_some(),
                 )? {
                     Ok(updates) => updates,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -2779,6 +2798,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         args.common().incremental_padding_percent,
                         previous_output.get()?,
                         &previous.macho_symbol_resolutions,
+                        &macho_resolution_updates.retiring_names,
                     )? {
                         Ok(activation) => Some(activation),
                         Err(reason) => {
@@ -2870,6 +2890,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     let replays = match macho_text_relocation_replays_for_input(
                         &previous.relocations,
                         &mut previous.macho_symbol_resolutions,
+                        &macho_resolution_updates.retiring_names,
                         input,
                         &matched_sections,
                         previous_resolver,
@@ -2912,6 +2933,27 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 macho_text_relocation_replays
                     .replays
                     .extend(activation.relocation_replays.iter().cloned());
+            }
+            let recycled_resolution_names = added_macho_archive_text_activation
+                .as_ref()
+                .into_iter()
+                .flat_map(|activation| activation.recycled_symbol_resolution_names.iter().cloned())
+                .collect::<HashSet<_>>();
+            match retire_missing_macho_symbol_resolutions(
+                &mut previous.macho_symbol_resolutions,
+                &previous.relocations,
+                &macho_text_relocation_replays.replays,
+                &macho_text_relocation_replays.rematerialized_sections,
+                &macho_resolution_updates.retiring_names,
+                &recycled_resolution_names,
+                input,
+                previous_output.get()?,
+            ) {
+                Ok(true) => {
+                    macho_text_relocation_replays.symbol_resolutions_changed = true;
+                }
+                Ok(false) => {}
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             }
             if macho_text_relocation_replays.symbol_resolutions_changed {
                 previous.macho_symbol_resolutions_file = None;
@@ -3048,8 +3090,34 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 } else {
                     false
                 };
+            let added_archive_base_diff_is_retired_symbols = if let Some(activation) =
+                &added_macho_archive_text_activation
+                && !added_archive_base_fingerprint_matches
+                && !macho_resolution_updates.retiring_names.is_empty()
+            {
+                let previous_bytes = {
+                    timing_phase!("Read previous incremental input snapshot");
+                    previous_snapshot_bytes.get()?
+                };
+                if let Some(previous_bytes) = previous_bytes {
+                    archive_diff_allows_retired_macho_symbols(
+                        previous_bytes,
+                        &bytes,
+                        input.path.as_str(),
+                        &matched_sections,
+                        &current_resolver,
+                        &activation.normalized_identifiers,
+                        &macho_resolution_updates.retiring_names,
+                    )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             if added_macho_archive_text_activation.is_some()
                 && !added_archive_base_fingerprint_matches
+                && !added_archive_base_diff_is_retired_symbols
             {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed archive members outside added Mach-O text members in `{}`",
@@ -4245,6 +4313,7 @@ struct RelocationTargetPatches {
 struct MachOSymbolResolutionUpdates {
     input_ranges: Vec<std::ops::Range<usize>>,
     output_symbols: Vec<RelocationTargetSymbolPatch>,
+    retiring_names: Vec<SharedText>,
     changed: bool,
 }
 
@@ -4876,6 +4945,7 @@ struct AddedMachOArchiveTextActivations {
     sections: Vec<PatchSection>,
     records: Vec<SectionRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    recycled_symbol_resolution_names: Vec<SharedText>,
     symbol_table_patches: Vec<SectionPatch>,
     chained_fixup_patches: Vec<SectionPatch>,
     relocation_replays: Vec<MachOTextRelocationReplay>,
@@ -9632,6 +9702,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
     relocations: &[RelocationRecord],
     replays: &[MachOTextRelocationReplay],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    retiring_names: &[SharedText],
     input: &FileState,
 ) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool), String> {
     let mut affected_names = HashSet::<SharedText>::new();
@@ -9700,6 +9771,18 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 continue;
             };
             let resolution = &resolutions[resolution_index];
+            if retiring_names.contains(&target_name)
+                && resolution.direct_value.is_some()
+                && resolution.got_address.is_none()
+                && resolution.stub_address.is_none()
+                && resolution.thunk_addresses.is_empty()
+                && resolution
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.input_file == input.path)
+            {
+                continue;
+            }
             if resolution.direct_value.unwrap_or_default() != 0
                 && resolution.got_address.is_none()
                 && resolution.stub_address.is_none()
@@ -9755,9 +9838,96 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
     Ok((output_symbols, changed))
 }
 
+fn retire_missing_macho_symbol_resolutions(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    relocations: &[RelocationRecord],
+    replays: &[MachOTextRelocationReplay],
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    retiring_names: &[SharedText],
+    recycled_names: &HashSet<SharedText>,
+    input: &FileState,
+    previous_output: &[u8],
+) -> std::result::Result<bool, String> {
+    if retiring_names.is_empty() {
+        return Ok(false);
+    }
+
+    let output_file = object::File::parse(previous_output)
+        .map_err(|_| "failed to parse previous output for Mach-O symbol retirement".to_owned())?;
+    let mut retiring_indices = Vec::with_capacity(retiring_names.len());
+    for name in retiring_names {
+        if !recycled_names.contains(name) {
+            return Err(format!(
+                "missing Mach-O symbol resolution has no recycled output slot in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+        let Some(resolution_index) =
+            macho_symbol_resolution_index_for_name(resolutions, name.as_str())?
+        else {
+            return Err("missing deferred Mach-O symbol resolution catalog entry".to_owned());
+        };
+        let resolution = &resolutions[resolution_index];
+        if resolution.direct_value.is_none()
+            || resolution.got_address.is_some()
+            || resolution.stub_address.is_some()
+            || !resolution.thunk_addresses.is_empty()
+            || resolution
+                .target
+                .as_ref()
+                .is_none_or(|target| target.input_file != input.path)
+        {
+            return Err(format!(
+                "missing Mach-O symbol resolution cannot be retired in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+        if relocations.iter().any(|relocation| {
+            relocation.target_name.as_ref() == Some(name)
+                && !relocation_is_in_rematerialized_macho_text_section(
+                    relocation,
+                    rematerialized_sections,
+                )
+        }) || replays
+            .iter()
+            .any(|replay| replay.target_name.as_ref() == Some(name))
+        {
+            return Err(format!(
+                "missing Mach-O symbol resolution is still referenced in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+        let decoded_name = hex::decode(name.as_str())
+            .map_err(|_| "malformed Mach-O symbol resolution name".to_owned())?;
+        let published_symbol_count = output_file
+            .symbols()
+            .filter(|symbol| {
+                symbol
+                    .name_bytes()
+                    .is_ok_and(|candidate| candidate == decoded_name)
+            })
+            .count();
+        if published_symbol_count != 1 {
+            return Err(format!(
+                "missing Mach-O symbol resolution has no unique recyclable output symbol in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+        retiring_indices.push(resolution_index);
+    }
+
+    retiring_indices.sort_unstable();
+    retiring_indices.dedup();
+    for index in retiring_indices.into_iter().rev() {
+        resolutions.remove(index);
+    }
+    Ok(true)
+}
+
 fn macho_text_relocation_replays_for_input(
     relocations: &[RelocationRecord],
     resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    retiring_names: &[SharedText],
     input: &FileState,
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
@@ -9932,8 +10102,49 @@ fn macho_text_relocation_replays_for_input(
             } else {
                 false
             };
+            let replaces_retiring_target = previous_signatures.len() == current_signatures.len()
+                && previous_signatures
+                    .iter()
+                    .zip(&current_signatures)
+                    .any(|(previous, current)| previous != current)
+                && previous_signatures.iter().zip(&current_signatures).all(
+                    |(previous, current)| {
+                        if previous == current {
+                            return true;
+                        }
+                        let (
+                            previous_type,
+                            previous_pcrel,
+                            previous_addend,
+                            Some((previous_name, previous_section)),
+                        ) = previous
+                        else {
+                            return false;
+                        };
+                        let (
+                            current_type,
+                            current_pcrel,
+                            current_addend,
+                            Some((current_name, current_section)),
+                        ) = current
+                        else {
+                            return false;
+                        };
+                        previous_type == current_type
+                            && previous_pcrel == current_pcrel
+                            && previous_addend == current_addend
+                            && previous_section.is_none()
+                            && current_section.is_none()
+                            && retiring_names
+                                .iter()
+                                .any(|name| name.as_str() == hex::encode(previous_name))
+                            && macho_symbol_resolution_for_name(resolutions, current_name).is_some()
+                    },
+                );
             if relocation_set_changed
-                && (previous_signatures.len() != current_signatures.len() || is_reordering)
+                && (previous_signatures.len() != current_signatures.len()
+                    || is_reordering
+                    || replaces_retiring_target)
             {
                 for relocation_index in &relocation_indices {
                     if target_moves.contains_key(relocation_index) {
@@ -10231,6 +10442,7 @@ fn macho_text_relocation_replays_for_input(
             relocations,
             &replays,
             &rematerialized_sections,
+            retiring_names,
             input,
         ) {
             Ok(updates) => updates,
@@ -11931,12 +12143,197 @@ fn archive_patch_fingerprint_with_previous(
     )))
 }
 
+fn archive_macho_defined_symbol_counts(
+    bytes: &[u8],
+    ignored_identifiers: &[Vec<u8>],
+    names: &HashSet<Vec<u8>>,
+) -> Result<Option<HashMap<Vec<u8>, usize>>> {
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut counts = names
+        .iter()
+        .cloned()
+        .map(|name| (name, 0))
+        .collect::<HashMap<_, _>>();
+    for entry in archive {
+        let ArchiveEntry::Regular(content) = entry? else {
+            return Ok(None);
+        };
+        let identifier = archive_member_patch_identifier(content.ident.as_slice());
+        if ignored_identifiers
+            .iter()
+            .any(|ignored| ignored == &identifier)
+            || identifier.starts_with(b"__.SYMDEF")
+            || matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link")
+        {
+            continue;
+        }
+        let Ok(file) = object::File::parse(content.entry_data) else {
+            return Ok(None);
+        };
+        if file.format() != object::BinaryFormat::MachO {
+            return Ok(None);
+        }
+        for symbol in file.symbols().filter(|symbol| !symbol.is_undefined()) {
+            let Ok(name) = symbol.name_bytes() else {
+                return Ok(None);
+            };
+            if let Some(count) = counts.get_mut(name) {
+                *count += 1;
+            }
+        }
+    }
+    Ok(Some(counts))
+}
+
+fn macho_definition_counts_prove_retirement(
+    names: &HashSet<Vec<u8>>,
+    previous: &HashMap<Vec<u8>, usize>,
+    current: &HashMap<Vec<u8>, usize>,
+) -> bool {
+    names
+        .iter()
+        .all(|name| previous.get(name) == Some(&1) && current.get(name) == Some(&0))
+}
+
+fn archive_retired_macho_symbols_proof_fingerprint(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+) -> Result<Option<blake3::Hash>> {
+    if ignored_defined_symbols.is_empty() {
+        return Ok(None);
+    }
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sld-archive-retired-macho-symbol-proof-v1");
+    let mut member_count = 0_u64;
+    for entry in archive {
+        let ArchiveEntry::Regular(content) = entry? else {
+            return Ok(None);
+        };
+        let identifier = archive_member_patch_identifier(content.ident.as_slice());
+        if ignored_identifiers
+            .iter()
+            .any(|ignored| ignored == &identifier)
+            || identifier.starts_with(b"__.SYMDEF")
+            || matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link")
+        {
+            continue;
+        }
+        let Some(member_hash) = macho_object_semantic_patch_fingerprint(
+            content.entry_data,
+            content.data_offset,
+            ranges,
+            &HashSet::new(),
+            ignored_defined_symbols,
+            true,
+        ) else {
+            return Ok(None);
+        };
+        member_count += 1;
+        hasher.update(&(identifier.len() as u64).to_le_bytes());
+        hasher.update(&identifier);
+        hasher.update(member_hash.as_bytes());
+    }
+    hasher.update(&member_count.to_le_bytes());
+    Ok(Some(hasher.finalize()))
+}
+
+fn archive_diff_allows_retired_macho_symbols(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    ignored_current_identifiers: &[Vec<u8>],
+    retiring_names: &[SharedText],
+) -> Result<bool> {
+    if retiring_names.is_empty() {
+        return Ok(false);
+    }
+    let ignored_defined_symbols = retiring_names
+        .iter()
+        .map(|name| hex::decode(name.as_str()))
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .context("Malformed deferred Mach-O symbol resolution name")?;
+    let Some(previous_definition_counts) =
+        archive_macho_defined_symbol_counts(previous_bytes, &[], &ignored_defined_symbols)?
+    else {
+        return Ok(false);
+    };
+    let Some(current_definition_counts) = archive_macho_defined_symbol_counts(
+        current_bytes,
+        ignored_current_identifiers,
+        &ignored_defined_symbols,
+    )?
+    else {
+        return Ok(false);
+    };
+    if !macho_definition_counts_prove_retirement(
+        &ignored_defined_symbols,
+        &previous_definition_counts,
+        &current_definition_counts,
+    ) {
+        return Ok(false);
+    }
+    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let Some(previous_ranges) = patch_ranges_with_resolver(
+        previous_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.previous.clone()),
+        &previous_resolver,
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(current_ranges) = patch_ranges_with_resolver(
+        current_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.current.clone()),
+        current_resolver,
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    else {
+        return Ok(false);
+    };
+    let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+        previous_bytes,
+        &previous_ranges,
+        &[],
+        &ignored_defined_symbols,
+    )?;
+    let current_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+        current_bytes,
+        &current_ranges,
+        ignored_current_identifiers,
+        &ignored_defined_symbols,
+    )?;
+    Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
+}
+
 fn macho_object_patch_fingerprint(
     bytes: &[u8],
     file_offset: usize,
     ranges: &[std::ops::Range<usize>],
 ) -> Option<blake3::Hash> {
-    macho_object_semantic_patch_fingerprint(bytes, file_offset, ranges, &HashSet::new(), true)
+    macho_object_semantic_patch_fingerprint(
+        bytes,
+        file_offset,
+        ranges,
+        &HashSet::new(),
+        &HashSet::new(),
+        true,
+    )
 }
 
 fn macho_object_semantic_patch_fingerprint(
@@ -11944,6 +12341,7 @@ fn macho_object_semantic_patch_fingerprint(
     file_offset: usize,
     ranges: &[std::ops::Range<usize>],
     ignored_sections: &HashSet<object::SectionIndex>,
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
     require_masked_text: bool,
 ) -> Option<blake3::Hash> {
     let file = object::File::parse(bytes).ok()?;
@@ -11960,7 +12358,11 @@ fn macho_object_semantic_patch_fingerprint(
     };
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sld-macho-object-patch-fingerprint-v5");
+    if ignored_defined_symbols.is_empty() {
+        hasher.update(b"sld-macho-object-patch-fingerprint-v5");
+    } else {
+        hasher.update(b"sld-macho-object-retired-symbol-proof-v1");
+    }
     hasher.update(bytes.get(4..12)?);
     hasher.update(&flags.to_le_bytes());
 
@@ -12072,6 +12474,12 @@ fn macho_object_semantic_patch_fingerprint(
     let symbols = file
         .symbols()
         .filter(|symbol| !masked_text_undefined_symbols.contains(&symbol.index()))
+        .filter(|symbol| {
+            symbol.is_undefined()
+                || symbol
+                    .name_bytes()
+                    .is_ok_and(|name| !ignored_defined_symbols.contains(name))
+        })
         .filter(|symbol| {
             symbol
                 .section_index()
@@ -12340,6 +12748,7 @@ fn macho_text_section_activation(
         0,
         &previous_ranges,
         &previous_text_index.into_iter().collect(),
+        &HashSet::new(),
         false,
     );
     let current_fingerprint = macho_object_semantic_patch_fingerprint(
@@ -12347,6 +12756,7 @@ fn macho_text_section_activation(
         0,
         &current_ranges,
         &HashSet::from([current_text_index]),
+        &HashSet::new(),
         false,
     );
     if previous_fingerprint.is_none() || previous_fingerprint != current_fingerprint {
@@ -12412,6 +12822,7 @@ fn added_macho_archive_text_activations(
     padding_percent: u32,
     previous_output: &[u8],
     resolutions: &[MachOSymbolResolutionRecord],
+    retiring_names: &[SharedText],
 ) -> Result<std::result::Result<AddedMachOArchiveTextActivations, String>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(current_bytes) else {
         return Ok(Err(
@@ -12583,17 +12994,37 @@ fn added_macho_archive_text_activations(
             target: Some(target),
         });
     }
-    let symbol_table_patches = match added_macho_symbol_table_patches(
+    if retiring_names.len() > symbol_resolutions.len() {
+        return Ok(Err(
+            "removed Mach-O symbols exceed selected new definitions".to_owned(),
+        ));
+    }
+    let (mut symbol_table_patches, recycled_symbol_resolution_names) =
+        match recycled_macho_symbol_table_patches(
+            previous_output,
+            &output_file,
+            &members,
+            &selected_indices[..retiring_names.len()],
+            &symbol_resolutions[..retiring_names.len()],
+            retiring_names,
+            resolutions,
+            &mut remaining_reserved_ranges,
+        )? {
+            Ok(patches) => patches,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let new_symbol_table_patches = match added_macho_symbol_table_patches(
         previous_output,
         &output_file,
         &members,
-        &selected_indices,
-        &symbol_resolutions,
+        &selected_indices[retiring_names.len()..],
+        &symbol_resolutions[retiring_names.len()..],
         &mut remaining_reserved_ranges,
     )? {
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
+    symbol_table_patches.extend(new_symbol_table_patches);
 
     let mut combined_resolutions = resolutions.to_vec();
     combined_resolutions.extend(symbol_resolutions.iter().cloned());
@@ -12627,12 +13058,278 @@ fn added_macho_archive_text_activations(
         sections,
         records,
         symbol_resolutions,
+        recycled_symbol_resolution_names,
         symbol_table_patches,
         chained_fixup_patches,
         relocation_replays,
         provisional_relocations,
         remaining_reserved_ranges,
     }))
+}
+
+fn macho_symbol_table_offset_for_recycling(bytes: &[u8]) -> std::result::Result<u64, String> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0)
+        .map_err(|_| "failed to parse Mach-O output for symbol slot recycling".to_owned())?;
+    let endian = header
+        .endian()
+        .map_err(|_| "unsupported Mach-O output endianness".to_owned())?;
+    if endian != object::Endianness::Little {
+        return Err("unsupported Mach-O output endianness".to_owned());
+    }
+    let mut commands = header
+        .load_commands(endian, bytes, 0)
+        .map_err(|_| "failed to parse Mach-O output load commands".to_owned())?;
+    let mut symbol_table_offset = None;
+    while let Some(command) = commands
+        .next()
+        .map_err(|_| "failed to parse Mach-O output load command".to_owned())?
+    {
+        if let Some(symtab) = command
+            .symtab()
+            .map_err(|_| "failed to parse Mach-O symbol table command".to_owned())?
+        {
+            if symbol_table_offset
+                .replace(u64::from(symtab.symoff.get(endian)))
+                .is_some()
+            {
+                return Err("Mach-O output has multiple symbol tables".to_owned());
+            }
+        }
+        if command.cmd() == object::macho::LC_DYSYMTAB {
+            return Err("Mach-O output has an indirect symbol table".to_owned());
+        }
+        if command.cmd() == object::macho::LC_DYLD_EXPORTS_TRIE {
+            return Err("Mach-O output has an exports trie".to_owned());
+        }
+        if let Some(dyld_info) = command
+            .dyld_info()
+            .map_err(|_| "failed to parse Mach-O dyld info".to_owned())?
+            && dyld_info.export_size.get(endian) != 0
+        {
+            return Err("Mach-O output has exported symbols".to_owned());
+        }
+    }
+    symbol_table_offset.ok_or_else(|| "Mach-O output has no symbol table".to_owned())
+}
+
+fn unique_macho_output_symbol_index(
+    output_file: &object::File<'_>,
+    name: &[u8],
+    value: u64,
+) -> std::result::Result<usize, String> {
+    let mut matching_symbol = None;
+    for symbol in output_file.symbols() {
+        if !symbol.name_bytes().is_ok_and(|candidate| candidate == name) {
+            continue;
+        }
+        if matching_symbol
+            .replace((symbol.index().0, symbol.address()))
+            .is_some()
+        {
+            return Err("ambiguous Mach-O output symbol for slot recycling".to_owned());
+        }
+    }
+    match matching_symbol {
+        Some((index, current_value)) if current_value == value => Ok(index),
+        Some(_) => Err("Mach-O output symbol value changed before slot recycling".to_owned()),
+        None => Err("missing Mach-O output symbol for slot recycling".to_owned()),
+    }
+}
+
+fn macho_symbol_entry_range(
+    previous_output: &[u8],
+    symbol_table_offset: u64,
+    symbol_index: usize,
+) -> std::result::Result<std::ops::Range<usize>, String> {
+    let start = usize::try_from(symbol_table_offset)
+        .map_err(|_| "Mach-O symbol table offset is too large".to_owned())?
+        .checked_add(
+            symbol_index
+                .checked_mul(std::mem::size_of::<
+                    object::macho::Nlist64<object::Endianness>,
+                >())
+                .ok_or_else(|| "Mach-O symbol entry offset overflowed".to_owned())?,
+        )
+        .ok_or_else(|| "Mach-O symbol entry offset overflowed".to_owned())?;
+    let end = start
+        .checked_add(std::mem::size_of::<
+            object::macho::Nlist64<object::Endianness>,
+        >())
+        .ok_or_else(|| "Mach-O symbol entry range overflowed".to_owned())?;
+    previous_output
+        .get(start..end)
+        .ok_or_else(|| "Mach-O symbol entry is outside output".to_owned())?;
+    Ok(start..end)
+}
+
+fn added_macho_symbol_entry(
+    member: &AddedMachOArchiveTextMember,
+    text_section_index: u8,
+    string_index: u32,
+    value: u64,
+) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(std::mem::size_of::<
+        object::macho::Nlist64<object::Endianness>,
+    >());
+    entry.extend_from_slice(&string_index.to_le_bytes());
+    let mut symbol_type = object::macho::N_SECT | object::macho::N_EXT;
+    if member.definition_private_external {
+        symbol_type |= object::macho::N_PEXT;
+    }
+    entry.push(symbol_type);
+    entry.push(text_section_index);
+    entry.extend_from_slice(&member.definition_desc.to_le_bytes());
+    entry.extend_from_slice(&value.to_le_bytes());
+    entry
+}
+
+fn recycled_macho_symbol_table_patches(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    members: &[AddedMachOArchiveTextMember],
+    selected_indices: &[usize],
+    resolutions: &[MachOSymbolResolutionRecord],
+    retiring_names: &[SharedText],
+    previous_resolutions: &[MachOSymbolResolutionRecord],
+    remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
+) -> Result<std::result::Result<(Vec<SectionPatch>, Vec<SharedText>), String>> {
+    if retiring_names.is_empty() {
+        return Ok(Ok((Vec::new(), Vec::new())));
+    }
+    let symbol_table_offset = match macho_symbol_table_offset_for_recycling(previous_output) {
+        Ok(offset) => offset,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let Some(text_section) = output_file.sections().find(|section| {
+        section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+            && section.name_bytes().ok() == Some(b"__text".as_slice())
+    }) else {
+        return Ok(Err(
+            "previous Mach-O output has no __TEXT,__text section".to_owned()
+        ));
+    };
+    let text_section_index = u8::try_from(text_section.index().0)
+        .context("Mach-O text output section index exceeds u8")?;
+    let Some(string_table_offset) = macho_string_table_offset(previous_output) else {
+        return Ok(Err(
+            "previous Mach-O output has no usable symbol string table".to_owned(),
+        ));
+    };
+    let string_output_section_id = u32::try_from(crate::output_section_id::STRTAB.as_usize())
+        .context("Mach-O string table output section ID exceeds u32")?;
+    let mut patches = Vec::with_capacity(retiring_names.len() * 2);
+
+    for ((&member_index, resolution), retiring_name) in
+        selected_indices.iter().zip(resolutions).zip(retiring_names)
+    {
+        let member = &members[member_index];
+        if output_file.symbols().any(|symbol| {
+            symbol
+                .name_bytes()
+                .is_ok_and(|name| name == member.definition_name.as_slice())
+        }) {
+            return Ok(Err(
+                "added Mach-O archive member definition already exists in output".to_owned(),
+            ));
+        }
+        let Some(previous_resolution_index) =
+            macho_symbol_resolution_index_for_name(previous_resolutions, retiring_name.as_str())?
+        else {
+            return Ok(Err(
+                "missing deferred Mach-O symbol resolution catalog entry".to_owned(),
+            ));
+        };
+        let previous_resolution = &previous_resolutions[previous_resolution_index];
+        let Some(previous_value) = previous_resolution.direct_value else {
+            return Ok(Err(
+                "deferred Mach-O symbol resolution has no direct value".to_owned()
+            ));
+        };
+        if previous_resolution.got_address.is_some()
+            || previous_resolution.stub_address.is_some()
+            || !previous_resolution.thunk_addresses.is_empty()
+            || previous_resolution.target.is_none()
+        {
+            return Ok(Err(
+                "deferred Mach-O symbol resolution uses an indirect target".to_owned(),
+            ));
+        }
+        let decoded_retiring_name = hex::decode(retiring_name.as_str())
+            .context("Malformed deferred Mach-O symbol resolution name")?;
+        let symbol_index = match unique_macho_output_symbol_index(
+            output_file,
+            &decoded_retiring_name,
+            previous_value,
+        ) {
+            Ok(index) => index,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let symbol_range =
+            match macho_symbol_entry_range(previous_output, symbol_table_offset, symbol_index) {
+                Ok(range) => range,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let old_entry = &previous_output[symbol_range.clone()];
+        let old_type = old_entry[4];
+        if old_type & object::macho::N_STAB != 0
+            || old_type & object::macho::N_TYPE != object::macho::N_SECT
+            || old_type & object::macho::N_EXT == 0
+            || old_entry[5] != text_section_index
+        {
+            return Ok(Err(
+                "removed Mach-O symbol is not a recyclable external text definition".to_owned(),
+            ));
+        }
+
+        let string_size = u64::try_from(member.definition_name.len() + 1)
+            .context("Added Mach-O symbol name is too large")?;
+        let Some(string_allocation) = allocate_reserved_range(
+            remaining_reserved_ranges,
+            string_output_section_id,
+            0,
+            string_size,
+        )?
+        else {
+            return Ok(Err(
+                "insufficient incremental reserve for added Mach-O symbol name".to_owned(),
+            ));
+        };
+        let Some(string_index) = string_allocation
+            .output_offset
+            .checked_sub(string_table_offset)
+            .and_then(|offset| u32::try_from(offset).ok())
+        else {
+            return Ok(Err(
+                "added Mach-O symbol name is outside the string table".to_owned()
+            ));
+        };
+        let Some(value) = resolution.direct_value else {
+            return Ok(Err(
+                "added Mach-O archive member definition has no direct value".to_owned(),
+            ));
+        };
+        patches.push(SectionPatch {
+            output_offset: symbol_range.start as u64,
+            size: symbol_range.len() as u64,
+            data: added_macho_symbol_entry(member, text_section_index, string_index, value),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        let mut name = member.definition_name.clone();
+        name.push(0);
+        patches.push(SectionPatch {
+            output_offset: string_allocation.output_offset,
+            size: string_allocation.size,
+            data: name,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+    Ok(Ok((patches, retiring_names.to_vec())))
 }
 
 fn added_macho_symbol_table_patches(
@@ -12719,16 +13416,7 @@ fn added_macho_symbol_table_patches(
             ));
         };
 
-        let mut entry = Vec::with_capacity(symbol_entry_size as usize);
-        entry.extend_from_slice(&string_index.to_le_bytes());
-        let mut symbol_type = object::macho::N_SECT | object::macho::N_EXT;
-        if member.definition_private_external {
-            symbol_type |= object::macho::N_PEXT;
-        }
-        entry.push(symbol_type);
-        entry.push(text_section_index);
-        entry.extend_from_slice(&member.definition_desc.to_le_bytes());
-        entry.extend_from_slice(&value.to_le_bytes());
+        let entry = added_macho_symbol_entry(member, text_section_index, string_index, value);
         debug_assert_eq!(entry.len() as u64, symbol_entry_size);
         patches.push(SectionPatch {
             output_offset: symbol_allocation.output_offset,
@@ -26325,6 +27013,159 @@ mod tests {
     }
 
     #[test]
+    fn retired_macho_symbol_proof_ignores_only_the_exact_definition() {
+        const DATA_SECTION_HEADER: usize = 32 + 72 + 80;
+        const SYMTAB_COMMAND: usize = 32 + 72 + 2 * 80;
+
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let previous_text = test_macho_section_range(&previous, "__text");
+        let text_entry = macho_symbol_value_field_range(&previous, object::SymbolIndex(0))
+            .unwrap()
+            .start
+            - 8;
+        let data_entry = macho_symbol_value_field_range(&previous, object::SymbolIndex(1))
+            .unwrap()
+            .start
+            - 8;
+        let ignored_text = HashSet::from([b"_text".to_vec()]);
+        let ignored_data = HashSet::from([b"_data".to_vec()]);
+        let fingerprint = |bytes: &[u8], ignored: &HashSet<Vec<u8>>| {
+            macho_object_semantic_patch_fingerprint(
+                bytes,
+                0,
+                &[test_macho_section_range(bytes, "__text")],
+                &HashSet::new(),
+                ignored,
+                true,
+            )
+            .unwrap()
+        };
+
+        let mut retired = previous.clone();
+        retired[text_entry + 4] = object::macho::N_STAB;
+        assert_eq!(
+            fingerprint(&previous, &ignored_text),
+            fingerprint(&retired, &ignored_text)
+        );
+        assert_ne!(
+            fingerprint(&previous, &HashSet::new()),
+            fingerprint(&retired, &HashSet::new())
+        );
+        assert_ne!(
+            fingerprint(&previous, &ignored_data),
+            fingerprint(&retired, &ignored_data)
+        );
+
+        let mut changed_flags = retired.clone();
+        changed_flags[data_entry + 6..data_entry + 8].copy_from_slice(&1_u16.to_le_bytes());
+        assert_ne!(
+            fingerprint(&previous, &ignored_text),
+            fingerprint(&changed_flags, &ignored_text)
+        );
+
+        let mut changed_section = retired.clone();
+        changed_section[data_entry + 5] = 1;
+        assert_ne!(
+            fingerprint(&previous, &ignored_text),
+            fingerprint(&changed_section, &ignored_text)
+        );
+
+        let mut added_relocation = retired.clone();
+        let symoff = read_u32_le(&added_relocation[SYMTAB_COMMAND + 8..SYMTAB_COMMAND + 12])
+            .unwrap() as usize;
+        let stroff = read_u32_le(&added_relocation[SYMTAB_COMMAND + 16..SYMTAB_COMMAND + 20])
+            .unwrap() as usize;
+        added_relocation.splice(
+            symoff..symoff,
+            [
+                0_u32.to_le_bytes(),
+                ((2_u32 << 25) | (1_u32 << 27)).to_le_bytes(),
+            ]
+            .concat(),
+        );
+        added_relocation[DATA_SECTION_HEADER + 56..DATA_SECTION_HEADER + 60]
+            .copy_from_slice(&(symoff as u32).to_le_bytes());
+        added_relocation[DATA_SECTION_HEADER + 60..DATA_SECTION_HEADER + 64]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        added_relocation[SYMTAB_COMMAND + 8..SYMTAB_COMMAND + 12]
+            .copy_from_slice(&((symoff + 8) as u32).to_le_bytes());
+        added_relocation[SYMTAB_COMMAND + 16..SYMTAB_COMMAND + 20]
+            .copy_from_slice(&((stroff + 8) as u32).to_le_bytes());
+        assert_ne!(
+            macho_object_semantic_patch_fingerprint(
+                &previous,
+                0,
+                &[previous_text],
+                &HashSet::new(),
+                &ignored_text,
+                true,
+            ),
+            macho_object_semantic_patch_fingerprint(
+                &added_relocation,
+                0,
+                &[test_macho_section_range(&added_relocation, "__text")],
+                &HashSet::new(),
+                &ignored_text,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn retired_macho_symbol_proof_requires_one_previous_and_zero_current_definitions() {
+        let object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let archive = |members: &[(&[u8], &[u8])]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, bytes) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        *bytes,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let name = b"_text".to_vec();
+        let names = HashSet::from([name.clone()]);
+        let one = archive(&[(b"one.o", object.as_slice())]);
+        let duplicate = archive(&[(b"one.o", object.as_slice()), (b"two.o", object.as_slice())]);
+
+        assert_eq!(
+            archive_macho_defined_symbol_counts(&one, &[], &names)
+                .unwrap()
+                .unwrap()[&name],
+            1
+        );
+        assert_eq!(
+            archive_macho_defined_symbol_counts(&duplicate, &[], &names)
+                .unwrap()
+                .unwrap()[&name],
+            2
+        );
+        let one_count = archive_macho_defined_symbol_counts(&one, &[], &names)
+            .unwrap()
+            .unwrap();
+        let duplicate_count = archive_macho_defined_symbol_counts(&duplicate, &[], &names)
+            .unwrap()
+            .unwrap();
+        let zero_count = HashMap::from([(name.clone(), 0)]);
+        assert!(macho_definition_counts_prove_retirement(
+            &names,
+            &one_count,
+            &zero_count
+        ));
+        assert!(
+            !macho_definition_counts_prove_retirement(&names, &duplicate_count, &zero_count),
+            "duplicate previous definitions must reject retirement"
+        );
+        assert!(
+            !macho_definition_counts_prove_retirement(&names, &one_count, &one_count),
+            "current same-name reappearance must reject retirement"
+        );
+    }
+
+    #[test]
     fn dormant_macho_text_section_activation_consumes_reserve_transactionally() {
         let previous = test_macho_data_object(b"\x05\x06\x07\x08", Some(b""), false);
         let current = test_macho_data_object(b"\x05\x06\x07\x08", Some(b"\x1f\x20\x03\xd5"), false);
@@ -26548,6 +27389,7 @@ mod tests {
             &mut current_resolutions,
             &input_state,
             &current,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -26636,13 +27478,338 @@ mod tests {
             }),
         }];
 
-        let updates = update_macho_symbol_resolutions_for_input(&mut resolutions, &input, &current)
-            .unwrap()
-            .unwrap();
+        let updates =
+            update_macho_symbol_resolutions_for_input(&mut resolutions, &input, &current, false)
+                .unwrap()
+                .unwrap();
 
         assert!(updates.changed);
         assert!(updates.output_symbols.is_empty());
         assert_eq!(resolutions[0].target.as_ref().unwrap().input, current_input);
+    }
+
+    #[test]
+    fn missing_macho_symbol_resolution_is_deferred_only_for_archive_additions() {
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let mut current = previous.clone();
+        let name_offset = current
+            .windows(b"_data\0".len())
+            .rposition(|window| window == b"_data\0")
+            .unwrap();
+        current[name_offset..name_offset + b"_gone\0".len()].copy_from_slice(b"_gone\0");
+        let input_path = hex::encode("input.o");
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: 2,
+                section_offset: 0,
+            }),
+        };
+
+        let mut resolutions = vec![resolution.clone()];
+        assert!(matches!(
+            update_macho_symbol_resolutions_for_input(
+                &mut resolutions,
+                &input,
+                &current,
+                false,
+            )
+            .unwrap(),
+            Err(reason) if reason.contains("missing Mach-O symbol catalog target")
+        ));
+
+        let updates =
+            update_macho_symbol_resolutions_for_input(&mut resolutions, &input, &current, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            updates.retiring_names,
+            vec![SharedText::from(hex::encode("_data"))]
+        );
+        assert_eq!(resolutions, vec![resolution.clone()]);
+
+        let mut indirect_resolutions = Vec::new();
+        let mut got = resolution.clone();
+        got.got_address = Some(0x2000);
+        indirect_resolutions.push(got);
+        let mut stub = resolution.clone();
+        stub.stub_address = Some(0x3000);
+        indirect_resolutions.push(stub);
+        let mut thunk = resolution.clone();
+        thunk.thunk_addresses.push(0x4000);
+        indirect_resolutions.push(thunk);
+        let mut no_direct = resolution;
+        no_direct.direct_value = None;
+        indirect_resolutions.push(no_direct);
+        for indirect in indirect_resolutions {
+            assert!(matches!(
+                update_macho_symbol_resolutions_for_input(
+                    &mut [indirect],
+                    &input,
+                    &current,
+                    true,
+                )
+                .unwrap(),
+                Err(reason) if reason.contains("missing Mach-O symbol catalog target")
+            ));
+        }
+    }
+
+    #[test]
+    fn published_macho_symbol_resolution_retires_only_after_slot_recycling() {
+        let input = state("args", b"output", &[("input.o", b"input")])
+            .input_files
+            .remove(0);
+        let name = SharedText::from(hex::encode("_data"));
+        let resolution = MachOSymbolResolutionRecord {
+            name: name.clone(),
+            direct_value: Some(4),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input.path.clone().into(),
+                input: input.path.clone().into(),
+                section_index: 2,
+                section_offset: 0,
+            }),
+        };
+        let output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+
+        let mut without_recycled_slot = vec![resolution.clone()];
+        assert!(
+            retire_missing_macho_symbol_resolutions(
+                &mut without_recycled_slot,
+                &[],
+                &[],
+                &[],
+                std::slice::from_ref(&name),
+                &HashSet::new(),
+                &input,
+                &output,
+            )
+            .unwrap_err()
+            .contains("no recycled output slot")
+        );
+        assert_eq!(without_recycled_slot, vec![resolution.clone()]);
+
+        let mut with_surviving_reference = vec![resolution.clone()];
+        let surviving =
+            relocation_record("other.o", 1, 0, None, 0, Some("_data"), None, 0, 0, 4, 0, 0);
+        assert!(
+            retire_missing_macho_symbol_resolutions(
+                &mut with_surviving_reference,
+                &[surviving],
+                &[],
+                &[],
+                std::slice::from_ref(&name),
+                &HashSet::from([name.clone()]),
+                &input,
+                &output,
+            )
+            .unwrap_err()
+            .contains("still referenced")
+        );
+        assert_eq!(with_surviving_reference, vec![resolution.clone()]);
+
+        let mut retired = vec![resolution];
+        assert!(
+            retire_missing_macho_symbol_resolutions(
+                &mut retired,
+                &[],
+                &[],
+                &[],
+                std::slice::from_ref(&name),
+                &HashSet::from([name.clone()]),
+                &input,
+                &output,
+            )
+            .unwrap()
+        );
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn recycled_macho_symbol_slot_replaces_the_full_nlist_entry() {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE;
+
+        let mut output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let reserve_offset = output.len() as u64;
+        let reserve_size = b"_new\0".len() as u64;
+        let previous_string_size = u32::from_le_bytes(
+            output[SYMTAB_COMMAND_OFFSET + 20..SYMTAB_COMMAND_OFFSET + 24]
+                .try_into()
+                .unwrap(),
+        );
+        output[SYMTAB_COMMAND_OFFSET + 20..SYMTAB_COMMAND_OFFSET + 24]
+            .copy_from_slice(&(previous_string_size + reserve_size as u32).to_le_bytes());
+        output.resize(output.len() + reserve_size as usize, 0);
+
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let member = AddedMachOArchiveTextMember {
+            input: "new.o".to_owned(),
+            sections: Vec::new(),
+            text_section_index: 1,
+            text_object_section_index: 1,
+            definition_name: b"_new".to_vec(),
+            definition_offset: 0,
+            definition_desc: 0,
+            definition_private_external: false,
+            referenced_names: Vec::new(),
+        };
+        let new_resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_new")),
+            direct_value: Some(0x1234),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
+        let retiring_name = SharedText::from(hex::encode("_text"));
+        let previous_resolution = MachOSymbolResolutionRecord {
+            name: retiring_name.clone(),
+            direct_value: Some(0),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "input.o".into(),
+                input: "input.o".into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+        };
+        let mut reserves = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::STRTAB.as_usize() as u32,
+            alignment_exponent: 0,
+            output_offset: reserve_offset,
+            size: reserve_size,
+        }];
+        let (patches, recycled_names) = recycled_macho_symbol_table_patches(
+            &output,
+            &output_file,
+            &[member],
+            &[0],
+            &[new_resolution],
+            std::slice::from_ref(&retiring_name),
+            &[previous_resolution],
+            &mut reserves,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recycled_names, vec![retiring_name]);
+        assert!(reserves.is_empty());
+        assert_eq!(patches.len(), 2);
+        assert_eq!(
+            patches[0].size,
+            std::mem::size_of::<object::macho::Nlist64<object::Endianness>>() as u64
+        );
+        assert_eq!(patches[0].data.len(), patches[0].size as usize);
+
+        drop(output_file);
+        for patch in patches {
+            let start = patch.output_offset as usize;
+            let end = start + patch.data.len();
+            output[start..end].copy_from_slice(&patch.data);
+        }
+        let patched = object::File::parse(output.as_slice()).unwrap();
+        assert!(
+            !patched
+                .symbols()
+                .any(|symbol| symbol.name().ok() == Some("_text"))
+        );
+        let new_symbol = patched
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some("_new"))
+            .unwrap();
+        assert_eq!(new_symbol.address(), 0x1234);
+    }
+
+    #[test]
+    fn macho_symbol_slot_recycling_requires_one_plain_symbol_table() {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE;
+
+        let output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        assert!(macho_symbol_table_offset_for_recycling(&output).is_ok());
+
+        let mut missing = output.clone();
+        missing[SYMTAB_COMMAND_OFFSET..SYMTAB_COMMAND_OFFSET + 4]
+            .copy_from_slice(&object::macho::LC_UUID.to_le_bytes());
+        assert!(
+            macho_symbol_table_offset_for_recycling(&missing)
+                .unwrap_err()
+                .contains("no symbol table")
+        );
+
+        let mut duplicate = output.clone();
+        duplicate[HEADER_SIZE..HEADER_SIZE + 4]
+            .copy_from_slice(&object::macho::LC_SYMTAB.to_le_bytes());
+        assert!(
+            macho_symbol_table_offset_for_recycling(&duplicate)
+                .unwrap_err()
+                .contains("multiple symbol tables")
+        );
+
+        for (command, expected) in [
+            (object::macho::LC_DYSYMTAB, "indirect symbol table"),
+            (object::macho::LC_DYLD_EXPORTS_TRIE, "exports trie"),
+        ] {
+            let mut dynamic = output.clone();
+            dynamic[SYMTAB_COMMAND_OFFSET..SYMTAB_COMMAND_OFFSET + 4]
+                .copy_from_slice(&command.to_le_bytes());
+            assert!(
+                macho_symbol_table_offset_for_recycling(&dynamic)
+                    .unwrap_err()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn macho_symbol_slot_recycling_rejects_duplicate_or_stab_names() {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE;
+
+        let mut duplicate = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let symoff = u32::from_le_bytes(
+            duplicate[SYMTAB_COMMAND_OFFSET + 8..SYMTAB_COMMAND_OFFSET + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        duplicate[symoff..symoff + 4].copy_from_slice(&7_u32.to_le_bytes());
+        let duplicate_file = object::File::parse(duplicate.as_slice()).unwrap();
+        assert!(
+            unique_macho_output_symbol_index(&duplicate_file, b"_data", 4)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+
+        let mut stab = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        stab[symoff + 4] |= object::macho::N_STAB;
+        let stab_file = object::File::parse(stab.as_slice()).unwrap();
+        assert!(unique_macho_output_symbol_index(&stab_file, b"_text", 0).is_err());
     }
 
     #[test]
@@ -29839,6 +31006,7 @@ mod tests {
                 hex::encode("input.o"),
                 1,
             )],
+            &[],
             &input,
         )
         .unwrap();
@@ -29898,7 +31066,7 @@ mod tests {
 
         let result = reconcile_rematerialized_macho_symbol_resolutions(
             &mut resolutions,
-            &[relocation],
+            &[relocation.clone()],
             &[],
             &[(
                 SharedText::from(hex::encode("input.o")),
@@ -29907,6 +31075,7 @@ mod tests {
                 hex::encode("input.o"),
                 1,
             )],
+            &[],
             &input,
         );
 
@@ -29917,6 +31086,26 @@ mod tests {
                     "removed Mach-O text relocation target may change symbol liveness"
                 )
         ));
+
+        let retiring_name = SharedText::from(hex::encode("_target"));
+        let result = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &[relocation],
+            &[],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            std::slice::from_ref(&retiring_name),
+            &input,
+        )
+        .unwrap();
+        assert!(result.0.is_empty());
+        assert!(!result.1);
+        assert_eq!(resolutions[0].name, retiring_name);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
