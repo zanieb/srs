@@ -1094,6 +1094,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     should_filter_sections_sidecar(&state_dir, sections_file)
                 });
         let should_retry_with_full_state = should_filter_records;
+        let mut attempted_filtered_records = false;
         let result = if should_filter_records {
             let result = patch_changed_inputs(
                 args,
@@ -1104,7 +1105,10 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 &changed_inputs,
                 &metadata_update_input_indices,
             )?;
-            if let ChangedInputPatchResult::Unsupported(reason) = result {
+            if changed_input_patch_should_retry_with_filtered_records(&result) {
+                let ChangedInputPatchResult::Unsupported(reason) = result else {
+                    unreachable!("filtered-record retry requires an unsupported result");
+                };
                 append_log(
                     &state_dir,
                     &format!(
@@ -1126,6 +1130,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
                     .collect::<HashSet<_>>();
                 previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                attempted_filtered_records = true;
                 patch_changed_inputs(
                     args,
                     &state_dir,
@@ -1135,6 +1140,14 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                     &changed_inputs,
                     &metadata_update_input_indices,
                 )?
+            } else if let ChangedInputPatchResult::RequiresCompleteRecords(reason) = result {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "metadata-only changed-input patch unavailable before loading inputs: {reason}"
+                    ),
+                )?;
+                ChangedInputPatchResult::RequiresCompleteRecords(reason)
             } else {
                 result
             }
@@ -1157,42 +1170,74 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 &metadata_update_input_indices,
             )?
         };
-        let result = if let ChangedInputPatchResult::Unsupported(reason) = result {
-            if should_retry_with_full_state {
-                append_log(
-                    &state_dir,
-                    &format!(
-                        "filtered-record changed-input patch unavailable before loading inputs: {reason}"
-                    ),
-                )?;
+        let result = match result {
+            ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
+                if attempted_filtered_records {
+                    append_log(
+                        &state_dir,
+                        &format!(
+                            "filtered-record changed-input patch unavailable before loading inputs: {reason}"
+                        ),
+                    )?;
+                }
+                if should_retry_with_full_state
+                    && let Some(mut full_previous) = PersistedState::read(&state_dir)?
+                {
+                    refresh_snapshotted_rewritten_input_metadata(
+                        &state_dir,
+                        &mut full_previous,
+                        &rewritten_inputs,
+                    );
+                    patch_changed_inputs(
+                        args,
+                        &state_dir,
+                        full_previous,
+                        current_link_start,
+                        true,
+                        &changed_inputs,
+                        &metadata_update_input_indices,
+                    )?
+                } else {
+                    ChangedInputPatchResult::Unsupported(reason)
+                }
             }
-            if should_retry_with_full_state
-                && changed_input_patch_retry_may_benefit_from_complete_records(&reason)
-                && let Some(mut full_previous) = PersistedState::read(&state_dir)?
-            {
-                refresh_snapshotted_rewritten_input_metadata(
-                    &state_dir,
-                    &mut full_previous,
-                    &rewritten_inputs,
-                );
-                patch_changed_inputs(
-                    args,
-                    &state_dir,
-                    full_previous,
-                    current_link_start,
-                    true,
-                    &changed_inputs,
-                    &metadata_update_input_indices,
-                )?
-            } else {
-                ChangedInputPatchResult::Unsupported(reason)
+            ChangedInputPatchResult::Unsupported(reason) => {
+                if attempted_filtered_records {
+                    append_log(
+                        &state_dir,
+                        &format!(
+                            "filtered-record changed-input patch unavailable before loading inputs: {reason}"
+                        ),
+                    )?;
+                }
+                if should_retry_with_full_state
+                    && changed_input_patch_retry_may_benefit_from_complete_records(&reason)
+                    && let Some(mut full_previous) = PersistedState::read(&state_dir)?
+                {
+                    refresh_snapshotted_rewritten_input_metadata(
+                        &state_dir,
+                        &mut full_previous,
+                        &rewritten_inputs,
+                    );
+                    patch_changed_inputs(
+                        args,
+                        &state_dir,
+                        full_previous,
+                        current_link_start,
+                        true,
+                        &changed_inputs,
+                        &metadata_update_input_indices,
+                    )?
+                } else {
+                    ChangedInputPatchResult::Unsupported(reason)
+                }
             }
-        } else {
-            result
+            result => result,
         };
         match result {
             ChangedInputPatchResult::Patched => return Ok(true),
-            ChangedInputPatchResult::Unsupported(reason) => {
+            ChangedInputPatchResult::Unsupported(reason)
+            | ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
                 append_log(
                     &state_dir,
                     &format!("changed-input patch unavailable before loading inputs: {reason}"),
@@ -1669,7 +1714,14 @@ fn refresh_rewritten_input_identities(
 enum ChangedInputPatchResult {
     Patched,
     Unsupported(String),
+    RequiresCompleteRecords(String),
     StartedUnsupported(String),
+}
+
+fn changed_input_patch_should_retry_with_filtered_records(
+    result: &ChangedInputPatchResult,
+) -> bool {
+    matches!(result, ChangedInputPatchResult::Unsupported(_))
 }
 
 fn changed_input_patch_retry_may_benefit_from_complete_records(reason: &str) -> bool {
@@ -2209,7 +2261,12 @@ fn update_macho_symbol_resolutions_for_input(
         };
         let position_changed = current.section_offset != target.section_offset;
         let value_changed = current_value != previous_value;
-        let input_changed = target.input != current_input;
+        let input_changed = target.input != current_input
+            && !normalized_archive_input_refs_match(
+                input.path.as_str(),
+                target.input.as_str(),
+                current_input.as_str(),
+            )?;
         if !position_changed && !value_changed && !input_changed {
             continue;
         }
@@ -3778,7 +3835,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let stable_relocation_count = previous.relocations.len();
             if let Some(activation) = &mut added_macho_archive_text_activation {
                 if !records_complete {
-                    return Ok(ChangedInputPatchResult::Unsupported(
+                    return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                         "added Mach-O archive member needs complete relocation records".to_owned(),
                     ));
                 }
@@ -4352,7 +4409,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 }
             };
             if !macho_text_relocation_replays.replays.is_empty() && !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete Mach-O text relocation records".to_owned(),
                 ));
             }
@@ -4779,10 +4836,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             previous.input_files[*input_index].path.as_str(),
             &matched_sections,
             &mut previous.sections,
-        );
+            can_normalize_rust_archive_patch,
+        )?;
         if sections_changed {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete section records".to_owned(),
                 ));
             }
@@ -4804,7 +4862,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if let Some(activation) = macho_text_section_activation {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "activated Mach-O text section needs complete section records".to_owned(),
                 ));
             }
@@ -4835,7 +4893,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if let Some(activation) = added_macho_archive_text_activation {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "added Mach-O archive member needs complete section records".to_owned(),
                 ));
             }
@@ -4852,7 +4910,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if let Some(activation) = changed_macho_archive_unwind_activation {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed Mach-O unwind metadata needs complete section records".to_owned(),
                 ));
             }
@@ -4865,7 +4923,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if !added_dynamic_relocations.is_empty() {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete dynamic relocation records".to_owned(),
                 ));
             }
@@ -4878,7 +4936,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if !removed_dynamic_relocations.is_empty() {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete dynamic relocation records".to_owned(),
                 ));
             }
@@ -4890,7 +4948,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if !removed_fdes.is_empty() {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete FDE records".to_owned(),
                 ));
             }
@@ -4901,7 +4959,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         if !updated_fdes.is_empty() {
             if !records_complete {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete FDE records".to_owned(),
                 ));
             }
@@ -5069,7 +5127,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     match fde_add_patches_for_output(&output, &fde_add_candidates, &previous.fdes)? {
         Ok(resolved_fdes) => {
             if !records_complete && !resolved_fdes.is_empty() {
-                return Ok(ChangedInputPatchResult::Unsupported(
+                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "changed input needs complete FDE records".to_owned(),
                 ));
             }
@@ -6691,9 +6749,15 @@ fn update_section_records_for_matched_patches(
     input_file: &str,
     matched_sections: &[MatchedPatchSection],
     records: &mut [SectionRecord],
-) -> bool {
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
     if matched_sections.len() == 1 {
-        return update_section_record_for_matched_patch(input_file, &matched_sections[0], records);
+        return update_section_record_for_matched_patch(
+            input_file,
+            &matched_sections[0],
+            records,
+            normalize_rust_archive_patch_inputs,
+        );
     }
 
     let updates = matched_sections
@@ -6718,18 +6782,24 @@ fn update_section_records_for_matched_patches(
             continue;
         };
 
-        if update_section_record(record, current) {
+        if update_section_record(
+            input_file,
+            record,
+            current,
+            normalize_rust_archive_patch_inputs,
+        )? {
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 fn update_section_record_for_matched_patch(
     input_file: &str,
     matched: &MatchedPatchSection,
     records: &mut [SectionRecord],
-) -> bool {
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
     let Some(record) = records.iter_mut().find(|record| {
         record.input_file == input_file
             && record.input == matched.previous.input
@@ -6737,10 +6807,15 @@ fn update_section_record_for_matched_patch(
             && record.output_offset == matched.previous.output_offset
             && record.size == matched.previous.output_size
     }) else {
-        return false;
+        return Ok(false);
     };
 
-    update_section_record(record, &matched.current)
+    update_section_record(
+        input_file,
+        record,
+        &matched.current,
+        normalize_rust_archive_patch_inputs,
+    )
 }
 
 fn section_record_update_key<'a>(
@@ -6756,20 +6831,32 @@ fn section_record_update_key<'a>(
     )
 }
 
-fn update_section_record(record: &mut SectionRecord, current: &PatchSection) -> bool {
-    if record.input == current.input
+fn update_section_record(
+    input_file: &str,
+    record: &mut SectionRecord,
+    current: &PatchSection,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    let input_is_stable = record.input == current.input
+        || (normalize_rust_archive_patch_inputs
+            && normalized_archive_input_refs_match(
+                input_file,
+                record.input.as_str(),
+                current.input.as_str(),
+            )?);
+    if input_is_stable
         && record.section_index == current.section_index
         && record.output_offset == current.output_offset
         && record.size == current.output_size
     {
-        return false;
+        return Ok(false);
     }
 
     record.input = current.input.clone().into();
     record.section_index = current.section_index;
     record.output_offset = current.output_offset;
     record.size = current.output_size;
-    true
+    Ok(true)
 }
 
 fn update_matched_patch_current_sections(
@@ -30812,15 +30899,68 @@ mod tests {
             cstring_nul_boundaries_hash: None,
         };
 
-        assert!(update_section_records_for_matched_patches(
-            &input_file,
-            &[MatchedPatchSection { previous, current }],
-            &mut records,
-        ));
+        assert!(
+            update_section_records_for_matched_patches(
+                &input_file,
+                &[MatchedPatchSection { previous, current }],
+                &mut records,
+                false,
+            )
+            .unwrap()
+        );
 
         assert_eq!(records[0].section_index, 7);
         assert_eq!(records[0].size, 16);
         assert_eq!(records[1].section_index, 3);
+    }
+
+    #[test]
+    fn normalized_archive_member_rename_preserves_persisted_section_identity() {
+        let input_file = hex::encode("libarchive.rlib");
+        let previous_input = hex::encode("libarchive.rlib\0crate-hash.cgu.old.rcgu.o\0100:200");
+        let current_input = hex::encode("libarchive.rlib\0crate-hash.cgu.new.rcgu.o\0300:400");
+        let previous = PatchSection {
+            input: previous_input.clone(),
+            section_index: 3,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 16,
+            output_offset: 64,
+            output_size: 16,
+            data_hash: Some("previous".to_owned()),
+            cstring_nul_boundaries_hash: None,
+        };
+        let current = PatchSection {
+            input: current_input.clone(),
+            data_hash: Some("current".to_owned()),
+            ..previous.clone()
+        };
+        let matched = MatchedPatchSection { previous, current };
+        let original = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input.clone().into(),
+            section_index: 3,
+            output_offset: 64,
+            size: 16,
+        };
+
+        let mut normalized = vec![original.clone()];
+        assert!(
+            !update_section_records_for_matched_patches(
+                &input_file,
+                std::slice::from_ref(&matched),
+                &mut normalized,
+                true,
+            )
+            .unwrap()
+        );
+        assert_eq!(normalized, vec![original.clone()]);
+
+        let mut exact = vec![original];
+        assert!(
+            update_section_records_for_matched_patches(&input_file, &[matched], &mut exact, false,)
+                .unwrap()
+        );
+        assert_eq!(exact[0].input, current_input);
     }
 
     #[test]
@@ -34738,7 +34878,7 @@ mod tests {
     }
 
     #[test]
-    fn macho_symbol_resolution_refreshes_archive_member_identity() {
+    fn macho_symbol_resolution_preserves_normalized_archive_member_identity() {
         fn archive(
             input_file: &str,
             identifier: &[u8],
@@ -34794,7 +34934,7 @@ mod tests {
             thunk_addresses: Vec::new(),
             target: Some(RelocationTargetRecord {
                 input_file: input_file.into(),
-                input: previous_input.into(),
+                input: previous_input.clone().into(),
                 section_index: 2,
                 section_offset: 0,
             }),
@@ -34811,9 +34951,20 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(updates.changed);
+        assert!(!updates.changed);
         assert!(updates.output_symbols.is_empty());
-        assert_eq!(resolutions[0].target.as_ref().unwrap().input, current_input);
+        assert_eq!(
+            resolutions[0].target.as_ref().unwrap().input,
+            previous_input
+        );
+        assert!(
+            normalized_archive_input_refs_match(
+                input.path.as_str(),
+                resolutions[0].target.as_ref().unwrap().input.as_str(),
+                &current_input,
+            )
+            .unwrap()
+        );
 
         let output = test_macho_unwind_output(0x1000);
         let mut unmapped_resolutions = vec![previous_resolution];
@@ -34826,13 +34977,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(unmapped_updates.changed);
+        assert!(!unmapped_updates.changed);
         assert!(unmapped_updates.retiring_names.is_empty());
         assert!(unmapped_updates.moves.is_empty());
         assert_eq!(unmapped_resolutions[0].direct_value, Some(0x1000));
         assert_eq!(
             unmapped_resolutions[0].target.as_ref().unwrap().input,
-            current_input
+            resolutions[0].target.as_ref().unwrap().input
         );
     }
 
@@ -43726,6 +43877,20 @@ mod tests {
         );
         assert!(changed_input_patch_retry_may_benefit_from_complete_records(
             "changed bytes outside patchable sections in `input.o`"
+        ));
+    }
+
+    #[test]
+    fn complete_record_requirement_skips_filtered_record_retry() {
+        assert!(!changed_input_patch_should_retry_with_filtered_records(
+            &ChangedInputPatchResult::RequiresCompleteRecords(
+                "changed input needs complete Mach-O text relocation records".to_owned()
+            )
+        ));
+        assert!(changed_input_patch_should_retry_with_filtered_records(
+            &ChangedInputPatchResult::Unsupported(
+                "changed bytes outside patchable sections in `input.o`".to_owned()
+            )
         ));
     }
 
