@@ -350,6 +350,7 @@ pub(crate) struct PreparedState<'data> {
     current: CurrentState,
     retained_output_to_restore: Option<FileContentState>,
     reusable_inputs: HashSet<String>,
+    reusable_changed_sections: HashSet<SectionRecord>,
     previous_sections: HashSet<SectionRecord>,
     previous_relocations: Vec<RelocationRecord>,
     previous_macho_symbol_resolutions_file: Option<String>,
@@ -497,7 +498,6 @@ struct RustcRlibProvenance {
     raw_object_manifest: Option<RustcRlibRawObjectManifest>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RustcRlibRawObjectDelta {
     unchanged: Vec<RustcRlibRawObjectDigest>,
@@ -679,6 +679,7 @@ pub(crate) fn maybe_prepare<'data>(
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -795,6 +796,40 @@ pub(crate) fn maybe_prepare<'data>(
         .as_ref()
         .map(|previous| reusable_input_files(&current.input_files, &previous.input_files))
         .unwrap_or_default();
+    let reusable_changed_sections = if mode_needs_previous_sections(&mode)
+        && rustc_work_product_provenance_enabled()
+        && let Some(previous) = previous_metadata.as_ref()
+    {
+        match reusable_changed_rust_archive_sections(
+            file_loader,
+            &current.input_files,
+            &previous.input_files,
+            &previous_sections,
+        ) {
+            Ok(sections) => {
+                if !sections.is_empty() {
+                    append_log(
+                        &state_dir,
+                        &format!(
+                            "prepared {} unchanged Rust archive member section{} for relink reuse",
+                            sections.len(),
+                            if sections.len() == 1 { "" } else { "s" },
+                        ),
+                    )?;
+                }
+                sections
+            }
+            Err(error) => {
+                append_log(
+                    &state_dir,
+                    &format!("Rust archive member relink reuse unavailable: {error:?}"),
+                )?;
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
     let retained_output_to_restore = matches!(mode, IncrementalMode::Reuse)
         .then_some(retained_output_to_restore)
         .flatten();
@@ -804,6 +839,7 @@ pub(crate) fn maybe_prepare<'data>(
         current,
         retained_output_to_restore,
         reusable_inputs,
+        reusable_changed_sections,
         previous_sections,
         previous_relocations,
         previous_macho_symbol_resolutions_file,
@@ -4975,10 +5011,9 @@ impl<'data> PreparedState<'data> {
         if !self.can_reuse_unchanged_sections() {
             return false;
         }
-        if !self.reusable_inputs.contains(record.input_file.as_str()) {
-            return false;
-        }
-        if !self.previous_sections.contains(&record) {
+        let reusable_unchanged_input = self.reusable_inputs.contains(record.input_file.as_str())
+            && self.previous_sections.contains(&record);
+        if !reusable_unchanged_input && !self.reusable_changed_sections.contains(&record) {
             return false;
         }
 
@@ -5572,6 +5607,104 @@ fn reusable_input_files(current: &[FileState], previous: &[FileState]) -> HashSe
         .filter(|file| previous_by_path.get(file.path.as_str()) == Some(&&file.content))
         .map(|file| file.path.clone())
         .collect()
+}
+
+fn reusable_changed_rust_archive_sections(
+    file_loader: &FileLoader<'_>,
+    current: &[FileState],
+    previous: &[FileState],
+    previous_sections: &HashSet<SectionRecord>,
+) -> Result<HashSet<SectionRecord>> {
+    let loaded_by_path = file_loader
+        .loaded_files
+        .iter()
+        .map(|input| (encode_path(&input.filename), *input))
+        .collect::<HashMap<_, _>>();
+    let previous_by_path = previous
+        .iter()
+        .map(|input| (input.path.as_str(), input))
+        .collect::<HashMap<_, _>>();
+    let mut reusable_sections = HashSet::new();
+
+    for current_input in current {
+        let Some(previous_input) = previous_by_path.get(current_input.path.as_str()) else {
+            continue;
+        };
+        if current_input.content == previous_input.content {
+            continue;
+        }
+        let Some(current_manifest) = current_input.rustc_raw_object_manifest.as_ref() else {
+            continue;
+        };
+        let Some(previous_manifest) = previous_input.rustc_raw_object_manifest.as_ref() else {
+            continue;
+        };
+        let Some(loaded) = loaded_by_path.get(&current_input.path) else {
+            continue;
+        };
+        reusable_sections.extend(reusable_rust_archive_section_aliases(
+            current_input.path.as_str(),
+            previous_manifest,
+            current_manifest,
+            loaded.full_data(),
+            previous_sections,
+        )?);
+    }
+
+    Ok(reusable_sections)
+}
+
+fn reusable_rust_archive_section_aliases(
+    input_file: &str,
+    previous_manifest: &RustcRlibRawObjectManifest,
+    current_manifest: &RustcRlibRawObjectManifest,
+    current_bytes: &[u8],
+    previous_sections: &HashSet<SectionRecord>,
+) -> Result<Vec<SectionRecord>> {
+    let Some(delta) = rustc_rlib_raw_object_delta(previous_manifest, current_manifest) else {
+        return Ok(Vec::new());
+    };
+    let unchanged = delta
+        .unchanged
+        .iter()
+        .map(|object| archive_member_patch_identifier(&object.identifier))
+        .collect::<HashSet<_>>();
+    if unchanged.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let current_resolver = PatchInputResolver::new(current_bytes, true)?;
+    let mut aliases = Vec::new();
+    for previous_section in previous_sections {
+        if previous_section.input_file.as_str() != input_file {
+            continue;
+        }
+        let Some(parsed) = parse_patch_input_ref(input_file, &previous_section.input)? else {
+            continue;
+        };
+        if !unchanged.contains(&archive_member_patch_identifier(&parsed.identifier)) {
+            continue;
+        }
+        let Some(current_input) = current_resolver.resolve(
+            input_file,
+            &previous_section.input,
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            continue;
+        };
+        let Some(current_identifier) = current_input.archive_identifier else {
+            continue;
+        };
+        if !unchanged.contains(&archive_member_patch_identifier(current_identifier)) {
+            continue;
+        }
+        let mut alias = previous_section.clone();
+        alias.input =
+            resolved_patch_input_ref(input_file, &previous_section.input, current_input)?.into();
+        aliases.push(alias);
+    }
+    Ok(aliases)
 }
 
 impl CurrentState {
@@ -10493,7 +10626,6 @@ fn rustc_rlib_link_content_digest_from_raw_objects(
     Some(hasher.finalize().to_hex().to_string())
 }
 
-#[allow(dead_code)]
 fn rustc_rlib_raw_object_delta(
     previous: &RustcRlibRawObjectManifest,
     current: &RustcRlibRawObjectManifest,
@@ -19973,6 +20105,7 @@ mod tests {
                 },
                 retained_output_to_restore: None,
                 reusable_inputs: HashSet::new(),
+                reusable_changed_sections: HashSet::new(),
                 previous_sections: HashSet::new(),
                 previous_relocations: Vec::new(),
                 previous_macho_symbol_resolutions_file: None,
@@ -24595,6 +24728,95 @@ mod tests {
             b"a",
         )]);
         assert!(rustc_rlib_raw_object_delta(&previous, &removed).is_none());
+
+        let (_, reordered) = rustc_rlib_with_raw_object_manifest(&[
+            (b"crate-hash.b.new.rcgu.o", digest_b.as_str(), b"b"),
+            (b"crate-hash.a.new.rcgu.o", digest_a.as_str(), b"a"),
+        ]);
+        assert!(rustc_rlib_raw_object_delta(&previous, &reordered).is_none());
+    }
+
+    #[test]
+    fn changed_rust_archive_aliases_only_unchanged_manifest_members() {
+        let digest_a = "a".repeat(blake3::OUT_LEN * 2);
+        let digest_b = "b".repeat(blake3::OUT_LEN * 2);
+        let digest_c = "c".repeat(blake3::OUT_LEN * 2);
+        let digest_d = "d".repeat(blake3::OUT_LEN * 2);
+        let (previous, previous_manifest) = rustc_rlib_with_raw_object_manifest(&[
+            (
+                b"crate-hash.unchanged.old.rcgu.o",
+                digest_a.as_str(),
+                b"unchanged",
+            ),
+            (
+                b"crate-hash.changed.same.rcgu.o",
+                digest_b.as_str(),
+                b"previous",
+            ),
+        ]);
+        let (current, current_manifest) = rustc_rlib_with_raw_object_manifest(&[
+            (b"crate-hash.added.new.rcgu.o", digest_c.as_str(), b"added"),
+            (
+                b"crate-hash.unchanged.new.rcgu.o",
+                digest_a.as_str(),
+                b"unchanged",
+            ),
+            (
+                b"crate-hash.changed.same.rcgu.o",
+                digest_d.as_str(),
+                b"current",
+            ),
+        ]);
+        let input_file = hex::encode("libcrate.rlib");
+        let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
+        let previous_input_ref = |identifier: &[u8]| {
+            let mut input_ref = b"libcrate.rlib".to_vec();
+            input_ref.push(0);
+            input_ref.extend_from_slice(identifier);
+            input_ref.extend_from_slice(b"\00:1");
+            let encoded = hex::encode(input_ref);
+            let input = previous_resolver
+                .resolve(&input_file, &encoded, PatchInputLookup::MatchArchiveMember)
+                .unwrap()
+                .unwrap();
+            resolved_patch_input_ref(&input_file, &encoded, input).unwrap()
+        };
+        let unchanged = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input_ref(b"crate-hash.unchanged.old.rcgu.o").into(),
+            section_index: 3,
+            output_offset: 64,
+            size: 16,
+        };
+        let changed = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input_ref(b"crate-hash.changed.same.rcgu.o").into(),
+            section_index: 4,
+            output_offset: 80,
+            size: 16,
+        };
+
+        let aliases = reusable_rust_archive_section_aliases(
+            &input_file,
+            &previous_manifest,
+            &current_manifest,
+            &current,
+            &[unchanged.clone(), changed].into_iter().collect(),
+        )
+        .unwrap();
+
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].section_index, unchanged.section_index);
+        assert_eq!(aliases[0].output_offset, unchanged.output_offset);
+        assert_eq!(aliases[0].size, unchanged.size);
+        let parsed = parse_patch_input_ref(&input_file, &aliases[0].input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed.identifier,
+            b"crate-hash.unchanged.new.rcgu.o".as_slice()
+        );
+        assert_ne!(aliases[0].input, unchanged.input);
     }
 
     #[test]
@@ -30097,6 +30319,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: [record].into_iter().collect(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -30118,6 +30341,55 @@ mod tests {
         assert!(!state.try_reuse_section(input, object::SectionIndex(3), 80, 16, true, true));
         assert_eq!(state.reused_sections.load(Ordering::Relaxed), 1);
         assert_eq!(state.current_sections.take_all().len(), 2);
+    }
+
+    #[test]
+    fn try_reuse_section_requires_exact_changed_member_allowlist() {
+        let mut input_file = crate::input_data::InputFile::for_testing();
+        input_file.filename = PathBuf::from("libchanged.rlib");
+        let input = InputRef {
+            file: &input_file,
+            entry: None,
+        };
+        let record = SectionRecord::new(input, object::SectionIndex(3), 64, 16);
+        let mut state = PreparedState {
+            mode: IncrementalMode::Relink {
+                reason: "input file changed: libchanged.rlib".to_owned(),
+                can_reuse_unchanged_sections: true,
+            },
+            current: CurrentState {
+                state_dir: PathBuf::new(),
+                args_hash: "args".to_owned(),
+                link_options_hash: "args".to_owned(),
+                input_order_hash: String::new(),
+                sld_version: "sld-test".to_owned(),
+                link_start: None,
+                input_files: Vec::new(),
+            },
+            retained_output_to_restore: None,
+            reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
+            previous_sections: [record.clone()].into_iter().collect(),
+            previous_relocations: Vec::new(),
+            previous_macho_symbol_resolutions_file: None,
+            previous_fdes: Vec::new(),
+            previous_dynamic_relocations: Vec::new(),
+            previous_reserved_ranges: Vec::new(),
+            current_sections: RecordBuffers::default(),
+            current_relocations: RecordBuffers::default(),
+            current_macho_symbol_resolutions: RecordBuffers::default(),
+            current_fdes: RecordBuffers::default(),
+            current_dynamic_relocations: RecordBuffers::default(),
+            current_reserved_ranges: RecordBuffers::default(),
+            record_texts: RecordTextInterner::default(),
+            reused_sections: AtomicUsize::new(0),
+            prepared_fast_build_id_state: Mutex::new(None),
+        };
+
+        assert!(!state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true, true));
+        state.reusable_changed_sections.insert(record);
+        assert!(state.try_reuse_section(input, object::SectionIndex(3), 64, 16, true, true));
+        assert_eq!(state.reused_sections.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -30144,6 +30416,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -30183,6 +30456,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -30237,6 +30511,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -30308,6 +30583,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
@@ -30454,6 +30730,7 @@ mod tests {
             },
             retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
+            reusable_changed_sections: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
             previous_macho_symbol_resolutions_file: None,
