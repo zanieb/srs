@@ -2,6 +2,7 @@
 .p2align 2
 .globl _incremental_multi_grown_archive_second
 _incremental_multi_grown_archive_second:
+    .cfi_startproc
     mov w0, #22
 #ifdef GROW_TEXT
     add w0, w0, #1
@@ -10,6 +11,7 @@ _incremental_multi_grown_archive_second:
     add w0, w0, #1
 #endif
     ret
+    .cfi_endproc
 
 #ifdef GROW_TEXT
 .private_extern _incremental_multi_grown_archive_added_private
