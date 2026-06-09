@@ -4748,15 +4748,22 @@ struct AddedMachOArchiveTextActivations {
 
 struct AddedMachOArchiveTextMember {
     input: String,
-    section_index: u32,
-    data_hash: String,
-    data_size: u64,
-    alignment_exponent: u8,
+    sections: Vec<AddedMachOArchiveSection>,
+    text_section_index: u32,
     definition_name: Vec<u8>,
     definition_offset: u64,
     definition_desc: u16,
     definition_private_external: bool,
     referenced_names: Vec<Vec<u8>>,
+}
+
+struct AddedMachOArchiveSection {
+    section_index: u32,
+    section_name: String,
+    output_section_id: u32,
+    data_hash: String,
+    data_size: u64,
+    alignment_exponent: u8,
 }
 
 enum NormalizedRustArchivePatchState {
@@ -11878,33 +11885,63 @@ fn added_macho_archive_text_activations(
 
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for added archive members")?;
-    let output_section_id = u32::try_from(crate::output_section_id::TEXT.as_usize())
-        .context("Mach-O text output section ID does not fit u32")?;
     let mut remaining_reserved_ranges = reserved_ranges.to_vec();
-    let mut sections = Vec::with_capacity(selected_indices.len());
-    let mut records = Vec::with_capacity(selected_indices.len());
+    let section_count = selected_indices
+        .iter()
+        .map(|&member_index| members[member_index].sections.len())
+        .sum();
+    let mut sections = Vec::with_capacity(section_count);
+    let mut records = Vec::with_capacity(section_count);
     let mut symbol_resolutions = Vec::with_capacity(selected_indices.len());
     for &member_index in &selected_indices {
         let member = &members[member_index];
-        let padding = (u128::from(member.data_size) * u128::from(padding_percent)).div_ceil(100);
-        let requested_size = u64::try_from(u128::from(member.data_size) + padding)
-            .context("Added Mach-O archive member text allocation size overflow")?;
-        let Some(allocation) = allocate_reserved_range(
-            &mut remaining_reserved_ranges,
-            output_section_id,
-            member.alignment_exponent,
-            requested_size,
-        )?
-        else {
+        for source_section in &member.sections {
+            let padding =
+                (u128::from(source_section.data_size) * u128::from(padding_percent)).div_ceil(100);
+            let requested_size = u64::try_from(u128::from(source_section.data_size) + padding)
+                .context("Added Mach-O archive member section allocation size overflow")?;
+            let Some(allocation) = allocate_reserved_range(
+                &mut remaining_reserved_ranges,
+                source_section.output_section_id,
+                source_section.alignment_exponent,
+                requested_size,
+            )?
+            else {
+                return Ok(Err(format!(
+                    "insufficient incremental reserve for added Mach-O archive member section {}",
+                    source_section.section_name
+                )));
+            };
+            sections.push(PatchSection {
+                input: member.input.clone(),
+                section_index: source_section.section_index,
+                section_name: Some(source_section.section_name.clone()),
+                input_size: source_section.data_size,
+                output_offset: allocation.output_offset,
+                output_size: allocation.size,
+                data_hash: Some(source_section.data_hash.clone()),
+                cstring_nul_boundaries_hash: None,
+            });
+            records.push(SectionRecord {
+                input_file: input_file_path.into(),
+                input: member.input.clone().into(),
+                section_index: source_section.section_index,
+                output_offset: allocation.output_offset,
+                size: allocation.size,
+            });
+        }
+        let Some(text_section) = sections.iter().find(|section| {
+            section.input == member.input && section.section_index == member.text_section_index
+        }) else {
             return Ok(Err(
-                "insufficient incremental reserve for added Mach-O archive member text".to_owned(),
+                "added Mach-O archive member text section was not allocated".to_owned(),
             ));
         };
         let Some(section_address) =
-            macho_output_address_for_file_offset(&output_file, allocation.output_offset)
+            macho_output_address_for_file_offset(&output_file, text_section.output_offset)
         else {
             return Ok(Err(
-                "added Mach-O archive member reserve has no output address".to_owned(),
+                "added Mach-O archive member text reserve has no output address".to_owned(),
             ));
         };
         let definition_value = section_address
@@ -11913,26 +11950,9 @@ fn added_macho_archive_text_activations(
         let target = RelocationTargetRecord {
             input_file: input_file_path.into(),
             input: member.input.clone().into(),
-            section_index: member.section_index,
+            section_index: member.text_section_index,
             section_offset: member.definition_offset,
         };
-        sections.push(PatchSection {
-            input: member.input.clone(),
-            section_index: member.section_index,
-            section_name: Some("__TEXT,__text".to_owned()),
-            input_size: member.data_size,
-            output_offset: allocation.output_offset,
-            output_size: allocation.size,
-            data_hash: Some(member.data_hash.clone()),
-            cstring_nul_boundaries_hash: None,
-        });
-        records.push(SectionRecord {
-            input_file: input_file_path.into(),
-            input: member.input.clone().into(),
-            section_index: member.section_index,
-            output_offset: allocation.output_offset,
-            size: allocation.size,
-        });
         symbol_resolutions.push(MachOSymbolResolutionRecord {
             name: hex::encode(&member.definition_name).into(),
             direct_value: Some(definition_value),
@@ -12126,6 +12146,22 @@ fn macho_string_table_offset(bytes: &[u8]) -> Option<u64> {
     string_table_offset
 }
 
+fn added_macho_archive_output_section_id(
+    segment_name: &[u8],
+    section_name: &[u8],
+    flags: u32,
+) -> Option<crate::output_section_id::OutputSectionId> {
+    if flags & object::macho::SECTION_TYPE != object::macho::S_REGULAR {
+        return None;
+    }
+    match (segment_name, section_name) {
+        (b"__TEXT", b"__text") => Some(crate::output_section_id::TEXT),
+        (b"__TEXT" | b"__DATA", b"__const") => Some(crate::output_section_id::RODATA),
+        (b"__TEXT", b"__gcc_except_tab") => Some(crate::output_section_id::GCC_EXCEPT_TABLE),
+        _ => None,
+    }
+}
+
 fn added_macho_archive_text_member(
     input_file_path: &str,
     added_member: PatchInputBytes<'_>,
@@ -12140,7 +12176,10 @@ fn added_macho_archive_text_member(
         ));
     }
 
-    let mut text = None;
+    let mut text_section_index = None;
+    let mut allocated_sections = Vec::new();
+    let mut allocated_section_indices = HashSet::new();
+    let mut ignored_debug_section_indices = HashSet::new();
     for section in file.sections() {
         let segment_name = section.segment_name_bytes().ok().flatten();
         let section_name = section.name_bytes().ok();
@@ -12149,28 +12188,64 @@ fn added_macho_archive_text_member(
                 "added Mach-O text archive member has a non-Mach-O section".to_owned(),
             ));
         };
-        if segment_name == Some(b"__TEXT".as_slice())
-            && section_name == Some(b"__text".as_slice())
-            && flags & object::macho::SECTION_TYPE == object::macho::S_REGULAR
+        if let (Some(segment_name), Some(section_name)) = (segment_name, section_name)
+            && let Some(output_section_id) =
+                added_macho_archive_output_section_id(segment_name, section_name, flags)
         {
-            if text.replace(section).is_some() {
+            if section_name == b"__text" {
+                if text_section_index.replace(section.index()).is_some() {
+                    return Ok(Err(
+                        "added Mach-O archive member has multiple text sections".to_owned(),
+                    ));
+                }
+            }
+            let data = section
+                .data()
+                .context("Failed to read added Mach-O archive member section")?;
+            if data.is_empty() {
+                continue;
+            }
+            if section_name != b"__text" && section.relocations().next().is_some() {
                 return Ok(Err(
-                    "added Mach-O archive member has multiple text sections".to_owned(),
+                    "added Mach-O archive member has unsupported auxiliary section relocations"
+                        .to_owned(),
                 ));
             }
-        } else if !segment_name.is_some_and(|name| name.starts_with(b"__DWARF"))
-            && flags & object::macho::S_ATTR_DEBUG == 0
+            let alignment = crate::alignment::Alignment::new(section.align().max(1))
+                .context("Invalid added Mach-O archive member section alignment")?;
+            let section_index = patch_section_record_index(&file, section.index())?;
+            let data_size = u64::try_from(data.len())
+                .context("Added Mach-O archive member section is too large")?;
+            allocated_section_indices.insert(section.index());
+            allocated_sections.push(AddedMachOArchiveSection {
+                section_index,
+                section_name: format!(
+                    "{},{}",
+                    String::from_utf8_lossy(segment_name),
+                    String::from_utf8_lossy(section_name)
+                ),
+                output_section_id: u32::try_from(output_section_id.as_usize())
+                    .context("Mach-O output section ID does not fit u32")?,
+                data_hash: hash_bytes(data),
+                data_size,
+                alignment_exponent: alignment.exponent,
+            });
+        } else if segment_name.is_some_and(|name| name.starts_with(b"__DWARF"))
+            || flags & object::macho::S_ATTR_DEBUG != 0
         {
+            ignored_debug_section_indices.insert(section.index());
+        } else {
             return Ok(Err(
                 "added Mach-O archive member has another allocated section".to_owned(),
             ));
         }
     }
-    let Some(text) = text else {
+    let Some(text_section_index) = text_section_index else {
         return Ok(Err(
             "added Mach-O archive member has no regular __TEXT,__text section".to_owned(),
         ));
     };
+    let text = file.section_by_index(text_section_index)?;
     let data = text
         .data()
         .context("Failed to read added Mach-O archive member text")?;
@@ -12194,9 +12269,13 @@ fn added_macho_archive_text_member(
             }
             continue;
         }
-        if symbol.section_index() != Some(text.index()) {
+        if symbol.section_index().is_some_and(|section_index| {
+            !allocated_section_indices.contains(&section_index)
+                && !ignored_debug_section_indices.contains(&section_index)
+        }) {
             return Ok(Err(
-                "added Mach-O archive member defines a symbol outside __text".to_owned(),
+                "added Mach-O archive member defines a symbol outside supported sections"
+                    .to_owned(),
             ));
         }
         if symbol.is_global() {
@@ -12205,7 +12284,8 @@ fn added_macho_archive_text_member(
                     "added Mach-O archive member definition has non-Mach-O flags".to_owned(),
                 ));
             };
-            if symbol.is_weak()
+            if symbol.section_index() != Some(text.index())
+                || symbol.is_weak()
                 || name.is_empty()
                 || definition
                     .replace((
@@ -12220,10 +12300,7 @@ fn added_macho_archive_text_member(
                     "added Mach-O archive member needs one strong global definition".to_owned(),
                 ));
             }
-        } else if symbol.scope() != object::SymbolScope::Compilation
-            || symbol.is_weak()
-            || !name.starts_with(b"ltmp")
-        {
+        } else if symbol.scope() != object::SymbolScope::Compilation || symbol.is_weak() {
             return Ok(Err(
                 "added Mach-O archive member has unsupported local symbols".to_owned(),
             ));
@@ -12262,8 +12339,6 @@ fn added_macho_archive_text_member(
         }
     }
 
-    let alignment = crate::alignment::Alignment::new(text.align().max(1))
-        .context("Invalid added Mach-O archive member text alignment")?;
     let data_size =
         u64::try_from(data.len()).context("Added Mach-O archive member text is too large")?;
     let definition_offset = definition_address
@@ -12289,12 +12364,11 @@ fn added_macho_archive_text_member(
     }
     referenced_names.sort_unstable();
     referenced_names.dedup();
+    allocated_sections.sort_by_key(|section| section.section_index);
     Ok(Ok(AddedMachOArchiveTextMember {
         input: current_input_ref,
-        section_index,
-        data_hash: hash_bytes(data),
-        data_size,
-        alignment_exponent: alignment.exponent,
+        sections: allocated_sections,
+        text_section_index: section_index,
         definition_name,
         definition_offset,
         definition_desc,
@@ -12385,7 +12459,7 @@ fn added_macho_archive_text_relocation_replays(
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for added text relocations")?;
     let mut replays = Vec::new();
-    for (&member_index, patch_section) in selected_indices.iter().zip(sections) {
+    for &member_index in selected_indices {
         let member = &members[member_index];
         let Some(input_bytes) = resolver.resolve(
             input_file_path,
@@ -12399,19 +12473,12 @@ fn added_macho_archive_text_relocation_replays(
         };
         let file = object::File::parse(input_bytes.bytes)
             .context("Failed to parse added Mach-O archive member for relocation replay")?;
-        let section_index = patch_section_object_index(&file, member.section_index)?;
+        let section_index = patch_section_object_index(&file, member.text_section_index)?;
         let section = file.section_by_index(section_index)?;
         let data = section.data()?;
         let Some(contexts) = macho_aarch64_text_relocation_contexts(&file, &section, data) else {
             return Ok(Err(
                 "added Mach-O archive member contains unsupported text relocations".to_owned(),
-            ));
-        };
-        let Some(section_address) =
-            macho_output_address_for_file_offset(&output_file, patch_section.output_offset)
-        else {
-            return Ok(Err(
-                "added Mach-O archive member text has no output address".to_owned(),
             ));
         };
         for context in contexts {
@@ -12447,23 +12514,38 @@ fn added_macho_archive_text_relocation_replays(
                         target_is_global = symbol.is_global();
                     }
                     if let Some(target_section_index) = symbol.section_index() {
-                        if target_section_index != section_index {
+                        let target_section_record_index =
+                            patch_section_record_index(&file, target_section_index)?;
+                        let Some(target_patch_section) = sections.iter().find(|section| {
+                            section.input == member.input
+                                && section.section_index == target_section_record_index
+                        }) else {
                             return Ok(Err(
-                                "added Mach-O text relocation targets another local section"
+                                "added Mach-O text relocation targets an unallocated local section"
                                     .to_owned(),
                             ));
-                        }
+                        };
+                        let target_section = file.section_by_index(target_section_index)?;
                         let target_offset = symbol
                             .address()
-                            .checked_sub(section.address())
-                            .context("Added Mach-O text relocation target precedes __text")?;
+                            .checked_sub(target_section.address())
+                            .context("Added Mach-O text relocation target precedes its section")?;
                         target = Some(RelocationTargetRecord {
                             input_file: input_file_path.into(),
                             input: member.input.clone().into(),
-                            section_index: member.section_index,
+                            section_index: target_patch_section.section_index,
                             section_offset: target_offset,
                         });
-                        section_address
+                        let Some(target_section_address) = macho_output_address_for_file_offset(
+                            &output_file,
+                            target_patch_section.output_offset,
+                        ) else {
+                            return Ok(Err(
+                                "added Mach-O text relocation target has no output address"
+                                    .to_owned(),
+                            ));
+                        };
+                        target_section_address
                             .checked_add(target_offset)
                             .context("Added Mach-O text relocation target address overflow")?
                     } else {
@@ -12485,18 +12567,28 @@ fn added_macho_archive_text_relocation_replays(
                     }
                 }
                 object::RelocationTarget::Section(target_section_index) => {
-                    if target_section_index != section_index {
+                    let target_section_record_index =
+                        patch_section_record_index(&file, target_section_index)?;
+                    let Some(target_patch_section) = sections.iter().find(|section| {
+                        section.input == member.input
+                            && section.section_index == target_section_record_index
+                    }) else {
                         return Ok(Err(
-                            "added Mach-O text relocation targets another local section".to_owned(),
+                            "added Mach-O text relocation targets an unallocated local section"
+                                .to_owned(),
                         ));
-                    }
+                    };
                     target = Some(RelocationTargetRecord {
                         input_file: input_file_path.into(),
                         input: member.input.clone().into(),
-                        section_index: member.section_index,
+                        section_index: target_patch_section.section_index,
                         section_offset: 0,
                     });
-                    section_address
+                    macho_output_address_for_file_offset(
+                        &output_file,
+                        target_patch_section.output_offset,
+                    )
+                    .context("Added Mach-O text relocation target has no output address")?
                 }
                 _ => {
                     return Ok(Err(
@@ -12515,7 +12607,7 @@ fn added_macho_archive_text_relocation_replays(
                 relocation_index: None,
                 input_file: input_file_path.into(),
                 input: member.input.clone(),
-                section_index: member.section_index,
+                section_index: member.text_section_index,
                 previous_range: None,
                 current_range: context.range,
                 r_type: context.r_type,
@@ -25643,10 +25735,8 @@ mod tests {
     fn added_macho_archive_member_selection_follows_reference_closure() {
         let member = |definition: &[u8], references: &[&[u8]]| AddedMachOArchiveTextMember {
             input: String::new(),
-            section_index: 0,
-            data_hash: String::new(),
-            data_size: 0,
-            alignment_exponent: 0,
+            sections: Vec::new(),
+            text_section_index: 0,
             definition_name: definition.to_vec(),
             definition_offset: 0,
             definition_desc: 0,
