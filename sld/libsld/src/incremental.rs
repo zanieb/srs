@@ -54,7 +54,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v43";
+const STATE_VERSION: &str = "sld-incremental-state-v44";
+const STATE_VERSION_V43: &str = "sld-incremental-state-v43";
 const STATE_VERSION_V42: &str = "sld-incremental-state-v42";
 const STATE_VERSION_V41: &str = "sld-incremental-state-v41";
 const STATE_VERSION_V40: &str = "sld-incremental-state-v40";
@@ -101,7 +102,8 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const METADATA_UPDATE_FILE: &str = "metadata-update";
-const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v6";
+const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v7";
+const METADATA_UPDATE_VERSION_V6: &str = "sld-incremental-metadata-update-v6";
 const METADATA_UPDATE_VERSION_V5: &str = "sld-incremental-metadata-update-v5";
 const METADATA_UPDATE_VERSION_V4: &str = "sld-incremental-metadata-update-v4";
 const METADATA_UPDATE_VERSION_V3: &str = "sld-incremental-metadata-update-v3";
@@ -475,6 +477,7 @@ struct MachOArchiveActivationState {
     sections: Vec<FilePatchSectionState>,
     relocations: Vec<RelocationRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    rollback_symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
     forward_patches: Vec<StoredOutputPatch>,
     rollback_patches: Vec<StoredOutputPatch>,
 }
@@ -2094,8 +2097,10 @@ fn update_macho_symbol_resolutions_for_input(
         let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &target.input)?
         else {
             return Ok(Err(format!(
-                "could not resolve Mach-O symbol catalog input in {}",
-                display_hex_path(&input.path)
+                "could not resolve Mach-O symbol catalog input {} for {} in {}",
+                display_hex_text(&target.input),
+                display_hex_text(&resolution.name),
+                display_hex_path(&input.path),
             )));
         };
         let file = object::File::parse(input_bytes.bytes)
@@ -3199,6 +3204,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 };
                 for index in indices {
                     let mut state = stored_patch.macho_archive_members[index].clone();
+                    let normalized_identifiers = state
+                        .members
+                        .iter()
+                        .map(|member| member.normalized_identifier.clone())
+                        .collect::<HashSet<_>>();
                     for member in &state.members {
                         let matched = match patch_archive_member_bytes(
                             previous_bytes,
@@ -3218,11 +3228,83 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             ));
                         }
                     }
-                    let member_inputs = state
+                    let mut member_inputs = state
                         .sections
                         .iter()
                         .map(|section| section.input.clone())
-                        .collect::<HashSet<_>>();
+                        .collect::<HashSet<String>>();
+                    let candidate_inputs =
+                        previous_patch
+                            .sections
+                            .iter()
+                            .map(|section| section.input.as_str())
+                            .chain(
+                                previous
+                                    .sections
+                                    .iter()
+                                    .filter(|record| record.input_file == input.path)
+                                    .map(|record| record.input.as_str()),
+                            )
+                            .chain(
+                                previous
+                                    .relocations
+                                    .iter()
+                                    .filter(|record| record.input_file == input.path)
+                                    .map(|record| record.input.as_str()),
+                            )
+                            .chain(previous.relocations.iter().filter_map(|record| {
+                                record
+                                    .target
+                                    .as_ref()
+                                    .filter(|target| target.input_file == input.path)
+                                    .map(|target| target.input.as_str())
+                            }))
+                            .chain(previous.macho_symbol_resolutions.iter().filter_map(
+                                |resolution| {
+                                    resolution
+                                        .target
+                                        .as_ref()
+                                        .filter(|target| target.input_file == input.path)
+                                        .map(|target| target.input.as_str())
+                                },
+                            ))
+                            .chain(
+                                previous
+                                    .dynamic_relocations
+                                    .iter()
+                                    .filter(|record| record.input_file == input.path)
+                                    .map(|record| record.input.as_str()),
+                            )
+                            .chain(
+                                previous
+                                    .fdes
+                                    .iter()
+                                    .filter(|record| record.input_file == input.path)
+                                    .map(|record| record.input.as_str()),
+                            )
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                    for candidate in candidate_inputs {
+                        if normalized_archive_input_ref_matches_identifiers(
+                            input.path.as_str(),
+                            &candidate,
+                            &normalized_identifiers,
+                        )? {
+                            member_inputs.insert(candidate);
+                        }
+                    }
+                    let current_member_sections = previous_patch
+                        .sections
+                        .iter()
+                        .filter(|section| member_inputs.contains(section.input.as_str()))
+                        .map(file_patch_section_state)
+                        .collect::<Vec<_>>();
+                    if current_member_sections.len() != state.sections.len() {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "removed Mach-O archive member ownership sections changed".to_owned(),
+                        ));
+                    }
+                    state.sections = current_member_sections;
                     if previous.dynamic_relocations.iter().any(|record| {
                         record.input_file == input.path
                             && member_inputs.contains(record.input.as_str())
@@ -3256,6 +3338,29 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             true
                         }
                     });
+                    for rollback in &state.rollback_symbol_resolutions {
+                        match macho_symbol_resolution_index_for_name(
+                            &previous.macho_symbol_resolutions,
+                            rollback.name.as_str(),
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(_)) => {
+                                return Ok(ChangedInputPatchResult::Unsupported(
+                                    "removed Mach-O archive member rollback symbol conflicts with \
+                                     a live resolution"
+                                        .to_owned(),
+                                ));
+                            }
+                            Err(reason) => {
+                                return Ok(ChangedInputPatchResult::Unsupported(reason));
+                            }
+                        }
+                    }
+                    previous
+                        .macho_symbol_resolutions
+                        .extend(state.rollback_symbol_resolutions.iter().cloned());
+                    previous.macho_symbol_resolutions.sort_unstable();
+                    previous.macho_symbol_resolutions.dedup();
                     previous_patch
                         .sections
                         .retain(|section| !member_inputs.contains(section.input.as_str()));
@@ -3526,19 +3631,46 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 None
             };
-            let migrated_macho_resolution_moves =
-                if let Some(activation) = added_macho_archive_text_activation.as_mut() {
-                    match reconcile_migrated_added_macho_symbol_resolutions(
-                        &mut previous.macho_symbol_resolutions,
-                        activation,
-                        &mut macho_resolution_updates.retiring_names,
+            let migrated_macho_resolution_moves = if let Some(activation) =
+                added_macho_archive_text_activation.as_mut()
+            {
+                let mut rollback_symbol_resolutions =
+                    Vec::with_capacity(macho_resolution_updates.retiring_names.len());
+                for name in &macho_resolution_updates.retiring_names {
+                    let index = match macho_symbol_resolution_index_for_name(
+                        &previous.macho_symbol_resolutions,
+                        name.as_str(),
                     ) {
-                        Ok(migrations) => migrations,
-                        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
-                    }
-                } else {
-                    Vec::new()
+                        Ok(Some(index)) => index,
+                        Ok(None) => {
+                            return Ok(ChangedInputPatchResult::Unsupported(
+                                "retiring Mach-O symbol has no rollback catalog entry".to_owned(),
+                            ));
+                        }
+                        Err(reason) => {
+                            return Ok(ChangedInputPatchResult::Unsupported(reason));
+                        }
+                    };
+                    rollback_symbol_resolutions
+                        .push(previous.macho_symbol_resolutions[index].clone());
+                }
+                let [state] = activation.member_states.as_mut_slice() else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive activation has no unique ownership state".to_owned(),
+                    ));
                 };
+                state.rollback_symbol_resolutions = rollback_symbol_resolutions;
+                match reconcile_migrated_added_macho_symbol_resolutions(
+                    &mut previous.macho_symbol_resolutions,
+                    activation,
+                    &mut macho_resolution_updates.retiring_names,
+                ) {
+                    Ok(migrations) => migrations,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                }
+            } else {
+                Vec::new()
+            };
             if !migrated_macho_resolution_moves.is_empty() {
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
@@ -3549,6 +3681,19 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .chain(&migrated_macho_resolution_moves)
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut macho_text_relocation_retiring_names = macho_resolution_updates
+                .retiring_names
+                .iter()
+                .cloned()
+                .chain(retired_macho_archive_activations.iter().flat_map(|state| {
+                    state
+                        .symbol_resolutions
+                        .iter()
+                        .map(|resolution| resolution.name.clone())
+                }))
+                .collect::<Vec<_>>();
+            macho_text_relocation_retiring_names.sort_unstable();
+            macho_text_relocation_retiring_names.dedup();
             match finish_macho_cross_input_target_moves(
                 &mut previous.relocations,
                 &mut relocation_target_patches,
@@ -3672,7 +3817,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     let replays = match macho_text_relocation_replays_for_input(
                         &previous.relocations,
                         &mut previous.macho_symbol_resolutions,
-                        &macho_resolution_updates.retiring_names,
+                        &macho_text_relocation_retiring_names,
                         input,
                         &matched_sections,
                         previous_resolver,
@@ -4051,6 +4196,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     .map(|member| member.normalized_identifier.clone())
                             })
                             .collect::<Vec<_>>();
+                        let restored_names = retired_macho_archive_activations
+                            .iter()
+                            .flat_map(|state| {
+                                state
+                                    .rollback_symbol_resolutions
+                                    .iter()
+                                    .map(|resolution| resolution.name.clone())
+                            })
+                            .collect::<Vec<_>>();
                         archive_diff_allows_owned_macho_member_removal(
                             previous_bytes,
                             &bytes,
@@ -4058,6 +4212,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &matched_sections,
                             &current_resolver,
                             &removed_identifiers,
+                            &restored_names,
                             &[],
                             &[],
                         )?
@@ -7744,6 +7899,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V6
             && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
             && version != METADATA_UPDATE_VERSION_V3
@@ -7758,6 +7914,7 @@ impl PersistedState {
         let output = parse_content_line(lines.next(), "output")?;
         let _ = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
@@ -7766,6 +7923,7 @@ impl PersistedState {
             let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
@@ -7851,6 +8009,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V43
             && version != STATE_VERSION_V42
             && version != STATE_VERSION_V41
             && version != STATE_VERSION_V40
@@ -7909,6 +8068,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
@@ -7929,6 +8089,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
@@ -7949,6 +8110,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
@@ -7998,6 +8160,7 @@ impl PersistedState {
                 Some(file.to_owned())
             }
         } else if version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
@@ -8013,6 +8176,7 @@ impl PersistedState {
         };
 
         let reserved_ranges = if (version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40)
@@ -8033,6 +8197,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V43
             || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
@@ -8077,6 +8242,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V43
                     && version != STATE_VERSION_V42
                     && version != STATE_VERSION_V41
                     && version != STATE_VERSION_V40
@@ -8092,7 +8258,7 @@ impl PersistedState {
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V42}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V43}`, `{STATE_VERSION_V42}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -8512,6 +8678,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V6
             && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
             && version != METADATA_UPDATE_VERSION_V3
@@ -8526,6 +8693,7 @@ impl PersistedState {
         self.output = parse_content_line(lines.next(), "output")?;
         self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
@@ -8541,6 +8709,7 @@ impl PersistedState {
             self.macho_symbol_resolutions.clear();
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
@@ -11708,9 +11877,23 @@ fn macho_text_relocation_replays_for_input(
                 let current_target =
                     macho_relocation_target_identity(&current_file, current_context.target)?;
                 if previous_target.is_none() || previous_target != current_target {
+                    let previous_name = previous_target
+                        .as_ref()
+                        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+                        .unwrap_or_else(|| "<none>".to_owned());
+                    let current_name = current_target
+                        .as_ref()
+                        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+                        .unwrap_or_else(|| "<none>".to_owned());
+                    let retiring_names = retiring_names
+                        .iter()
+                        .map(|name| display_hex_text(name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     return Ok(Err(format!(
-                        "changed Mach-O text relocation target in {}",
-                        display_hex_path(&input.path)
+                        "changed Mach-O text relocation target from {previous_name} to \
+                         {current_name} in {} (retiring: {retiring_names})",
+                        display_hex_path(&input.path),
                     )));
                 }
 
@@ -13181,6 +13364,18 @@ fn normalized_archive_input_refs_match(
         == archive_member_patch_identifier(&current.identifier))
 }
 
+fn normalized_archive_input_ref_matches_identifiers(
+    input_file_path: &str,
+    input_ref: &str,
+    normalized_identifiers: &HashSet<Vec<u8>>,
+) -> Result<bool> {
+    let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)? else {
+        return Ok(false);
+    };
+    Ok(!parsed.identifier.is_empty()
+        && normalized_identifiers.contains(&archive_member_patch_identifier(&parsed.identifier)))
+}
+
 fn patch_archive_member_bytes<'data>(
     bytes: &'data [u8],
     identifier: &[u8],
@@ -13253,6 +13448,7 @@ fn archive_members_match_snapshot(
     Ok(members_match)
 }
 
+#[cfg(test)]
 fn added_archive_member_identifiers(
     previous_bytes: &[u8],
     current_bytes: &[u8],
@@ -14265,21 +14461,52 @@ fn macho_definition_counts_prove_retirement(
         .all(|name| previous.get(name) == Some(&1) && current.get(name) == Some(&0))
 }
 
-fn archive_retired_macho_symbols_proof_fingerprint(
+fn macho_definition_counts_prove_restoration(
+    names: &HashSet<Vec<u8>>,
+    previous: &HashMap<Vec<u8>, usize>,
+    current: &HashMap<Vec<u8>, usize>,
+) -> bool {
+    names
+        .iter()
+        .all(|name| previous.get(name) == Some(&0) && current.get(name) == Some(&1))
+}
+
+fn archive_macho_semantic_patch_proof_fingerprint(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
     ignored_identifiers: &[Vec<u8>],
     ignored_defined_symbols: &HashSet<Vec<u8>>,
 ) -> Result<Option<blake3::Hash>> {
-    if ignored_defined_symbols.is_empty() {
-        return Ok(None);
-    }
-    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+    let Some(members) = archive_macho_semantic_patch_proof_members(
+        bytes,
+        ranges,
+        ignored_identifiers,
+        ignored_defined_symbols,
+    )?
+    else {
         return Ok(None);
     };
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sld-archive-retired-macho-symbol-proof-v1");
-    let mut member_count = 0_u64;
+    for (identifier, member_hash) in &members {
+        hasher.update(&(identifier.len() as u64).to_le_bytes());
+        hasher.update(identifier);
+        hasher.update(member_hash.as_bytes());
+    }
+    hasher.update(&(members.len() as u64).to_le_bytes());
+    Ok(Some(hasher.finalize()))
+}
+
+fn archive_macho_semantic_patch_proof_members(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+) -> Result<Option<Vec<(Vec<u8>, blake3::Hash)>>> {
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut members = Vec::new();
     for entry in archive {
         let ArchiveEntry::Regular(content) = entry? else {
             return Ok(None);
@@ -14303,13 +14530,9 @@ fn archive_retired_macho_symbols_proof_fingerprint(
         ) else {
             return Ok(None);
         };
-        member_count += 1;
-        hasher.update(&(identifier.len() as u64).to_le_bytes());
-        hasher.update(&identifier);
-        hasher.update(member_hash.as_bytes());
+        members.push((identifier, member_hash));
     }
-    hasher.update(&member_count.to_le_bytes());
-    Ok(Some(hasher.finalize()))
+    Ok(Some(members))
 }
 
 fn archive_diff_allows_retired_macho_symbols(
@@ -14382,13 +14605,13 @@ fn archive_diff_allows_retired_macho_symbols(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+    let previous_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
         previous_bytes,
         &previous_ranges,
         ignored_previous_identifiers,
         &ignored_defined_symbols,
     )?;
-    let current_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+    let current_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
         current_bytes,
         &current_ranges,
         ignored_current_identifiers,
@@ -14404,9 +14627,37 @@ fn archive_diff_allows_owned_macho_member_removal(
     matched_sections: &[MatchedPatchSection],
     current_resolver: &PatchInputResolver<'_>,
     removed_identifiers: &[Vec<u8>],
+    restored_names: &[SharedText],
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
 ) -> Result<bool> {
+    let restored_names = restored_names
+        .iter()
+        .map(|name| hex::decode(name.as_str()))
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .context("Malformed rollback Mach-O symbol resolution name")?;
+    if !restored_names.is_empty() {
+        let Some(previous_definition_counts) = archive_macho_defined_symbol_counts(
+            previous_bytes,
+            removed_identifiers,
+            &restored_names,
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(current_definition_counts) =
+            archive_macho_defined_symbol_counts(current_bytes, &[], &restored_names)?
+        else {
+            return Ok(false);
+        };
+        if !macho_definition_counts_prove_restoration(
+            &restored_names,
+            &previous_definition_counts,
+            &current_definition_counts,
+        ) {
+            return Ok(false);
+        }
+    }
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let Some(mut previous_ranges) = patch_ranges_with_resolver(
         previous_bytes,
@@ -14434,17 +14685,17 @@ fn archive_diff_allows_owned_macho_member_removal(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+    let previous_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
         previous_bytes,
         &previous_ranges,
         removed_identifiers,
-        &HashSet::new(),
+        &restored_names,
     )?;
-    let current_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+    let current_fingerprint = archive_macho_semantic_patch_proof_fingerprint(
         current_bytes,
         &current_ranges,
         &[],
-        &HashSet::new(),
+        &restored_names,
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
@@ -16057,6 +16308,7 @@ fn added_macho_archive_text_activations(
         sections: sections.iter().map(file_patch_section_state).collect(),
         relocations: Vec::new(),
         symbol_resolutions: Vec::new(),
+        rollback_symbol_resolutions: Vec::new(),
         forward_patches: Vec::new(),
         rollback_patches: Vec::new(),
     }];
@@ -25279,13 +25531,20 @@ fn render_macho_archive_member_states(states: &[MachOArchiveActivationState]) ->
             let mut resolutions = String::new();
             write_rendered_macho_symbol_resolutions(&mut resolutions, &state.symbol_resolutions)
                 .expect("writing dormant Mach-O resolutions to String should not fail");
+            let mut rollback_resolutions = String::new();
+            write_rendered_macho_symbol_resolutions(
+                &mut rollback_resolutions,
+                &state.rollback_symbol_resolutions,
+            )
+            .expect("writing rollback Mach-O resolutions to String should not fail");
             format!(
-                "{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}",
                 u8::from(state.active),
                 hex::encode(members),
                 hex::encode(render_patch_section_states(&state.sections)),
                 hex::encode(relocations),
                 hex::encode(resolutions),
+                hex::encode(rollback_resolutions),
                 hex::encode(render_stored_output_patches(&state.forward_patches)),
                 hex::encode(render_stored_output_patches(&state.rollback_patches)),
             )
@@ -25305,18 +25564,24 @@ fn parse_macho_archive_member_states(
     }
     let mut states = Vec::new();
     let mut identifiers = HashSet::new();
+    let empty_rollback_resolutions = {
+        let mut resolutions = String::new();
+        write_rendered_macho_symbol_resolutions(&mut resolutions, &[])?;
+        hex::encode(resolutions)
+    };
     for encoded_state in encoded_states.split(';') {
         let parts = encoded_state.split(':').collect::<Vec<_>>();
         if parts.len() == 6 {
             let normalized_identifier = hex::decode(parts[1])
                 .context("Invalid incremental Mach-O archive member identifier")?;
             let legacy = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}",
                 parts[0],
                 hex::encode(format!("{}={}", parts[1], parts[2])),
                 parts[3],
                 parts[4],
                 parts[5],
+                empty_rollback_resolutions,
                 hex::encode(""),
                 hex::encode(""),
             );
@@ -25332,7 +25597,32 @@ fn parse_macho_archive_member_states(
             states.push(state);
             continue;
         }
-        if parts.len() != 7 {
+        if parts.len() == 7 {
+            let legacy = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+                empty_rollback_resolutions,
+                parts[5],
+                parts[6],
+            );
+            let parsed = parse_macho_archive_member_states(input_file, &legacy)?;
+            for state in parsed {
+                for member in &state.members {
+                    if !identifiers.insert(member.normalized_identifier.clone()) {
+                        return Err(crate::error!(
+                            "Invalid incremental Mach-O archive member identity"
+                        ));
+                    }
+                }
+                states.push(state);
+            }
+            continue;
+        }
+        if parts.len() != 8 {
             return Err(crate::error!(
                 "Malformed incremental Mach-O archive member state"
             ));
@@ -25427,13 +25717,20 @@ fn parse_macho_archive_member_states(
                 "Active incremental Mach-O archive member has dormant records"
             ));
         }
+        let rollback_resolution_contents = String::from_utf8(
+            hex::decode(parts[5])
+                .context("Invalid incremental Mach-O archive rollback resolutions")?,
+        )
+        .context("Invalid UTF-8 in incremental Mach-O archive rollback resolutions")?;
+        let rollback_symbol_resolutions =
+            parse_macho_symbol_resolutions(rollback_resolution_contents.lines())?;
         let forward_patches = String::from_utf8(
-            hex::decode(parts[5]).context("Invalid incremental Mach-O archive forward patches")?,
+            hex::decode(parts[6]).context("Invalid incremental Mach-O archive forward patches")?,
         )
         .context("Invalid UTF-8 in incremental Mach-O archive forward patches")
         .and_then(|patches| parse_stored_output_patches(&patches))?;
         let rollback_patches = String::from_utf8(
-            hex::decode(parts[6]).context("Invalid incremental Mach-O archive rollback patches")?,
+            hex::decode(parts[7]).context("Invalid incremental Mach-O archive rollback patches")?,
         )
         .context("Invalid UTF-8 in incremental Mach-O archive rollback patches")
         .and_then(|patches| parse_stored_output_patches(&patches))?;
@@ -25448,6 +25745,7 @@ fn parse_macho_archive_member_states(
             sections,
             relocations: relocation_records.relocations,
             symbol_resolutions,
+            rollback_symbol_resolutions,
             forward_patches,
             rollback_patches,
         });
@@ -27414,6 +27712,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         .next()
         .context("Missing incremental metadata update header")?;
     if version != METADATA_UPDATE_VERSION
+        && version != METADATA_UPDATE_VERSION_V6
         && version != METADATA_UPDATE_VERSION_V5
         && version != METADATA_UPDATE_VERSION_V4
         && version != METADATA_UPDATE_VERSION_V3
@@ -27428,6 +27727,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
     let output = parse_content_line(lines.next(), "output")?;
     let _ = parse_build_id_hash_line(lines.next())?;
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V6
         || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
         || version == METADATA_UPDATE_VERSION_V3
@@ -27436,6 +27736,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
     }
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V6
         || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
         || version == METADATA_UPDATE_VERSION_V3
@@ -32305,6 +32606,31 @@ mod tests {
     }
 
     #[test]
+    fn archive_member_ownership_matches_renamed_invocation_inputs() {
+        let input_file = hex::encode("libarchive.a");
+        let renamed_input = hex::encode("libarchive.a\0crate.cgu.renamed.rcgu.o\064:128");
+        let normalized_identifiers =
+            HashSet::from([archive_member_patch_identifier(b"crate.cgu.old.rcgu.o")]);
+
+        assert!(
+            normalized_archive_input_ref_matches_identifiers(
+                &input_file,
+                &renamed_input,
+                &normalized_identifiers,
+            )
+            .unwrap()
+        );
+        assert!(
+            !normalized_archive_input_ref_matches_identifiers(
+                &input_file,
+                &hex::encode("libarchive.a\0other.cgu.renamed.rcgu.o\064:128"),
+                &normalized_identifiers,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn patch_input_bytes_finds_archive_member_by_identifier() {
         let mut builder = ar::Builder::new(Vec::new());
         builder
@@ -32992,14 +33318,14 @@ mod tests {
         let ignored = HashSet::from([b"_text".to_vec()]);
 
         assert_eq!(
-            archive_retired_macho_symbols_proof_fingerprint(
+            archive_macho_semantic_patch_proof_fingerprint(
                 &previous_archive,
                 &[previous_text],
                 &[],
                 &ignored,
             )
             .unwrap(),
-            archive_retired_macho_symbols_proof_fingerprint(
+            archive_macho_semantic_patch_proof_fingerprint(
                 &current_archive,
                 &[current_text],
                 &[],
@@ -33019,6 +33345,41 @@ mod tests {
                 &[test_macho_section_range(&current, "__text")],
             ),
             "ordinary patch fingerprints must retain symbol layout sensitivity",
+        );
+    }
+
+    #[test]
+    fn owned_macho_member_removal_proof_accepts_exact_survivors() {
+        let kept = test_macho_object(&[1; 4], &[2; 4], 0);
+        let removed = test_macho_object(&[3; 4], &[4; 4], 0);
+        let archive = |members: &[(&[u8], &[u8])]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, bytes) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        *bytes,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let previous = archive(&[
+            (b"kept.o".as_slice(), kept.as_slice()),
+            (b"removed.o".as_slice(), removed.as_slice()),
+        ]);
+        let current = archive(&[(b"kept.o".as_slice(), kept.as_slice())]);
+
+        assert_eq!(
+            archive_macho_semantic_patch_proof_fingerprint(
+                &previous,
+                &[],
+                &[b"removed.o".to_vec()],
+                &HashSet::new(),
+            )
+            .unwrap(),
+            archive_macho_semantic_patch_proof_fingerprint(&current, &[], &[], &HashSet::new(),)
+                .unwrap(),
         );
     }
 
@@ -33073,6 +33434,19 @@ mod tests {
         assert!(
             !macho_definition_counts_prove_retirement(&names, &one_count, &one_count),
             "current same-name reappearance must reject retirement"
+        );
+        assert!(macho_definition_counts_prove_restoration(
+            &names,
+            &zero_count,
+            &one_count,
+        ));
+        assert!(
+            !macho_definition_counts_prove_restoration(&names, &zero_count, &duplicate_count),
+            "duplicate current definitions must reject restoration"
+        );
+        assert!(
+            !macho_definition_counts_prove_restoration(&names, &one_count, &one_count),
+            "previous same-name definitions must reject restoration"
         );
     }
 
@@ -37629,6 +38003,7 @@ mod tests {
             sections: Vec::new(),
             relocations: Vec::new(),
             symbol_resolutions: Vec::new(),
+            rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 64,
                 data: vec![1; 4],
@@ -41534,6 +41909,7 @@ mod tests {
                     sections: vec![section.clone()],
                     relocations: Vec::new(),
                     symbol_resolutions: Vec::new(),
+                    rollback_symbol_resolutions: vec![dormant_resolution.clone()],
                     forward_patches: vec![StoredOutputPatch {
                         output_offset: 256,
                         data: vec![1, 2, 3, 4],
@@ -41551,7 +41927,8 @@ mod tests {
                     active: false,
                     sections: vec![dormant_section],
                     relocations: vec![dormant_relocation],
-                    symbol_resolutions: vec![dormant_resolution],
+                    symbol_resolutions: vec![dormant_resolution.clone()],
+                    rollback_symbol_resolutions: vec![dormant_resolution],
                     forward_patches: vec![StoredOutputPatch {
                         output_offset: 512,
                         data: vec![5, 6, 7, 8],
@@ -41566,7 +41943,50 @@ mod tests {
             raw_sections: None,
         });
 
-        assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
+        let rendered = state.render();
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
+
+        let current_members = render_macho_archive_member_states(
+            &state.input_files[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members,
+        );
+        let legacy_members = current_members
+            .split(';')
+            .map(|member| {
+                let parts = member.split(':').collect::<Vec<_>>();
+                assert_eq!(parts.len(), 8);
+                [
+                    parts[0], parts[1], parts[2], parts[3], parts[4], parts[6], parts[7],
+                ]
+                .join(":")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let mut expected_v43_members = state.input_files[0]
+            .patch
+            .as_ref()
+            .unwrap()
+            .macho_archive_members
+            .clone();
+        for member in &mut expected_v43_members {
+            member.rollback_symbol_resolutions.clear();
+        }
+        assert_eq!(
+            parse_macho_archive_member_states(state.input_files[0].path.as_str(), &legacy_members,)
+                .unwrap(),
+            expected_v43_members,
+        );
+    }
+
+    #[test]
+    fn v43_state_version_is_accepted() {
+        let state = state("args", b"output", &[("a.o", b"a")]);
+        let rendered = state.render().replacen(STATE_VERSION, STATE_VERSION_V43, 1);
+
+        assert_eq!(PersistedState::parse(&rendered).unwrap(), state);
     }
 
     #[test]
