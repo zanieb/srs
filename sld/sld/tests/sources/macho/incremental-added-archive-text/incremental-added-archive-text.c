@@ -20,6 +20,7 @@
 //#TestIncrementalChangedPatchedSectionCount:5
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
+//#TestIncrementalChangedRestore:true
 //#TestIncrementalChangedSymbolBytes:_incremental_added_archive_extra_second=0xc0028052
 //#TestIncrementalChangedNoSym:_incremental_added_archive_retired
 //#TestIncrementalChangedExpectMachODwarfUnwindInfo:_incremental_added_archive_extra
