@@ -11708,6 +11708,126 @@ fn macho_data_relocation_layout_is_stable(
         && preserves_record_locations
 }
 
+fn macho_aarch64_thunk_target_is_reachable(thunk_address: u64, target_address: u64) -> bool {
+    let thunk_page = thunk_address & !linker_utils::elf::PAGE_MASK_4KB;
+    let target_page = target_address & !linker_utils::elf::PAGE_MASK_4KB;
+    let page_delta = i128::from(target_page) - i128::from(thunk_page);
+    let page_count = page_delta / i128::from(linker_utils::elf::SIZE_4KB);
+    (-(1_i128 << 20)..(1_i128 << 20)).contains(&page_count)
+}
+
+fn macho_text_patch_thunk_range(
+    patch: &ResolvedSectionPatch,
+    output_file: &object::File<'_>,
+    thunk_address: u64,
+    thunk_size: usize,
+) -> std::result::Result<Option<std::ops::Range<usize>>, String> {
+    let Some(section_address) =
+        macho_output_address_for_file_offset(output_file, patch.section.output_offset)
+    else {
+        return Err("Mach-O text patch section has no output address".to_owned());
+    };
+    let Some(start) = thunk_address.checked_sub(section_address) else {
+        return Ok(None);
+    };
+    let Some(end) = start.checked_add(thunk_size as u64) else {
+        return Err("Mach-O text thunk range overflowed".to_owned());
+    };
+    if end > patch.section.output_size {
+        return Ok(None);
+    }
+    let start = usize::try_from(start)
+        .map_err(|_| "Mach-O text thunk offset does not fit usize".to_owned())?;
+    let end =
+        usize::try_from(end).map_err(|_| "Mach-O text thunk end does not fit usize".to_owned())?;
+    Ok(Some(start..end))
+}
+
+fn materialize_recorded_macho_text_thunk(
+    patch: &mut ResolvedSectionPatch,
+    output_file: &object::File<'_>,
+    thunk_address: u64,
+    target_address: u64,
+    thunk_size: usize,
+) -> std::result::Result<Option<std::ops::Range<usize>>, String> {
+    let Some(range) = macho_text_patch_thunk_range(patch, output_file, thunk_address, thunk_size)?
+    else {
+        return Ok(None);
+    };
+    let input_size = usize::try_from(patch.section.input_size)
+        .map_err(|_| "Mach-O text patch input size does not fit usize".to_owned())?;
+    if range.start < input_size {
+        return Err("recorded Mach-O text thunk overlaps the current input section".to_owned());
+    }
+    if thunk_address % 4 != 0 {
+        return Err("recorded Mach-O text thunk is not instruction-aligned".to_owned());
+    }
+    if !macho_aarch64_thunk_target_is_reachable(thunk_address, target_address) {
+        return Err("recorded Mach-O text thunk target is out of ADRP range".to_owned());
+    }
+    patch.patch.data.resize(range.end, 0);
+    <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+        thunk_address,
+        target_address,
+        &mut patch.patch.data[range.clone()],
+    );
+    Ok(Some(range))
+}
+
+fn allocate_macho_text_thunk(
+    patch: &mut ResolvedSectionPatch,
+    output_file: &object::File<'_>,
+    previous_output: &[u8],
+    target_address: u64,
+    thunk_size: usize,
+) -> std::result::Result<Option<(u64, std::ops::Range<usize>)>, String> {
+    let input_size = usize::try_from(patch.section.input_size)
+        .map_err(|_| "Mach-O text patch input size does not fit usize".to_owned())?;
+    let output_size = usize::try_from(patch.section.output_size)
+        .map_err(|_| "Mach-O text patch output size does not fit usize".to_owned())?;
+    let mut start = patch.patch.data.len().max(input_size).next_multiple_of(4);
+    loop {
+        let Some(end) = start.checked_add(thunk_size) else {
+            return Err("Mach-O text thunk allocation overflowed".to_owned());
+        };
+        if end > output_size {
+            return Ok(None);
+        }
+        let Some(output_start) = patch.section.output_offset.checked_add(start as u64) else {
+            return Err("Mach-O text thunk output offset overflowed".to_owned());
+        };
+        let Some(output_end) = output_start.checked_add(thunk_size as u64) else {
+            return Err("Mach-O text thunk output range overflowed".to_owned());
+        };
+        let output_start_usize = usize::try_from(output_start)
+            .map_err(|_| "Mach-O text thunk output offset does not fit usize".to_owned())?;
+        let output_end_usize = usize::try_from(output_end)
+            .map_err(|_| "Mach-O text thunk output end does not fit usize".to_owned())?;
+        let Some(previous_bytes) = previous_output.get(output_start_usize..output_end_usize) else {
+            return Err("Mach-O text thunk output range is out of bounds".to_owned());
+        };
+        if previous_bytes.iter().all(|byte| *byte == 0) {
+            let Some(thunk_address) =
+                macho_output_address_for_file_offset(output_file, output_start)
+            else {
+                return Err("Mach-O text thunk has no output address".to_owned());
+            };
+            if macho_aarch64_thunk_target_is_reachable(thunk_address, target_address) {
+                patch.patch.data.resize(end, 0);
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+                    thunk_address,
+                    target_address,
+                    &mut patch.patch.data[start..end],
+                );
+                return Ok(Some((thunk_address, start..end)));
+            }
+        }
+        start = start
+            .checked_add(4)
+            .ok_or_else(|| "Mach-O text thunk allocation overflowed".to_owned())?;
+    }
+}
+
 fn apply_macho_text_relocation_replays(
     patches: &mut [ResolvedSectionPatch],
     replays: &MachOTextRelocationReplays,
@@ -11716,14 +11836,67 @@ fn apply_macho_text_relocation_replays(
 ) -> std::result::Result<(), String> {
     let output_file = object::File::parse(previous_output)
         .map_err(|error| format!("failed to parse previous Mach-O output: {error}"))?;
-    let mut rematerialized_records = Vec::new();
+    let thunk_size = <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config()
+        .ok_or_else(|| "Mach-O text thunks are unavailable for this architecture".to_owned())?
+        .thunk_size as usize;
+    let mut local_thunks = Vec::<(usize, u64, u64, std::ops::Range<usize>)>::new();
     for replay in &replays.replays {
-        let Some(patch) = patches.iter_mut().find(|patch| {
+        if replay.r_type != object::macho::ARM64_RELOC_BRANCH26 {
+            continue;
+        }
+        let Some(thunk_address) = replay
+            .previous_applied_target_value
+            .filter(|address| *address != replay.current_target_value)
+        else {
+            continue;
+        };
+        let Some(patch_index) = patches.iter().position(|patch| {
             patch.section.input == replay.input
                 && patch.section.section_index == replay.section_index
         }) else {
             return Err("missing changed Mach-O text section for relocation replay".to_owned());
         };
+        let Some(range) = materialize_recorded_macho_text_thunk(
+            &mut patches[patch_index],
+            &output_file,
+            thunk_address,
+            replay.current_target_value,
+            thunk_size,
+        )?
+        else {
+            continue;
+        };
+        if local_thunks
+            .iter()
+            .any(|(owner, address, target, existing)| {
+                *owner == patch_index
+                    && existing.start < range.end
+                    && range.start < existing.end
+                    && (*address != thunk_address || *target != replay.current_target_value)
+            })
+        {
+            return Err("overlapping recorded Mach-O text thunks".to_owned());
+        }
+        if !local_thunks.iter().any(|(_, address, target, _)| {
+            *address == thunk_address && *target == replay.current_target_value
+        }) {
+            local_thunks.push((
+                patch_index,
+                thunk_address,
+                replay.current_target_value,
+                range,
+            ));
+        }
+    }
+    let mut rematerialized_records = Vec::new();
+    for replay in &replays.replays {
+        let Some(patch_index) = patches.iter().position(|patch| {
+            patch.section.input == replay.input
+                && patch.section.section_index == replay.section_index
+        }) else {
+            return Err("missing changed Mach-O text section for relocation replay".to_owned());
+        };
+        let patch = &mut patches[patch_index];
         let current_output_offset = patch
             .section
             .output_offset
@@ -11785,13 +11958,19 @@ fn apply_macho_text_relocation_replays(
                 return Err("previous Mach-O text relocation value changed".to_owned());
             }
         }
-        let current_bytes = patch
-            .patch
-            .data
-            .get_mut(replay.current_range.clone())
-            .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?;
+        let mut candidates = replay.current_relocation_target_candidates.clone();
+        candidates.extend(
+            local_thunks
+                .iter()
+                .filter_map(|(owner, address, target, _)| {
+                    (*owner == patch_index && *target == replay.current_target_value)
+                        .then_some(*address)
+                }),
+        );
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(*candidate));
         let mut selected = None;
-        for target_value in &replay.current_relocation_target_candidates {
+        for target_value in &candidates {
             let Some(relocated_value) = macho_aarch64_relocated_value(
                 replay.r_type,
                 *target_value,
@@ -11806,7 +11985,12 @@ fn apply_macho_text_relocation_replays(
                 continue;
             };
             let written_value = replay.chained_rebase_value.unwrap_or(relocated_value);
-            let mut relocated = current_bytes.to_vec();
+            let mut relocated = patch
+                .patch
+                .data
+                .get(replay.current_range.clone())
+                .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?
+                .to_vec();
             if replay
                 .rel_info
                 .write_to_buffer(written_value, &mut relocated)
@@ -11816,9 +12000,43 @@ fn apply_macho_text_relocation_replays(
                 break;
             }
         }
+        if selected.is_none()
+            && replay.r_type == object::macho::ARM64_RELOC_BRANCH26
+            && replay.current_target_value != 0
+            && let Some((thunk_address, range)) = allocate_macho_text_thunk(
+                patch,
+                &output_file,
+                previous_output,
+                replay.current_target_value,
+                thunk_size,
+            )?
+        {
+            let relocated_value =
+                macho_aarch64_relocated_value(replay.r_type, thunk_address, 0, current_place)
+                    .ok_or_else(|| "Mach-O text thunk branch value overflowed".to_owned())?;
+            let written_value = replay.chained_rebase_value.unwrap_or(relocated_value);
+            let mut relocated = patch
+                .patch
+                .data
+                .get(replay.current_range.clone())
+                .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?
+                .to_vec();
+            if replay
+                .rel_info
+                .write_to_buffer(written_value, &mut relocated)
+                .is_ok()
+            {
+                local_thunks.push((
+                    patch_index,
+                    thunk_address,
+                    replay.current_target_value,
+                    range,
+                ));
+                selected = Some((thunk_address, written_value, relocated));
+            }
+        }
         let Some((applied_target_value, written_value, relocated)) = selected else {
-            let candidates = replay
-                .current_relocation_target_candidates
+            let candidates = candidates
                 .iter()
                 .map(|candidate| format!("{candidate:#x}"))
                 .collect::<Vec<_>>()
@@ -11833,6 +12051,11 @@ fn apply_macho_text_relocation_replays(
                 replay.current_target_value,
             ));
         };
+        let current_bytes = patch
+            .patch
+            .data
+            .get_mut(replay.current_range.clone())
+            .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?;
         current_bytes.copy_from_slice(&relocated);
         patch
             .patch
@@ -38482,6 +38705,139 @@ mod tests {
                 object::macho::ARM64_RELOC_PAGE21,
             )
         );
+    }
+
+    #[test]
+    fn macho_text_relocation_replay_allocates_and_rematerializes_local_branch_thunk() {
+        let previous_output = test_macho_object(&[0; 16], b"\x01\x02\x03\x04", 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let text_range = test_macho_section_range(&previous_output, "__text");
+        let input = "crate-hash.cgu.rcgu.o";
+        let target_name = "_target";
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("libarchive.rlib")),
+            input: SharedText::from(hex::encode("target.rcgu.o")),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let place =
+            macho_output_address_for_file_offset(&output_file, text_range.start as u64).unwrap();
+        let target_value = place + 200 * 1024 * 1024;
+        let mut replay =
+            rematerialized_macho_replay(input, target_name, target_value, target.clone());
+        replay.r_type = object::macho::ARM64_RELOC_BRANCH26;
+        replay.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        replay.rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                object::macho::RelocationInfo {
+                    r_address: 0,
+                    r_symbolnum: 0,
+                    r_pcrel: true,
+                    r_length: 2,
+                    r_extern: true,
+                    r_type: object::macho::ARM64_RELOC_BRANCH26,
+                },
+            )
+            .unwrap();
+        replay.current_target_value = target_value;
+        replay.current_relocation_target_candidates = vec![target_value];
+        let replays = MachOTextRelocationReplays {
+            replays: vec![replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut patches = vec![ResolvedSectionPatch {
+            section: PatchSection {
+                input: hex::encode(input),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: text_range.start as u64,
+                output_size: 16,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 16,
+                data: 0x1400_0000_u32.to_le_bytes().to_vec(),
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+        let mut relocations = Vec::new();
+
+        apply_macho_text_relocation_replays(
+            &mut patches,
+            &replays,
+            &previous_output,
+            &mut relocations,
+        )
+        .unwrap();
+
+        let thunk_address = place + 4;
+        let mut expected_thunk = vec![0; 12];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            target_value,
+            &mut expected_thunk,
+        );
+        let mut expected_branch = 0x1400_0000_u32.to_le_bytes();
+        replays.replays[0]
+            .rel_info
+            .write_to_buffer(thunk_address - place, &mut expected_branch)
+            .unwrap();
+        assert_eq!(&patches[0].patch.data[..4], expected_branch);
+        assert_eq!(&patches[0].patch.data[4..], expected_thunk);
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
+
+        let mut next_previous_output = previous_output;
+        next_previous_output[text_range.start..text_range.start + 16]
+            .copy_from_slice(&patches[0].patch.data);
+        let mut next_replay = replays.replays[0].clone();
+        next_replay.relocation_index = Some(0);
+        next_replay.previous_output_offset = Some(text_range.start as u64);
+        next_replay.previous_range = Some(0..4);
+        next_replay.previous_written_value = relocations[0].written_value;
+        next_replay.previous_applied_target_value = Some(thunk_address);
+        next_replay.current_relocation_target_candidates = vec![thunk_address, target_value];
+        let next_replays = MachOTextRelocationReplays {
+            replays: vec![next_replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut next_patches = vec![ResolvedSectionPatch {
+            section: patches[0].section.clone(),
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 16,
+                data: 0x1400_0000_u32.to_le_bytes().to_vec(),
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+
+        apply_macho_text_relocation_replays(
+            &mut next_patches,
+            &next_replays,
+            &next_previous_output,
+            &mut relocations,
+        )
+        .unwrap();
+
+        assert_eq!(&next_patches[0].patch.data[4..], expected_thunk);
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
     }
 
     #[test]
