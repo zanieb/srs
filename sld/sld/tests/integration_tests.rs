@@ -234,6 +234,10 @@
 //! TestIncrementalChangedAppendArchiveMember:{bool} Whether the changed-input test should append
 //! an extra archive member after mutating the selected section.
 //!
+//! TestIncrementalChangedAddedArchiveMember:{member-name}={source-filename} Whether the
+//! changed-input test should rebuild the selected archive and append the compiled source under the
+//! supplied archive member name. Requires TestIncrementalChangedCompArgs.
+//!
 //! TestIncrementalChangedCompareFull:{bool} Whether the changed-input incremental output should be
 //! byte-compared to a fresh full relink. Defaults to true. Disable this when the initial
 //! incremental link intentionally reserves capacity and the changed incremental output should
@@ -891,6 +895,7 @@ struct Config {
     test_incremental_changed_section_offset: u64,
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
+    test_incremental_changed_added_archive_member: Option<IncrementalAddedArchiveMember>,
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
@@ -902,6 +907,12 @@ struct Config {
     so_single_linker: Option<Linker>,
     available_linkers: Vec<Linker>,
     driver_mode: Option<DriverMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncrementalAddedArchiveMember {
+    identifier: String,
+    source: PathBuf,
 }
 
 /// These configs are used by the config file specified in `$SLD_TEST_CONFIG`
@@ -1630,6 +1641,7 @@ impl Config {
             test_incremental_changed_section_offset: 0,
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
+            test_incremental_changed_added_archive_member: None,
             test_incremental_changed_compare_full: true,
             test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
@@ -1757,6 +1769,160 @@ fn changed_source_for_input(config: &Config, input_path: &Path) -> Result<PathBu
         );
     }
     Ok(source_path)
+}
+
+fn replace_changed_object_from_source(
+    input_path: &Path,
+    config: &Config,
+    changed_comp_args: &ArgumentSet,
+    cross_arch: Option<Architecture>,
+) -> Result {
+    let changed_source = changed_source_for_input(config, input_path).with_context(|| {
+        format!(
+            "Failed to identify source for incremental input `{}`",
+            input_path.display()
+        )
+    })?;
+    let replacement_config = config.config_for_deps();
+    let changed_source = FilenameArgumentPair::new(&changed_source, changed_comp_args.clone());
+    let pre_replacement_path = append_to_path(input_path, ".previous");
+    std::fs::rename(input_path, &pre_replacement_path).with_context(|| {
+        format!(
+            "Failed to move incremental input `{}` aside before rebuilding it",
+            input_path.display()
+        )
+    })?;
+    let replacement = build_obj_impl(
+        &changed_source,
+        &replacement_config,
+        &Linker::Sld,
+        InputType::Object,
+        cross_arch,
+        false,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to build incremental replacement source `{}`",
+            changed_source.path.display()
+        )
+    })?;
+    if replacement.path != input_path {
+        let tmp_path = append_to_path(input_path, ".replacement");
+        std::fs::copy(&replacement.path, &tmp_path).with_context(|| {
+            format!(
+                "Failed to copy incremental replacement `{}` to `{}`",
+                replacement.path.display(),
+                tmp_path.display()
+            )
+        })?;
+        std::fs::rename(&tmp_path, input_path).with_context(|| {
+            format!(
+                "Failed to replace incremental input `{}` with `{}`",
+                input_path.display(),
+                tmp_path.display()
+            )
+        })?;
+    }
+    // Make the compiler-produced replacement a fresh file before sld snapshots it.
+    rewrite_file_with_same_contents(input_path)?;
+    let _ = std::fs::remove_file(&pre_replacement_path);
+    Ok(())
+}
+
+fn rebuild_changed_archive_with_added_member(
+    archive_path: &Path,
+    config: &Config,
+    changed_comp_args: &ArgumentSet,
+    added_member: &IncrementalAddedArchiveMember,
+    cross_arch: Option<Architecture>,
+) -> Result {
+    ensure!(
+        archive_path
+            .extension()
+            .is_some_and(|extension| extension == "a"),
+        "Incremental added archive member requires an archive input, got `{}`",
+        archive_path.display()
+    );
+    ensure!(
+        added_member.source.exists(),
+        "Incremental added archive member source `{}` does not exist",
+        added_member.source.display()
+    );
+
+    let archive_stem = archive_path
+        .file_stem()
+        .context("Incremental changed archive input has no file stem")?;
+    let dep = config
+        .deps
+        .iter()
+        .find(|dep| {
+            dep.input_type == InputType::Archive
+                && dep.files.first().is_some_and(|file| {
+                    file.path
+                        .file_stem()
+                        .is_some_and(|stem| stem == archive_stem)
+                })
+        })
+        .with_context(|| {
+            format!(
+                "Could not identify archive sources for incremental input `{}`",
+                archive_path.display()
+            )
+        })?;
+    let replacement_config = config.config_for_deps();
+    let mut objects = dep
+        .files
+        .iter()
+        .map(|file| {
+            let changed_source = FilenameArgumentPair::new(&file.path, changed_comp_args.clone());
+            build_obj_impl(
+                &changed_source,
+                &replacement_config,
+                &Linker::Sld,
+                InputType::Object,
+                cross_arch,
+                false,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to rebuild incremental archive source `{}`",
+                    changed_source.path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let added_source = FilenameArgumentPair::new(&added_member.source, ArgumentSet::empty());
+    let added_object = build_obj_impl(
+        &added_source,
+        &replacement_config,
+        &Linker::Sld,
+        InputType::Object,
+        cross_arch,
+        false,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to build incremental added archive member source `{}`",
+            added_member.source.display()
+        )
+    })?;
+    let added_object_path = replacement_config
+        .build_dir()
+        .join(&added_member.identifier);
+    std::fs::copy(&added_object.path, &added_object_path).with_context(|| {
+        format!(
+            "Failed to copy incremental added archive member `{}` to `{}`",
+            added_object.path.display(),
+            added_object_path.display()
+        )
+    })?;
+    objects.push(BuiltObject {
+        path: added_object_path,
+        inputs: added_object.inputs,
+    });
+
+    make_archive(archive_path, &objects, false, &replacement_config)?;
+    rewrite_file_with_same_contents(archive_path)
 }
 
 fn parse_configs(src_filename: &Path, default_config: &Config) -> Result<Vec<Config>> {
@@ -2202,6 +2368,27 @@ fn process_directive(
         }
         "TestIncrementalChangedAppendArchiveMember" => {
             config.test_incremental_changed_append_archive_member = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedAddedArchiveMember" => {
+            let (identifier, source) = arg.split_once('=').with_context(|| {
+                format!(
+                    "TestIncrementalChangedAddedArchiveMember requires \
+                     member-name=source-filename, got `{arg}`"
+                )
+            })?;
+            ensure!(
+                !identifier.is_empty()
+                    && Path::new(identifier)
+                        .file_name()
+                        .is_some_and(|name| name == identifier),
+                "TestIncrementalChangedAddedArchiveMember requires a plain archive member name, \
+                 got `{identifier}`"
+            );
+            config.test_incremental_changed_added_archive_member =
+                Some(IncrementalAddedArchiveMember {
+                    identifier: identifier.to_owned(),
+                    source: config.source_path(source),
+                });
         }
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
@@ -2845,6 +3032,17 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config
+                .test_incremental_changed_added_archive_member
+                .is_some()
+                && config.test_incremental_changed_comp_args.is_none()
+            {
+                bail!(
+                    "Incremental added-archive-member test for {} requires \
+                     TestIncrementalChangedCompArgs",
+                    self.name()
+                );
+            }
             if config.test_incremental_changed_restore
                 && config.test_incremental_changed_compare_full
             {
@@ -2861,59 +3059,24 @@ impl ProgramInputs {
             for changed_input in &changed_inputs {
                 _restore_changed_inputs.push(RestoreFileOnDrop::new(&changed_input.path)?);
                 if let Some(changed_comp_args) = &config.test_incremental_changed_comp_args {
-                    let changed_source = changed_source_for_input(config, &changed_input.path)
-                        .with_context(|| {
-                            format!(
-                                "Failed to identify source for incremental input `{}`",
-                                changed_input.path.display()
-                            )
-                        })?;
-                    let replacement_config = config.config_for_deps();
-                    let changed_source =
-                        FilenameArgumentPair::new(&changed_source, changed_comp_args.clone());
-                    let pre_replacement_path = append_to_path(&changed_input.path, ".previous");
-                    std::fs::rename(&changed_input.path, &pre_replacement_path).with_context(
-                        || {
-                            format!(
-                                "Failed to move incremental input `{}` aside before rebuilding it",
-                                changed_input.path.display()
-                            )
-                        },
-                    )?;
-                    let replacement = build_obj_impl(
-                        &changed_source,
-                        &replacement_config,
-                        &Linker::Sld,
-                        InputType::Object,
-                        cross_arch,
-                        false,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Failed to build incremental replacement source `{}`",
-                            changed_source.path.display()
-                        )
-                    })?;
-                    if replacement.path != changed_input.path {
-                        let tmp_path = append_to_path(&changed_input.path, ".replacement");
-                        std::fs::copy(&replacement.path, &tmp_path).with_context(|| {
-                            format!(
-                                "Failed to copy incremental replacement `{}` to `{}`",
-                                replacement.path.display(),
-                                tmp_path.display()
-                            )
-                        })?;
-                        std::fs::rename(&tmp_path, &changed_input.path).with_context(|| {
-                            format!(
-                                "Failed to replace incremental input `{}` with `{}`",
-                                changed_input.path.display(),
-                                tmp_path.display()
-                            )
-                        })?;
+                    if let Some(added_member) =
+                        &config.test_incremental_changed_added_archive_member
+                    {
+                        rebuild_changed_archive_with_added_member(
+                            &changed_input.path,
+                            config,
+                            changed_comp_args,
+                            added_member,
+                            cross_arch,
+                        )?;
+                    } else {
+                        replace_changed_object_from_source(
+                            &changed_input.path,
+                            config,
+                            changed_comp_args,
+                            cross_arch,
+                        )?;
                     }
-                    // Make the compiler-produced replacement a fresh file before sld snapshots it.
-                    rewrite_file_with_same_contents(&changed_input.path)?;
-                    let _ = std::fs::remove_file(&pre_replacement_path);
                 } else {
                     for changed_section in &changed_sections {
                         if let Some(growth) = config.test_incremental_changed_grow_section {
