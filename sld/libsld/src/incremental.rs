@@ -4807,6 +4807,7 @@ struct AddedMachOArchiveTextMember {
     input: String,
     sections: Vec<AddedMachOArchiveSection>,
     text_section_index: u32,
+    text_object_section_index: u32,
     definition_name: Vec<u8>,
     definition_offset: u64,
     definition_desc: u16,
@@ -10374,15 +10375,15 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 };
-                let previous_target_section_index =
+                let previous_target_patch_section_index =
                     patch_section_record_index(&previous_file, previous_target.section_index)?;
-                let current_target_section_index =
+                let current_target_patch_section_index =
                     patch_section_record_index(&current_file, current_target.section_index)?;
                 let Some(target_section) = matched_sections.iter().find(|section| {
                     section.previous.input == patch_section.previous.input
-                        && section.previous.section_index == previous_target_section_index
+                        && section.previous.section_index == previous_target_patch_section_index
                         && section.current.input == patch_section.current.input
-                        && section.current.section_index == current_target_section_index
+                        && section.current.section_index == current_target_patch_section_index
                 }) else {
                     return Ok(Err(format!(
                         "missing Mach-O data relocation target section in {}",
@@ -10400,7 +10401,7 @@ fn validate_macho_data_relocations_are_stable(
                 let expected_target = RelocationTargetRecord {
                     input_file: input.path.clone().into(),
                     input: patch_section.previous.input.clone().into(),
-                    section_index: previous_target_section_index,
+                    section_index: relocation_target_record_index(previous_target.section_index)?,
                     section_offset: previous_target.section_offset,
                 };
                 if relocation.target.as_ref() != Some(&expected_target) {
@@ -10453,7 +10454,8 @@ fn validate_macho_data_relocations_are_stable(
                     relocation.section_index = patch_section.current.section_index;
                     let target = relocation.target.as_mut().unwrap();
                     target.input = patch_section.current.input.clone().into();
-                    target.section_index = current_target_section_index;
+                    target.section_index =
+                        relocation_target_record_index(current_target.section_index)?;
                     target.section_offset = current_target.section_offset;
                     changed = true;
                 }
@@ -12489,7 +12491,7 @@ fn added_macho_archive_text_activations(
         let target = RelocationTargetRecord {
             input_file: input_file_path.into(),
             input: member.input.clone().into(),
-            section_index: member.text_section_index,
+            section_index: member.text_object_section_index,
             section_offset: member.definition_offset,
         };
         symbol_resolutions.push(MachOSymbolResolutionRecord {
@@ -13480,6 +13482,7 @@ fn added_macho_archive_text_member(
     let current_input_ref =
         resolved_patch_input_ref(input_file_path, input_file_path, added_member)?;
     let section_index = patch_section_record_index(&file, text.index())?;
+    let text_object_section_index = relocation_target_record_index(text.index())?;
     let mut referenced_names = Vec::new();
     for context in contexts {
         let object::RelocationTarget::Symbol(symbol_index) = context.target else {
@@ -13497,6 +13500,7 @@ fn added_macho_archive_text_member(
         input: current_input_ref,
         sections: allocated_sections,
         text_section_index: section_index,
+        text_object_section_index,
         definition_name,
         definition_offset,
         definition_desc,
@@ -13661,7 +13665,7 @@ fn added_macho_archive_text_relocation_replays(
                         target = Some(RelocationTargetRecord {
                             input_file: input_file_path.into(),
                             input: member.input.clone().into(),
-                            section_index: target_patch_section.section_index,
+                            section_index: relocation_target_record_index(target_section_index)?,
                             section_offset: target_offset,
                         });
                         let Some(target_section_address) = macho_output_address_for_file_offset(
@@ -13709,7 +13713,7 @@ fn added_macho_archive_text_relocation_replays(
                     target = Some(RelocationTargetRecord {
                         input_file: input_file_path.into(),
                         input: member.input.clone().into(),
-                        section_index: target_patch_section.section_index,
+                        section_index: relocation_target_record_index(target_section_index)?,
                         section_offset: 0,
                     });
                     macho_output_address_for_file_offset(
@@ -13823,7 +13827,7 @@ fn added_macho_archive_text_relocation_replays(
                         target = Some(RelocationTargetRecord {
                             input_file: input_file_path.into(),
                             input: member.input.clone().into(),
-                            section_index: target_patch_section.section_index,
+                            section_index: relocation_target_record_index(target_section_index)?,
                             section_offset: target_offset,
                         });
                         let Some(target_section_address) = macho_output_address_for_file_offset(
@@ -13854,7 +13858,7 @@ fn added_macho_archive_text_relocation_replays(
                         target = Some(RelocationTargetRecord {
                             input_file: input_file_path.into(),
                             input: member.input.clone().into(),
-                            section_index: target_patch_section.section_index,
+                            section_index: relocation_target_record_index(target_section_index)?,
                             section_offset: 0,
                         });
                         macho_output_address_for_file_offset(
@@ -17687,6 +17691,10 @@ fn patch_section_record_index(
         _ => section_index.0,
     };
     u32::try_from(section_index).context("Incremental section index does not fit u32")
+}
+
+fn relocation_target_record_index(section_index: object::SectionIndex) -> Result<u32> {
+    u32::try_from(section_index.0).context("Relocation target section index does not fit u32")
 }
 
 fn update_hash_with_zeroes(hasher: &mut blake3::Hasher, mut len: usize) {
@@ -26893,6 +26901,19 @@ mod tests {
         assert!(!macho_data_relocation_layout_is_stable(1, 1, 1, false));
     }
 
+    #[test]
+    fn macho_relocation_targets_keep_object_section_indices() {
+        let bytes = test_macho_object(b"\x1f\x20\x03\xd5", b"\0\0\0\0", 0);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let data = file.section_by_name("__data").unwrap();
+
+        assert_eq!(patch_section_record_index(&file, text.index()).unwrap(), 0);
+        assert_eq!(relocation_target_record_index(text.index()).unwrap(), 1);
+        assert_eq!(patch_section_record_index(&file, data.index()).unwrap(), 1);
+        assert_eq!(relocation_target_record_index(data.index()).unwrap(), 2);
+    }
+
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
         test_macho_object_with_optional_debug(text, data, None, data_symbol_offset)
     }
@@ -27376,6 +27397,7 @@ mod tests {
             input: String::new(),
             sections: Vec::new(),
             text_section_index: 0,
+            text_object_section_index: 1,
             definition_name: definition.to_vec(),
             definition_offset: 0,
             definition_desc: 0,
