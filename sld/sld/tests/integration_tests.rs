@@ -263,6 +263,10 @@
 //! input object, then check that a second incremental update returns to the original output.
 //! Defaults to false.
 //!
+//! TestIncrementalChangedReapply:{bool} Whether the changed-input restore test should reapply the
+//! exact changed input bytes, then check that the update returns to the changed output and the
+//! resulting state can be reused. Requires TestIncrementalChangedRestore. Defaults to false.
+//!
 //! TestIncrementalChangedSectionPrefix:{section_name}=0x{hex_bytes} Checks that the changed-input
 //! incremental output section starts with the specified bytes.
 //!
@@ -913,6 +917,7 @@ struct Config {
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
+    test_incremental_changed_reapply: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_incremental_changed_no_sym: HashSet<String>,
@@ -1662,6 +1667,7 @@ impl Config {
             test_incremental_changed_compare_full: true,
             test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
+            test_incremental_changed_reapply: false,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
             test_incremental_changed_no_sym: HashSet::new(),
@@ -2432,6 +2438,9 @@ fn process_directive(
         "TestIncrementalChangedRestore" => {
             config.test_incremental_changed_restore = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChangedReapply" => {
+            config.test_incremental_changed_reapply = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChangedSectionPrefix" => {
             let (section_name, expected_bytes) =
                 parse_section_bytes_directive("TestIncrementalChangedSectionPrefix", arg.trim())?;
@@ -3105,6 +3114,22 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.test_incremental_changed_reapply && !config.test_incremental_changed_restore {
+                bail!(
+                    "Incremental changed-reapply test for {} requires \
+                     TestIncrementalChangedRestore:true",
+                    self.name()
+                );
+            }
+            if config.test_incremental_changed_reapply
+                && !config.test_incremental_changed_expect_patch
+            {
+                bail!(
+                    "Incremental changed-reapply test for {} requires \
+                     TestIncrementalChangedExpectPatch:true",
+                    self.name()
+                );
+            }
 
             let mut _restore_changed_inputs = Vec::with_capacity(changed_inputs.len());
             let changed_sections = config.incremental_changed_sections();
@@ -3515,6 +3540,21 @@ impl ProgramInputs {
                 );
             }
             if config.test_incremental_changed_restore {
+                let reapplied_inputs = if config.test_incremental_changed_reapply {
+                    changed_inputs
+                        .iter()
+                        .map(|input| {
+                            std::fs::read(&input.path).with_context(|| {
+                                format!(
+                                    "Failed to snapshot changed incremental input `{}`",
+                                    input.path.display()
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
                 let patched_input_message =
                     format!("patched {} changed input file", changed_inputs.len());
                 let patched_input_count_before = log.matches(&patched_input_message).count();
@@ -3599,6 +3639,172 @@ impl ProgramInputs {
                         self.name(),
                         restored_repeat_log
                     );
+                }
+                if config.test_incremental_changed_reapply {
+                    for (changed_input, contents) in changed_inputs.iter().zip(&reapplied_inputs) {
+                        let reapplied_path = append_to_path(&changed_input.path, ".reapply");
+                        std::fs::write(&reapplied_path, contents).with_context(|| {
+                            format!(
+                                "Failed to write reapplied incremental input `{}`",
+                                reapplied_path.display()
+                            )
+                        })?;
+                        std::fs::rename(&reapplied_path, &changed_input.path).with_context(
+                            || {
+                                format!(
+                                    "Failed to replace incremental input `{}` with `{}`",
+                                    changed_input.path.display(),
+                                    reapplied_path.display()
+                                )
+                            },
+                        )?;
+                    }
+
+                    let reapply_log_before = restored_repeat_log;
+                    let reapply_patched_input_count_before =
+                        reapply_log_before.matches(&patched_input_message).count();
+                    let reapply_fallback_count_before = reapply_log_before
+                        .lines()
+                        .filter(|line| {
+                            line.starts_with(
+                                "changed-input patch unavailable before loading inputs",
+                            )
+                        })
+                        .count();
+                    let reapply_full_relink_count_before = reapply_log_before
+                        .matches("full relink: input file changed:")
+                        .count();
+                    let link_output_reapplied =
+                        Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
+                    let reapplied_content = std::fs::read(&link_output_reapplied.binary)
+                        .with_context(|| {
+                            format!(
+                                "Failed to read reapplied incremental output: {}",
+                                link_output_reapplied.binary.display()
+                            )
+                        })?;
+                    if reapplied_content != repeated_changed_content {
+                        let diffs =
+                            sections_with_diffs(&reapplied_content, &repeated_changed_content)?;
+                        bail!(
+                            "Incremental test failed for {}: reapplied changed-input output \
+                             differs from the previous changed output. Diffs:\n{diffs:#?}",
+                            self.name()
+                        );
+                    }
+                    if config.platform == PlatformKind::MachO
+                        && !config.test_incremental_unsigned_macho_output
+                    {
+                        verify_macho_signature(&link_output_reapplied.binary)?;
+                    }
+                    if config.test_incremental_changed_run {
+                        run_binary(&link_output_reapplied.binary, cross_arch).with_context(
+                            || {
+                                format!(
+                                    "Failed to run reapplied incremental output `{}`",
+                                    link_output_reapplied.binary.display()
+                                )
+                            },
+                        )?;
+                    }
+                    if let Some(expected) = &config.test_incremental_changed_symbol_bytes {
+                        assert_output_symbol_bytes(
+                            &reapplied_content,
+                            &expected.symbol_name,
+                            &expected.expected_bytes,
+                        )?;
+                    }
+                    assert_output_symbols_absent(
+                        &reapplied_content,
+                        &config.test_incremental_changed_no_sym,
+                    )?;
+                    assert_output_macho_dwarf_unwind_info(
+                        &reapplied_content,
+                        &config.test_incremental_changed_expected_macho_dwarf_unwind_info,
+                    )?;
+
+                    let reapplied_log = std::fs::read_to_string(&log_path).with_context(|| {
+                        format!("Failed to read incremental log `{}`", log_path.display())
+                    })?;
+                    if reapplied_log.matches(&patched_input_message).count()
+                        <= reapply_patched_input_count_before
+                        || reapplied_log
+                            .lines()
+                            .filter(|line| {
+                                line.starts_with(
+                                    "changed-input patch unavailable before loading inputs",
+                                )
+                            })
+                            .count()
+                            > reapply_fallback_count_before
+                        || reapplied_log
+                            .matches("full relink: input file changed:")
+                            .count()
+                            > reapply_full_relink_count_before
+                    {
+                        bail!(
+                            "Incremental test failed for {}: reapplied changed-input relink did \
+                             not patch before loading inputs. Log:\n{}",
+                            self.name(),
+                            reapplied_log
+                        );
+                    }
+                    let patched_section_counts = if config
+                        .test_incremental_changed_patched_section_counts
+                        .is_empty()
+                    {
+                        vec![changed_inputs.len() * changed_sections.len()]
+                    } else {
+                        config
+                            .test_incremental_changed_patched_section_counts
+                            .clone()
+                    };
+                    if !patched_section_counts.iter().any(|patched_section_count| {
+                        let message = format!(
+                            "patched {patched_section_count} changed input sections before loading inputs"
+                        );
+                        reapplied_log.matches(&message).count()
+                            > reapply_log_before.matches(&message).count()
+                    }) {
+                        bail!(
+                            "Incremental test failed for {}: reapplied changed-input relink did \
+                             not narrow the update to the expected sections. Log:\n{}",
+                            self.name(),
+                            reapplied_log
+                        );
+                    }
+
+                    let reapply_reuse_count_before = reapplied_log.matches(reuse_message).count();
+                    let link_output_reapplied_repeat =
+                        Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
+                    let reapplied_repeat_content =
+                        std::fs::read(&link_output_reapplied_repeat.binary).with_context(|| {
+                            format!(
+                                "Failed to read repeated reapplied incremental output: {}",
+                                link_output_reapplied_repeat.binary.display()
+                            )
+                        })?;
+                    if reapplied_repeat_content != reapplied_content {
+                        bail!(
+                            "Incremental test failed for {}: repeated reapplied-input link changed \
+                             output",
+                            self.name()
+                        );
+                    }
+                    let reapplied_repeat_log =
+                        std::fs::read_to_string(&log_path).with_context(|| {
+                            format!("Failed to read incremental log `{}`", log_path.display())
+                        })?;
+                    if reapplied_repeat_log.matches(reuse_message).count()
+                        <= reapply_reuse_count_before
+                    {
+                        bail!(
+                            "Incremental test failed for {}: repeated reapplied-input link did not \
+                             reuse the updated incremental state. Log:\n{}",
+                            self.name(),
+                            reapplied_repeat_log
+                        );
+                    }
                 }
             }
         }

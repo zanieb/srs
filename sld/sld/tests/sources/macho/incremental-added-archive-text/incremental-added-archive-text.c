@@ -18,9 +18,11 @@
 //#TestIncrementalChangedRenameAddedArchiveMembers:true
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:5
+//#TestIncrementalChangedPatchedSectionCount:12
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedRestore:true
+//#TestIncrementalChangedReapply:true
 //#TestIncrementalChangedSymbolBytes:_incremental_added_archive_extra_second=0xc0028052
 //#TestIncrementalChangedNoSym:_incremental_added_archive_retired
 //#TestIncrementalChangedExpectMachODwarfUnwindInfo:_incremental_added_archive_extra
