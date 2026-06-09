@@ -9153,6 +9153,7 @@ struct MachOTextRelocationReplay {
     input_file: SharedText,
     input: String,
     section_index: u32,
+    previous_output_offset: Option<u64>,
     previous_range: Option<std::ops::Range<usize>>,
     current_range: std::ops::Range<usize>,
     r_type: u8,
@@ -9873,6 +9874,7 @@ fn rematerialized_macho_text_relocation_replay(
         input_file: input.path.clone().into(),
         input: patch_section.current.input.clone(),
         section_index: patch_section.current.section_index,
+        previous_output_offset: None,
         previous_range: None,
         current_range: current_context.range.clone(),
         r_type: current_context.r_type,
@@ -10608,6 +10610,7 @@ fn macho_text_relocation_replays_for_input(
                     input_file: input.path.clone().into(),
                     input: patch_section.current.input.clone(),
                     section_index: patch_section.current.section_index,
+                    previous_output_offset: Some(patch_section.previous.output_offset),
                     previous_range: Some(previous_context.range.clone()),
                     current_range: current_context.range.clone(),
                     r_type: raw_relocation.r_type,
@@ -11026,17 +11029,17 @@ fn apply_macho_text_relocation_replays(
             macho_output_address_for_file_offset(&output_file, current_output_offset)
                 .ok_or_else(|| "current Mach-O text relocation has no output address".to_owned())?;
         if let (
+            Some(previous_output_offset),
             Some(previous_range),
             Some(previous_written_value),
             Some(previous_applied_target_value),
         ) = (
+            replay.previous_output_offset,
             replay.previous_range.as_ref(),
             replay.previous_written_value,
             replay.previous_applied_target_value,
         ) {
-            let previous_start = patch
-                .section
-                .output_offset
+            let previous_start = previous_output_offset
                 .checked_add(previous_range.start as u64)
                 .and_then(|offset| usize::try_from(offset).ok())
                 .ok_or_else(|| "previous Mach-O text relocation range overflowed".to_owned())?;
@@ -16976,6 +16979,7 @@ fn added_macho_archive_text_relocation_replays(
                 input_file: input_file_path.into(),
                 input: member.input.clone(),
                 section_index: member.text_section_index,
+                previous_output_offset: None,
                 previous_range: None,
                 current_range: context.range,
                 r_type: context.r_type,
@@ -17118,6 +17122,7 @@ fn added_macho_archive_text_relocation_replays(
                     input_file: input_file_path.into(),
                     input: member.input.clone(),
                     section_index: source_section.section_index,
+                    previous_output_offset: None,
                     previous_range: None,
                     current_range: context.range.clone(),
                     r_type: object::macho::ARM64_RELOC_UNSIGNED,
@@ -35460,6 +35465,7 @@ mod tests {
             input_file: SharedText::from(hex::encode(input)),
             input: hex::encode(input),
             section_index: 1,
+            previous_output_offset: None,
             previous_range: None,
             current_range: 0..4,
             r_type: raw_relocation.r_type,
