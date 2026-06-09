@@ -2719,9 +2719,14 @@ fn output_symbol_value_patches(
             }
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get().0 != symbol.target_value {
-                    return Ok(Err(
-                        "conflicting incremental symbol value patches".to_owned()
-                    ));
+                    return Ok(Err(format!(
+                        "conflicting incremental symbol value patches for `{}` from {:#x} to \
+                         {:#x} and {:#x}",
+                        display_hex_text(symbol.target_name.as_str()),
+                        symbol.previous_target_value,
+                        entry.get().0,
+                        symbol.target_value,
+                    )));
                 }
                 entry.get_mut().1 &= symbol.allow_missing;
             }
@@ -26785,6 +26790,38 @@ mod tests {
         assert!(matches!(
             patches,
             Err(reason) if reason == "missing output symbol for incremental value patch"
+        ));
+    }
+
+    #[test]
+    fn output_symbol_value_patches_report_conflicting_values() {
+        let (output, _, _) = duplicate_symbol_name_elf();
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[
+                RelocationTargetSymbolPatch {
+                    target_name: hex::encode(b"duplicate"),
+                    previous_target_value: 0x200,
+                    target_value: 0x208,
+                    allow_missing: false,
+                },
+                RelocationTargetSymbolPatch {
+                    target_name: hex::encode(b"duplicate"),
+                    previous_target_value: 0x200,
+                    target_value: 0x210,
+                    allow_missing: true,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            patches,
+            Err(reason)
+                if reason
+                    == "conflicting incremental symbol value patches for `duplicate` from 0x200 \
+                        to 0x208 and 0x210"
         ));
     }
 
