@@ -44,7 +44,7 @@
 //#TestIncrementalPrivateSignedMachOOutput:true
 //#TestIncrementalChangedCompArgs:-DRETARGET=1
 //#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:changed Mach-O text relocation target
+//#TestIncrementalChangedFallbackReason:Mach-O symbol catalog target changed sections
 //#TestIncrementalChangedRun:true
 //#Config:moved-cross-input-targets:incremental-relocated-text-base
 //#RunEnabled:true
@@ -64,8 +64,8 @@
 //#RunEnabled:true
 //#TestIncrementalPrivateSignedMachOOutput:true
 //#TestIncrementalChangedCompArgs:-DREMOVE_RELOCATIONS=1
-//#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:1
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:removed Mach-O text relocation target may change symbol liveness
 //#TestIncrementalChangedRun:true
 //#Config:reordered-relocations:incremental-relocated-text-base
 //#RunEnabled:true

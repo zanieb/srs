@@ -2603,7 +2603,7 @@ fn patch_changed_inputs(
                 if let Some(previous_resolver) = previous_resolver.as_ref() {
                     match macho_text_relocation_replays_for_input(
                         &previous.relocations,
-                        &previous.macho_symbol_resolutions,
+                        &mut previous.macho_symbol_resolutions,
                         input,
                         &matched_sections,
                         previous_resolver,
@@ -2618,9 +2618,14 @@ fn patch_changed_inputs(
                     MachOTextRelocationReplays {
                         replays: Vec::new(),
                         rematerialized_sections: Vec::new(),
+                        symbol_resolutions_changed: false,
                     }
                 }
             };
+            if macho_text_relocation_replays.symbol_resolutions_changed {
+                previous.macho_symbol_resolutions_file = None;
+                previous.sections_file = None;
+            }
             output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
             if args.should_validate_x86_64_elf_got_relaxation_contexts() {
                 let mut got_contexts_are_stable = {
@@ -8110,6 +8115,7 @@ struct MachOTextRelocationReplay {
     current_target_section_offset: u64,
     target_symbol_id: u32,
     target_name: Option<SharedText>,
+    target_is_global: bool,
     target: Option<RelocationTargetRecord>,
     addend: i64,
 }
@@ -8117,6 +8123,7 @@ struct MachOTextRelocationReplay {
 struct MachOTextRelocationReplays {
     replays: Vec<MachOTextRelocationReplay>,
     rematerialized_sections: Vec<(SharedText, String, u32, String, u32)>,
+    symbol_resolutions_changed: bool,
 }
 
 fn macho_aarch64_text_relocation_contexts<'data>(
@@ -8328,6 +8335,21 @@ fn macho_symbol_resolution_for_name<'a>(
     matches.next().is_none().then_some(resolution)
 }
 
+fn macho_symbol_resolution_index_for_name(
+    resolutions: &[MachOSymbolResolutionRecord],
+    encoded_name: &str,
+) -> std::result::Result<Option<usize>, String> {
+    let mut matches = resolutions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, resolution)| (resolution.name == encoded_name).then_some(index));
+    let index = matches.next();
+    if matches.next().is_some() {
+        return Err("ambiguous Mach-O symbol resolution catalog entry".to_owned());
+    }
+    Ok(index)
+}
+
 fn macho_text_relocation_target_candidates(
     resolutions: &[MachOSymbolResolutionRecord],
     target_name: Option<&str>,
@@ -8387,6 +8409,7 @@ fn rematerialized_macho_text_relocation_replay(
         })?;
 
     let mut target_name = None;
+    let mut target_is_global = false;
     let target;
     let mut resolution = None;
     let current_target_value = match current_context.target {
@@ -8397,6 +8420,7 @@ fn rematerialized_macho_text_relocation_replay(
             let name = symbol.name_bytes()?.to_vec();
             if !name.is_empty() {
                 target_name = Some(SharedText::from(hex::encode(&name)));
+                target_is_global = symbol.is_global();
                 resolution = macho_symbol_resolution_for_name(resolutions, &name);
             }
             if let Some(section_index) = symbol.section_index() {
@@ -8498,14 +8522,156 @@ fn rematerialized_macho_text_relocation_replay(
         current_target_section_offset: target.as_ref().map_or(0, |target| target.section_offset),
         target_symbol_id,
         target_name,
+        target_is_global,
         target,
         addend: current_context.addend,
     }))
 }
 
+fn relocation_is_in_rematerialized_macho_text_section(
+    relocation: &RelocationRecord,
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+) -> bool {
+    rematerialized_sections.iter().any(
+        |(previous_input_file, previous_input, previous_section_index, _, _)| {
+            relocation.input_file == *previous_input_file
+                && relocation.input == *previous_input
+                && relocation.section_index == *previous_section_index
+        },
+    )
+}
+
+fn reconcile_rematerialized_macho_symbol_resolutions(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    relocations: &[RelocationRecord],
+    replays: &[MachOTextRelocationReplay],
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    input: &FileState,
+) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool), String> {
+    let mut affected_names = HashSet::<SharedText>::new();
+    let mut current_references =
+        HashMap::<SharedText, Vec<(u64, Option<RelocationTargetRecord>)>>::new();
+
+    for relocation in relocations {
+        let Some(target_name) = relocation.target_name.as_ref() else {
+            continue;
+        };
+        if relocation_is_in_rematerialized_macho_text_section(relocation, rematerialized_sections) {
+            affected_names.insert(target_name.clone());
+        } else {
+            current_references
+                .entry(target_name.clone())
+                .or_default()
+                .push((relocation.target_value, relocation.target.clone()));
+        }
+    }
+    for replay in replays
+        .iter()
+        .filter(|replay| replay.relocation_index.is_none() && replay.target_is_global)
+    {
+        let Some(target_name) = replay.target_name.as_ref() else {
+            continue;
+        };
+        affected_names.insert(target_name.clone());
+        current_references
+            .entry(target_name.clone())
+            .or_default()
+            .push((replay.current_target_value, replay.target.clone()));
+    }
+
+    let mut output_symbols = Vec::new();
+    let mut changed = false;
+    for target_name in affected_names {
+        let references = current_references
+            .get(&target_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut target_values = references.iter().map(|(value, _)| *value);
+        let current_target_value = target_values.next();
+        if current_target_value.is_some()
+            && !target_values.all(|value| Some(value) == current_target_value)
+        {
+            return Err(format!(
+                "conflicting current Mach-O symbol resolutions in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+        let mut targets = references.iter().filter_map(|(_, target)| target.as_ref());
+        let current_target = targets.next().cloned();
+        if current_target.is_some()
+            && !targets.all(|target| Some(target) == current_target.as_ref())
+        {
+            return Err(format!(
+                "conflicting current Mach-O symbol owners in {}",
+                display_hex_path(&input.path)
+            ));
+        }
+
+        let resolution_index =
+            macho_symbol_resolution_index_for_name(resolutions, target_name.as_str())?;
+        let Some(current_target_value) = current_target_value else {
+            let Some(resolution_index) = resolution_index else {
+                continue;
+            };
+            let resolution = &resolutions[resolution_index];
+            if resolution.direct_value.unwrap_or_default() != 0
+                && resolution.got_address.is_none()
+                && resolution.stub_address.is_none()
+                && resolution.thunk_addresses.is_empty()
+            {
+                return Err(format!(
+                    "removed Mach-O text relocation target may change symbol liveness in {}",
+                    display_hex_path(&input.path)
+                ));
+            }
+            continue;
+        };
+
+        if let Some(resolution_index) = resolution_index {
+            let resolution = &mut resolutions[resolution_index];
+            if resolution.direct_value != Some(current_target_value) {
+                output_symbols.push(RelocationTargetSymbolPatch {
+                    target_name: target_name.to_string(),
+                    previous_target_value: resolution.direct_value.unwrap_or_default(),
+                    target_value: current_target_value,
+                    allow_missing: true,
+                });
+                resolution.direct_value = Some(current_target_value);
+                if resolution.target.is_none() {
+                    resolution.target = current_target;
+                }
+                changed = true;
+            }
+        } else {
+            let Some(current_target) = current_target else {
+                return Err(format!(
+                    "missing current Mach-O symbol owner in {}",
+                    display_hex_path(&input.path)
+                ));
+            };
+            output_symbols.push(RelocationTargetSymbolPatch {
+                target_name: target_name.to_string(),
+                previous_target_value: 0,
+                target_value: current_target_value,
+                allow_missing: true,
+            });
+            resolutions.push(MachOSymbolResolutionRecord {
+                name: target_name,
+                direct_value: Some(current_target_value),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(current_target),
+            });
+            changed = true;
+        }
+    }
+    Ok((output_symbols, changed))
+}
+
 fn macho_text_relocation_replays_for_input(
     relocations: &[RelocationRecord],
-    resolutions: &[MachOSymbolResolutionRecord],
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
     input: &FileState,
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
@@ -8909,6 +9075,7 @@ fn macho_text_relocation_replays_for_input(
                         .unwrap_or_default(),
                     target_symbol_id: relocation.target_symbol_id,
                     target_name: relocation.target_name.clone(),
+                    target_is_global: false,
                     target: relocation.target.clone(),
                     addend: relocation.addend,
                 });
@@ -8933,9 +9100,24 @@ fn macho_text_relocation_replays_for_input(
     target_patches.input_ranges.extend(target_input_ranges);
     dedup_ranges(&mut target_patches.input_ranges);
     target_patches.output_symbols.extend(target_output_symbols);
+    let (resolution_output_symbols, symbol_resolutions_changed) =
+        match reconcile_rematerialized_macho_symbol_resolutions(
+            resolutions,
+            relocations,
+            &replays,
+            &rematerialized_sections,
+            input,
+        ) {
+            Ok(updates) => updates,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    target_patches
+        .output_symbols
+        .extend(resolution_output_symbols);
     Ok(Ok(MachOTextRelocationReplays {
         replays,
         rematerialized_sections,
+        symbol_resolutions_changed,
     }))
 }
 
@@ -22742,6 +22924,154 @@ mod tests {
             parse_macho_symbol_resolutions(rendered.lines()).unwrap(),
             resolutions
         );
+    }
+
+    fn rematerialized_macho_replay(
+        input: &str,
+        target_name: &str,
+        target_value: u64,
+        target: RelocationTargetRecord,
+    ) -> MachOTextRelocationReplay {
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_PAGE21,
+        };
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                raw_relocation,
+            )
+            .unwrap();
+        MachOTextRelocationReplay {
+            relocation_index: None,
+            input_file: SharedText::from(hex::encode(input)),
+            input: hex::encode(input),
+            section_index: 1,
+            previous_range: None,
+            current_range: 0..4,
+            r_type: raw_relocation.r_type,
+            kind: encode_macho_aarch64_relocation_kind(raw_relocation),
+            rel_info,
+            previous_written_value: None,
+            previous_applied_target_value: None,
+            current_target_value: target_value,
+            current_relocation_target_candidates: vec![target_value],
+            current_target_section_offset: target.section_offset,
+            target_symbol_id: 1,
+            target_name: Some(SharedText::from(hex::encode(target_name))),
+            target_is_global: true,
+            target: Some(target),
+            addend: 0,
+        }
+    }
+
+    #[test]
+    fn rematerialized_macho_symbol_resolution_activates_new_direct_target() {
+        let input = state("args", b"output", &[("input.o", b"input")])
+            .input_files
+            .remove(0);
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("input.o")),
+            input: SharedText::from(hex::encode("input.o")),
+            section_index: 3,
+            section_offset: 32,
+        };
+        let replay =
+            rematerialized_macho_replay("input.o", "_new_target", 0x1000_4020, target.clone());
+        let mut resolutions = Vec::new();
+
+        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &[],
+            &[replay],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            &input,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(output_symbols.len(), 1);
+        assert_eq!(output_symbols[0].target_name, hex::encode("_new_target"));
+        assert_eq!(output_symbols[0].previous_target_value, 0);
+        assert_eq!(output_symbols[0].target_value, 0x1000_4020);
+        assert_eq!(
+            resolutions,
+            vec![MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode("_new_target")),
+                direct_value: Some(0x1000_4020),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(target),
+            }]
+        );
+    }
+
+    #[test]
+    fn rematerialized_macho_symbol_resolution_rejects_unproven_removal() {
+        let input = state("args", b"output", &[("input.o", b"input")])
+            .input_files
+            .remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            1,
+            Some(0),
+            0x1000_4010,
+            Some("_target"),
+            Some(("input.o", 3, 16)),
+            0,
+            0x350,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_PAGE21,
+            }),
+            0,
+        );
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(0x1000_4010),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: relocation.target.clone(),
+        }];
+
+        let result = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &[relocation],
+            &[],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            &input,
+        );
+
+        assert!(matches!(
+            result,
+            Err(reason)
+                if reason.contains(
+                    "removed Mach-O text relocation target may change symbol liveness"
+                )
+        ));
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
