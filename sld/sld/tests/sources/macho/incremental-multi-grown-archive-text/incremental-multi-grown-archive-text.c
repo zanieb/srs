@@ -1,5 +1,6 @@
 //#Config:incremental-multi-grown-archive-text
 //#Object:runtime.c
+//#Object:incremental-multi-grown-archive-unwind-reserve.S
 //#Archive:incremental-multi-grown-archive-first.S,incremental-multi-grown-archive-second.S
 //#RunEnabled:true
 //#DiffEnabled:false
@@ -11,7 +12,7 @@
 //#TestIncrementalChangedInput:incremental-multi-grown-archive-first.a
 //#TestIncrementalChangedCompArgs:-DGROW_TEXT=1
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:5
+//#TestIncrementalChangedPatchedSectionCount:6
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedRestore:true
