@@ -504,6 +504,13 @@ struct RustcRlibRawObjectDelta {
     unchanged: Vec<RustcRlibRawObjectDigest>,
     changed: Vec<RustcRlibRawObjectDigest>,
     added: Vec<RustcRlibRawObjectDigest>,
+    removed: Vec<RustcRlibRawObjectDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveMemberIdentifierDelta {
+    added: Vec<Vec<u8>>,
+    removed: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12884,15 +12891,31 @@ fn added_archive_member_identifiers(
     current_bytes: &[u8],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<Option<Vec<Vec<u8>>>> {
+    let Some(delta) = archive_member_identifier_delta(
+        previous_bytes,
+        current_bytes,
+        normalize_rust_archive_patch_inputs,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !delta.removed.is_empty() || delta.added.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(delta.added))
+}
+
+fn archive_member_identifier_delta(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<Option<ArchiveMemberIdentifierDelta>> {
     let Some(previous) = archive_member_identifiers(previous_bytes)? else {
         return Ok(None);
     };
     let Some(current) = archive_member_identifiers(current_bytes)? else {
         return Ok(None);
     };
-    if current.len() <= previous.len() {
-        return Ok(None);
-    }
     let normalize = |identifier: &[u8]| {
         if normalize_rust_archive_patch_inputs {
             archive_member_patch_identifier(identifier)
@@ -12900,29 +12923,51 @@ fn added_archive_member_identifiers(
             identifier.to_vec()
         }
     };
-    let mut normalized_current = HashSet::with_capacity(current.len());
-    if current
-        .iter()
-        .any(|identifier| !normalized_current.insert(normalize(identifier)))
-    {
-        return Ok(None);
-    }
-    let mut previous = previous.iter().peekable();
-    let mut added = Vec::with_capacity(current.len() - previous.len());
-    for identifier in &current {
-        if previous
-            .peek()
-            .is_some_and(|previous| normalize(previous) == normalize(identifier))
+    let mut previous_positions = HashMap::with_capacity(previous.len());
+    for (index, identifier) in previous.iter().enumerate() {
+        if previous_positions
+            .insert(normalize(identifier), index)
+            .is_some()
         {
-            previous.next();
-        } else {
-            added.push(identifier.clone());
+            return Ok(None);
         }
     }
-    if previous.next().is_some() || added.is_empty() {
+    let mut current_positions = HashMap::with_capacity(current.len());
+    for (index, identifier) in current.iter().enumerate() {
+        if current_positions
+            .insert(normalize(identifier), index)
+            .is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut previous_common_position = None;
+    for identifier in &previous {
+        let identifier = normalize(identifier);
+        let Some(&current_position) = current_positions.get(&identifier) else {
+            continue;
+        };
+        if previous_common_position.is_some_and(|previous| current_position <= previous) {
+            return Ok(None);
+        }
+        previous_common_position = Some(current_position);
+    }
+
+    let added = current
+        .iter()
+        .filter(|identifier| !previous_positions.contains_key(&normalize(identifier)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = previous
+        .iter()
+        .filter(|identifier| !current_positions.contains_key(&normalize(identifier)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() {
         return Ok(None);
     }
-    Ok(Some(added))
+    Ok(Some(ArchiveMemberIdentifierDelta { added, removed }))
 }
 
 fn archive_member_set_proof_matches_current(
@@ -13213,35 +13258,68 @@ fn rustc_rlib_raw_object_delta(
     previous: &RustcRlibRawObjectManifest,
     current: &RustcRlibRawObjectManifest,
 ) -> Option<RustcRlibRawObjectDelta> {
+    let mut previous_positions = HashMap::with_capacity(previous.ordered_objects.len());
+    for (index, object) in previous.ordered_objects.iter().enumerate() {
+        if previous_positions
+            .insert(archive_member_patch_identifier(&object.identifier), index)
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let mut current_positions = HashMap::with_capacity(current.ordered_objects.len());
+    for (index, object) in current.ordered_objects.iter().enumerate() {
+        if current_positions
+            .insert(archive_member_patch_identifier(&object.identifier), index)
+            .is_some()
+        {
+            return None;
+        }
+    }
+
     let mut unchanged = Vec::new();
     let mut changed = Vec::new();
-    let mut added = Vec::new();
-    let mut previous_objects = previous.ordered_objects.iter().peekable();
-    for object in &current.ordered_objects {
-        let identifier = archive_member_patch_identifier(&object.identifier);
-        let Some(previous_object) = previous_objects.peek() else {
-            added.push(object.clone());
+    let mut previous_common_position = None;
+    for previous_object in &previous.ordered_objects {
+        let identifier = archive_member_patch_identifier(&previous_object.identifier);
+        let Some(&current_position) = current_positions.get(&identifier) else {
             continue;
         };
-        if archive_member_patch_identifier(&previous_object.identifier) != identifier {
-            added.push(object.clone());
-            continue;
+        if previous_common_position.is_some_and(|previous| current_position <= previous) {
+            return None;
         }
-        let previous_object = previous_objects.next().unwrap();
+        previous_common_position = Some(current_position);
+        let object = &current.ordered_objects[current_position];
         if previous_object.digest == object.digest {
             unchanged.push(object.clone());
         } else {
             changed.push(object.clone());
         }
     }
-    previous_objects
-        .next()
-        .is_none()
-        .then_some(RustcRlibRawObjectDelta {
-            unchanged,
-            changed,
-            added,
+    let added = current
+        .ordered_objects
+        .iter()
+        .filter(|object| {
+            let identifier = archive_member_patch_identifier(&object.identifier);
+            !previous_positions.contains_key(&identifier)
         })
+        .cloned()
+        .collect();
+    let removed = previous
+        .ordered_objects
+        .iter()
+        .filter(|object| {
+            let identifier = archive_member_patch_identifier(&object.identifier);
+            !current_positions.contains_key(&identifier)
+        })
+        .cloned()
+        .collect();
+    Some(RustcRlibRawObjectDelta {
+        unchanged,
+        changed,
+        added,
+        removed,
+    })
 }
 
 fn decode_rustc_rlib_link_content_digest(metadata: &[u8]) -> Option<String> {
@@ -36691,6 +36769,18 @@ mod tests {
                 b"crate.cgu.7.new.rcgu.o".to_vec(),
             ])
         );
+        assert_eq!(
+            archive_member_identifier_delta(&previous, &four_added, true).unwrap(),
+            Some(ArchiveMemberIdentifierDelta {
+                added: vec![
+                    b"crate.cgu.1.new.rcgu.o".to_vec(),
+                    b"crate.cgu.3.new.rcgu.o".to_vec(),
+                    b"crate.cgu.5.new.rcgu.o".to_vec(),
+                    b"crate.cgu.7.new.rcgu.o".to_vec(),
+                ],
+                removed: Vec::new(),
+            })
+        );
 
         let removed = archive(&[
             (b"crate.cgu.0.new.rcgu.o", b"zero"),
@@ -36703,6 +36793,16 @@ mod tests {
             added_archive_member_identifiers(&previous, &removed, true).unwrap(),
             None
         );
+        assert_eq!(
+            archive_member_identifier_delta(&previous, &removed, true).unwrap(),
+            Some(ArchiveMemberIdentifierDelta {
+                added: vec![
+                    b"crate.cgu.7.new.rcgu.o".to_vec(),
+                    b"crate.cgu.8.new.rcgu.o".to_vec(),
+                ],
+                removed: vec![b"crate.cgu.2.old.rcgu.o".to_vec()],
+            })
+        );
 
         let reordered = archive(&[
             (b"crate.cgu.2.new.rcgu.o", b"two"),
@@ -36713,6 +36813,10 @@ mod tests {
         ]);
         assert_eq!(
             added_archive_member_identifiers(&previous, &reordered, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            archive_member_identifier_delta(&previous, &reordered, true).unwrap(),
             None
         );
     }
@@ -37289,7 +37393,7 @@ mod tests {
     }
 
     #[test]
-    fn rustc_rlib_raw_object_delta_classifies_ordered_superset() {
+    fn rustc_rlib_raw_object_delta_classifies_ordered_changes() {
         let digest_a = "a".repeat(blake3::OUT_LEN * 2);
         let digest_b = "b".repeat(blake3::OUT_LEN * 2);
         let digest_c = "c".repeat(blake3::OUT_LEN * 2);
@@ -37309,13 +37413,18 @@ mod tests {
         assert_eq!(delta.unchanged, current.ordered_objects[0..1]);
         assert_eq!(delta.changed, current.ordered_objects[1..2]);
         assert_eq!(delta.added, current.ordered_objects[2..3]);
+        assert!(delta.removed.is_empty());
 
         let (_, removed) = rustc_rlib_with_raw_object_manifest(&[(
             b"crate-hash.a.new.rcgu.o",
             digest_a.as_str(),
             b"a",
         )]);
-        assert!(rustc_rlib_raw_object_delta(&previous, &removed).is_none());
+        let removed_delta = rustc_rlib_raw_object_delta(&previous, &removed).unwrap();
+        assert_eq!(removed_delta.unchanged, removed.ordered_objects);
+        assert!(removed_delta.changed.is_empty());
+        assert!(removed_delta.added.is_empty());
+        assert_eq!(removed_delta.removed, previous.ordered_objects[1..2]);
 
         let (_, reordered) = rustc_rlib_with_raw_object_manifest(&[
             (b"crate-hash.b.new.rcgu.o", digest_b.as_str(), b"b"),
