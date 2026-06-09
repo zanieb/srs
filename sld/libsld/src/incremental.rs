@@ -2592,7 +2592,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )?
                 }
             };
-            let added_archive_member_identifier = if archive_members_match {
+            let added_archive_member_identifiers = if archive_members_match {
                 None
             } else if args.should_activate_macho_text_sections() {
                 let previous_bytes = {
@@ -2600,7 +2600,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     previous_snapshot_bytes.get()?
                 };
                 if let Some(previous_bytes) = previous_bytes {
-                    appended_archive_member_identifier(
+                    added_archive_member_identifiers(
                         previous_bytes,
                         &bytes,
                         normalize_rust_archive_patch_inputs,
@@ -2611,7 +2611,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 None
             };
-            if !archive_members_match && added_archive_member_identifier.is_none() {
+            if !archive_members_match && added_archive_member_identifiers.is_none() {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "archive members changed in `{}`",
                     path.display()
@@ -2766,7 +2766,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 }
             }
             let added_macho_archive_text_activation =
-                if let Some(added_identifier) = added_archive_member_identifier.as_deref() {
+                if let Some(added_identifiers) = added_archive_member_identifiers.as_deref() {
+                    let [added_identifier] = added_identifiers else {
+                        return Ok(ChangedInputPatchResult::Unsupported(format!(
+                            "multiple Mach-O archive members were added in `{}`",
+                            path.display()
+                        )));
+                    };
                     match added_macho_archive_text_activation(
                         &bytes,
                         input.path.as_str(),
@@ -2992,7 +2998,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let added_archive_base_fingerprint_matches =
                 if let Some(activation) = &added_macho_archive_text_activation {
                     normalize_rust_archive_patch_inputs
-                        && patch_fingerprint_ignoring_archive_member_with_resolver(
+                        && patch_fingerprint_ignoring_archive_members_with_resolver(
                             &bytes,
                             input.path.as_str(),
                             current_sections.iter().cloned(),
@@ -3000,7 +3006,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &current_resolver,
                             PatchInputLookup::MatchArchiveMember,
                             previous_patch.archive_member_patch_fingerprints.as_deref(),
-                            &activation.normalized_identifier,
+                            std::slice::from_ref(&activation.normalized_identifier),
                         )?
                         .as_deref()
                             == Some(previous_patch.fingerprint.as_str())
@@ -10475,18 +10481,18 @@ fn archive_members_match_snapshot(
     Ok(members_match)
 }
 
-fn appended_archive_member_identifier(
+fn added_archive_member_identifiers(
     previous_bytes: &[u8],
     current_bytes: &[u8],
     normalize_rust_archive_patch_inputs: bool,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<Vec<u8>>>> {
     let Some(previous) = archive_member_identifiers(previous_bytes)? else {
         return Ok(None);
     };
     let Some(current) = archive_member_identifiers(current_bytes)? else {
         return Ok(None);
     };
-    if current.len() != previous.len() + 1 {
+    if current.len() <= previous.len() {
         return Ok(None);
     }
     let normalize = |identifier: &[u8]| {
@@ -10496,22 +10502,29 @@ fn appended_archive_member_identifier(
             identifier.to_vec()
         }
     };
-    if previous
+    let mut normalized_current = HashSet::with_capacity(current.len());
+    if current
         .iter()
-        .zip(&current)
-        .any(|(previous, current)| normalize(previous) != normalize(current))
+        .any(|identifier| !normalized_current.insert(normalize(identifier)))
     {
         return Ok(None);
     }
-    let added = current.last().context("Missing appended archive member")?;
-    let added_normalized = normalize(added);
-    if current[..current.len() - 1]
-        .iter()
-        .any(|identifier| normalize(identifier) == added_normalized)
-    {
+    let mut previous = previous.iter().peekable();
+    let mut added = Vec::with_capacity(current.len() - previous.len());
+    for identifier in &current {
+        if previous
+            .peek()
+            .is_some_and(|previous| normalize(previous) == normalize(identifier))
+        {
+            previous.next();
+        } else {
+            added.push(identifier.clone());
+        }
+    }
+    if previous.next().is_some() || added.is_empty() {
         return Ok(None);
     }
-    Ok(Some(added.clone()))
+    Ok(Some(added))
 }
 
 fn archive_member_set_proof_matches_current(
@@ -11090,7 +11103,7 @@ fn patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
             &ranges,
             previous_archive_member_patch_fingerprints,
             rustc_work_product_provenance_enabled(),
-            None,
+            &[],
         )?
     {
         return Ok(Some(fingerprint));
@@ -11117,12 +11130,12 @@ fn archive_patch_fingerprint(
     ranges: &[std::ops::Range<usize>],
 ) -> Result<Option<String>> {
     Ok(
-        archive_patch_fingerprint_with_previous(bytes, ranges, None, false, None)?
+        archive_patch_fingerprint_with_previous(bytes, ranges, None, false, &[])?
             .map(|(fingerprint, _)| fingerprint),
     )
 }
 
-fn patch_fingerprint_ignoring_archive_member_with_resolver(
+fn patch_fingerprint_ignoring_archive_members_with_resolver(
     bytes: &[u8],
     input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
@@ -11130,7 +11143,7 @@ fn patch_fingerprint_ignoring_archive_member_with_resolver(
     resolver: &PatchInputResolver<'_>,
     lookup: PatchInputLookup,
     previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
-    ignored_identifier: &[u8],
+    ignored_identifiers: &[Vec<u8>],
 ) -> Result<Option<String>> {
     let Some(mut ranges) =
         patch_ranges_with_resolver(bytes, input_file_path, sections, resolver, lookup)?
@@ -11147,7 +11160,7 @@ fn patch_fingerprint_ignoring_archive_member_with_resolver(
         &ranges,
         previous_archive_member_patch_fingerprints,
         rustc_work_product_provenance_enabled(),
-        Some(ignored_identifier),
+        ignored_identifiers,
     )?
     .map(|(fingerprint, _)| fingerprint))
 }
@@ -11157,7 +11170,7 @@ fn archive_patch_fingerprint_with_previous(
     ranges: &[std::ops::Range<usize>],
     previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
     trust_rustc_object_digests: bool,
-    ignored_identifier: Option<&[u8]>,
+    ignored_identifiers: &[Vec<u8>],
 ) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
@@ -11213,7 +11226,9 @@ fn archive_patch_fingerprint_with_previous(
         .enumerate()
         .map(
             |(archive_member_index, (_, identifier, data, data_offset))| {
-                if ignored_identifier == Some(identifier.as_slice())
+                if ignored_identifiers
+                    .iter()
+                    .any(|ignored| ignored.as_slice() == identifier.as_slice())
                     || identifier.starts_with(b"__.SYMDEF")
                     || (is_rust_archive
                         && matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link"))
@@ -24948,7 +24963,7 @@ mod tests {
     }
 
     #[test]
-    fn appended_archive_member_requires_one_unique_normalized_tail() {
+    fn added_archive_members_require_a_unique_normalized_ordered_superset() {
         let archive = |members: &[(&[u8], &[u8])]| {
             let mut builder = ar::Builder::new(Vec::new());
             for (identifier, data) in members {
@@ -24967,8 +24982,8 @@ mod tests {
             (b"crate.cgu.1.new.rcgu.o", b"added"),
         ]);
         assert_eq!(
-            appended_archive_member_identifier(&previous, &current, true).unwrap(),
-            Some(b"crate.cgu.1.new.rcgu.o".to_vec())
+            added_archive_member_identifiers(&previous, &current, true).unwrap(),
+            Some(vec![b"crate.cgu.1.new.rcgu.o".to_vec()])
         );
 
         let duplicate = archive(&[
@@ -24976,22 +24991,63 @@ mod tests {
             (b"crate.cgu.0.other.rcgu.o", b"duplicate"),
         ]);
         assert_eq!(
-            appended_archive_member_identifier(&previous, &duplicate, true).unwrap(),
+            added_archive_member_identifiers(&previous, &duplicate, true).unwrap(),
             None
         );
-        let two_added = archive(&[
-            (b"crate.cgu.0.new.rcgu.o", b"changed"),
+
+        let previous = archive(&[
+            (b"crate.cgu.0.old.rcgu.o", b"zero"),
+            (b"crate.cgu.2.old.rcgu.o", b"two"),
+            (b"crate.cgu.4.old.rcgu.o", b"four"),
+            (b"crate.cgu.6.old.rcgu.o", b"six"),
+        ]);
+        let four_added = archive(&[
+            (b"crate.cgu.0.new.rcgu.o", b"zero"),
             (b"crate.cgu.1.new.rcgu.o", b"added"),
-            (b"crate.cgu.2.new.rcgu.o", b"added"),
+            (b"crate.cgu.2.new.rcgu.o", b"two"),
+            (b"crate.cgu.3.new.rcgu.o", b"added"),
+            (b"crate.cgu.4.new.rcgu.o", b"four"),
+            (b"crate.cgu.5.new.rcgu.o", b"added"),
+            (b"crate.cgu.6.new.rcgu.o", b"six"),
+            (b"crate.cgu.7.new.rcgu.o", b"added"),
         ]);
         assert_eq!(
-            appended_archive_member_identifier(&previous, &two_added, true).unwrap(),
+            added_archive_member_identifiers(&previous, &four_added, true).unwrap(),
+            Some(vec![
+                b"crate.cgu.1.new.rcgu.o".to_vec(),
+                b"crate.cgu.3.new.rcgu.o".to_vec(),
+                b"crate.cgu.5.new.rcgu.o".to_vec(),
+                b"crate.cgu.7.new.rcgu.o".to_vec(),
+            ])
+        );
+
+        let removed = archive(&[
+            (b"crate.cgu.0.new.rcgu.o", b"zero"),
+            (b"crate.cgu.4.new.rcgu.o", b"four"),
+            (b"crate.cgu.6.new.rcgu.o", b"six"),
+            (b"crate.cgu.7.new.rcgu.o", b"added"),
+            (b"crate.cgu.8.new.rcgu.o", b"added"),
+        ]);
+        assert_eq!(
+            added_archive_member_identifiers(&previous, &removed, true).unwrap(),
+            None
+        );
+
+        let reordered = archive(&[
+            (b"crate.cgu.2.new.rcgu.o", b"two"),
+            (b"crate.cgu.0.new.rcgu.o", b"zero"),
+            (b"crate.cgu.4.new.rcgu.o", b"four"),
+            (b"crate.cgu.6.new.rcgu.o", b"six"),
+            (b"crate.cgu.7.new.rcgu.o", b"added"),
+        ]);
+        assert_eq!(
+            added_archive_member_identifiers(&previous, &reordered, true).unwrap(),
             None
         );
     }
 
     #[test]
-    fn archive_patch_fingerprint_can_omit_one_appended_member() {
+    fn archive_patch_fingerprint_can_omit_added_members() {
         let archive = |members: &[(&[u8], &[u8])]| {
             let mut builder = ar::Builder::new(Vec::new());
             for (identifier, data) in members {
@@ -25004,18 +25060,29 @@ mod tests {
             }
             builder.into_inner().unwrap()
         };
-        let previous = archive(&[(b"root.o", b"root")]);
-        let current = archive(&[(b"root.o", b"root"), (b"added.o", b"added")]);
+        let previous = archive(&[(b"first.o", b"first"), (b"last.o", b"last")]);
+        let current = archive(&[
+            (b"added-before.o", b"added"),
+            (b"first.o", b"first"),
+            (b"added-middle.o", b"added"),
+            (b"last.o", b"last"),
+            (b"added-after.o", b"added"),
+        ]);
         let (previous_fingerprint, _) =
-            archive_patch_fingerprint_with_previous(&previous, &[], None, false, None)
+            archive_patch_fingerprint_with_previous(&previous, &[], None, false, &[])
                 .unwrap()
                 .unwrap();
         let (current_fingerprint, _) =
-            archive_patch_fingerprint_with_previous(&current, &[], None, false, None)
+            archive_patch_fingerprint_with_previous(&current, &[], None, false, &[])
                 .unwrap()
                 .unwrap();
+        let ignored = [
+            b"added-before.o".to_vec(),
+            b"added-middle.o".to_vec(),
+            b"added-after.o".to_vec(),
+        ];
         let (without_added, _) =
-            archive_patch_fingerprint_with_previous(&current, &[], None, false, Some(b"added.o"))
+            archive_patch_fingerprint_with_previous(&current, &[], None, false, &ignored)
                 .unwrap()
                 .unwrap();
 
@@ -25541,7 +25608,7 @@ mod tests {
         let changed_with_same_digest = archive(&digest, b"mutant");
         let changed_with_changed_digest = archive(&"b".repeat(blake3::OUT_LEN * 2), b"mutant");
         let (previous_fingerprint, previous_members) =
-            archive_patch_fingerprint_with_previous(&previous, &[], None, true, None)
+            archive_patch_fingerprint_with_previous(&previous, &[], None, true, &[])
                 .unwrap()
                 .unwrap();
         let (reused_fingerprint, _) = archive_patch_fingerprint_with_previous(
@@ -25549,7 +25616,7 @@ mod tests {
             &[],
             previous_members.as_deref(),
             true,
-            None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -25558,7 +25625,7 @@ mod tests {
             &[],
             previous_members.as_deref(),
             true,
-            None,
+            &[],
         )
         .unwrap()
         .unwrap();
