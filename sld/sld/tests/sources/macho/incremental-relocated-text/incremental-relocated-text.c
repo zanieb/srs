@@ -82,8 +82,10 @@
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedLogContains:metadata-only changed-input patch unavailable before loading inputs: missing patch metadata for
 //#TestIncrementalChangedLogContains:loaded records for 1 changed input file before loading inputs
-//#TestIncrementalChangedLogContains:filtered-record changed-input patch unavailable before loading inputs: changed Mach-O text symbol resolutions need complete relocation records
+//#TestIncrementalChangedLogContains:filtered-record changed-input patch requires complete Mach-O resolutions before loading inputs: changed Mach-O text symbol resolutions need the complete resolution catalog
+//#TestIncrementalChangedLogNotContains:filtered-record changed-input patch unavailable before loading inputs
 //#TestIncrementalChangedLogNotContains:full relink: input file changed:
+//#TestIncrementalChangedPreservesIndexedRecords:true
 //#Config:removed-relocations:incremental-relocated-text-base
 //#RunEnabled:true
 //#TestIncrementalPrivateSignedMachOOutput:true

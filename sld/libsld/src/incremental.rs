@@ -1150,7 +1150,8 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
         let should_start_with_filtered_records = should_filter_records
             && changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs_to_patch);
         let result = if should_start_with_filtered_records {
-            previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+            let complete_macho_symbol_resolutions =
+                previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
             append_log(
                 &state_dir,
                 &format!(
@@ -1169,7 +1170,11 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 &state_dir,
                 previous,
                 current_link_start.clone(),
-                ChangedInputRecordCoverage::ChangedInputs,
+                if complete_macho_symbol_resolutions {
+                    ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions
+                } else {
+                    ChangedInputRecordCoverage::ChangedInputs
+                },
                 &changed_inputs_to_patch,
                 &metadata_update_input_indices,
             )?
@@ -1209,7 +1214,8 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
-                previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                let complete_macho_symbol_resolutions =
+                    previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
                 append_log(
                     &state_dir,
                     &format!(
@@ -1228,7 +1234,11 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     &state_dir,
                     previous,
                     current_link_start.clone(),
-                    ChangedInputRecordCoverage::ChangedInputs,
+                    if complete_macho_symbol_resolutions {
+                        ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions
+                    } else {
+                        ChangedInputRecordCoverage::ChangedInputs
+                    },
                     &changed_inputs_to_patch,
                     &metadata_update_input_indices,
                 )?
@@ -1259,7 +1269,46 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             )?
         };
         let result = match result {
+            ChangedInputPatchResult::RequiresCompleteMachOResolutions(reason)
+                if attempted_filtered_records =>
+            {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "filtered-record changed-input patch requires complete Mach-O \
+                         resolutions before loading inputs: {reason}"
+                    ),
+                )?;
+                let Some(mut previous) = PersistedState::read_metadata(&state_dir)? else {
+                    return Ok(false);
+                };
+                refresh_snapshotted_rewritten_input_metadata(
+                    &state_dir,
+                    &mut previous,
+                    &rewritten_inputs,
+                );
+                apply_preclassified_unchanged_rustc_rlibs(
+                    &mut previous,
+                    &preclassified_unchanged_inputs,
+                );
+                previous
+                    .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
+                previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                patch_changed_inputs(
+                    args,
+                    &state_dir,
+                    previous,
+                    current_link_start.clone(),
+                    ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions,
+                    &changed_inputs_to_patch,
+                    &metadata_update_input_indices,
+                )?
+            }
+            result => result,
+        };
+        let result = match result {
             ChangedInputPatchResult::RequiresChangedInputRecords(reason)
+            | ChangedInputPatchResult::RequiresCompleteMachOResolutions(reason)
             | ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
                 if attempted_filtered_records {
                     append_log(
@@ -1335,6 +1384,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             ChangedInputPatchResult::Patched => return Ok(true),
             ChangedInputPatchResult::Unsupported(reason)
             | ChangedInputPatchResult::RequiresChangedInputRecords(reason)
+            | ChangedInputPatchResult::RequiresCompleteMachOResolutions(reason)
             | ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
                 append_log(
                     &state_dir,
@@ -1854,23 +1904,30 @@ enum ChangedInputPatchResult {
     Patched,
     Unsupported(String),
     RequiresChangedInputRecords(String),
+    RequiresCompleteMachOResolutions(String),
     RequiresCompleteRecords(String),
     StartedUnsupported(String),
 }
 
 const MACHO_TEXT_RELOCATION_RECORDS_REQUIRED: &str =
     "changed input needs Mach-O text relocation records";
+const MACHO_SYMBOL_RESOLUTIONS_REQUIRED: &str = "missing Mach-O symbol resolution";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangedInputRecordCoverage {
     MetadataOnly,
     ChangedInputs,
+    ChangedInputsWithCompleteMachOResolutions,
     Complete,
 }
 
 impl ChangedInputRecordCoverage {
     fn has_changed_input_records(self) -> bool {
         self != Self::MetadataOnly
+    }
+
+    fn has_complete_macho_symbol_resolutions(self) -> bool {
+        self != Self::ChangedInputs
     }
 
     fn is_complete(self) -> bool {
@@ -3151,7 +3208,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
 
     let records_complete = record_coverage.is_complete();
     let mut previous = previous;
-    if record_coverage != ChangedInputRecordCoverage::ChangedInputs {
+    if record_coverage == ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions {
+        previous.macho_symbol_resolutions.clear();
+    }
+    if record_coverage.has_complete_macho_symbol_resolutions() {
         previous.load_macho_symbol_resolutions(state_dir)?;
     }
     let mut patches = Vec::new();
@@ -4153,6 +4213,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 reason,
                             ));
                         }
+                        Err(reason)
+                            if !record_coverage.has_complete_macho_symbol_resolutions()
+                                && reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED) =>
+                        {
+                            return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                                reason,
+                            ));
+                        }
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                     };
                     match validate_macho_data_relocations_are_stable(
@@ -4218,14 +4286,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             }
             if macho_text_relocation_replays.symbol_resolutions_changed {
-                if !records_complete {
-                    return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
-                        "changed Mach-O text symbol resolutions need complete relocation records"
+                if !record_coverage.has_complete_macho_symbol_resolutions() {
+                    return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                        "changed Mach-O text symbol resolutions need the complete resolution \
+                             catalog"
                             .to_owned(),
                     ));
                 }
                 previous.macho_symbol_resolutions_file = None;
-                previous.sections_file = None;
+                if records_complete {
+                    previous.sections_file = None;
+                }
             }
             output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
             if args.should_validate_x86_64_elf_got_relaxation_contexts() {
@@ -4661,7 +4732,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 && added_macho_archive_text_activation.is_none()
                 && changed_macho_archive_unwind_activation.is_none()
                 && macho_text_relocation_replays
-                    .uses_only_existing_records_for_input(input.path.as_str());
+                    .uses_only_records_owned_by_input(&previous.relocations, input.path.as_str());
             if (!macho_text_relocation_replays.replays.is_empty()
                 || !macho_text_relocation_replays
                     .rematerialized_sections
@@ -8174,7 +8245,7 @@ impl PersistedState {
         &mut self,
         state_dir: &Path,
         input_files: &HashSet<String>,
-    ) -> Result {
+    ) -> Result<bool> {
         self.materialize_patch_record_locations()?;
         if let Some(patch_records_file) = self.patch_records_file.as_deref() {
             let canonical_index = self.sections_file.as_deref() == Some(patch_records_file);
@@ -8193,9 +8264,11 @@ impl PersistedState {
                 {
                     self.macho_symbol_resolutions.clear();
                     self.load_macho_symbol_resolutions(state_dir)?;
+                    self.apply_record_overrides(state_dir, Some(input_files))?;
+                    return Ok(true);
                 }
                 self.apply_record_overrides(state_dir, Some(input_files))?;
-                return Ok(());
+                return Ok(false);
             }
             if canonical_index {
                 self.sections.clear();
@@ -8203,7 +8276,7 @@ impl PersistedState {
                 self.fdes.clear();
                 self.dynamic_relocations.clear();
                 self.apply_record_overrides(state_dir, Some(input_files))?;
-                return Ok(());
+                return Ok(false);
             }
             if self.patch_record_locations.is_empty() {
                 timing_phase!("Read incremental patch-record sidecar");
@@ -8228,15 +8301,17 @@ impl PersistedState {
                     {
                         self.macho_symbol_resolutions.clear();
                         self.load_macho_symbol_resolutions(state_dir)?;
+                        self.apply_record_overrides(state_dir, Some(input_files))?;
+                        return Ok(true);
                     }
                     self.apply_record_overrides(state_dir, Some(input_files))?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
         let Some(sections_file) = self.sections_file.as_deref() else {
             self.apply_record_overrides(state_dir, Some(input_files))?;
-            return Ok(());
+            return Ok(false);
         };
         timing_phase!("Read incremental sidecar records");
         let contents = read_sections_sidecar(state_dir, sections_file)?;
@@ -8252,9 +8327,11 @@ impl PersistedState {
         {
             self.macho_symbol_resolutions.clear();
             self.load_macho_symbol_resolutions(state_dir)?;
+            self.apply_record_overrides(state_dir, Some(input_files))?;
+            return Ok(true);
         }
         self.apply_record_overrides(state_dir, Some(input_files))?;
-        Ok(())
+        Ok(false)
     }
 
     fn apply_record_overrides(
@@ -8398,12 +8475,6 @@ impl PersistedState {
                     .target
                     .as_ref()
                     .is_some_and(|target| input_files.contains(target.input_file.as_str()))
-        });
-        records.macho_symbol_resolutions.retain(|resolution| {
-            resolution
-                .target
-                .as_ref()
-                .is_some_and(|target| input_files.contains(target.input_file.as_str()))
         });
         records
             .fdes
@@ -9798,6 +9869,14 @@ fn write_indexed_records_streaming(
         })?;
     let mut writer = SectionSidecarWriter::new(file);
     let mut records_by_input = HashMap::<&str, CompactRecordRefs<'_>>::new();
+    let mut macho_symbol_resolutions_by_name =
+        HashMap::<&str, Vec<&MachOSymbolResolutionRecord>>::new();
+    for resolution in macho_symbol_resolutions {
+        macho_symbol_resolutions_by_name
+            .entry(resolution.name.as_str())
+            .or_default()
+            .push(resolution);
+    }
     for record in sections {
         records_by_input
             .entry(record.input_file.as_str())
@@ -9812,6 +9891,15 @@ fn write_indexed_records_streaming(
             .or_default()
             .relocations
             .push(record);
+        if let Some(target_name) = record.target_name.as_deref()
+            && let Some(resolutions) = macho_symbol_resolutions_by_name.get(target_name)
+        {
+            records_by_input
+                .entry(record.input_file.as_str())
+                .or_default()
+                .macho_symbol_resolutions
+                .extend(resolutions);
+        }
         if let Some(target) = record.target.as_ref()
             && target.input_file != record.input_file
         {
@@ -11470,13 +11558,22 @@ struct MachOTextRelocationReplays {
 }
 
 impl MachOTextRelocationReplays {
-    fn uses_only_existing_records_for_input(&self, input_file: &str) -> bool {
-        self.rematerialized_sections.is_empty()
-            && !self.symbol_resolutions_changed
-            && self
-                .replays
-                .iter()
-                .all(|replay| replay.relocation_index.is_some() && replay.input_file == input_file)
+    fn uses_only_records_owned_by_input(
+        &self,
+        relocations: &[RelocationRecord],
+        input_file: &str,
+    ) -> bool {
+        self.rematerialized_sections
+            .iter()
+            .all(|(previous_input_file, _, _, _, _)| previous_input_file.as_str() == input_file)
+            && self.replays.iter().all(|replay| {
+                replay.input_file.as_str() == input_file
+                    && replay.relocation_index.is_none_or(|index| {
+                        relocations
+                            .get(index)
+                            .is_some_and(|relocation| relocation.input_file.as_str() == input_file)
+                    })
+            })
     }
 }
 
@@ -42725,7 +42822,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_macho_text_replays_require_existing_changed_input_records() {
+    fn filtered_macho_text_replays_require_changed_input_record_owners() {
         let input = "changed.o";
         let target = RelocationTargetRecord {
             input_file: SharedText::from(hex::encode(input)),
@@ -42742,15 +42839,29 @@ mod tests {
             symbol_resolutions_changed: false,
         };
         let input_file = hex::encode(input);
+        let relocations = vec![relocation_record(
+            input,
+            1,
+            1,
+            Some(0x1000),
+            0x1000,
+            Some("_target"),
+            Some((input, 2, 0)),
+            0,
+            100,
+            4,
+            0,
+            0,
+        )];
 
-        assert!(replays.uses_only_existing_records_for_input(&input_file));
+        assert!(replays.uses_only_records_owned_by_input(&relocations, &input_file));
 
         replays.replays[0].relocation_index = None;
-        assert!(!replays.uses_only_existing_records_for_input(&input_file));
+        assert!(replays.uses_only_records_owned_by_input(&relocations, &input_file));
         replays.replays[0].relocation_index = Some(0);
 
         replays.replays[0].input_file = SharedText::from(hex::encode("other.o"));
-        assert!(!replays.uses_only_existing_records_for_input(&input_file));
+        assert!(!replays.uses_only_records_owned_by_input(&relocations, &input_file));
         replays.replays[0].input_file = SharedText::from(input_file.clone());
 
         replays.rematerialized_sections.push((
@@ -42760,11 +42871,17 @@ mod tests {
             hex::encode(input),
             1,
         ));
-        assert!(!replays.uses_only_existing_records_for_input(&input_file));
+        assert!(replays.uses_only_records_owned_by_input(&relocations, &input_file));
+        replays.rematerialized_sections[0].0 = SharedText::from(hex::encode("other.o"));
+        assert!(!replays.uses_only_records_owned_by_input(&relocations, &input_file));
+        replays.rematerialized_sections[0].0 = SharedText::from(input_file.clone());
         replays.rematerialized_sections.clear();
 
         replays.symbol_resolutions_changed = true;
-        assert!(!replays.uses_only_existing_records_for_input(&input_file));
+        assert!(replays.uses_only_records_owned_by_input(&relocations, &input_file));
+
+        replays.replays[0].relocation_index = Some(1);
+        assert!(!replays.uses_only_records_owned_by_input(&relocations, &input_file));
     }
 
     #[test]
@@ -45607,6 +45724,11 @@ mod tests {
                 "changed input needs complete section records".to_owned()
             )
         ));
+        assert!(!changed_input_patch_should_retry_with_filtered_records(
+            &ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                "changed input needs complete Mach-O resolutions".to_owned()
+            )
+        ));
         assert!(changed_input_patch_should_retry_with_filtered_records(
             &ChangedInputPatchResult::Unsupported(
                 "changed bytes outside patchable sections in `input.o`".to_owned()
@@ -45819,7 +45941,7 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
-    fn read_records_for_input_files_loads_target_owned_macho_resolutions() {
+    fn read_records_for_input_files_loads_owned_and_referenced_macho_resolutions() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
         state.sections.push(section_record("a.o", 1, 100, 8));
@@ -45875,6 +45997,10 @@ mod tests {
         state.write(dir.path()).unwrap();
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let full_resolutions_file = metadata.macho_symbol_resolutions_file.clone();
+        let path = dir.path().join(full_resolutions_file.as_ref().unwrap());
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&path, contents).unwrap();
         let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
 
         metadata
@@ -45882,9 +46008,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(metadata.sections, vec![state.sections[0].clone()]);
-        assert_eq!(
-            metadata.macho_symbol_resolutions,
-            vec![resolution("_target_a", Some("a.o"))]
+        assert!(
+            metadata
+                .macho_symbol_resolutions
+                .contains(&resolution("_target_a", Some("a.o")))
+        );
+        assert!(
+            metadata
+                .macho_symbol_resolutions
+                .contains(&resolution("_import", None))
         );
         assert_eq!(
             metadata.macho_symbol_resolutions_file,
@@ -45896,9 +46028,15 @@ mod tests {
         metadata
             .read_records_for_input_files(dir.path(), &input_files)
             .unwrap();
-        assert_eq!(
-            metadata.macho_symbol_resolutions,
-            vec![resolution("_target_b", Some("b.o"))]
+        assert!(
+            metadata
+                .macho_symbol_resolutions
+                .contains(&resolution("_target_b", Some("b.o")))
+        );
+        assert!(
+            metadata
+                .macho_symbol_resolutions
+                .contains(&resolution("_target_a", Some("a.o")))
         );
     }
 
