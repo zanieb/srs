@@ -11,13 +11,14 @@
 //#TestIncrementalChangedInput:incremental-multi-grown-archive-first.a
 //#TestIncrementalChangedCompArgs:-DGROW_TEXT=1
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:2
+//#TestIncrementalChangedPatchedSectionCount:4
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedRestore:true
 //#TestIncrementalChangedRestoreCompareOriginal:false
 //#TestIncrementalChangedReapply:true
-//#TestIncrementalChangedSymbolBytes:_incremental_multi_grown_archive_first=0x8002805200040011000400110004001100040011c0035fd6
+//#TestIncrementalChangedSymbolBytes:_incremental_multi_grown_archive_first=0x800280520004001100040011000400110004001101000014
+//#TestIncrementalChangedSymbolBytes:_incremental_multi_grown_archive_added_private=0x00038052c0035fd6
 //#TestIncrementalChangedRestoreSymbolBytes:_incremental_multi_grown_archive_first=0x80028052c0035fd6
 //#TestIncrementalChangedLogNotContains:changed Mach-O object grew more than one text section
 //#TestIncrementalChangedLogNotContains:full relink: input file changed:
