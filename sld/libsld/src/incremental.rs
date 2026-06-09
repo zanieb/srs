@@ -54,7 +54,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v42";
+const STATE_VERSION: &str = "sld-incremental-state-v43";
+const STATE_VERSION_V42: &str = "sld-incremental-state-v42";
 const STATE_VERSION_V41: &str = "sld-incremental-state-v41";
 const STATE_VERSION_V40: &str = "sld-incremental-state-v40";
 const STATE_VERSION_V39: &str = "sld-incremental-state-v39";
@@ -100,7 +101,8 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const METADATA_UPDATE_FILE: &str = "metadata-update";
-const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v5";
+const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v6";
+const METADATA_UPDATE_VERSION_V5: &str = "sld-incremental-metadata-update-v5";
 const METADATA_UPDATE_VERSION_V4: &str = "sld-incremental-metadata-update-v4";
 const METADATA_UPDATE_VERSION_V3: &str = "sld-incremental-metadata-update-v3";
 const METADATA_UPDATE_VERSION_V2: &str = "sld-incremental-metadata-update-v2";
@@ -461,19 +463,32 @@ struct FilePatchState {
     fingerprint: String,
     archive_member_set_proof: Option<ArchiveMemberSetProof>,
     archive_member_patch_fingerprints: Option<Vec<ArchiveMemberPatchFingerprint>>,
-    macho_archive_members: Vec<MachOArchiveMemberState>,
+    macho_archive_members: Vec<MachOArchiveActivationState>,
     sections: Vec<FilePatchSectionState>,
     raw_sections: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MachOArchiveMemberState {
-    normalized_identifier: Vec<u8>,
-    object_hash: String,
+struct MachOArchiveActivationState {
+    members: Vec<MachOArchiveMemberIdentity>,
     active: bool,
     sections: Vec<FilePatchSectionState>,
     relocations: Vec<RelocationRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    forward_patches: Vec<StoredOutputPatch>,
+    rollback_patches: Vec<StoredOutputPatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MachOArchiveMemberIdentity {
+    normalized_identifier: Vec<u8>,
+    object_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredOutputPatch {
+    output_offset: u64,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2990,7 +3005,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             )?;
             previous.input_files[*input_index].patch = patch;
         }
-        let previous_patch = {
+        let mut previous_patch = {
             let input = &previous.input_files[*input_index];
             match patch_sections_from_previous_state(input, path) {
                 Ok(previous_patch) => previous_patch,
@@ -3101,6 +3116,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             macho_text_section_activation,
             changed_macho_archive_unwind_activation,
             added_macho_archive_text_activation,
+            retired_macho_archive_activations,
         ) = {
             let input = &previous.input_files[*input_index];
             let mut previous_snapshot_bytes =
@@ -3137,7 +3153,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )?
                 }
             };
-            let added_archive_member_identifiers = if archive_members_match {
+            let archive_member_delta = if archive_members_match {
                 None
             } else if args.should_activate_macho_archive_members() {
                 let previous_bytes = {
@@ -3145,7 +3161,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     previous_snapshot_bytes.get()?
                 };
                 if let Some(previous_bytes) = previous_bytes {
-                    added_archive_member_identifiers(
+                    archive_member_identifier_delta(
                         previous_bytes,
                         &bytes,
                         normalize_rust_archive_patch_inputs,
@@ -3156,12 +3172,114 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 None
             };
-            if !archive_members_match && added_archive_member_identifiers.is_none() {
+            let added_archive_member_identifiers = archive_member_delta
+                .as_ref()
+                .filter(|delta| delta.removed.is_empty() && !delta.added.is_empty())
+                .map(|delta| delta.added.clone());
+            let mut retired_macho_archive_activations = Vec::new();
+            if let Some(delta) = archive_member_delta
+                .as_ref()
+                .filter(|delta| delta.added.is_empty() && !delta.removed.is_empty())
+            {
+                let Some(stored_patch) = input.patch.as_ref() else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "removed Mach-O archive member has no patch state".to_owned(),
+                    ));
+                };
+                let indices =
+                    match owned_macho_archive_removal_indices(stored_patch, &delta.removed) {
+                        Ok(indices) => indices,
+                        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                    };
+                let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "removed Mach-O archive member needs the previous input snapshot"
+                            .to_owned(),
+                    ));
+                };
+                for index in indices {
+                    let mut state = stored_patch.macho_archive_members[index].clone();
+                    for member in &state.members {
+                        let matched = match patch_archive_member_bytes(
+                            previous_bytes,
+                            &member.normalized_identifier,
+                        )? {
+                            ArchiveMemberMatch::Unique(member) => member,
+                            ArchiveMemberMatch::Unavailable | ArchiveMemberMatch::Ambiguous => {
+                                return Ok(ChangedInputPatchResult::Unsupported(
+                                    "could not validate removed Mach-O archive member ownership"
+                                        .to_owned(),
+                                ));
+                            }
+                        };
+                        if hash_bytes(matched.bytes) != member.object_hash {
+                            return Ok(ChangedInputPatchResult::Unsupported(
+                                "removed Mach-O archive member changed after activation".to_owned(),
+                            ));
+                        }
+                    }
+                    let member_inputs = state
+                        .sections
+                        .iter()
+                        .map(|section| section.input.clone())
+                        .collect::<HashSet<_>>();
+                    if previous.dynamic_relocations.iter().any(|record| {
+                        record.input_file == input.path
+                            && member_inputs.contains(record.input.as_str())
+                    }) || previous.fdes.iter().any(|record| {
+                        record.input_file == input.path
+                            && member_inputs.contains(record.input.as_str())
+                    }) {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "removed Mach-O archive member owns unsupported persisted records"
+                                .to_owned(),
+                        ));
+                    }
+                    previous.relocations.retain(|record| {
+                        if record.input_file == input.path
+                            && member_inputs.contains(record.input.as_str())
+                        {
+                            state.relocations.push(record.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    previous.macho_symbol_resolutions.retain(|resolution| {
+                        if resolution.target.as_ref().is_some_and(|target| {
+                            target.input_file == input.path
+                                && member_inputs.contains(target.input.as_str())
+                        }) {
+                            state.symbol_resolutions.push(resolution.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    previous_patch
+                        .sections
+                        .retain(|section| !member_inputs.contains(section.input.as_str()));
+                    state.active = false;
+                    retired_macho_archive_activations.push(state);
+                }
+                previous.sections_file = None;
+                previous.macho_symbol_resolutions_file = None;
+            }
+            if !archive_members_match
+                && added_archive_member_identifiers.is_none()
+                && retired_macho_archive_activations.is_empty()
+            {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "archive members changed in `{}`",
                     path.display()
                 )));
             }
+            let normalized_rust_archive_matched_sections =
+                if retired_macho_archive_activations.is_empty() {
+                    normalized_rust_archive_matched_sections
+                } else {
+                    None
+                };
             let mut relocation_target_patches = {
                 timing_phase!("Resolve changed relocation targets");
                 match relocation_target_patches_for_input(&mut previous.relocations, input, &bytes)?
@@ -3300,7 +3418,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &mut previous.macho_symbol_resolutions,
                     input,
                     &bytes,
-                    added_archive_member_identifiers.is_some(),
+                    added_archive_member_identifiers.is_some()
+                        || !retired_macho_archive_activations.is_empty(),
                     Some((&matched_sections, previous_output.get()?)),
                 )? {
                     Ok(updates) => updates,
@@ -3454,6 +3573,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let mut changed_macho_archive_unwind_activation = if args
                 .should_activate_macho_archive_members()
                 && added_macho_archive_text_activation.is_none()
+                && retired_macho_archive_activations.is_empty()
             {
                 let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
                     return Ok(ChangedInputPatchResult::Unsupported(
@@ -3918,11 +4038,38 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     } else {
                         false
                     };
+                let allows_owned_macho_member_removal =
+                    if retired_macho_archive_activations.is_empty() {
+                        false
+                    } else if let Some(previous_bytes) = previous_snapshot_bytes {
+                        let removed_identifiers = retired_macho_archive_activations
+                            .iter()
+                            .flat_map(|state| {
+                                state
+                                    .members
+                                    .iter()
+                                    .map(|member| member.normalized_identifier.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        archive_diff_allows_owned_macho_member_removal(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            &current_resolver,
+                            &removed_identifiers,
+                            &[],
+                            &[],
+                        )?
+                    } else {
+                        false
+                    };
                 if !allows_dynamic_relocation_removal
                     && !allows_dynamic_relocation_addition
                     && !allows_fde_removal
                     && !allows_fde_addition
                     && !metadata_only_fingerprint_matches
+                    && !allows_owned_macho_member_removal
                     && macho_text_section_activation.is_none()
                     && added_macho_archive_text_activation.is_none()
                     && changed_macho_archive_unwind_activation.is_none()
@@ -4110,6 +4257,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             if added_macho_archive_text_activation.is_some()
                 || changed_macho_archive_unwind_activation.is_some()
+                || !retired_macho_archive_activations.is_empty()
             {
                 let dynamic_relocation_patches = dynamic_relocation_patches_for_input(
                     &bytes,
@@ -4210,10 +4358,79 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.unwind_patches))
                 .unwrap_or_default();
+            if let Some(activation) = added_macho_archive_text_activation.as_mut() {
+                let activation_section_ranges = activation
+                    .sections
+                    .iter()
+                    .map(|section| (section.output_offset, section.output_size))
+                    .collect::<HashSet<_>>();
+                let mut transaction_patches = resolved_patches
+                    .iter()
+                    .filter(|patch| {
+                        activation_section_ranges
+                            .contains(&(patch.patch.output_offset, patch.patch.size))
+                    })
+                    .map(|patch| &patch.patch)
+                    .collect::<Vec<_>>();
+                transaction_patches.extend(&macho_reserved_thunk_patches);
+                transaction_patches.extend(&added_macho_archive_symbol_table_patches);
+                transaction_patches.extend(&added_macho_archive_chained_fixup_patches);
+                transaction_patches.extend(&added_macho_archive_unwind_patches);
+                let previous_output = previous_output.get()?;
+                let forward_patches = match transaction_patches
+                    .iter()
+                    .map(|patch| stored_output_patch(patch, previous_output))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(patches) => patches,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                };
+                let rollback_patches = match forward_patches
+                    .iter()
+                    .map(|patch| {
+                        let start = usize::try_from(patch.output_offset).map_err(|_| {
+                            "Mach-O archive rollback patch offset is too large".to_owned()
+                        })?;
+                        let end = start.checked_add(patch.data.len()).ok_or_else(|| {
+                            "Mach-O archive rollback patch range overflowed".to_owned()
+                        })?;
+                        let data = previous_output.get(start..end).ok_or_else(|| {
+                            "Mach-O archive rollback patch is outside output".to_owned()
+                        })?;
+                        Ok(StoredOutputPatch {
+                            output_offset: patch.output_offset,
+                            data: data.to_vec(),
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()
+                {
+                    Ok(patches) => patches,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                };
+                let Some(state) = activation.member_states.first_mut() else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive activation has no ownership state".to_owned(),
+                    ));
+                };
+                state.forward_patches = forward_patches;
+                state.rollback_patches = rollback_patches;
+            }
             let changed_macho_archive_unwind_patches = changed_macho_archive_unwind_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.patches))
                 .unwrap_or_default();
+            let retired_macho_archive_rollback_patches = retired_macho_archive_activations
+                .iter()
+                .flat_map(|state| state.rollback_patches.iter())
+                .map(|patch| SectionPatch {
+                    output_offset: patch.output_offset,
+                    size: patch.data.len() as u64,
+                    data: patch.data.clone(),
+                    deferred_relocation: None,
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                })
+                .collect::<Vec<_>>();
             let macho_text_auxiliary_patches = macho_text_section_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.auxiliary_patches))
@@ -4222,6 +4439,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             patched_section_count += macho_reserved_thunk_patches.len();
             patched_section_count += macho_text_auxiliary_patches.len();
             patched_section_count += changed_macho_archive_unwind_patches.len();
+            patched_section_count += retired_macho_archive_rollback_patches.len();
             patched_section_count += dynamic_relocation_patches.len();
             patched_section_count += relocation_addend_patches.output_patches.len();
             patched_section_count += eh_frame_patches
@@ -4278,6 +4496,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(added_macho_archive_chained_fixup_patches)
                     .chain(added_macho_archive_unwind_patches)
                     .chain(changed_macho_archive_unwind_patches)
+                    .chain(retired_macho_archive_rollback_patches)
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
                 input_fde_add_candidates,
@@ -4288,8 +4507,49 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 macho_text_section_activation,
                 changed_macho_archive_unwind_activation,
                 added_macho_archive_text_activation,
+                retired_macho_archive_activations,
             )
         };
+        let mut macho_archive_members = previous.input_files[*input_index]
+            .patch
+            .as_ref()
+            .map(|patch| patch.macho_archive_members.clone())
+            .unwrap_or_default();
+        for retired in &retired_macho_archive_activations {
+            let Some(stored) = macho_archive_members.iter_mut().find(|stored| {
+                stored.active
+                    && stored
+                        .members
+                        .iter()
+                        .map(|member| member.normalized_identifier.as_slice())
+                        .eq(retired
+                            .members
+                            .iter()
+                            .map(|member| member.normalized_identifier.as_slice()))
+            }) else {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "removed Mach-O archive activation ownership changed".to_owned(),
+                ));
+            };
+            *stored = retired.clone();
+        }
+        if let Some(activation) = &added_macho_archive_text_activation {
+            for member in &activation.member_states {
+                if macho_archive_members.iter().any(|previous_member| {
+                    previous_member.members.iter().any(|previous_identity| {
+                        member.members.iter().any(|identity| {
+                            previous_identity.normalized_identifier
+                                == identity.normalized_identifier
+                        })
+                    })
+                }) {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive member already has retained ownership".to_owned(),
+                    ));
+                }
+                macho_archive_members.push(member.clone());
+            }
+        }
 
         let sections_changed = update_section_records_for_matched_patches(
             previous.input_files[*input_index].path.as_str(),
@@ -4302,6 +4562,20 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     "changed input needs complete section records".to_owned(),
                 ));
             }
+            previous.sections_file = None;
+        }
+        if !retired_macho_archive_activations.is_empty() {
+            let retired_section_keys = retired_macho_archive_activations
+                .iter()
+                .flat_map(|state| state.sections.iter())
+                .map(|section| (section.input.as_str(), section.section_index))
+                .collect::<HashSet<_>>();
+            let input_path = previous.input_files[*input_index].path.as_str();
+            previous.sections.retain(|record| {
+                record.input_file != input_path
+                    || !retired_section_keys
+                        .contains(&(record.input.as_str(), record.section_index))
+            });
             previous.sections_file = None;
         }
         if let Some(activation) = macho_text_section_activation {
@@ -4422,23 +4696,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             fingerprint: fingerprint.clone(),
             archive_member_set_proof,
             archive_member_patch_fingerprints,
-            macho_archive_members: previous.input_files[*input_index]
-                .patch
-                .as_ref()
-                .map(|patch| patch.macho_archive_members.clone())
-                .unwrap_or_default(),
+            macho_archive_members,
             sections: current_sections
                 .iter()
-                .map(|section| FilePatchSectionState {
-                    input: section.input.clone(),
-                    section_index: section.section_index,
-                    section_name: section.section_name.clone(),
-                    input_size: section.input_size,
-                    output_offset: section.output_offset,
-                    output_size: section.output_size,
-                    data_hash: section.data_hash.clone(),
-                    cstring_nul_boundaries_hash: section.cstring_nul_boundaries_hash.clone(),
-                })
+                .map(file_patch_section_state)
                 .collect(),
             raw_sections: None,
         });
@@ -5101,6 +5362,54 @@ struct SectionPatch {
     deferred_relocation: Option<DeferredRelocationPatch>,
     preserve_ranges: Vec<std::ops::Range<usize>>,
     adjustments: Vec<PatchAdjustment>,
+}
+
+fn stored_output_patch(
+    patch: &SectionPatch,
+    previous_output: &[u8],
+) -> std::result::Result<StoredOutputPatch, String> {
+    let start = usize::try_from(patch.output_offset)
+        .map_err(|_| "Mach-O archive transaction patch offset is too large".to_owned())?;
+    let size = usize::try_from(patch.size)
+        .map_err(|_| "Mach-O archive transaction patch size is too large".to_owned())?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| "Mach-O archive transaction patch range overflowed".to_owned())?;
+    let previous = previous_output
+        .get(start..end)
+        .ok_or_else(|| "Mach-O archive transaction patch is outside output".to_owned())?;
+    if patch.data.len() > size {
+        return Err("Mach-O archive transaction patch data exceeds its range".to_owned());
+    }
+    let mut data = patch.data.clone();
+    if let Some(deferred_relocation) = patch.deferred_relocation {
+        let data_len = data.len();
+        materialize_deferred_relocation_patch(
+            &mut data,
+            &previous[..data_len],
+            deferred_relocation,
+        )?;
+    }
+    for preserve_range in &patch.preserve_ranges {
+        let data_range = data
+            .get_mut(preserve_range.clone())
+            .ok_or_else(|| "Mach-O archive transaction preserve range is invalid".to_owned())?;
+        let previous_range = previous
+            .get(preserve_range.clone())
+            .ok_or_else(|| "Mach-O archive transaction preserve range is invalid".to_owned())?;
+        data_range.copy_from_slice(previous_range);
+    }
+    for adjustment in &patch.adjustments {
+        let data_range = data
+            .get_mut(adjustment.range.clone())
+            .ok_or_else(|| "Mach-O archive transaction adjustment range is invalid".to_owned())?;
+        apply_addend_delta(data_range, adjustment.addend_delta)?;
+    }
+    data.resize(size, 0);
+    Ok(StoredOutputPatch {
+        output_offset: patch.output_offset,
+        data,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -5793,6 +6102,7 @@ struct MachOTextSectionActivation {
 
 struct AddedMachOArchiveTextActivations {
     normalized_identifiers: Vec<Vec<u8>>,
+    member_states: Vec<MachOArchiveActivationState>,
     sections: Vec<PatchSection>,
     records: Vec<SectionRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
@@ -7434,6 +7744,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
             && version != METADATA_UPDATE_VERSION_V3
             && version != METADATA_UPDATE_VERSION_V2
@@ -7447,6 +7758,7 @@ impl PersistedState {
         let output = parse_content_line(lines.next(), "output")?;
         let _ = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
             || version == METADATA_UPDATE_VERSION_V2
@@ -7454,6 +7766,7 @@ impl PersistedState {
             let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
         {
@@ -7538,6 +7851,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V42
             && version != STATE_VERSION_V41
             && version != STATE_VERSION_V40
             && version != STATE_VERSION_V39
@@ -7595,6 +7909,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
             || version == STATE_VERSION_V39
@@ -7614,6 +7929,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
             || version == STATE_VERSION_V39
@@ -7633,6 +7949,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
             || version == STATE_VERSION_V39
@@ -7681,6 +7998,7 @@ impl PersistedState {
                 Some(file.to_owned())
             }
         } else if version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
             || version == STATE_VERSION_V39
@@ -7695,6 +8013,7 @@ impl PersistedState {
         };
 
         let reserved_ranges = if (version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40)
             && lines
@@ -7714,6 +8033,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V42
             || version == STATE_VERSION_V41
             || version == STATE_VERSION_V40
             || version == STATE_VERSION_V39
@@ -7757,6 +8077,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V42
                     && version != STATE_VERSION_V41
                     && version != STATE_VERSION_V40
                     && version != STATE_VERSION_V39
@@ -7771,7 +8092,7 @@ impl PersistedState {
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V42}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -8191,6 +8512,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
             && version != METADATA_UPDATE_VERSION_V3
             && version != METADATA_UPDATE_VERSION_V2
@@ -8204,6 +8526,7 @@ impl PersistedState {
         self.output = parse_content_line(lines.next(), "output")?;
         self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
             || version == METADATA_UPDATE_VERSION_V2
@@ -8218,6 +8541,7 @@ impl PersistedState {
             self.macho_symbol_resolutions.clear();
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
         {
@@ -13013,6 +13337,46 @@ fn archive_member_identifier_delta(
     Ok(Some(ArchiveMemberIdentifierDelta { added, removed }))
 }
 
+fn owned_macho_archive_removal_indices(
+    patch: &FilePatchState,
+    removed_identifiers: &[Vec<u8>],
+) -> std::result::Result<Vec<usize>, String> {
+    let mut remaining = HashSet::with_capacity(removed_identifiers.len());
+    for identifier in removed_identifiers {
+        if !remaining.insert(archive_member_patch_identifier(identifier)) {
+            return Err("removed Mach-O archive member identity is ambiguous".to_owned());
+        }
+    }
+    let mut indices = Vec::new();
+    for (index, state) in patch.macho_archive_members.iter().enumerate() {
+        if !state.active
+            || !state
+                .members
+                .iter()
+                .any(|member| remaining.contains(member.normalized_identifier.as_slice()))
+        {
+            continue;
+        }
+        if state.forward_patches.is_empty()
+            || state.rollback_patches.is_empty()
+            || state
+                .members
+                .iter()
+                .any(|member| !remaining.contains(member.normalized_identifier.as_slice()))
+        {
+            return Err("removed Mach-O archive members split an activation cohort".to_owned());
+        }
+        for member in &state.members {
+            remaining.remove(member.normalized_identifier.as_slice());
+        }
+        indices.push(index);
+    }
+    if !remaining.is_empty() {
+        return Err("removed Mach-O archive member has no active ownership record".to_owned());
+    }
+    Ok(indices)
+}
+
 fn archive_member_set_proof_matches_current(
     previous_input: &FileState,
     previous_patch: &PreviousPatchState,
@@ -14029,6 +14393,58 @@ fn archive_diff_allows_retired_macho_symbols(
         &current_ranges,
         ignored_current_identifiers,
         &ignored_defined_symbols,
+    )?;
+    Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
+}
+
+fn archive_diff_allows_owned_macho_member_removal(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    removed_identifiers: &[Vec<u8>],
+    previous_extra_ranges: &[std::ops::Range<usize>],
+    current_extra_ranges: &[std::ops::Range<usize>],
+) -> Result<bool> {
+    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let Some(mut previous_ranges) = patch_ranges_with_resolver(
+        previous_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.previous.clone()),
+        &previous_resolver,
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(mut current_ranges) = patch_ranges_with_resolver(
+        current_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.current.clone()),
+        current_resolver,
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    else {
+        return Ok(false);
+    };
+    previous_ranges.extend(previous_extra_ranges.iter().cloned());
+    current_ranges.extend(current_extra_ranges.iter().cloned());
+    let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+        previous_bytes,
+        &previous_ranges,
+        removed_identifiers,
+        &HashSet::new(),
+    )?;
+    let current_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
+        current_bytes,
+        &current_ranges,
+        &[],
+        &HashSet::new(),
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
@@ -15606,12 +16022,51 @@ fn added_macho_archive_text_activations(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
+    let mut member_identities = Vec::with_capacity(selected_indices.len());
+    for &member_index in &selected_indices {
+        let member = &members[member_index];
+        let Some(input_bytes) = current_resolver.resolve(
+            input_file_path,
+            member.input.as_str(),
+            PatchInputLookup::CurrentRecordedRange,
+        )?
+        else {
+            return Ok(Err(
+                "could not retain added Mach-O archive member ownership".to_owned(),
+            ));
+        };
+        let Some(identifier) = parse_patch_input_ref(input_file_path, member.input.as_str())?
+        else {
+            return Ok(Err(
+                "added Mach-O archive member ownership has no identifier".to_owned(),
+            ));
+        };
+        if identifier.identifier.is_empty() {
+            return Ok(Err(
+                "added Mach-O archive member ownership has no identifier".to_owned(),
+            ));
+        }
+        member_identities.push(MachOArchiveMemberIdentity {
+            normalized_identifier: archive_member_patch_identifier(&identifier.identifier),
+            object_hash: hash_bytes(input_bytes.bytes),
+        });
+    }
+    let member_states = vec![MachOArchiveActivationState {
+        members: member_identities,
+        active: true,
+        sections: sections.iter().map(file_patch_section_state).collect(),
+        relocations: Vec::new(),
+        symbol_resolutions: Vec::new(),
+        forward_patches: Vec::new(),
+        rollback_patches: Vec::new(),
+    }];
 
     Ok(Ok(AddedMachOArchiveTextActivations {
         normalized_identifiers: added_identifiers
             .iter()
             .map(|identifier| archive_member_patch_identifier(identifier))
             .collect(),
+        member_states,
         sections,
         records,
         symbol_resolutions,
@@ -15625,6 +16080,19 @@ fn added_macho_archive_text_activations(
         current_unwind_input_ranges: changed_unwind.current_input_ranges,
         remaining_reserved_ranges,
     }))
+}
+
+fn file_patch_section_state(section: &PatchSection) -> FilePatchSectionState {
+    FilePatchSectionState {
+        input: section.input.clone(),
+        section_index: section.section_index,
+        section_name: section.section_name.clone(),
+        input_size: section.input_size,
+        output_offset: section.output_offset,
+        output_size: section.output_size,
+        data_hash: section.data_hash.clone(),
+        cstring_nul_boundaries_hash: section.cstring_nul_boundaries_hash.clone(),
+    }
 }
 
 fn matched_macho_definition_resolution(
@@ -24752,10 +25220,58 @@ fn render_patch_section_states(sections: &[FilePatchSectionState]) -> String {
         .join(",")
 }
 
-fn render_macho_archive_member_states(states: &[MachOArchiveMemberState]) -> String {
+fn render_stored_output_patches(patches: &[StoredOutputPatch]) -> String {
+    patches
+        .iter()
+        .map(|patch| format!("{}:{}", patch.output_offset, hex::encode(&patch.data)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_stored_output_patches(encoded: &str) -> Result<Vec<StoredOutputPatch>> {
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    encoded
+        .split(',')
+        .map(|patch| {
+            let (output_offset, data) = patch
+                .split_once(':')
+                .context("Malformed incremental Mach-O archive output patch")?;
+            let output_offset = output_offset
+                .parse()
+                .context("Invalid incremental Mach-O archive output patch offset")?;
+            let data = hex::decode(data)
+                .context("Invalid incremental Mach-O archive output patch data")?;
+            if data.is_empty() {
+                return Err(crate::error!(
+                    "Incremental Mach-O archive output patch is empty"
+                ));
+            }
+            Ok(StoredOutputPatch {
+                output_offset,
+                data,
+            })
+        })
+        .collect()
+}
+
+fn render_macho_archive_member_states(states: &[MachOArchiveActivationState]) -> String {
     states
         .iter()
         .map(|state| {
+            let members = state
+                .members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "{}={}",
+                        hex::encode(&member.normalized_identifier),
+                        member.object_hash
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             let mut relocations = String::new();
             let relocation_refs = state.relocations.iter().collect::<Vec<_>>();
             write_rendered_records(&mut relocations, &[], &relocation_refs, &[], &[])
@@ -24764,13 +25280,14 @@ fn render_macho_archive_member_states(states: &[MachOArchiveMemberState]) -> Str
             write_rendered_macho_symbol_resolutions(&mut resolutions, &state.symbol_resolutions)
                 .expect("writing dormant Mach-O resolutions to String should not fail");
             format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 u8::from(state.active),
-                hex::encode(&state.normalized_identifier),
-                state.object_hash,
+                hex::encode(members),
                 hex::encode(render_patch_section_states(&state.sections)),
                 hex::encode(relocations),
                 hex::encode(resolutions),
+                hex::encode(render_stored_output_patches(&state.forward_patches)),
+                hex::encode(render_stored_output_patches(&state.rollback_patches)),
             )
         })
         .collect::<Vec<_>>()
@@ -24780,7 +25297,7 @@ fn render_macho_archive_member_states(states: &[MachOArchiveMemberState]) -> Str
 fn parse_macho_archive_member_states(
     input_file: &str,
     encoded_states: &str,
-) -> Result<Vec<MachOArchiveMemberState>> {
+) -> Result<Vec<MachOArchiveActivationState>> {
     if encoded_states.is_empty() {
         return Err(crate::error!(
             "Malformed incremental Mach-O archive member state"
@@ -24790,7 +25307,32 @@ fn parse_macho_archive_member_states(
     let mut identifiers = HashSet::new();
     for encoded_state in encoded_states.split(';') {
         let parts = encoded_state.split(':').collect::<Vec<_>>();
-        if parts.len() != 6 {
+        if parts.len() == 6 {
+            let normalized_identifier = hex::decode(parts[1])
+                .context("Invalid incremental Mach-O archive member identifier")?;
+            let legacy = format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                parts[0],
+                hex::encode(format!("{}={}", parts[1], parts[2])),
+                parts[3],
+                parts[4],
+                parts[5],
+                hex::encode(""),
+                hex::encode(""),
+            );
+            let mut parsed = parse_macho_archive_member_states(input_file, &legacy)?;
+            let state = parsed
+                .pop()
+                .context("Missing legacy incremental Mach-O archive member state")?;
+            if !identifiers.insert(normalized_identifier) {
+                return Err(crate::error!(
+                    "Invalid incremental Mach-O archive member identity"
+                ));
+            }
+            states.push(state);
+            continue;
+        }
+        if parts.len() != 7 {
             return Err(crate::error!(
                 "Malformed incremental Mach-O archive member state"
             ));
@@ -24804,28 +25346,54 @@ fn parse_macho_archive_member_states(
                 ));
             }
         };
-        let normalized_identifier = hex::decode(parts[1])
-            .context("Invalid incremental Mach-O archive member identifier")?;
-        if normalized_identifier.is_empty()
-            || !identifiers.insert(normalized_identifier.clone())
-            || !is_blake3_hex_digest(parts[2])
-        {
+        let members = String::from_utf8(
+            hex::decode(parts[1])
+                .context("Invalid incremental Mach-O archive member identities")?,
+        )
+        .context("Invalid UTF-8 in incremental Mach-O archive member identities")?
+        .split(',')
+        .map(|member| {
+            let (identifier, object_hash) = member
+                .split_once('=')
+                .context("Malformed incremental Mach-O archive member identity")?;
+            let normalized_identifier = hex::decode(identifier)
+                .context("Invalid incremental Mach-O archive member identifier")?;
+            if normalized_identifier.is_empty()
+                || !identifiers.insert(normalized_identifier.clone())
+                || !is_blake3_hex_digest(object_hash)
+            {
+                return Err(crate::error!(
+                    "Invalid incremental Mach-O archive member identity"
+                ));
+            }
+            Ok(MachOArchiveMemberIdentity {
+                normalized_identifier,
+                object_hash: object_hash.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        if members.is_empty() {
             return Err(crate::error!(
                 "Invalid incremental Mach-O archive member identity"
             ));
         }
         let sections = String::from_utf8(
-            hex::decode(parts[3]).context("Invalid incremental Mach-O archive member sections")?,
+            hex::decode(parts[2]).context("Invalid incremental Mach-O archive member sections")?,
         )
         .context("Invalid UTF-8 in incremental Mach-O archive member sections")
         .and_then(|sections| parse_patch_sections(input_file, &sections))?;
+        let member_identifiers = members
+            .iter()
+            .map(|member| member.normalized_identifier.clone())
+            .collect::<HashSet<_>>();
         if sections.is_empty()
             || sections.iter().any(|section| {
                 parse_patch_input_ref(input_file, &section.input)
                     .ok()
                     .flatten()
                     .is_none_or(|input| {
-                        archive_member_patch_identifier(&input.identifier) != normalized_identifier
+                        !member_identifiers
+                            .contains(&archive_member_patch_identifier(&input.identifier))
                     })
             })
         {
@@ -24834,7 +25402,7 @@ fn parse_macho_archive_member_states(
             ));
         }
         let relocation_contents = String::from_utf8(
-            hex::decode(parts[4])
+            hex::decode(parts[3])
                 .context("Invalid incremental Mach-O archive member relocations")?,
         )
         .context("Invalid UTF-8 in incremental Mach-O archive member relocations")?;
@@ -24848,7 +25416,7 @@ fn parse_macho_archive_member_states(
             ));
         }
         let resolution_contents = String::from_utf8(
-            hex::decode(parts[5])
+            hex::decode(parts[4])
                 .context("Invalid incremental Mach-O archive member resolutions")?,
         )
         .context("Invalid UTF-8 in incremental Mach-O archive member resolutions")?;
@@ -24859,13 +25427,29 @@ fn parse_macho_archive_member_states(
                 "Active incremental Mach-O archive member has dormant records"
             ));
         }
-        states.push(MachOArchiveMemberState {
-            normalized_identifier,
-            object_hash: parts[2].to_owned(),
+        let forward_patches = String::from_utf8(
+            hex::decode(parts[5]).context("Invalid incremental Mach-O archive forward patches")?,
+        )
+        .context("Invalid UTF-8 in incremental Mach-O archive forward patches")
+        .and_then(|patches| parse_stored_output_patches(&patches))?;
+        let rollback_patches = String::from_utf8(
+            hex::decode(parts[6]).context("Invalid incremental Mach-O archive rollback patches")?,
+        )
+        .context("Invalid UTF-8 in incremental Mach-O archive rollback patches")
+        .and_then(|patches| parse_stored_output_patches(&patches))?;
+        if forward_patches.is_empty() != rollback_patches.is_empty() {
+            return Err(crate::error!(
+                "Incremental Mach-O archive transaction is incomplete"
+            ));
+        }
+        states.push(MachOArchiveActivationState {
+            members,
             active,
             sections,
             relocations: relocation_records.relocations,
             symbol_resolutions,
+            forward_patches,
+            rollback_patches,
         });
     }
     Ok(states)
@@ -26830,6 +27414,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         .next()
         .context("Missing incremental metadata update header")?;
     if version != METADATA_UPDATE_VERSION
+        && version != METADATA_UPDATE_VERSION_V5
         && version != METADATA_UPDATE_VERSION_V4
         && version != METADATA_UPDATE_VERSION_V3
         && version != METADATA_UPDATE_VERSION_V2
@@ -26843,6 +27428,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
     let output = parse_content_line(lines.next(), "output")?;
     let _ = parse_build_id_hash_line(lines.next())?;
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
         || version == METADATA_UPDATE_VERSION_V3
         || version == METADATA_UPDATE_VERSION_V2
@@ -26850,6 +27436,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
     }
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
         || version == METADATA_UPDATE_VERSION_V3
     {
@@ -33368,6 +33955,7 @@ mod tests {
         let mut resolutions = vec![old_resolution];
         let mut activation = AddedMachOArchiveTextActivations {
             normalized_identifiers: Vec::new(),
+            member_states: Vec::new(),
             sections: Vec::new(),
             records: Vec::new(),
             symbol_resolutions: vec![new_resolution.clone()],
@@ -37021,6 +37609,72 @@ mod tests {
         assert_eq!(
             archive_member_identifier_delta(&previous, &reordered, true).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn owned_macho_archive_removal_requires_a_complete_active_cohort() {
+        let transaction = MachOArchiveActivationState {
+            members: vec![
+                MachOArchiveMemberIdentity {
+                    normalized_identifier: b"crate.cgu.1.rcgu.o".to_vec(),
+                    object_hash: "a".repeat(blake3::OUT_LEN * 2),
+                },
+                MachOArchiveMemberIdentity {
+                    normalized_identifier: b"crate.cgu.2.rcgu.o".to_vec(),
+                    object_hash: "b".repeat(blake3::OUT_LEN * 2),
+                },
+            ],
+            active: true,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 64,
+                data: vec![1; 4],
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 64,
+                data: vec![0; 4],
+            }],
+        };
+        let dormant = MachOArchiveActivationState {
+            members: vec![MachOArchiveMemberIdentity {
+                normalized_identifier: b"crate.cgu.3.rcgu.o".to_vec(),
+                object_hash: "c".repeat(blake3::OUT_LEN * 2),
+            }],
+            active: false,
+            ..transaction.clone()
+        };
+        let patch = FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: vec![transaction, dormant],
+            sections: Vec::new(),
+            raw_sections: None,
+        };
+
+        assert_eq!(
+            owned_macho_archive_removal_indices(
+                &patch,
+                &[
+                    b"crate.cgu.1.session.rcgu.o".to_vec(),
+                    b"crate.cgu.2.session.rcgu.o".to_vec(),
+                ],
+            )
+            .unwrap(),
+            vec![0]
+        );
+        assert!(
+            owned_macho_archive_removal_indices(&patch, &[b"crate.cgu.1.session.rcgu.o".to_vec()],)
+                .unwrap_err()
+                .contains("split an activation cohort")
+        );
+        assert!(
+            owned_macho_archive_removal_indices(&patch, &[b"crate.cgu.3.session.rcgu.o".to_vec()],)
+                .unwrap_err()
+                .contains("no active ownership record")
         );
     }
 
@@ -40860,31 +41514,52 @@ mod tests {
                 section_offset: 4,
             }),
         };
+        let dormant_section = FilePatchSectionState {
+            input: section
+                .input
+                .replace(&hex::encode(identifier), &hex::encode("dormant.member.o")),
+            ..section.clone()
+        };
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
             archive_member_patch_fingerprints: None,
             macho_archive_members: vec![
-                MachOArchiveMemberState {
-                    normalized_identifier: normalized_identifier.clone(),
-                    object_hash: "a".repeat(blake3::OUT_LEN * 2),
+                MachOArchiveActivationState {
+                    members: vec![MachOArchiveMemberIdentity {
+                        normalized_identifier,
+                        object_hash: "a".repeat(blake3::OUT_LEN * 2),
+                    }],
                     active: true,
                     sections: vec![section.clone()],
                     relocations: Vec::new(),
                     symbol_resolutions: Vec::new(),
-                },
-                MachOArchiveMemberState {
-                    normalized_identifier: b"dormant.member.o".to_vec(),
-                    object_hash: "b".repeat(blake3::OUT_LEN * 2),
-                    active: false,
-                    sections: vec![FilePatchSectionState {
-                        input: section
-                            .input
-                            .replace(&hex::encode(identifier), &hex::encode("dormant.member.o")),
-                        ..section
+                    forward_patches: vec![StoredOutputPatch {
+                        output_offset: 256,
+                        data: vec![1, 2, 3, 4],
                     }],
+                    rollback_patches: vec![StoredOutputPatch {
+                        output_offset: 256,
+                        data: vec![0; 4],
+                    }],
+                },
+                MachOArchiveActivationState {
+                    members: vec![MachOArchiveMemberIdentity {
+                        normalized_identifier: b"dormant.member.o".to_vec(),
+                        object_hash: "b".repeat(blake3::OUT_LEN * 2),
+                    }],
+                    active: false,
+                    sections: vec![dormant_section],
                     relocations: vec![dormant_relocation],
                     symbol_resolutions: vec![dormant_resolution],
+                    forward_patches: vec![StoredOutputPatch {
+                        output_offset: 512,
+                        data: vec![5, 6, 7, 8],
+                    }],
+                    rollback_patches: vec![StoredOutputPatch {
+                        output_offset: 512,
+                        data: vec![0; 4],
+                    }],
                 },
             ],
             sections: Vec::new(),
