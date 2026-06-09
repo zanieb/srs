@@ -212,6 +212,9 @@
 //! changed-input relink. Can be repeated. Defaults to the exact count implied by
 //! TestIncrementalChangedSection.
 //!
+//! TestIncrementalChangedNoSym:{symbol_name} Checks that a symbol is absent from the changed and
+//! repeated changed incremental outputs.
+//!
 //! TestIncrementalChangedExpectReuse:{bool} Whether the changed-input incremental relink should
 //! log reuse of unchanged input sections. Defaults to false.
 //!
@@ -908,6 +911,7 @@ struct Config {
     test_incremental_changed_restore: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
+    test_incremental_changed_no_sym: HashSet<String>,
     test_incremental_state_contains: Vec<String>,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
@@ -1655,6 +1659,7 @@ impl Config {
             test_incremental_changed_restore: false,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
+            test_incremental_changed_no_sym: HashSet::new(),
             test_incremental_state_contains: Vec::new(),
             test_config: test_config.clone(),
             tracked_files: Default::default(),
@@ -2437,6 +2442,11 @@ fn process_directive(
                 expected_bytes,
             });
         }
+        "TestIncrementalChangedNoSym" => {
+            config
+                .test_incremental_changed_no_sym
+                .insert(arg.trim().to_owned());
+        }
         "TestIncrementalStateContains" => {
             config
                 .test_incremental_state_contains
@@ -3189,6 +3199,14 @@ impl ProgramInputs {
                     )
                 })?;
             }
+            assert_output_symbols_absent(&changed_content, &config.test_incremental_changed_no_sym)
+                .with_context(|| {
+                    format!(
+                        "Incremental test failed for {}: changed-input output symbol absence \
+                         assertion failed",
+                        self.name()
+                    )
+                })?;
 
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
@@ -3228,6 +3246,17 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            assert_output_symbols_absent(
+                &repeated_changed_content,
+                &config.test_incremental_changed_no_sym,
+            )
+            .with_context(|| {
+                format!(
+                    "Incremental test failed for {}: repeated changed-input output symbol absence \
+                     assertion failed",
+                    self.name()
+                )
+            })?;
             if config.platform == PlatformKind::MachO
                 && !config.test_incremental_unsigned_macho_output
             {
@@ -4440,6 +4469,21 @@ fn assert_output_symbol_bytes(output: &[u8], symbol_name: &str, expected_bytes: 
         return Ok(());
     }
     bail!("Missing {symbol_name} symbol in changed incremental output");
+}
+
+fn assert_output_symbols_absent(output: &[u8], symbol_names: &HashSet<String>) -> Result {
+    if symbol_names.is_empty() {
+        return Ok(());
+    }
+    let file = object::File::parse(output).context("Failed to parse changed incremental output")?;
+    for symbol in file.symbols() {
+        if let Ok(name) = symbol.name()
+            && symbol_names.contains(name)
+        {
+            bail!("Unexpected {name} symbol in changed incremental output");
+        }
+    }
+    Ok(())
 }
 
 struct SectionDiff {
