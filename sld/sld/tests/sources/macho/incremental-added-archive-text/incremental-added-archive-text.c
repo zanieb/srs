@@ -1,9 +1,10 @@
 //#Config:incremental-added-archive-text
 //#Object:runtime.c
+//#Object:incremental-added-archive-reserve.S
 //#Archive:incremental-added-archive-root.S
 //#RunEnabled:true
 //#DiffEnabled:false
-//#SldExtraLinkArgs:--incremental-padding-percent=300
+//#SldExtraLinkArgs:--incremental-padding-percent=300 -dead_strip
 //#TestIncremental:true
 //#TestIncrementalCompareFull:false
 //#TestIncrementalPrivateSignedMachOOutput:true
@@ -21,7 +22,12 @@
 #include "../common/runtime.h"
 
 extern int incremental_added_archive_value(void);
+extern int incremental_added_archive_reserve(void);
 
 void main(void) {
-    exit_syscall(incremental_added_archive_value() == 42 ? 42 : 1);
+    exit_syscall(
+        incremental_added_archive_value() == 42 &&
+                incremental_added_archive_reserve() == 0
+            ? 42
+            : 1);
 }

@@ -1442,6 +1442,11 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether changed-input patching may activate selected Mach-O archive members.
+    fn should_activate_macho_archive_members(&self) -> bool {
+        false
+    }
+
     /// Whether changed-input patching needs to validate x86-64 ELF GOT relaxation contexts.
     fn should_validate_x86_64_elf_got_relaxation_contexts(&self) -> bool {
         false

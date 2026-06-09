@@ -285,6 +285,10 @@ impl platform::Args for MachOArgs {
         !self.dead_strip
     }
 
+    fn should_activate_macho_archive_members(&self) -> bool {
+        true
+    }
+
     fn should_normalize_rust_archive_patch_inputs(&self) -> bool {
         true
     }
@@ -1394,6 +1398,7 @@ mod tests {
         assert!(!args.should_trust_persistent_output_data_identity());
         assert!(!args.should_retain_output_snapshot());
         assert!(args.should_validate_macho_cstring_patches());
+        assert!(args.should_activate_macho_archive_members());
         assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
         assert!(args.should_normalize_rust_archive_patch_inputs());
         assert!(!args.should_publish_incremental_state_in_background());
@@ -1406,9 +1411,14 @@ mod tests {
         assert!(!args.should_trust_persistent_output_data_identity());
         assert!(!args.should_retain_output_snapshot());
         assert!(args.should_validate_macho_cstring_patches());
+        assert!(args.should_activate_macho_archive_members());
         assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
         assert!(args.should_normalize_rust_archive_patch_inputs());
         assert!(!args.should_publish_incremental_state_in_background());
+
+        args.dead_strip = true;
+        assert!(!args.should_activate_macho_text_sections());
+        assert!(args.should_activate_macho_archive_members());
     }
 
     #[test]
