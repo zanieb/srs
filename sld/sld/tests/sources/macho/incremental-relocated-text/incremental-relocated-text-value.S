@@ -3,6 +3,9 @@
 .globl _incremental_relocated_text_value
 _incremental_relocated_text_value:
     .long 0x52800540
+#ifdef GROW_TEXT
+    nop
+#endif
 #ifdef REORDER_RELOCATIONS
     stp x29, x30, [sp, #-16]!
     bl _incremental_relocated_text_helper
