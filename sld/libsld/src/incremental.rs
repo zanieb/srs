@@ -10774,8 +10774,7 @@ fn rustc_rlib_link_content_digest_from_raw_objects(
     hasher.update(b"rustc-rlib-link-content-v1");
     hasher.update(&(objects.len() as u64).to_le_bytes());
     for object in objects {
-        let identifier = archive_member_patch_identifier(&object.identifier);
-        let module_name = identifier.strip_suffix(b".rcgu.o")?;
+        let module_name = rustc_rlib_module_name_from_object_identifier(&object.identifier)?;
         if module_name.is_empty() || !is_blake3_hex_digest(&object.digest) {
             return None;
         }
@@ -10784,6 +10783,19 @@ fn rustc_rlib_link_content_digest_from_raw_objects(
         hasher.update(object.digest.as_bytes());
     }
     Some(hasher.finalize().to_hex().to_string())
+}
+
+fn rustc_rlib_module_name_from_object_identifier(identifier: &[u8]) -> Option<&[u8]> {
+    let stem = identifier.strip_suffix(b".rcgu.o")?;
+    let invocation_separator = stem.iter().rposition(|byte| *byte == b'.')?;
+    let output_filestem_and_module = stem.get(..invocation_separator)?;
+    let invocation = stem.get(invocation_separator + 1..)?;
+    let module_separator = output_filestem_and_module
+        .iter()
+        .position(|byte| *byte == b'.')?;
+    let module_name = output_filestem_and_module.get(module_separator + 1..)?;
+    (module_separator > 0 && !module_name.is_empty() && !invocation.is_empty())
+        .then_some(module_name)
 }
 
 fn rustc_rlib_raw_object_delta(
@@ -25152,20 +25164,40 @@ mod tests {
         let digest_b = "b".repeat(blake3::OUT_LEN * 2);
         let mut producer_contents = b"rustc-rlib-link-content-v1".to_vec();
         producer_contents.extend_from_slice(&1_u64.to_le_bytes());
-        producer_contents.extend_from_slice(&(b"crate-hash.cgu.0".len() as u64).to_le_bytes());
-        producer_contents.extend_from_slice(b"crate-hash.cgu.0");
+        producer_contents.extend_from_slice(&(b"cgu.module.0".len() as u64).to_le_bytes());
+        producer_contents.extend_from_slice(b"cgu.module.0");
         producer_contents.extend_from_slice(digest_a.as_bytes());
         assert_eq!(
             rustc_rlib_link_content_digest_from_raw_objects(&[RustcRlibRawObjectDigest {
-                identifier: b"crate-hash.cgu.0.old.rcgu.o".to_vec(),
+                identifier: b"crate-hash.cgu.module.0.old.rcgu.o".to_vec(),
                 digest: digest_a.clone(),
             }]),
             Some(blake3::hash(&producer_contents).to_hex().to_string())
         );
+        assert_eq!(
+            rustc_rlib_module_name_from_object_identifier(b"crate-hash.cgu.module.0.old.rcgu.o"),
+            Some(b"cgu.module.0".as_slice())
+        );
+        assert_eq!(
+            rustc_rlib_module_name_from_object_identifier(b"missing-module.old.rcgu.o"),
+            None
+        );
+        assert_eq!(
+            rustc_rlib_module_name_from_object_identifier(b".module.old.rcgu.o"),
+            None
+        );
 
         let (archive, expected) = rustc_rlib_with_raw_object_manifest(&[
-            (b"crate-hash.cgu.0.old.rcgu.o", digest_a.as_str(), b"first"),
-            (b"crate-hash.cgu.1.old.rcgu.o", digest_b.as_str(), b"second"),
+            (
+                b"crate-hash.cgu.module.0.old.rcgu.o",
+                digest_a.as_str(),
+                b"first",
+            ),
+            (
+                b"crate-hash.cgu.module.1.old.rcgu.o",
+                digest_b.as_str(),
+                b"second",
+            ),
         ]);
 
         let provenance = rustc_rlib_provenance(&archive).unwrap();
@@ -25174,21 +25206,134 @@ mod tests {
         assert_eq!(provenance.raw_object_manifest, Some(expected));
 
         let (reordered_archive, _) = rustc_rlib_with_raw_object_manifest(&[
-            (b"crate-hash.cgu.1.old.rcgu.o", digest_b.as_str(), b"second"),
-            (b"crate-hash.cgu.0.old.rcgu.o", digest_a.as_str(), b"first"),
+            (
+                b"crate-hash.cgu.module.1.old.rcgu.o",
+                digest_b.as_str(),
+                b"second",
+            ),
+            (
+                b"crate-hash.cgu.module.0.old.rcgu.o",
+                digest_a.as_str(),
+                b"first",
+            ),
         ]);
         let mut mismatched = reordered_archive;
         let first = mismatched
-            .windows(b"crate-hash.cgu.1.old.rcgu.o".len())
-            .position(|bytes| bytes == b"crate-hash.cgu.1.old.rcgu.o")
+            .windows(b"crate-hash.cgu.module.1.old.rcgu.o".len())
+            .position(|bytes| bytes == b"crate-hash.cgu.module.1.old.rcgu.o")
             .unwrap();
-        mismatched[first..first + b"crate-hash.cgu.1.old.rcgu.o".len()]
-            .copy_from_slice(b"crate-hash.cgu.0.old.rcgu.o");
+        mismatched[first..first + b"crate-hash.cgu.module.1.old.rcgu.o".len()]
+            .copy_from_slice(b"crate-hash.cgu.module.0.old.rcgu.o");
         assert!(
             rustc_rlib_provenance(&mismatched)
                 .unwrap()
                 .raw_object_manifest
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn rustc_rlib_raw_object_digest_matches_real_codex_cgu_names() {
+        let objects = [
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.0q06h54o08cdxof3enapbg93v.1i8u380.rcgu.o"
+                    .as_slice(),
+                "43ff60a7d343145a61b0197c112a43bd7315b6d6e552e9bb23339437a2282203",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.2mwpvfgtrlq56mixxm0od7ha1.1i8u380.rcgu.o"
+                    .as_slice(),
+                "368bfafb9906eea957eacadcd36098fc341ac087a48b5f9a9537fb6fdb29aa9f",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.3frxjhk47pch1f9164jk9w1yk.1i8u380.rcgu.o"
+                    .as_slice(),
+                "24e19118e049e85aa988f01fa748a3157586ded37faae42385fc0840c77616ab",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.3iobxabkeu8x90uicng9c2f11.1i8u380.rcgu.o"
+                    .as_slice(),
+                "1b04832d4176e93d9c71c74a174950dd4728dbecea9abdf376b8b03981461b94",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.3tw4i07cyos695le3suqq21wo.1i8u380.rcgu.o"
+                    .as_slice(),
+                "cedc5daeb0f244a1dc6851b84c2353a6550ec34e246919dd6c5a0e74a5403634",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.40amm2fk9g3pnnfjmjs7pr9jh.1i8u380.rcgu.o"
+                    .as_slice(),
+                "b390e4440fa34e6d03cf2c113c267e2409c1ba4992080be91d123fa78f23c63d",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.43lvfdv1yex02f49155ksjk14.1i8u380.rcgu.o"
+                    .as_slice(),
+                "a3dfc8952bebf0835d2ad260536c209e901843a522ecb88878a210949daabf2f",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.45n4uk4byw0svvnodg9twluhv.1i8u380.rcgu.o"
+                    .as_slice(),
+                "f79beaf8b9a44749bc17ee5602a8b9f7a5d04d1275ea66569a53b5b917712e62",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.5bhu3m27pei050ffwcov4r7mj.1i8u380.rcgu.o"
+                    .as_slice(),
+                "4aeb21018af890485f491c3745d2ed88341c97a33036e68d26658c2054430f68",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.5kd9s2bcc466marzcazfa6i06.1i8u380.rcgu.o"
+                    .as_slice(),
+                "bc47a8973e3d43528f5f31be68437f7c32e70ddd8b0d1fe174819605acb3a366",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.5qzxus1c367fmqg8sv635jg9i.1i8u380.rcgu.o"
+                    .as_slice(),
+                "36915cd4ccce90c9dcc34664eddd6b1a73f89698eb1db48d5deea4bbf94cb337",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.6alw6hfzmuk7zcxa2si4luvk2.1i8u380.rcgu.o"
+                    .as_slice(),
+                "bd3fa3f478068fdff5d7f5d8bacdf3b5ff4806802c3d0c8e9cd268a1f3d3699e",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.ah37xahae9tkdbqs6jg3a463i.1i8u380.rcgu.o"
+                    .as_slice(),
+                "d30d252277f95e6ab361f43b3a7ec69271b6feab336c14bead28932ee41376ef",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.c9dubb9vuusd4prvq43z72yxg.1i8u380.rcgu.o"
+                    .as_slice(),
+                "022775d8ba4d4b4f86a8fa1e8430ab145582be4fcc87b4597376ad127e905612",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.dec3purf8h7pjmgy6t05lyiee.1i8u380.rcgu.o"
+                    .as_slice(),
+                "5ee7bff103fd56d83399e124dd77e5cc6b998b620f9ce04d7e91552323622076",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.dnk8geutqo3prdfbu0domweck.1i8u380.rcgu.o"
+                    .as_slice(),
+                "be970ea0a9a0dd497884fcc71b0a4f7ad877f6d608d074f8064e5fb290d02ccd",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.dxoxr7uzlu3zlxhwrmxgexxjp.1i8u380.rcgu.o"
+                    .as_slice(),
+                "7914373b12473dbb1ad51b0da5ffcb1ac0c2f0e95b1974f6c88759497a849829",
+            ),
+            (
+                b"codex_utils_elapsed-58d8754e3177c9f1.f3hdd6fg75ijxo08638w95lpw.1i8u380.rcgu.o"
+                    .as_slice(),
+                "3e3f1712803a94e4578eea469dd8b711f1fdcb3fad4da733190eb1972577fa64",
+            ),
+        ]
+        .map(|(identifier, digest)| RustcRlibRawObjectDigest {
+            identifier: identifier.to_vec(),
+            digest: digest.to_owned(),
+        });
+
+        assert_eq!(
+            rustc_rlib_link_content_digest_from_raw_objects(&objects).as_deref(),
+            Some("119011303bbe2a1ade905f22806a29c68b5f2e9ba7a290618cceea28eb04dadc")
         );
     }
 
