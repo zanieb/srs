@@ -8,5 +8,6 @@ _incremental_multi_grown_archive_first:
     add w0, w0, #1
     add w0, w0, #1
     add w0, w0, #1
+    b _incremental_multi_grown_archive_added_private
 #endif
     ret
