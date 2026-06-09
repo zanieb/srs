@@ -13178,6 +13178,34 @@ fn added_macho_archive_text_activations(
 
     let mut combined_resolutions = resolutions.to_vec();
     combined_resolutions.extend(symbol_resolutions.iter().cloned());
+    let mut referenced_names = selected_indices
+        .iter()
+        .flat_map(|&member_index| members[member_index].referenced_names.iter().cloned())
+        .collect::<Vec<_>>();
+    referenced_names.sort_unstable();
+    referenced_names.dedup();
+    for referenced_name in referenced_names {
+        let encoded_name = hex::encode(&referenced_name);
+        match macho_symbol_resolution_index_for_name(&combined_resolutions, &encoded_name) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+        let resolution = match matched_macho_definition_resolution(
+            input_file_path,
+            &referenced_name,
+            matched_sections,
+            current_resolver,
+            &output_file,
+        )? {
+            Ok(resolution) => resolution,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if let Some(resolution) = resolution {
+            combined_resolutions.push(resolution.clone());
+            symbol_resolutions.push(resolution);
+        }
+    }
     combined_resolutions.sort_unstable();
     let unwind_patches = match added_macho_archive_unwind_activation(
         &members,
@@ -13230,6 +13258,97 @@ fn added_macho_archive_text_activations(
         provisional_relocations,
         remaining_reserved_ranges,
     }))
+}
+
+fn matched_macho_definition_resolution(
+    input_file_path: &str,
+    name: &[u8],
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<Option<MachOSymbolResolutionRecord>, String>> {
+    let mut visited_inputs = HashSet::new();
+    let mut matched_resolution = None;
+    for matched in matched_sections {
+        if !visited_inputs.insert(matched.current.input.as_str()) {
+            continue;
+        }
+        let Some(input_bytes) = current_resolver.resolve(
+            input_file_path,
+            matched.current.input.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(Err(
+                "could not resolve current Mach-O archive member definition".to_owned(),
+            ));
+        };
+        let file = object::File::parse(input_bytes.bytes)
+            .context("Failed to parse current Mach-O archive member definition")?;
+        if !is_supported_incremental_macho_object(&file) {
+            continue;
+        }
+        for symbol in file.symbols() {
+            if symbol.is_undefined()
+                || !symbol.is_global()
+                || symbol.is_weak()
+                || symbol.name_bytes()? != name
+            {
+                continue;
+            }
+            let Some(section_index) = symbol.section_index() else {
+                return Ok(Err(
+                    "current Mach-O archive member definition has no section".to_owned(),
+                ));
+            };
+            let section_record_index = patch_section_record_index(&file, section_index)?;
+            let Some(patch_section) = matched_sections.iter().find(|section| {
+                section.current.input == matched.current.input
+                    && section.current.section_index == section_record_index
+            }) else {
+                return Ok(Err(
+                    "current Mach-O archive member definition is outside a matched section"
+                        .to_owned(),
+                ));
+            };
+            let input_section = file.section_by_index(section_index)?;
+            let section_offset = symbol
+                .address()
+                .checked_sub(input_section.address())
+                .context("Current Mach-O archive member definition precedes its section")?;
+            let output_offset = patch_section
+                .current
+                .output_offset
+                .checked_add(section_offset)
+                .context("Current Mach-O archive member definition offset overflow")?;
+            let Some(direct_value) =
+                macho_output_address_for_file_offset(output_file, output_offset)
+            else {
+                return Ok(Err(
+                    "current Mach-O archive member definition has no output address".to_owned(),
+                ));
+            };
+            if matched_resolution.is_some() {
+                return Ok(Err(
+                    "current Mach-O archive member definition is ambiguous".to_owned()
+                ));
+            }
+            matched_resolution = Some(MachOSymbolResolutionRecord {
+                name: hex::encode(name).into(),
+                direct_value: Some(direct_value),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(RelocationTargetRecord {
+                    input_file: input_file_path.into(),
+                    input: matched.current.input.clone().into(),
+                    section_index: relocation_target_record_index(section_index)?,
+                    section_offset,
+                }),
+            });
+        }
+    }
+    Ok(Ok(matched_resolution))
 }
 
 fn macho_symbol_table_offset_for_recycling(bytes: &[u8]) -> std::result::Result<u64, String> {
