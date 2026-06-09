@@ -1437,6 +1437,11 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether changed-input patching may activate Mach-O text sections.
+    fn should_activate_macho_text_sections(&self) -> bool {
+        false
+    }
+
     /// Whether changed-input patching needs to validate x86-64 ELF GOT relaxation contexts.
     fn should_validate_x86_64_elf_got_relaxation_contexts(&self) -> bool {
         false

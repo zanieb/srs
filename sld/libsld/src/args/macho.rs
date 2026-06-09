@@ -281,6 +281,10 @@ impl platform::Args for MachOArgs {
         true
     }
 
+    fn should_activate_macho_text_sections(&self) -> bool {
+        !self.dead_strip
+    }
+
     fn should_normalize_rust_archive_patch_inputs(&self) -> bool {
         true
     }

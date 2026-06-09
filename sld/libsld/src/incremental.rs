@@ -2482,6 +2482,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             removed_dynamic_relocations,
             removed_fdes,
             updated_fdes,
+            macho_text_section_activation,
         ) = {
             let input = &previous.input_files[*input_index];
             let mut previous_snapshot_bytes =
@@ -2638,6 +2639,39 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .iter()
                 .map(|section| section.current.clone())
                 .collect::<Vec<_>>();
+            let macho_text_section_activation = if args.should_activate_macho_text_sections() {
+                let previous_bytes = {
+                    timing_phase!("Read previous incremental input snapshot");
+                    previous_snapshot_bytes.get()?
+                };
+                if let Some(previous_bytes) = previous_bytes {
+                    match macho_text_section_activation(
+                        previous_bytes,
+                        &bytes,
+                        input.path.as_str(),
+                        &matched_sections,
+                        &previous.reserved_ranges,
+                        args.common().incremental_padding_percent,
+                    )? {
+                        Ok(activation) => activation,
+                        Err(reason) => {
+                            return Ok(ChangedInputPatchResult::Unsupported(reason));
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(activation) = &macho_text_section_activation {
+                if let Some(index) = activation.matched_section_index {
+                    matched_sections[index].current = activation.section.clone();
+                    current_sections[index] = activation.section.clone();
+                } else {
+                    current_sections.push(activation.section.clone());
+                }
+            }
             if args.should_validate_macho_cstring_patches() {
                 let mut boundaries_are_stable = matched_cstring_literal_boundaries_are_stable(
                     input.path.as_str(),
@@ -2914,6 +2948,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     && !allows_fde_removal
                     && !allows_fde_addition
                     && !metadata_only_fingerprint_matches
+                    && macho_text_section_activation.is_none()
                 {
                     return Ok(ChangedInputPatchResult::Unsupported(format!(
                         "changed bytes outside patchable sections in `{}`",
@@ -2962,6 +2997,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )));
                 };
                 patch_sections.push(section.current.clone());
+            }
+            if let Some(activation) = &macho_text_section_activation {
+                patch_sections.retain(|section| {
+                    section.input != activation.section.input
+                        || section.section_index != activation.section.section_index
+                });
+                patch_sections.push(activation.section.clone());
             }
             patched_section_count += patch_sections.len();
 
@@ -3087,6 +3129,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 removed_dynamic_relocations,
                 removed_fdes,
                 updated_fdes,
+                macho_text_section_activation,
             )
         };
 
@@ -3101,6 +3144,28 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     "changed input needs complete section records".to_owned(),
                 ));
             }
+            previous.sections_file = None;
+        }
+        if let Some(activation) = macho_text_section_activation {
+            if !records_complete {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "activated Mach-O text section needs complete section records".to_owned(),
+                ));
+            }
+            if let Some(record) = activation.appended_record {
+                previous.sections.push(record);
+                previous.sections.sort();
+                previous.sections.dedup();
+            } else if !sections_changed {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "missing dormant Mach-O text section record".to_owned(),
+                ));
+            }
+            previous.reserved_ranges = activation.remaining_reserved_ranges;
+            validate_reserved_ranges_against_sections(
+                &previous.reserved_ranges,
+                &previous.sections,
+            )?;
             previous.sections_file = None;
         }
         if !added_dynamic_relocations.is_empty() {
@@ -4461,7 +4526,7 @@ fn merged_output_ranges(ranges: &[std::ops::Range<usize>]) -> Vec<std::ops::Rang
     merged
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PatchSection {
     input: String,
     section_index: u32,
@@ -4482,6 +4547,14 @@ struct MatchedPatchSection {
 struct MatchedPatchSections {
     sections: Vec<MatchedPatchSection>,
     changed_sections: Vec<PatchSection>,
+}
+
+#[derive(Debug)]
+struct MachOTextSectionActivation {
+    section: PatchSection,
+    appended_record: Option<SectionRecord>,
+    matched_section_index: Option<usize>,
+    remaining_reserved_ranges: Vec<ReservedRangeRecord>,
 }
 
 enum NormalizedRustArchivePatchState {
@@ -5489,66 +5562,64 @@ impl CurrentState {
     }
 }
 
-impl PersistedState {
-    fn allocate_reserved_range(
-        &mut self,
-        output_section_id: u32,
-        alignment_exponent: u8,
-        size: u64,
-    ) -> Result<Option<ReservedRangeAllocation>> {
-        if size == 0 {
-            return Ok(None);
-        }
-        validate_reserved_ranges(&self.reserved_ranges)?;
-        crate::alignment::Alignment::from_exponent(alignment_exponent.into())
-            .context("Invalid incremental reserve allocation alignment")?;
-        let Some((range_index, allocation_size)) = self
-            .reserved_ranges
-            .iter()
-            .enumerate()
-            .filter_map(|(range_index, range)| {
-                if range.output_section_id != output_section_id
-                    || range.alignment_exponent != alignment_exponent
-                {
-                    return None;
-                }
-                let alignment =
-                    crate::alignment::Alignment::from_exponent(range.alignment_exponent.into())
-                        .ok()?;
-                let allocation_size = size
-                    .checked_add(alignment.mask())
-                    .map(|size| alignment.align_down(size))?;
-                (range.size >= allocation_size).then_some((
-                    range_index,
-                    allocation_size,
-                    range.alignment_exponent,
-                    range.output_offset,
-                ))
-            })
-            .min_by_key(|(_, _, _, output_offset)| *output_offset)
-            .map(|(range_index, allocation_size, _, _)| (range_index, allocation_size))
-        else {
-            return Ok(None);
-        };
-
-        let range = &mut self.reserved_ranges[range_index];
-        let allocation = ReservedRangeAllocation {
-            output_offset: range.output_offset,
-            size: allocation_size,
-        };
-        range.output_offset = range
-            .output_offset
-            .checked_add(allocation_size)
-            .context("Incremental reserve allocation offset overflow")?;
-        range.size -= allocation_size;
-        if range.size == 0 {
-            self.reserved_ranges.swap_remove(range_index);
-        }
-        self.reserved_ranges.sort_unstable();
-        validate_reserved_ranges(&self.reserved_ranges)?;
-        Ok(Some(allocation))
+fn allocate_reserved_range(
+    reserved_ranges: &mut Vec<ReservedRangeRecord>,
+    output_section_id: u32,
+    alignment_exponent: u8,
+    size: u64,
+) -> Result<Option<ReservedRangeAllocation>> {
+    if size == 0 {
+        return Ok(None);
     }
+    validate_reserved_ranges(reserved_ranges)?;
+    crate::alignment::Alignment::from_exponent(alignment_exponent.into())
+        .context("Invalid incremental reserve allocation alignment")?;
+    let Some((range_index, allocation_size)) = reserved_ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(range_index, range)| {
+            if range.output_section_id != output_section_id
+                || range.alignment_exponent != alignment_exponent
+            {
+                return None;
+            }
+            let alignment =
+                crate::alignment::Alignment::from_exponent(range.alignment_exponent.into()).ok()?;
+            let allocation_size = size
+                .checked_add(alignment.mask())
+                .map(|size| alignment.align_down(size))?;
+            (range.size >= allocation_size).then_some((
+                range_index,
+                allocation_size,
+                range.alignment_exponent,
+                range.output_offset,
+            ))
+        })
+        .min_by_key(|(_, _, _, output_offset)| *output_offset)
+        .map(|(range_index, allocation_size, _, _)| (range_index, allocation_size))
+    else {
+        return Ok(None);
+    };
 
+    let range = &mut reserved_ranges[range_index];
+    let allocation = ReservedRangeAllocation {
+        output_offset: range.output_offset,
+        size: allocation_size,
+    };
+    range.output_offset = range
+        .output_offset
+        .checked_add(allocation_size)
+        .context("Incremental reserve allocation offset overflow")?;
+    range.size -= allocation_size;
+    if range.size == 0 {
+        reserved_ranges.swap_remove(range_index);
+    }
+    reserved_ranges.sort_unstable();
+    validate_reserved_ranges(reserved_ranges)?;
+    Ok(Some(allocation))
+}
+
+impl PersistedState {
     fn read(state_dir: &Path) -> Result<Option<Self>> {
         Self::read_impl(state_dir, true, PatchSectionReadMode::Parse, true)
     }
@@ -10617,6 +10688,16 @@ fn macho_object_patch_fingerprint(
     file_offset: usize,
     ranges: &[std::ops::Range<usize>],
 ) -> Option<blake3::Hash> {
+    macho_object_semantic_patch_fingerprint(bytes, file_offset, ranges, &HashSet::new(), true)
+}
+
+fn macho_object_semantic_patch_fingerprint(
+    bytes: &[u8],
+    file_offset: usize,
+    ranges: &[std::ops::Range<usize>],
+    ignored_sections: &HashSet<object::SectionIndex>,
+    require_masked_text: bool,
+) -> Option<blake3::Hash> {
     let file = object::File::parse(bytes).ok()?;
     if file.format() != object::BinaryFormat::MachO
         || file.kind() != object::ObjectKind::Relocatable
@@ -10637,6 +10718,9 @@ fn macho_object_patch_fingerprint(
 
     let mut sections = Vec::new();
     for section in file.sections() {
+        if ignored_sections.contains(&section.index()) {
+            continue;
+        }
         let segment_name = section.segment_name_bytes().ok().flatten()?;
         let object::SectionFlags::MachO { flags } = section.flags() else {
             return None;
@@ -10652,6 +10736,7 @@ fn macho_object_patch_fingerprint(
         .collect::<HashSet<_>>();
     hasher.update(&(sections.len() as u64).to_le_bytes());
     let mut has_masked_text = false;
+    let mut has_masked_section = false;
     let mut masked_text_undefined_symbols = HashSet::new();
     for section in sections {
         let segment_name = section.segment_name_bytes().ok().flatten()?;
@@ -10683,6 +10768,7 @@ fn macho_object_patch_fingerprint(
                     .iter()
                     .any(|range| range.start <= start && range.end >= end)
         });
+        has_masked_section |= fully_masked;
         has_masked_text |= fully_masked && section_name == b"__text";
         hasher.update(&[u8::from(fully_masked)]);
         if !fully_masked {
@@ -10778,7 +10864,302 @@ fn macho_object_patch_fingerprint(
         hasher.update(&n_desc.to_le_bytes());
     }
 
-    has_masked_text.then(|| hasher.finalize())
+    (has_masked_section && (!require_masked_text || has_masked_text)).then(|| hasher.finalize())
+}
+
+fn macho_section_symbols_fingerprint(
+    file: &object::File<'_>,
+    section_index: object::SectionIndex,
+) -> Option<blake3::Hash> {
+    let section = file.section_by_index(section_index).ok()?;
+    let symbols = file
+        .symbols()
+        .filter(|symbol| symbol.section_index() == Some(section_index))
+        .collect::<Vec<_>>();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sld-macho-section-symbols-v1");
+    hasher.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in symbols {
+        let name = symbol.name_bytes().ok()?;
+        if symbol.scope() != object::SymbolScope::Compilation
+            || symbol.is_weak()
+            || !name.starts_with(b"ltmp")
+        {
+            return None;
+        }
+        hash_length_prefixed(&mut hasher, name);
+        hasher.update(
+            &symbol
+                .address()
+                .checked_sub(section.address())?
+                .to_le_bytes(),
+        );
+        hasher.update(&symbol.size().to_le_bytes());
+        hasher.update(&[
+            macho_symbol_kind_tag(symbol.kind())?,
+            macho_symbol_scope_tag(symbol.scope()),
+            u8::from(symbol.is_weak()),
+        ]);
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            return None;
+        };
+        hasher.update(&n_desc.to_le_bytes());
+    }
+    Some(hasher.finalize())
+}
+
+fn macho_text_section_activation(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    reserved_ranges: &[ReservedRangeRecord],
+    padding_percent: u32,
+) -> Result<std::result::Result<Option<MachOTextSectionActivation>, String>> {
+    let Ok(previous_file) = object::File::parse(previous_bytes) else {
+        return Ok(Ok(None));
+    };
+    let Ok(current_file) = object::File::parse(current_bytes) else {
+        return Ok(Ok(None));
+    };
+    if !is_supported_incremental_macho_object(&previous_file)
+        || !is_supported_incremental_macho_object(&current_file)
+    {
+        return Ok(Ok(None));
+    }
+    if matched_sections.iter().any(|section| {
+        section.previous.input != input_file_path || section.current.input != input_file_path
+    }) {
+        return Ok(Ok(None));
+    }
+
+    let previous_sections = previous_file.sections().collect::<Vec<_>>();
+    let current_sections = current_file.sections().collect::<Vec<_>>();
+    let (matched_section_index, previous_text_index, current_text_index, appended) =
+        if current_sections.len() == previous_sections.len() {
+            let mut dormant = Vec::new();
+            for (matched_index, matched) in matched_sections.iter().enumerate() {
+                if matched.previous.input_size != 0
+                    || matched.previous.output_size != 0
+                    || matched.previous.section_name.as_deref() != Some("__TEXT,__text")
+                    || matched.current.section_name.as_deref() != Some("__TEXT,__text")
+                {
+                    continue;
+                }
+                let Some(previous_index) = patch_section_index(&previous_file, &matched.previous)?
+                else {
+                    continue;
+                };
+                let Some(current_index) = patch_section_index(&current_file, &matched.current)?
+                else {
+                    continue;
+                };
+                let previous_section = previous_file
+                    .section_by_index(previous_index)
+                    .context("Missing dormant Mach-O text section")?;
+                let current_section = current_file
+                    .section_by_index(current_index)
+                    .context("Missing activated Mach-O text section")?;
+                if previous_section
+                    .data()
+                    .context("Failed to read dormant Mach-O text section")?
+                    .is_empty()
+                    && !current_section
+                        .data()
+                        .context("Failed to read activated Mach-O text section")?
+                        .is_empty()
+                {
+                    dormant.push((matched_index, previous_index, current_index));
+                }
+            }
+            match dormant.as_slice() {
+                [] => return Ok(Ok(None)),
+                [candidate] => (Some(candidate.0), Some(candidate.1), candidate.2, false),
+                _ => {
+                    return Ok(Err(
+                        "changed Mach-O object activated more than one text section".to_owned(),
+                    ));
+                }
+            }
+        } else if current_sections.len() == previous_sections.len() + 1 {
+            let added = current_sections
+                .last()
+                .context("Missing appended Mach-O text section")?;
+            if added.index().0 != current_sections.len() {
+                return Ok(Err("added Mach-O text section was not appended".to_owned()));
+            }
+            (None, None, added.index(), true)
+        } else {
+            return Ok(Err(
+                "changed Mach-O object added more than one section".to_owned()
+            ));
+        };
+    let text = current_file
+        .section_by_index(current_text_index)
+        .context("Missing activated Mach-O text section")?;
+    let segment_name = text.segment_name_bytes().ok().flatten();
+    let section_name = text.name_bytes().ok();
+    let object::SectionFlags::MachO { flags } = text.flags() else {
+        return Ok(Err("activated section is not a Mach-O section".to_owned()));
+    };
+    if segment_name != Some(b"__TEXT".as_slice())
+        || section_name != Some(b"__text".as_slice())
+        || flags & object::macho::SECTION_TYPE != object::macho::S_REGULAR
+    {
+        return Ok(Err(
+            "activated Mach-O section is not regular __TEXT,__text".to_owned()
+        ));
+    }
+    let data = text
+        .data()
+        .context("Failed to read activated Mach-O text section data")?;
+    if data.is_empty() {
+        return Ok(Err("activated Mach-O text section is empty".to_owned()));
+    }
+    if text.relocations().next().is_some() {
+        return Ok(Err(
+            "activated Mach-O text section contains relocations".to_owned()
+        ));
+    }
+    if let Some(previous_text_index) = previous_text_index {
+        let previous_text = previous_file
+            .section_by_index(previous_text_index)
+            .context("Missing dormant Mach-O text section")?;
+        if previous_text.relocations().next().is_some() {
+            return Ok(Err(
+                "dormant Mach-O text section contains relocations".to_owned()
+            ));
+        }
+        let previous_symbols =
+            macho_section_symbols_fingerprint(&previous_file, previous_text_index);
+        let current_symbols = macho_section_symbols_fingerprint(&current_file, current_text_index);
+        if previous_symbols.is_none() || previous_symbols != current_symbols {
+            return Ok(Err(
+                "activated Mach-O text section changed symbols".to_owned()
+            ));
+        }
+    } else if current_file
+        .symbols()
+        .any(|symbol| symbol.section_index() == Some(current_text_index))
+    {
+        return Ok(Err("added Mach-O text section contains symbols".to_owned()));
+    }
+    for section in current_file.sections() {
+        for (_, relocation) in section.relocations() {
+            let targets_added_section = match relocation.target() {
+                object::RelocationTarget::Section(index) => index == current_text_index,
+                object::RelocationTarget::Symbol(index) => current_file
+                    .symbol_by_index(index)
+                    .is_ok_and(|symbol| symbol.section_index() == Some(current_text_index)),
+                _ => false,
+            } || relocation.subtractor().is_some_and(|index| {
+                current_file
+                    .symbol_by_index(index)
+                    .is_ok_and(|symbol| symbol.section_index() == Some(current_text_index))
+            });
+            if targets_added_section {
+                return Ok(Err(
+                    "activated Mach-O text section is targeted by a relocation".to_owned(),
+                ));
+            }
+        }
+    }
+
+    let proof_sections = matched_sections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != matched_section_index)
+        .map(|(_, section)| section)
+        .collect::<Vec<_>>();
+    let previous_ranges = patch_ranges_with_lookup(
+        previous_bytes,
+        input_file_path,
+        proof_sections
+            .iter()
+            .map(|section| section.previous.clone()),
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    .context("Could not resolve previous Mach-O patch sections")?;
+    let current_ranges = patch_ranges_with_lookup(
+        current_bytes,
+        input_file_path,
+        proof_sections.iter().map(|section| section.current.clone()),
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    .context("Could not resolve current Mach-O patch sections")?;
+    let previous_fingerprint = macho_object_semantic_patch_fingerprint(
+        previous_bytes,
+        0,
+        &previous_ranges,
+        &previous_text_index.into_iter().collect(),
+        false,
+    );
+    let current_fingerprint = macho_object_semantic_patch_fingerprint(
+        current_bytes,
+        0,
+        &current_ranges,
+        &HashSet::from([current_text_index]),
+        false,
+    );
+    if previous_fingerprint.is_none() || previous_fingerprint != current_fingerprint {
+        return Ok(Err(
+            "changed Mach-O object outside activated __TEXT,__text section".to_owned(),
+        ));
+    }
+
+    let alignment = crate::alignment::Alignment::new(text.align().max(1))
+        .context("Invalid activated Mach-O text section alignment")?;
+    let data_size =
+        u64::try_from(data.len()).context("Activated Mach-O text section is too large")?;
+    let padding = (u128::from(data_size) * u128::from(padding_percent)).div_ceil(100);
+    let requested_size = u64::try_from(u128::from(data_size) + padding)
+        .context("Added Mach-O text section allocation size overflow")?;
+    let output_section_id = u32::try_from(crate::output_section_id::TEXT.as_usize())
+        .context("Mach-O text output section ID does not fit u32")?;
+    let mut remaining_reserved_ranges = reserved_ranges.to_vec();
+    let Some(allocation) = allocate_reserved_range(
+        &mut remaining_reserved_ranges,
+        output_section_id,
+        alignment.exponent,
+        requested_size,
+    )?
+    else {
+        return Ok(Err(
+            "insufficient incremental reserve for activated Mach-O text section".to_owned(),
+        ));
+    };
+    let section_index = patch_section_record_index(&current_file, current_text_index)?;
+    let section = PatchSection {
+        input: input_file_path.to_owned(),
+        section_index,
+        section_name: Some("__TEXT,__text".to_owned()),
+        input_size: data_size,
+        output_offset: allocation.output_offset,
+        output_size: allocation.size,
+        data_hash: Some(hash_bytes(data)),
+        cstring_nul_boundaries_hash: None,
+    };
+    let appended_record = appended.then(|| SectionRecord {
+        input_file: input_file_path.into(),
+        input: input_file_path.into(),
+        section_index,
+        output_offset: allocation.output_offset,
+        size: allocation.size,
+    });
+    Ok(Ok(Some(MachOTextSectionActivation {
+        appended_record,
+        matched_section_index,
+        section,
+        remaining_reserved_ranges,
+    })))
+}
+
+fn is_supported_incremental_macho_object(file: &object::File<'_>) -> bool {
+    file.format() == object::BinaryFormat::MachO
+        && file.kind() == object::ObjectKind::Relocatable
+        && file.architecture() == object::Architecture::Aarch64
+        && file.is_64()
+        && file.is_little_endian()
 }
 
 fn hash_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
@@ -22779,6 +23160,171 @@ mod tests {
     }
 
     #[test]
+    fn dormant_macho_text_section_activation_consumes_reserve_transactionally() {
+        let previous = test_macho_data_object(b"\x05\x06\x07\x08", Some(b""), false);
+        let current = test_macho_data_object(b"\x05\x06\x07\x08", Some(b"\x1f\x20\x03\xd5"), false);
+        let input = hex::encode("input.o");
+        let data = PatchSection {
+            input: input.clone(),
+            section_index: 0,
+            section_name: Some("__DATA,__data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: Some(hash_bytes(b"\x05\x06\x07\x08")),
+            cstring_nul_boundaries_hash: None,
+        };
+        let previous_text = PatchSection {
+            input: input.clone(),
+            section_index: 1,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 0,
+            output_offset: 96,
+            output_size: 0,
+            data_hash: Some(hash_bytes(b"")),
+            cstring_nul_boundaries_hash: None,
+        };
+        let mut current_text = previous_text.clone();
+        current_text.input_size = 4;
+        current_text.data_hash = Some(hash_bytes(b"\x1f\x20\x03\xd5"));
+        let matched = [
+            MatchedPatchSection::same(data),
+            MatchedPatchSection {
+                previous: previous_text,
+                current: current_text,
+            },
+        ];
+        let reserves = [ReservedRangeRecord {
+            output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+            alignment_exponent: 2,
+            output_offset: 128,
+            size: 16,
+        }];
+
+        let activation =
+            macho_text_section_activation(&previous, &current, &input, &matched, &reserves, 100)
+                .unwrap()
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(activation.section.section_index, 1);
+        assert_eq!(
+            activation.section.section_name.as_deref(),
+            Some("__TEXT,__text")
+        );
+        assert_eq!(activation.section.input_size, 4);
+        assert_eq!(activation.section.output_offset, 128);
+        assert_eq!(activation.section.output_size, 8);
+        assert_eq!(activation.matched_section_index, Some(1));
+        assert!(activation.appended_record.is_none());
+        assert_eq!(
+            activation.remaining_reserved_ranges,
+            vec![ReservedRangeRecord {
+                output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+                alignment_exponent: 2,
+                output_offset: 136,
+                size: 8,
+            }]
+        );
+
+        let resolved = resolved_patch_sections_for_input(&current, &input, [activation.section])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved[0].patch.data, b"\x1f\x20\x03\xd5");
+        assert_eq!(resolved[0].patch.size, 8);
+    }
+
+    #[test]
+    fn dormant_macho_text_section_activation_rejects_unsafe_deltas() {
+        let previous = test_macho_data_object(b"\x05\x06\x07\x08", Some(b""), false);
+        let input = hex::encode("input.o");
+        let data = PatchSection {
+            input: input.clone(),
+            section_index: 0,
+            section_name: Some("__DATA,__data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: Some(hash_bytes(b"\x05\x06\x07\x08")),
+            cstring_nul_boundaries_hash: None,
+        };
+        let previous_text = PatchSection {
+            input: input.clone(),
+            section_index: 1,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 0,
+            output_offset: 96,
+            output_size: 0,
+            data_hash: Some(hash_bytes(b"")),
+            cstring_nul_boundaries_hash: None,
+        };
+        let mut current_text = previous_text.clone();
+        current_text.input_size = 4;
+        current_text.data_hash = Some(hash_bytes(b"\x1f\x20\x03\xd5"));
+        let matched = [
+            MatchedPatchSection::same(data),
+            MatchedPatchSection {
+                previous: previous_text,
+                current: current_text,
+            },
+        ];
+        let reserves = [ReservedRangeRecord {
+            output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+            alignment_exponent: 2,
+            output_offset: 128,
+            size: 16,
+        }];
+
+        let symbol = test_macho_data_object(b"\x05\x06\x07\x08", Some(b"\x1f\x20\x03\xd5"), true);
+        assert!(
+            macho_text_section_activation(&previous, &symbol, &input, &matched, &reserves, 100,)
+                .unwrap()
+                .unwrap_err()
+                .contains("changed symbols")
+        );
+
+        let mut unrelated_change =
+            test_macho_data_object(b"\x05\x06\x07\x08", Some(b"\x1f\x20\x03\xd5"), false);
+        unrelated_change[8] ^= 1;
+        assert!(
+            macho_text_section_activation(
+                &previous,
+                &unrelated_change,
+                &input,
+                &matched,
+                &reserves,
+                100,
+            )
+            .unwrap()
+            .unwrap_err()
+            .contains("outside activated")
+        );
+
+        let current = test_macho_data_object(b"\x05\x06\x07\x08", Some(b"\x1f\x20\x03\xd5"), false);
+        let insufficient = [ReservedRangeRecord {
+            output_section_id: crate::output_section_id::TEXT.as_usize() as u32,
+            alignment_exponent: 2,
+            output_offset: 128,
+            size: 4,
+        }];
+        assert!(
+            macho_text_section_activation(
+                &previous,
+                &current,
+                &input,
+                &matched,
+                &insufficient,
+                100,
+            )
+            .unwrap()
+            .unwrap_err()
+            .contains("insufficient incremental reserve")
+        );
+        assert_eq!(insufficient[0].output_offset, 128);
+        assert_eq!(insufficient[0].size, 4);
+    }
+
+    #[test]
     fn current_patch_state_masks_macho_symbol_catalog_values() {
         let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
         let current = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 1);
@@ -23136,6 +23682,100 @@ mod tests {
         bytes
     }
 
+    fn test_macho_data_object(
+        data: &[u8],
+        added_text: Option<&[u8]>,
+        added_text_symbol: bool,
+    ) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let section_count = 1 + usize::from(added_text.is_some());
+        let symbol_count = 1 + usize::from(added_text.is_some()) + usize::from(added_text_symbol);
+        let commands_size =
+            SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let data_offset = HEADER_SIZE + commands_size;
+        let text_offset = data_offset + data.len();
+        let text_len = added_text.map_or(0, <[u8]>::len);
+        let symoff = (text_offset + text_len).next_multiple_of(8);
+        let stroff = symoff + symbol_count * NLIST_64_SIZE;
+        let strings = b"\0_data\0ltmp0\0_added_text\0";
+        let mut bytes = Vec::new();
+
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(
+            &mut bytes,
+            (SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE) as u32,
+        );
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, (data.len() + text_len) as u64);
+        push_u64(&mut bytes, data_offset as u64);
+        push_u64(&mut bytes, (data.len() + text_len) as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, section_count as u32);
+        push_u32(&mut bytes, 0);
+
+        push_macho_section(
+            &mut bytes,
+            b"__data",
+            b"__DATA",
+            0,
+            data.len(),
+            data_offset,
+            object::macho::S_REGULAR,
+        );
+        if let Some(text) = added_text {
+            push_macho_section(
+                &mut bytes,
+                b"__text",
+                b"__TEXT",
+                data.len() as u64,
+                text.len(),
+                text_offset,
+                object::macho::S_REGULAR
+                    | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                    | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+            );
+        }
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, symbol_count as u32);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), data_offset);
+        bytes.extend_from_slice(data);
+        if let Some(text) = added_text {
+            bytes.extend_from_slice(text);
+        }
+        bytes.resize(symoff, 0);
+        push_macho_symbol(&mut bytes, 1, 1, 0);
+        if added_text.is_some() {
+            push_macho_local_symbol(&mut bytes, 7, 2, data.len() as u64);
+        }
+        if added_text_symbol {
+            push_macho_symbol(&mut bytes, 13, 2, data.len() as u64);
+        }
+        bytes.extend_from_slice(strings);
+        bytes
+    }
+
     fn push_macho_section(
         bytes: &mut Vec<u8>,
         name: &[u8],
@@ -23162,6 +23802,14 @@ mod tests {
     fn push_macho_symbol(bytes: &mut Vec<u8>, name_offset: u32, section: u8, value: u64) {
         push_u32(bytes, name_offset);
         bytes.push(object::macho::N_SECT | object::macho::N_EXT);
+        bytes.push(section);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        push_u64(bytes, value);
+    }
+
+    fn push_macho_local_symbol(bytes: &mut Vec<u8>, name_offset: u32, section: u8, value: u64) {
+        push_u32(bytes, name_offset);
+        bytes.push(object::macho::N_SECT);
         bytes.push(section);
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         push_u64(bytes, value);
@@ -24398,21 +25046,21 @@ mod tests {
         ];
 
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 5).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 48,
                 size: 8,
             })
         );
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 9).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 9).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 64,
                 size: 12,
             })
         );
         assert_eq!(
-            state.allocate_reserved_range(4, 3, 8).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 3, 8).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 32,
                 size: 8,
@@ -24455,15 +25103,30 @@ mod tests {
         }];
         let previous = state.reserved_ranges.clone();
 
-        assert_eq!(state.allocate_reserved_range(4, 2, 9).unwrap(), None);
-        assert_eq!(state.allocate_reserved_range(4, 3, 8).unwrap(), None);
-        assert_eq!(state.allocate_reserved_range(5, 2, 8).unwrap(), None);
-        assert_eq!(state.allocate_reserved_range(4, 2, 0).unwrap(), None);
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 9).unwrap(),
+            None
+        );
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 3, 8).unwrap(),
+            None
+        );
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 5, 2, 8).unwrap(),
+            None
+        );
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 0).unwrap(),
+            None
+        );
         assert_eq!(state.reserved_ranges, previous);
 
         state.reserved_ranges[0].alignment_exponent = 3;
         let previous = state.reserved_ranges.clone();
-        assert_eq!(state.allocate_reserved_range(4, 2, 8).unwrap(), None);
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 8).unwrap(),
+            None
+        );
         assert_eq!(state.reserved_ranges, previous);
     }
 
@@ -24479,28 +25142,31 @@ mod tests {
         }];
 
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 1).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 1).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 16,
                 size: 4,
             })
         );
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 5).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 20,
                 size: 8,
             })
         );
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 4).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 4).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 28,
                 size: 4,
             })
         );
         assert!(state.reserved_ranges.is_empty());
-        assert_eq!(state.allocate_reserved_range(4, 2, 1).unwrap(), None);
+        assert_eq!(
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 1).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -24515,7 +25181,7 @@ mod tests {
         }];
 
         assert_eq!(
-            state.allocate_reserved_range(4, 2, 5).unwrap(),
+            allocate_reserved_range(&mut state.reserved_ranges, 4, 2, 5).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 32,
                 size: 8,
@@ -24523,7 +25189,7 @@ mod tests {
         );
         let mut parsed = PersistedState::parse(&state.render()).unwrap();
         assert_eq!(
-            parsed.allocate_reserved_range(4, 2, 8).unwrap(),
+            allocate_reserved_range(&mut parsed.reserved_ranges, 4, 2, 8).unwrap(),
             Some(ReservedRangeAllocation {
                 output_offset: 40,
                 size: 8,
