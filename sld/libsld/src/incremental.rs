@@ -3012,7 +3012,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .flat_map(|candidate| candidate.input_ranges.iter().cloned()),
                 )
                 .collect::<Vec<_>>();
-            let Some((fingerprint, archive_member_patch_fingerprints)) = ({
+            let Some((mut fingerprint, mut archive_member_patch_fingerprints)) = ({
                 timing_phase!("Fingerprint changed patch input");
                 patch_fingerprint_with_resolver_and_archive_member_patch_fingerprints(
                     &bytes,
@@ -3273,6 +3273,86 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )));
                 };
                 current_sections = resolved_sections;
+            }
+            if added_macho_archive_text_activation.is_some() {
+                let dynamic_relocation_patches = dynamic_relocation_patches_for_input(
+                    &bytes,
+                    input.path.as_str(),
+                    previous
+                        .dynamic_relocations
+                        .iter()
+                        .filter(|record| record.input_file == input.path),
+                )?;
+                let relocation_addend_ranges = relocation_addend_ranges_for_input_with_lookup(
+                    &bytes,
+                    input.path.as_str(),
+                    previous
+                        .relocations
+                        .iter()
+                        .filter(|record| record.input_file == input.path),
+                    PatchInputLookup::MatchArchiveMember,
+                )?;
+                let relocation_target_ranges = relocation_target_ranges_for_input_with_lookup(
+                    &bytes,
+                    input.path.as_str(),
+                    previous.relocations.iter().filter(|record| {
+                        record
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| target.input_file == input.path)
+                    }),
+                    PatchInputLookup::MatchArchiveMember,
+                )?;
+                let Some(macho_symbol_resolution_ranges) =
+                    macho_symbol_resolution_ranges_for_records_with_lookup(
+                        &bytes,
+                        input.path.as_str(),
+                        previous
+                            .macho_symbol_resolutions
+                            .iter()
+                            .filter(|resolution| {
+                                resolution
+                                    .target
+                                    .as_ref()
+                                    .is_some_and(|target| target.input_file == input.path)
+                            }),
+                        PatchInputLookup::MatchArchiveMember,
+                    )?
+                else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "could not refresh added Mach-O archive member fingerprint".to_owned(),
+                    ));
+                };
+                let fde_relocation_ranges = fde_patch_input_ranges_for_input_with_lookup(
+                    &bytes,
+                    input.path.as_str(),
+                    previous
+                        .fdes
+                        .iter()
+                        .filter(|record| record.input_file == input.path),
+                    PatchInputLookup::MatchArchiveMember,
+                )?;
+                let Some((refreshed_fingerprint, refreshed_member_fingerprints)) =
+                    patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_patch_fingerprints(
+                        &bytes,
+                        input.path.as_str(),
+                        current_sections.iter().cloned(),
+                        dynamic_relocation_patches
+                            .iter()
+                            .filter_map(|patch| patch.input_range.clone())
+                            .chain(relocation_addend_ranges)
+                            .chain(relocation_target_ranges)
+                            .chain(macho_symbol_resolution_ranges)
+                            .chain(fde_relocation_ranges),
+                        normalize_rust_archive_patch_inputs,
+                    )?
+                else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "could not refresh added Mach-O archive member fingerprint".to_owned(),
+                    ));
+                };
+                fingerprint = refreshed_fingerprint;
+                archive_member_patch_fingerprints = refreshed_member_fingerprints;
             }
             let added_macho_archive_symbol_table_patches = added_macho_archive_text_activation
                 .as_mut()
@@ -15355,6 +15435,20 @@ fn macho_symbol_resolution_ranges_for_current_records<'a>(
     input_file_path: &str,
     resolutions: impl IntoIterator<Item = &'a MachOSymbolResolutionRecord>,
 ) -> Result<Option<Vec<std::ops::Range<usize>>>> {
+    macho_symbol_resolution_ranges_for_records_with_lookup(
+        bytes,
+        input_file_path,
+        resolutions,
+        PatchInputLookup::CurrentRecordedRange,
+    )
+}
+
+fn macho_symbol_resolution_ranges_for_records_with_lookup<'a>(
+    bytes: &[u8],
+    input_file_path: &str,
+    resolutions: impl IntoIterator<Item = &'a MachOSymbolResolutionRecord>,
+    lookup: PatchInputLookup,
+) -> Result<Option<Vec<std::ops::Range<usize>>>> {
     let mut ranges = Vec::new();
     for resolution in resolutions {
         let Some(target) = resolution
@@ -15364,12 +15458,8 @@ fn macho_symbol_resolution_ranges_for_current_records<'a>(
         else {
             continue;
         };
-        let Some(input_bytes) = patch_input_bytes_with_lookup(
-            bytes,
-            input_file_path,
-            target.input.as_str(),
-            PatchInputLookup::CurrentRecordedRange,
-        )?
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, target.input.as_str(), lookup)?
         else {
             return Ok(None);
         };
@@ -15420,6 +15510,21 @@ fn relocation_target_ranges_for_input_with_lookup<'a>(
             .context("Failed to parse incremental relocation target input")?;
         let mut seen_names = HashSet::new();
         for record in records {
+            if record.input_file == input_file_path
+                && record
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| record.input == target.input)
+                && file.format() == object::BinaryFormat::MachO
+                && file.architecture() == object::Architecture::Aarch64
+                && decode_macho_aarch64_relocation_kind(record.kind).is_some_and(|raw| {
+                    raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                        && !raw.r_pcrel
+                        && raw.r_length == 3
+                })
+            {
+                continue;
+            }
             let Some(target_name) = record.target_name.as_deref() else {
                 continue;
             };
@@ -26912,6 +27017,68 @@ mod tests {
         assert_eq!(relocation_target_record_index(text.index()).unwrap(), 1);
         assert_eq!(patch_section_record_index(&file, data.index()).unwrap(), 1);
         assert_eq!(relocation_target_record_index(data.index()).unwrap(), 2);
+    }
+
+    #[test]
+    fn current_macho_target_ranges_exclude_chained_data_targets() {
+        let bytes = test_macho_object(b"\x1f\x20\x03\xd5", b"\0\0\0\0", 0);
+        let input = "input.o";
+        let target = Some((input, 2, 0));
+        let text = relocation_record(
+            input,
+            1,
+            1,
+            Some(0),
+            0,
+            Some("_data"),
+            target,
+            0,
+            0,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_PAGE21,
+            }),
+            0,
+        );
+        let data = relocation_record(
+            input,
+            1,
+            2,
+            Some(0),
+            0,
+            Some("_data"),
+            target,
+            0,
+            0,
+            8,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 3,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            }),
+            0,
+        );
+        let input_file_path = hex::encode(input);
+
+        assert_eq!(
+            relocation_target_ranges_for_current_records(&bytes, &input_file_path, [&text, &data])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            relocation_target_ranges_for_current_records(&bytes, &input_file_path, [&data])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
