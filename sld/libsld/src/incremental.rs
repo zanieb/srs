@@ -2797,6 +2797,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &previous.reserved_ranges,
                         args.common().incremental_padding_percent,
                         previous_output.get()?,
+                        &previous.relocations,
                         &previous.macho_symbol_resolutions,
                         &macho_resolution_updates.retiring_names,
                     )? {
@@ -9543,6 +9544,62 @@ fn macho_text_relocation_target_candidates(
     candidates
 }
 
+fn recorded_macho_branch_target_candidate(
+    relocation: &RelocationRecord,
+    target_name: Option<&SharedText>,
+    target_is_global: bool,
+    target: Option<&RelocationTargetRecord>,
+    target_value: u64,
+    addend: i64,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> Option<u64> {
+    let raw_relocation = decode_macho_aarch64_relocation_kind(relocation.kind)?;
+    if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
+        || relocation.addend != addend
+        || relocation.target_value != target_value
+        || if target_is_global {
+            target_name.is_none() || relocation.target_name.as_ref() != target_name
+        } else {
+            target.is_none() || relocation.target.as_ref() != target
+        }
+    {
+        return None;
+    }
+    let applied_target_value = relocation.applied_target_value?;
+    let written_value = relocation.written_value?;
+    let start = usize::try_from(relocation.output_offset).ok()?;
+    let size = usize::try_from(relocation.size).ok()?;
+    let end = start.checked_add(size)?;
+    let previous_bytes = previous_output.get(start..end)?;
+    let rel_info =
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+            raw_relocation,
+        )
+        .ok()?;
+    let mut replayed_previous = previous_bytes.to_vec();
+    rel_info
+        .write_to_buffer(written_value, &mut replayed_previous)
+        .ok()?;
+    if replayed_previous != previous_bytes {
+        return None;
+    }
+    let previous_place =
+        macho_output_address_for_file_offset(output_file, relocation.output_offset)?;
+    (macho_aarch64_relocated_value(
+        raw_relocation.r_type,
+        applied_target_value,
+        macho_aarch64_applied_target_addend(
+            raw_relocation.r_type,
+            relocation.target_value,
+            applied_target_value,
+            relocation.addend,
+        ),
+        previous_place,
+    ) == Some(written_value))
+    .then_some(applied_target_value)
+}
+
 fn recorded_macho_branch_target_candidates(
     relocations: &[RelocationRecord],
     target_name: Option<&SharedText>,
@@ -9556,51 +9613,43 @@ fn recorded_macho_branch_target_candidates(
     relocations
         .iter()
         .filter_map(|relocation| {
-            let raw_relocation = decode_macho_aarch64_relocation_kind(relocation.kind)?;
-            if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
-                || relocation.addend != addend
-                || relocation.target_value != target_value
-                || if target_is_global {
-                    target_name.is_none() || relocation.target_name.as_ref() != target_name
-                } else {
-                    target.is_none() || relocation.target.as_ref() != target
-                }
-            {
-                return None;
-            }
-            let applied_target_value = relocation.applied_target_value?;
-            let written_value = relocation.written_value?;
-            let start = usize::try_from(relocation.output_offset).ok()?;
-            let size = usize::try_from(relocation.size).ok()?;
-            let end = start.checked_add(size)?;
-            let previous_bytes = previous_output.get(start..end)?;
-            let rel_info =
-                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
-                    raw_relocation,
-                )
-                .ok()?;
-            let mut replayed_previous = previous_bytes.to_vec();
-            rel_info
-                .write_to_buffer(written_value, &mut replayed_previous)
-                .ok()?;
-            if replayed_previous != previous_bytes {
-                return None;
-            }
-            let previous_place =
-                macho_output_address_for_file_offset(output_file, relocation.output_offset)?;
-            (macho_aarch64_relocated_value(
-                raw_relocation.r_type,
-                applied_target_value,
-                macho_aarch64_applied_target_addend(
-                    raw_relocation.r_type,
-                    relocation.target_value,
-                    applied_target_value,
-                    relocation.addend,
-                ),
-                previous_place,
-            ) == Some(written_value))
-            .then_some(applied_target_value)
+            recorded_macho_branch_target_candidate(
+                relocation,
+                target_name,
+                target_is_global,
+                target,
+                target_value,
+                addend,
+                previous_output,
+                output_file,
+            )
         })
+        .collect()
+}
+
+fn recorded_macho_import_stub_candidates(
+    relocations: &[RelocationRecord],
+    target_name: &SharedText,
+    addend: i64,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> Vec<u64> {
+    relocations
+        .iter()
+        .filter(|relocation| relocation.target.is_none())
+        .filter_map(|relocation| {
+            recorded_macho_branch_target_candidate(
+                relocation,
+                Some(target_name),
+                true,
+                None,
+                0,
+                addend,
+                previous_output,
+                output_file,
+            )
+        })
+        .filter(|candidate| *candidate != 0)
         .collect()
 }
 
@@ -12922,6 +12971,7 @@ fn added_macho_archive_text_activations(
     reserved_ranges: &[ReservedRangeRecord],
     padding_percent: u32,
     previous_output: &[u8],
+    relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
     retiring_names: &[SharedText],
 ) -> Result<std::result::Result<AddedMachOArchiveTextActivations, String>> {
@@ -13149,6 +13199,7 @@ fn added_macho_archive_text_activations(
         &selected_indices,
         &sections,
         previous_output,
+        relocations,
         &combined_resolutions,
     )? {
         Ok(replays) => replays,
@@ -16519,6 +16570,7 @@ fn added_macho_archive_text_relocation_replays(
     selected_indices: &[usize],
     sections: &[PatchSection],
     previous_output: &[u8],
+    relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
 ) -> Result<std::result::Result<Vec<MachOTextRelocationReplay>, String>> {
     let resolver = PatchInputResolver::new(current_bytes, true)?;
@@ -16570,6 +16622,7 @@ fn added_macho_archive_text_relocation_replays(
                 })?;
             let mut target_name = None;
             let mut target_is_global = false;
+            let mut recorded_target_candidates = Vec::new();
             let target;
             let current_target_value = match context.target {
                 object::RelocationTarget::Symbol(symbol_index) => {
@@ -16615,21 +16668,52 @@ fn added_macho_archive_text_relocation_replays(
                             .checked_add(target_offset)
                             .context("Added Mach-O text relocation target address overflow")?
                     } else {
-                        let Some(resolution) = macho_symbol_resolution_for_name(resolutions, &name)
-                        else {
+                        let encoded_name = hex::encode(&name);
+                        let resolution_index = match macho_symbol_resolution_index_for_name(
+                            resolutions,
+                            &encoded_name,
+                        ) {
+                            Ok(index) => index,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                        if let Some(resolution_index) = resolution_index {
+                            let resolution = &resolutions[resolution_index];
+                            let Some(value) = resolution.direct_value else {
+                                return Ok(Err(
+                                    "added Mach-O text relocation target has no direct value"
+                                        .to_owned(),
+                                ));
+                            };
+                            target = resolution.target.clone();
+                            value
+                        } else if symbol.is_undefined()
+                            && symbol.is_global()
+                            && symbol.address() == 0
+                            && context.r_type == object::macho::ARM64_RELOC_BRANCH26
+                            && context.r_pcrel
+                            && let Some(encoded_name) = target_name.as_ref()
+                        {
+                            recorded_target_candidates = recorded_macho_import_stub_candidates(
+                                relocations,
+                                encoded_name,
+                                context.addend,
+                                previous_output,
+                                &output_file,
+                            );
+                            if recorded_target_candidates.is_empty() {
+                                return Ok(Err(format!(
+                                    "missing Mach-O symbol resolution for added archive member {}",
+                                    display_hex_text(&encoded_name)
+                                )));
+                            }
+                            target = None;
+                            0
+                        } else {
                             return Ok(Err(format!(
                                 "missing Mach-O symbol resolution for added archive member {}",
-                                display_hex_text(&hex::encode(&name))
+                                display_hex_text(&encoded_name)
                             )));
-                        };
-                        let Some(value) = resolution.direct_value else {
-                            return Ok(Err(
-                                "added Mach-O text relocation target has no direct value"
-                                    .to_owned(),
-                            ));
-                        };
-                        target = resolution.target.clone();
-                        value
+                        }
                     }
                 }
                 object::RelocationTarget::Section(target_section_index) => {
@@ -16667,8 +16751,14 @@ fn added_macho_archive_text_relocation_replays(
                 target_name.as_deref(),
                 context.r_type,
                 current_target_value,
-                &[],
+                &recorded_target_candidates,
             );
+            let target_symbol_id = relocations
+                .iter()
+                .find(|relocation| {
+                    relocation.target_name == target_name && relocation.target == target
+                })
+                .map_or(0, |relocation| relocation.target_symbol_id);
             replays.push(MachOTextRelocationReplay {
                 relocation_index: None,
                 input_file: input_file_path.into(),
@@ -16686,7 +16776,7 @@ fn added_macho_archive_text_relocation_replays(
                 current_target_section_offset: target
                     .as_ref()
                     .map_or(0, |target| target.section_offset),
-                target_symbol_id: 0,
+                target_symbol_id,
                 target_name,
                 target_is_global,
                 target,
