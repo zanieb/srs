@@ -2,5 +2,5 @@
 .p2align 2
 .globl _incremental_added_archive_extra
 _incremental_added_archive_extra:
-    mov w0, #42
+    mov w0, #20
     ret

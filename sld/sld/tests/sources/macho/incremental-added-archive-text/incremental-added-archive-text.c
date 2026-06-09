@@ -10,9 +10,10 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-added-archive-root.a
 //#TestIncrementalChangedCompArgs:-DACTIVATE_ADDED_MEMBER=1
-//#TestIncrementalChangedAddedArchiveMember:incremental_added_archive.1.changed.rcgu.o=incremental-added-archive-extra.S
-//#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:2
+//#TestIncrementalChangedAddedArchiveMember:aaa_incremental_added_archive.1.changed.rcgu.o=incremental-added-archive-extra.S
+//#TestIncrementalChangedAddedArchiveMember:zzz_incremental_added_archive.2.changed.rcgu.o=incremental-added-archive-extra-second.S
+//#TestIncrementalChangedExpectPatch:false
+//#TestIncrementalChangedFallbackReason:multiple Mach-O archive members were added
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 

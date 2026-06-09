@@ -235,8 +235,9 @@
 //! an extra archive member after mutating the selected section.
 //!
 //! TestIncrementalChangedAddedArchiveMember:{member-name}={source-filename} Whether the
-//! changed-input test should rebuild the selected archive and append the compiled source under the
-//! supplied archive member name. Requires TestIncrementalChangedCompArgs.
+//! changed-input test should rebuild the selected archive and add the compiled source under the
+//! supplied archive member name. Can be repeated; members are sorted by archive identifier with
+//! the rebuilt original members. Requires TestIncrementalChangedCompArgs.
 //!
 //! TestIncrementalChangedCompareFull:{bool} Whether the changed-input incremental output should be
 //! byte-compared to a fresh full relink. Defaults to true. Disable this when the initial
@@ -895,7 +896,7 @@ struct Config {
     test_incremental_changed_section_offset: u64,
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
-    test_incremental_changed_added_archive_member: Option<IncrementalAddedArchiveMember>,
+    test_incremental_changed_added_archive_members: Vec<IncrementalAddedArchiveMember>,
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
@@ -1641,7 +1642,7 @@ impl Config {
             test_incremental_changed_section_offset: 0,
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
-            test_incremental_changed_added_archive_member: None,
+            test_incremental_changed_added_archive_members: Vec::new(),
             test_incremental_changed_compare_full: true,
             test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
@@ -1829,11 +1830,11 @@ fn replace_changed_object_from_source(
     Ok(())
 }
 
-fn rebuild_changed_archive_with_added_member(
+fn rebuild_changed_archive_with_added_members(
     archive_path: &Path,
     config: &Config,
     changed_comp_args: &ArgumentSet,
-    added_member: &IncrementalAddedArchiveMember,
+    added_members: &[IncrementalAddedArchiveMember],
     cross_arch: Option<Architecture>,
 ) -> Result {
     ensure!(
@@ -1843,12 +1844,6 @@ fn rebuild_changed_archive_with_added_member(
         "Incremental added archive member requires an archive input, got `{}`",
         archive_path.display()
     );
-    ensure!(
-        added_member.source.exists(),
-        "Incremental added archive member source `{}` does not exist",
-        added_member.source.display()
-    );
-
     let archive_stem = archive_path
         .file_stem()
         .context("Incremental changed archive input has no file stem")?;
@@ -1891,35 +1886,43 @@ fn rebuild_changed_archive_with_added_member(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let added_source = FilenameArgumentPair::new(&added_member.source, ArgumentSet::empty());
-    let added_object = build_obj_impl(
-        &added_source,
-        &replacement_config,
-        &Linker::Sld,
-        InputType::Object,
-        cross_arch,
-        false,
-    )
-    .with_context(|| {
-        format!(
-            "Failed to build incremental added archive member source `{}`",
+    for added_member in added_members {
+        ensure!(
+            added_member.source.exists(),
+            "Incremental added archive member source `{}` does not exist",
             added_member.source.display()
+        );
+        let added_source = FilenameArgumentPair::new(&added_member.source, ArgumentSet::empty());
+        let added_object = build_obj_impl(
+            &added_source,
+            &replacement_config,
+            &Linker::Sld,
+            InputType::Object,
+            cross_arch,
+            false,
         )
-    })?;
-    let added_object_path = replacement_config
-        .build_dir()
-        .join(&added_member.identifier);
-    std::fs::copy(&added_object.path, &added_object_path).with_context(|| {
-        format!(
-            "Failed to copy incremental added archive member `{}` to `{}`",
-            added_object.path.display(),
-            added_object_path.display()
-        )
-    })?;
-    objects.push(BuiltObject {
-        path: added_object_path,
-        inputs: added_object.inputs,
-    });
+        .with_context(|| {
+            format!(
+                "Failed to build incremental added archive member source `{}`",
+                added_member.source.display()
+            )
+        })?;
+        let added_object_path = replacement_config
+            .build_dir()
+            .join(&added_member.identifier);
+        std::fs::copy(&added_object.path, &added_object_path).with_context(|| {
+            format!(
+                "Failed to copy incremental added archive member `{}` to `{}`",
+                added_object.path.display(),
+                added_object_path.display()
+            )
+        })?;
+        objects.push(BuiltObject {
+            path: added_object_path,
+            inputs: added_object.inputs,
+        });
+    }
+    objects.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
 
     make_archive(archive_path, &objects, false, &replacement_config)?;
     rewrite_file_with_same_contents(archive_path)
@@ -2384,11 +2387,19 @@ fn process_directive(
                 "TestIncrementalChangedAddedArchiveMember requires a plain archive member name, \
                  got `{identifier}`"
             );
-            config.test_incremental_changed_added_archive_member =
-                Some(IncrementalAddedArchiveMember {
+            ensure!(
+                !config
+                    .test_incremental_changed_added_archive_members
+                    .iter()
+                    .any(|member| member.identifier == identifier),
+                "TestIncrementalChangedAddedArchiveMember repeats archive member `{identifier}`"
+            );
+            config.test_incremental_changed_added_archive_members.push(
+                IncrementalAddedArchiveMember {
                     identifier: identifier.to_owned(),
                     source: config.source_path(source),
-                });
+                },
+            );
         }
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
@@ -3032,9 +3043,9 @@ impl ProgramInputs {
                     self.name()
                 );
             }
-            if config
-                .test_incremental_changed_added_archive_member
-                .is_some()
+            if !config
+                .test_incremental_changed_added_archive_members
+                .is_empty()
                 && config.test_incremental_changed_comp_args.is_none()
             {
                 bail!(
@@ -3059,14 +3070,15 @@ impl ProgramInputs {
             for changed_input in &changed_inputs {
                 _restore_changed_inputs.push(RestoreFileOnDrop::new(&changed_input.path)?);
                 if let Some(changed_comp_args) = &config.test_incremental_changed_comp_args {
-                    if let Some(added_member) =
-                        &config.test_incremental_changed_added_archive_member
+                    if !config
+                        .test_incremental_changed_added_archive_members
+                        .is_empty()
                     {
-                        rebuild_changed_archive_with_added_member(
+                        rebuild_changed_archive_with_added_members(
                             &changed_input.path,
                             config,
                             changed_comp_args,
-                            added_member,
+                            &config.test_incremental_changed_added_archive_members,
                             cross_arch,
                         )?;
                     } else {
