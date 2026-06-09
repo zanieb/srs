@@ -4225,6 +4225,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     previous_output.get()?,
                     &previous.macho_symbol_resolutions,
                     activation_reserved_ranges,
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .map_or(&[], |activation| activation.added_names.as_slice()),
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .map_or(&[], |activation| activation.retired_names.as_slice()),
                 )? {
                     Ok(activation) => activation,
                     Err(reason) => {
@@ -17691,6 +17697,8 @@ fn changed_macho_archive_unwind_activation(
     previous_output: &[u8],
     resolutions: &[MachOSymbolResolutionRecord],
     reserved_ranges: &[ReservedRangeRecord],
+    added_definition_names: &[SharedText],
+    retired_definition_names: &[SharedText],
 ) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for changed unwind metadata")?;
@@ -17708,14 +17716,29 @@ fn changed_macho_archive_unwind_activation(
     if changed.members.is_empty() {
         return Ok(Ok(None));
     }
-    if !archive_diff_allows_changed_macho_unwind(
+    let allows_unwind_only = archive_diff_allows_changed_macho_unwind(
         previous_bytes,
         current_bytes,
         input_file_path,
         matched_sections,
         current_resolver,
         &changed,
-    )? {
+    )?;
+    let allows_unwind_and_definitions = !allows_unwind_only
+        && archive_diff_allows_changed_macho_symbols(
+            previous_bytes,
+            current_bytes,
+            input_file_path,
+            matched_sections,
+            current_resolver,
+            &[],
+            &[],
+            &changed.previous_input_ranges,
+            &changed.current_input_ranges,
+            added_definition_names,
+            retired_definition_names,
+        )?;
+    if !allows_unwind_only && !allows_unwind_and_definitions {
         return Ok(Err(
             "changed Mach-O archive member differs outside text and unwind metadata".to_owned(),
         ));
@@ -38891,6 +38914,8 @@ mod tests {
             &output.bytes,
             &[],
             &reserves,
+            &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -38964,6 +38989,8 @@ mod tests {
             &output.bytes,
             &[],
             &activation.remaining_reserved_ranges,
+            &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -39024,6 +39051,8 @@ mod tests {
             &output.bytes,
             &[],
             &reserves,
+            &[],
+            &[],
         )
         .unwrap();
         assert!(matches!(
