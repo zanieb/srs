@@ -34589,6 +34589,136 @@ mod tests {
         assert_eq!(candidates, vec![0x1000_1000]);
     }
 
+    #[test]
+    fn added_macho_import_stub_candidates_reuse_validated_branch() {
+        let target_name = SharedText::from(hex::encode("_Unwind_Resume"));
+        let recorded_stub = 0x1000;
+        let (previous_output, text_range, written_value) =
+            recorded_branch_output(0, recorded_stub, 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut relocation = relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(written_value),
+            0,
+            Some("_Unwind_Resume"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            branch_kind,
+            0,
+        );
+        relocation.applied_target_value = Some(recorded_stub);
+
+        let recorded = recorded_macho_import_stub_candidates(
+            &[relocation],
+            &target_name,
+            0,
+            &previous_output,
+            &output_file,
+        );
+        let candidates = macho_text_relocation_target_candidates(
+            &[],
+            Some(target_name.as_str()),
+            object::macho::ARM64_RELOC_BRANCH26,
+            0,
+            &recorded,
+        );
+
+        assert_eq!(recorded, vec![recorded_stub]);
+        assert_eq!(candidates, vec![recorded_stub, 0]);
+    }
+
+    #[test]
+    fn added_macho_import_stub_candidates_reject_unproven_targets() {
+        let target_name = SharedText::from(hex::encode("_Unwind_Resume"));
+        let recorded_stub = 0x1000;
+        let (previous_output, text_range, written_value) =
+            recorded_branch_output(0, recorded_stub, 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut valid = relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(written_value),
+            0,
+            Some("_Unwind_Resume"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            branch_kind,
+            0,
+        );
+        valid.applied_target_value = Some(recorded_stub);
+
+        let mut wrong_name = valid.clone();
+        wrong_name.target_name = Some(SharedText::from(hex::encode("_other")));
+        let mut wrong_addend = valid.clone();
+        wrong_addend.addend = 4;
+        let mut stale = valid.clone();
+        stale.written_value = Some(written_value + 4);
+        let mut missing_applied_target = valid.clone();
+        missing_applied_target.applied_target_value = None;
+        let mut zero_applied_target = valid.clone();
+        zero_applied_target.applied_target_value = Some(0);
+        let mut owned_target = valid.clone();
+        owned_target.target = Some(RelocationTargetRecord {
+            input_file: "owner.o".into(),
+            input: "owner.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        });
+        let mut non_branch = valid;
+        non_branch.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_PAGE21,
+        });
+
+        for relocation in [
+            wrong_name,
+            wrong_addend,
+            stale,
+            missing_applied_target,
+            zero_applied_target,
+            owned_target,
+            non_branch,
+        ] {
+            assert!(
+                recorded_macho_import_stub_candidates(
+                    &[relocation],
+                    &target_name,
+                    0,
+                    &previous_output,
+                    &output_file,
+                )
+                .is_empty()
+            );
+        }
+    }
+
     fn recorded_branch_output(
         target_value: u64,
         applied_target_value: u64,
