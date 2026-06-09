@@ -4956,6 +4956,7 @@ struct AddedMachOArchiveTextActivations {
 struct AddedMachOArchiveTextMember {
     input: String,
     sections: Vec<AddedMachOArchiveSection>,
+    unwind: Option<AddedMachOArchiveUnwind>,
     text_section_index: u32,
     text_object_section_index: u32,
     definition_name: Vec<u8>,
@@ -4973,6 +4974,98 @@ struct AddedMachOArchiveSection {
     data_size: u64,
     alignment_exponent: u8,
     relocations: Vec<MachODataRelocationContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveUnwind {
+    compact_unwind: Option<AddedMachOArchiveCompactUnwind>,
+    eh_frame: Option<AddedMachOArchiveEhFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveCompactUnwind {
+    section_index: u32,
+    entries: Vec<AddedMachOArchiveCompactUnwindEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveCompactUnwindEntry {
+    input_range: std::ops::Range<usize>,
+    function: AddedMachOArchiveUnwindSectionPosition,
+    function_length: u32,
+    encoding: u32,
+    function_field: AddedMachOArchiveUnwindPointerField,
+    personality: Option<AddedMachOArchiveUnwindPointerField>,
+    lsda: Option<AddedMachOArchiveUnwindPointerField>,
+    fde_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveEhFrame {
+    section_index: u32,
+    cies: Vec<AddedMachOArchiveCie>,
+    fdes: Vec<AddedMachOArchiveFde>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveCie {
+    input_range: std::ops::Range<usize>,
+    address_size: u8,
+    fde_pointer_encoding: u8,
+    lsda_pointer_encoding: Option<u8>,
+    personality: Option<AddedMachOArchiveUnwindPointerField>,
+    has_fde_augmentation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveFde {
+    input_range: std::ops::Range<usize>,
+    cie_index: usize,
+    function: AddedMachOArchiveUnwindSectionPosition,
+    function_length: u32,
+    pc_begin: AddedMachOArchiveUnwindPointerField,
+    lsda: Option<AddedMachOArchiveUnwindPointerField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AddedMachOArchiveUnwindSectionPosition {
+    section_index: u32,
+    section_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddedMachOArchiveUnwindTarget {
+    Section(AddedMachOArchiveUnwindSectionPosition),
+    UndefinedSymbol(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveUnwindPointerField {
+    input_offset: usize,
+    width: u8,
+    encoding: Option<u8>,
+    value: u64,
+    target: AddedMachOArchiveUnwindTarget,
+    relocation: AddedMachOArchiveUnwindRelocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveUnwindRelocation {
+    input_offset: usize,
+    width: u8,
+    explicit_addend: i64,
+    field_value: u64,
+    raw: Vec<AddedMachOArchiveRawRelocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveRawRelocation {
+    r_address: u32,
+    r_symbolnum: u32,
+    r_pcrel: bool,
+    r_length: u8,
+    r_extern: bool,
+    r_type: u8,
 }
 
 enum NormalizedRustArchivePatchState {
@@ -12914,6 +13007,14 @@ fn added_macho_archive_text_activations(
             "could not prove all added Mach-O archive members are selected".to_owned(),
         ));
     }
+    if selected_indices
+        .iter()
+        .any(|&member_index| members[member_index].unwind.is_some())
+    {
+        return Ok(Err(
+            "added Mach-O archive member unwind activation is not supported".to_owned(),
+        ));
+    }
 
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for added archive members")?;
@@ -14045,6 +14146,1048 @@ fn added_macho_archive_output_section_id(
     }
 }
 
+const ADDED_MACHO_UNWIND_MODE_MASK: u32 = 0x0f00_0000;
+const ADDED_MACHO_UNWIND_MODE_DWARF: u32 = 0x0300_0000;
+const DW_EH_PE_ABSPTR: u8 = 0x00;
+const DW_EH_PE_UDATA4: u8 = 0x03;
+const DW_EH_PE_UDATA8: u8 = 0x04;
+const DW_EH_PE_SDATA4: u8 = 0x0b;
+const DW_EH_PE_SDATA8: u8 = 0x0c;
+const DW_EH_PE_OMIT: u8 = 0xff;
+
+fn added_macho_archive_unwind(
+    file: &object::File<'_>,
+) -> Result<std::result::Result<Option<AddedMachOArchiveUnwind>, String>> {
+    let object::File::MachO64(macho_file) = file else {
+        return Ok(Err(
+            "added Mach-O archive member unwind metadata is not Mach-O 64-bit".to_owned(),
+        ));
+    };
+    let mut compact_unwind_index = None;
+    let mut eh_frame_index = None;
+    for section in file.sections() {
+        match (
+            section.segment_name_bytes().ok().flatten(),
+            section.name_bytes().ok(),
+        ) {
+            (Some(b"__LD"), Some(b"__compact_unwind")) => {
+                if compact_unwind_index.replace(section.index()).is_some() {
+                    return Ok(Err(
+                        "added Mach-O archive member has multiple __compact_unwind sections"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (Some(b"__TEXT"), Some(b"__eh_frame")) => {
+                if eh_frame_index.replace(section.index()).is_some() {
+                    return Ok(Err(
+                        "added Mach-O archive member has multiple __eh_frame sections".to_owned(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if compact_unwind_index.is_none() && eh_frame_index.is_none() {
+        return Ok(Ok(None));
+    }
+
+    let compact_unwind = if let Some(section_index) = compact_unwind_index {
+        let section = macho_file.section_by_index(section_index)?;
+        match added_macho_archive_compact_unwind(file, &section)? {
+            Ok(compact_unwind) => Some(compact_unwind),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    } else {
+        None
+    };
+    let eh_frame = if let Some(section_index) = eh_frame_index {
+        let section = macho_file.section_by_index(section_index)?;
+        match added_macho_archive_eh_frame(file, &section)? {
+            Ok(eh_frame) => Some(eh_frame),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    } else {
+        None
+    };
+
+    let mut unwind = AddedMachOArchiveUnwind {
+        compact_unwind,
+        eh_frame,
+    };
+    if let Some(compact_unwind) = &mut unwind.compact_unwind {
+        for entry in &mut compact_unwind.entries {
+            if entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF {
+                continue;
+            }
+            let matches = unwind
+                .eh_frame
+                .as_ref()
+                .into_iter()
+                .flat_map(|eh_frame| eh_frame.fdes.iter().enumerate())
+                .filter(|(_, fde)| {
+                    fde.function == entry.function && fde.function_length == entry.function_length
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [fde_index] => entry.fde_index = Some(*fde_index),
+                [] => {
+                    return Ok(Err(
+                        "added Mach-O archive member DWARF compact unwind entry has no matching FDE"
+                            .to_owned(),
+                    ));
+                }
+                _ => {
+                    return Ok(Err(
+                        "added Mach-O archive member DWARF compact unwind entry has ambiguous FDEs"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Ok(Some(unwind)))
+}
+
+fn added_macho_archive_compact_unwind<'data>(
+    file: &object::File<'data>,
+    section: &object::read::macho::MachOSection64<'data, '_, object::Endianness>,
+) -> Result<std::result::Result<AddedMachOArchiveCompactUnwind, String>> {
+    let object::SectionFlags::MachO { flags } = section.flags() else {
+        return Ok(Err(
+            "added Mach-O archive member __compact_unwind has non-Mach-O flags".to_owned(),
+        ));
+    };
+    if flags & object::macho::SECTION_TYPE != object::macho::S_REGULAR {
+        return Ok(Err(
+            "added Mach-O archive member __compact_unwind is not regular".to_owned(),
+        ));
+    }
+    let data = section
+        .data()
+        .context("Failed to read added Mach-O archive member __compact_unwind")?;
+    if data.is_empty()
+        || !data
+            .len()
+            .is_multiple_of(crate::macho::MACHO_COMPACT_UNWIND_ENTRY_SIZE)
+    {
+        return Ok(Err(format!(
+            "added Mach-O archive member __compact_unwind size is not a nonzero multiple of {}",
+            crate::macho::MACHO_COMPACT_UNWIND_ENTRY_SIZE
+        )));
+    }
+    let mut relocations = match added_macho_archive_unwind_relocations(section, data) {
+        Ok(relocations) => relocations,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let mut entries =
+        Vec::with_capacity(data.len() / crate::macho::MACHO_COMPACT_UNWIND_ENTRY_SIZE);
+    for entry_start in (0..data.len()).step_by(crate::macho::MACHO_COMPACT_UNWIND_ENTRY_SIZE) {
+        let function_field = match added_macho_archive_unwind_pointer_field(
+            file,
+            data,
+            &mut relocations,
+            entry_start,
+            8,
+            None,
+            true,
+        )? {
+            Ok(Some(field)) => field,
+            Ok(None) => unreachable!("required compact unwind function field"),
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if added_macho_archive_unwind_subtractor(&function_field.relocation).is_some() {
+            return Ok(Err(
+                "added Mach-O archive member compact unwind function uses a subtractor relocation"
+                    .to_owned(),
+            ));
+        }
+        let function = match added_macho_archive_unwind_pointer_position(&function_field, true)? {
+            Ok(function) => function,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let function_length = read_u32_le(&data[entry_start + 8..entry_start + 12])
+            .context("Added Mach-O compact unwind length is truncated")?;
+        if function_length == 0 {
+            return Ok(Err(
+                "added Mach-O archive member compact unwind function has zero length".to_owned(),
+            ));
+        }
+        let encoding = read_u32_le(&data[entry_start + 12..entry_start + 16])
+            .context("Added Mach-O compact unwind encoding is truncated")?;
+        let personality = match added_macho_archive_unwind_pointer_field(
+            file,
+            data,
+            &mut relocations,
+            entry_start + 16,
+            8,
+            None,
+            false,
+        )? {
+            Ok(field) => field,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let lsda = match added_macho_archive_unwind_pointer_field(
+            file,
+            data,
+            &mut relocations,
+            entry_start + 24,
+            8,
+            None,
+            false,
+        )? {
+            Ok(field) => field,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        entries.push(AddedMachOArchiveCompactUnwindEntry {
+            input_range: entry_start..entry_start + crate::macho::MACHO_COMPACT_UNWIND_ENTRY_SIZE,
+            function,
+            function_length,
+            encoding,
+            function_field,
+            personality,
+            lsda,
+            fde_index: None,
+        });
+    }
+    if !relocations.is_empty() {
+        return Ok(Err(
+            "added Mach-O archive member __compact_unwind has an unexpected relocation".to_owned(),
+        ));
+    }
+    entries.sort_by_key(|entry| (entry.function.section_index, entry.function.section_offset));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].function == pair[1].function)
+    {
+        return Ok(Err(
+            "added Mach-O archive member compact unwind functions are ambiguous".to_owned(),
+        ));
+    }
+    Ok(Ok(AddedMachOArchiveCompactUnwind {
+        section_index: patch_section_record_index(file, section.index())?,
+        entries,
+    }))
+}
+
+fn added_macho_archive_eh_frame<'data>(
+    file: &object::File<'data>,
+    section: &object::read::macho::MachOSection64<'data, '_, object::Endianness>,
+) -> Result<std::result::Result<AddedMachOArchiveEhFrame, String>> {
+    let data = section
+        .data()
+        .context("Failed to read added Mach-O archive member __eh_frame")?;
+    if data.is_empty() {
+        return Ok(Err(
+            "added Mach-O archive member __eh_frame is empty".to_owned()
+        ));
+    }
+    let mut relocations = match added_macho_archive_unwind_relocations(section, data) {
+        Ok(relocations) => relocations,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let Some(length_bytes) = data.get(offset..offset + 4) else {
+            return Ok(Err(
+                "added Mach-O archive member __eh_frame length is truncated".to_owned(),
+            ));
+        };
+        let length = read_u32_le(length_bytes).unwrap() as usize;
+        if length == 0 {
+            if data[offset..].iter().any(|byte| *byte != 0) {
+                return Ok(Err(
+                    "added Mach-O archive member __eh_frame has nonzero bytes after its terminator"
+                        .to_owned(),
+                ));
+            }
+            break;
+        }
+        if length == u32::MAX as usize {
+            return Ok(Err(
+                "added Mach-O archive member uses 64-bit __eh_frame lengths".to_owned(),
+            ));
+        }
+        let Some(end) = offset
+            .checked_add(4)
+            .and_then(|entry| entry.checked_add(length))
+        else {
+            return Ok(Err(
+                "added Mach-O archive member __eh_frame entry length overflowed".to_owned(),
+            ));
+        };
+        if end > data.len() || length < 4 {
+            return Ok(Err(
+                "added Mach-O archive member __eh_frame entry extends past the section".to_owned(),
+            ));
+        }
+        let cie_pointer = read_u32_le(&data[offset + 4..offset + 8]).unwrap();
+        entries.push((offset..end, cie_pointer));
+        offset = end;
+    }
+
+    let mut cies = Vec::new();
+    let mut cie_indices = HashMap::new();
+    for (range, cie_pointer) in &entries {
+        if *cie_pointer != 0 {
+            continue;
+        }
+        let cie = match added_macho_archive_cie(file, data, range.clone(), &mut relocations)? {
+            Ok(cie) => cie,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        cie_indices.insert(range.start, cies.len());
+        cies.push(cie);
+    }
+
+    let eh_frame_position = AddedMachOArchiveUnwindSectionPosition {
+        section_index: patch_section_record_index(file, section.index())?,
+        section_offset: 0,
+    };
+    let mut fdes = Vec::new();
+    for (range, cie_pointer) in entries {
+        if cie_pointer == 0 {
+            continue;
+        }
+        let cie_pointer_offset = range.start + 4;
+        let Some(cie_start) = cie_pointer_offset.checked_sub(cie_pointer as usize) else {
+            return Ok(Err(
+                "added Mach-O archive member FDE has an invalid CIE pointer".to_owned(),
+            ));
+        };
+        let Some(&cie_index) = cie_indices.get(&cie_start) else {
+            return Ok(Err(
+                "added Mach-O archive member FDE references a missing CIE".to_owned(),
+            ));
+        };
+        let fde = match added_macho_archive_fde(
+            file,
+            data,
+            range,
+            cie_index,
+            &cies[cie_index],
+            &eh_frame_position,
+            &mut relocations,
+        )? {
+            Ok(fde) => fde,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        fdes.push(fde);
+    }
+    if !relocations.is_empty() {
+        return Ok(Err(
+            "added Mach-O archive member __eh_frame has an unexpected relocation".to_owned(),
+        ));
+    }
+    Ok(Ok(AddedMachOArchiveEhFrame {
+        section_index: eh_frame_position.section_index,
+        cies,
+        fdes,
+    }))
+}
+
+fn added_macho_archive_cie(
+    file: &object::File<'_>,
+    data: &[u8],
+    input_range: std::ops::Range<usize>,
+    relocations: &mut HashMap<usize, AddedMachOArchiveUnwindRelocation>,
+) -> Result<std::result::Result<AddedMachOArchiveCie, String>> {
+    let mut cursor = input_range.start + 8;
+    let end = input_range.end;
+    let Some(&version) = data.get(cursor) else {
+        return Ok(Err(
+            "added Mach-O archive member CIE version is truncated".to_owned()
+        ));
+    };
+    cursor += 1;
+    if !matches!(version, 1 | 3 | 4) {
+        return Ok(Err(format!(
+            "added Mach-O archive member CIE version {version} is unsupported"
+        )));
+    }
+    let Some(augmentation_end) = data[cursor..end].iter().position(|byte| *byte == 0) else {
+        return Ok(Err(
+            "added Mach-O archive member CIE augmentation is unterminated".to_owned(),
+        ));
+    };
+    let augmentation = &data[cursor..cursor + augmentation_end];
+    cursor += augmentation_end + 1;
+    let address_size = if version == 4 {
+        let Some((&address_size, rest)) = data.get(cursor..end).and_then(|data| data.split_first())
+        else {
+            return Ok(Err(
+                "added Mach-O archive member CIE address size is truncated".to_owned(),
+            ));
+        };
+        cursor += 1;
+        let Some(&segment_size) = rest.first() else {
+            return Ok(Err(
+                "added Mach-O archive member CIE segment size is truncated".to_owned(),
+            ));
+        };
+        cursor += 1;
+        if !matches!(address_size, 4 | 8) || segment_size != 0 {
+            return Ok(Err(
+                "added Mach-O archive member CIE address or segment size is unsupported".to_owned(),
+            ));
+        }
+        address_size
+    } else {
+        8
+    };
+    if let Err(reason) = read_added_macho_unwind_uleb(data, &mut cursor, end) {
+        return Ok(Err(reason));
+    }
+    if let Err(reason) = read_added_macho_unwind_sleb(data, &mut cursor, end) {
+        return Ok(Err(reason));
+    }
+    if version == 1 {
+        if data.get(cursor).is_none() {
+            return Ok(Err(
+                "added Mach-O archive member CIE return register is truncated".to_owned(),
+            ));
+        }
+        cursor += 1;
+    } else if let Err(reason) = read_added_macho_unwind_uleb(data, &mut cursor, end) {
+        return Ok(Err(reason));
+    }
+
+    let has_fde_augmentation = augmentation.first() == Some(&b'z');
+    let mut fde_pointer_encoding = DW_EH_PE_ABSPTR;
+    let mut has_fde_pointer_encoding = false;
+    let mut lsda_pointer_encoding = None;
+    let mut personality = None;
+    if has_fde_augmentation {
+        let augmentation_size = match read_added_macho_unwind_uleb(data, &mut cursor, end) {
+            Ok(size) => match usize::try_from(size) {
+                Ok(size) => size,
+                Err(_) => {
+                    return Ok(Err(
+                        "added Mach-O archive member CIE augmentation is too large".to_owned(),
+                    ));
+                }
+            },
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(augmentation_data_end) = cursor.checked_add(augmentation_size) else {
+            return Ok(Err(
+                "added Mach-O archive member CIE augmentation range overflowed".to_owned(),
+            ));
+        };
+        if augmentation_data_end > end {
+            return Ok(Err(
+                "added Mach-O archive member CIE augmentation extends past the entry".to_owned(),
+            ));
+        }
+        for &kind in &augmentation[1..] {
+            match kind {
+                b'L' => {
+                    let Some(&encoding) = data.get(cursor) else {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE LSDA encoding is truncated".to_owned(),
+                        ));
+                    };
+                    cursor += 1;
+                    if lsda_pointer_encoding.replace(encoding).is_some() {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE has duplicate LSDA encodings"
+                                .to_owned(),
+                        ));
+                    }
+                    if encoding != DW_EH_PE_OMIT
+                        && let Err(reason) =
+                            added_macho_archive_dwarf_pointer_width(encoding, address_size)
+                    {
+                        return Ok(Err(reason));
+                    }
+                }
+                b'P' => {
+                    let Some(&encoding) = data.get(cursor) else {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE personality encoding is truncated"
+                                .to_owned(),
+                        ));
+                    };
+                    cursor += 1;
+                    if personality.is_some() {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE has duplicate personalities"
+                                .to_owned(),
+                        ));
+                    }
+                    let width =
+                        match added_macho_archive_dwarf_pointer_width(encoding, address_size) {
+                            Ok(width) => width,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                    personality = match added_macho_archive_unwind_pointer_field(
+                        file,
+                        data,
+                        relocations,
+                        cursor,
+                        width,
+                        Some(encoding),
+                        true,
+                    )? {
+                        Ok(Some(field)) => Some(field),
+                        Ok(None) => unreachable!("required CIE personality field"),
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    cursor += usize::from(width);
+                }
+                b'R' => {
+                    let Some(&encoding) = data.get(cursor) else {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE FDE encoding is truncated".to_owned(),
+                        ));
+                    };
+                    cursor += 1;
+                    if has_fde_pointer_encoding {
+                        return Ok(Err(
+                            "added Mach-O archive member CIE has duplicate FDE encodings"
+                                .to_owned(),
+                        ));
+                    }
+                    if let Err(reason) =
+                        added_macho_archive_dwarf_pointer_width(encoding, address_size)
+                    {
+                        return Ok(Err(reason));
+                    }
+                    fde_pointer_encoding = encoding;
+                    has_fde_pointer_encoding = true;
+                }
+                b'S' => {}
+                _ => {
+                    return Ok(Err(format!(
+                        "added Mach-O archive member CIE augmentation `{}` is unsupported",
+                        char::from(kind)
+                    )));
+                }
+            }
+        }
+        if cursor != augmentation_data_end {
+            return Ok(Err(
+                "added Mach-O archive member CIE augmentation size is inconsistent".to_owned(),
+            ));
+        }
+    } else if !augmentation.is_empty() {
+        return Ok(Err(
+            "added Mach-O archive member CIE augmentation without `z` is unsupported".to_owned(),
+        ));
+    }
+    Ok(Ok(AddedMachOArchiveCie {
+        input_range,
+        address_size,
+        fde_pointer_encoding,
+        lsda_pointer_encoding: lsda_pointer_encoding.filter(|encoding| *encoding != DW_EH_PE_OMIT),
+        personality,
+        has_fde_augmentation,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn added_macho_archive_fde(
+    file: &object::File<'_>,
+    data: &[u8],
+    input_range: std::ops::Range<usize>,
+    cie_index: usize,
+    cie: &AddedMachOArchiveCie,
+    eh_frame_position: &AddedMachOArchiveUnwindSectionPosition,
+    relocations: &mut HashMap<usize, AddedMachOArchiveUnwindRelocation>,
+) -> Result<std::result::Result<AddedMachOArchiveFde, String>> {
+    let pc_width =
+        match added_macho_archive_dwarf_pointer_width(cie.fde_pointer_encoding, cie.address_size) {
+            Ok(width) => width,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let pc_offset = input_range.start + 8;
+    let pc_begin = match added_macho_archive_unwind_pointer_field(
+        file,
+        data,
+        relocations,
+        pc_offset,
+        pc_width,
+        Some(cie.fde_pointer_encoding),
+        true,
+    )? {
+        Ok(Some(field)) => field,
+        Ok(None) => unreachable!("required FDE PC-begin field"),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let Some(subtractor) = added_macho_archive_unwind_subtractor(&pc_begin.relocation) else {
+        return Ok(Err(
+            "added Mach-O archive member FDE PC-begin relocation has no subtractor".to_owned(),
+        ));
+    };
+    if match added_macho_archive_raw_relocation_target(file, subtractor)? {
+        Ok(AddedMachOArchiveUnwindTarget::Section(position)) => position != *eh_frame_position,
+        Ok(AddedMachOArchiveUnwindTarget::UndefinedSymbol(_)) | Err(_) => true,
+    } {
+        return Ok(Err(
+            "added Mach-O archive member FDE PC-begin subtractor is unsupported".to_owned(),
+        ));
+    }
+    let function = match added_macho_archive_unwind_pointer_position(&pc_begin, false)? {
+        Ok(function) => function,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let range_offset = pc_offset + usize::from(pc_width);
+    let range_width = match added_macho_archive_dwarf_pointer_width(
+        cie.fde_pointer_encoding & 0x0f,
+        cie.address_size,
+    ) {
+        Ok(width) => width,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let function_length = match read_added_macho_unwind_pointer(data, range_offset, range_width) {
+        Some(length) => match u32::try_from(length) {
+            Ok(length) if length != 0 => length,
+            _ => {
+                return Ok(Err(
+                    "added Mach-O archive member FDE function range is invalid".to_owned(),
+                ));
+            }
+        },
+        None => {
+            return Ok(Err(
+                "added Mach-O archive member FDE function range is truncated".to_owned(),
+            ));
+        }
+    };
+    let mut cursor = range_offset + usize::from(range_width);
+    let mut lsda = None;
+    if cie.has_fde_augmentation {
+        let augmentation_size =
+            match read_added_macho_unwind_uleb(data, &mut cursor, input_range.end) {
+                Ok(size) => match usize::try_from(size) {
+                    Ok(size) => size,
+                    Err(_) => {
+                        return Ok(Err(
+                            "added Mach-O archive member FDE augmentation is too large".to_owned(),
+                        ));
+                    }
+                },
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let Some(augmentation_end) = cursor.checked_add(augmentation_size) else {
+            return Ok(Err(
+                "added Mach-O archive member FDE augmentation range overflowed".to_owned(),
+            ));
+        };
+        if augmentation_end > input_range.end {
+            return Ok(Err(
+                "added Mach-O archive member FDE augmentation extends past the entry".to_owned(),
+            ));
+        }
+        if let Some(encoding) = cie.lsda_pointer_encoding {
+            let width = match added_macho_archive_dwarf_pointer_width(encoding, cie.address_size) {
+                Ok(width) => width,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            lsda = match added_macho_archive_unwind_pointer_field(
+                file,
+                data,
+                relocations,
+                cursor,
+                width,
+                Some(encoding),
+                false,
+            )? {
+                Ok(field) => field,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if let Some(lsda) = &lsda {
+                let Some(subtractor) = added_macho_archive_unwind_subtractor(&lsda.relocation)
+                else {
+                    return Ok(Err(
+                        "added Mach-O archive member FDE LSDA relocation has no subtractor"
+                            .to_owned(),
+                    ));
+                };
+                if match added_macho_archive_raw_relocation_target(file, subtractor)? {
+                    Ok(AddedMachOArchiveUnwindTarget::Section(position)) => {
+                        position != *eh_frame_position
+                    }
+                    Ok(AddedMachOArchiveUnwindTarget::UndefinedSymbol(_)) | Err(_) => true,
+                } {
+                    return Ok(Err(
+                        "added Mach-O archive member FDE LSDA subtractor is unsupported".to_owned(),
+                    ));
+                }
+            }
+            cursor += usize::from(width);
+        }
+        if cursor != augmentation_end {
+            return Ok(Err(
+                "added Mach-O archive member FDE augmentation size is inconsistent".to_owned(),
+            ));
+        }
+    }
+    Ok(Ok(AddedMachOArchiveFde {
+        input_range,
+        cie_index,
+        function,
+        function_length,
+        pc_begin,
+        lsda,
+    }))
+}
+
+fn added_macho_archive_dwarf_pointer_width(
+    encoding: u8,
+    address_size: u8,
+) -> std::result::Result<u8, String> {
+    let width = match encoding & 0x0f {
+        DW_EH_PE_ABSPTR => address_size,
+        DW_EH_PE_UDATA4 | DW_EH_PE_SDATA4 => 4,
+        DW_EH_PE_UDATA8 | DW_EH_PE_SDATA8 => 8,
+        _ => {
+            return Err(format!(
+                "added Mach-O archive member uses unsupported DWARF pointer encoding {encoding:#x}"
+            ));
+        }
+    };
+    matches!(width, 4 | 8).then_some(width).ok_or_else(|| {
+        format!("added Mach-O archive member uses unsupported DWARF pointer width {width}")
+    })
+}
+
+fn read_added_macho_unwind_uleb(
+    data: &[u8],
+    cursor: &mut usize,
+    end: usize,
+) -> std::result::Result<u64, String> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let Some(&byte) = data.get(*cursor).filter(|_| *cursor < end) else {
+            return Err("added Mach-O archive member ULEB128 value is truncated".to_owned());
+        };
+        *cursor += 1;
+        let payload = u64::from(byte & 0x7f);
+        if shift == 63 && payload > 1 {
+            return Err("added Mach-O archive member ULEB128 value overflowed".to_owned());
+        }
+        value |= payload << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("added Mach-O archive member ULEB128 value overflowed".to_owned())
+}
+
+fn read_added_macho_unwind_sleb(
+    data: &[u8],
+    cursor: &mut usize,
+    end: usize,
+) -> std::result::Result<i64, String> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let Some(&byte) = data.get(*cursor).filter(|_| *cursor < end) else {
+            return Err("added Mach-O archive member SLEB128 value is truncated".to_owned());
+        };
+        *cursor += 1;
+        let payload = u64::from(byte & 0x7f);
+        if shift == 63 && !matches!(payload, 0 | 0x7f) {
+            return Err("added Mach-O archive member SLEB128 value overflowed".to_owned());
+        }
+        value |= payload << shift;
+        if byte & 0x80 == 0 {
+            let used_bits = shift + 7;
+            if used_bits < 64 && byte & 0x40 != 0 {
+                value |= u64::MAX << used_bits;
+            }
+            return Ok(value as i64);
+        }
+    }
+    Err("added Mach-O archive member SLEB128 value overflowed".to_owned())
+}
+
+fn added_macho_archive_unwind_relocations<'data>(
+    section: &object::read::macho::MachOSection64<'data, '_, object::Endianness>,
+    data: &[u8],
+) -> std::result::Result<HashMap<usize, AddedMachOArchiveUnwindRelocation>, String> {
+    let endian = section.macho_file().endian();
+    let raw_relocations = section
+        .macho_relocations()
+        .map_err(|error| format!("failed to read added Mach-O unwind relocations: {error}"))?;
+    let mut relocations = HashMap::new();
+    let mut pending = Vec::new();
+    let mut explicit_addend = 0i64;
+    let mut has_explicit_addend = false;
+    let mut has_subtractor = false;
+    for raw in raw_relocations {
+        if raw.r_scattered(endian, object::macho::CPU_TYPE_ARM64) {
+            return Err(
+                "added Mach-O archive member unwind uses a scattered relocation".to_owned(),
+            );
+        }
+        let info = raw.info(endian);
+        let modeled = AddedMachOArchiveRawRelocation::from(info);
+        if info.r_type == object::macho::ARM64_RELOC_ADDEND {
+            if has_explicit_addend || has_subtractor {
+                return Err(
+                    "added Mach-O archive member unwind has a misplaced ADDEND relocation"
+                        .to_owned(),
+                );
+            }
+            explicit_addend = i64::from(info.r_symbolnum)
+                .wrapping_shl(64 - 24)
+                .wrapping_shr(64 - 24);
+            has_explicit_addend = true;
+            pending.push(modeled);
+            continue;
+        }
+        if info.r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
+            if has_subtractor {
+                return Err(
+                    "added Mach-O archive member unwind has consecutive SUBTRACTOR relocations"
+                        .to_owned(),
+                );
+            }
+            has_subtractor = true;
+            pending.push(modeled);
+            continue;
+        }
+        if has_subtractor && info.r_type != object::macho::ARM64_RELOC_UNSIGNED {
+            return Err(
+                "added Mach-O archive member unwind SUBTRACTOR is not paired with UNSIGNED"
+                    .to_owned(),
+            );
+        }
+        if pending
+            .iter()
+            .any(|relocation| relocation.r_address != info.r_address)
+        {
+            return Err(
+                "added Mach-O archive member unwind relocation operation has mismatched offsets"
+                    .to_owned(),
+            );
+        }
+        if pending
+            .iter()
+            .any(|relocation| relocation.r_length != info.r_length)
+        {
+            return Err(
+                "added Mach-O archive member unwind relocation operation has mismatched widths"
+                    .to_owned(),
+            );
+        }
+        if has_subtractor {
+            let subtractor = pending
+                .iter()
+                .find(|relocation| relocation.r_type == object::macho::ARM64_RELOC_SUBTRACTOR)
+                .expect("tracked SUBTRACTOR relocation");
+            if subtractor.r_pcrel || info.r_pcrel {
+                return Err(
+                    "added Mach-O archive member unwind SUBTRACTOR/UNSIGNED pair is PC-relative"
+                        .to_owned(),
+                );
+            }
+            if !subtractor.r_extern {
+                return Err(
+                    "added Mach-O archive member unwind SUBTRACTOR relocation is not external"
+                        .to_owned(),
+                );
+            }
+        }
+        let input_offset = info.r_address as usize;
+        let Some(width) = 1usize.checked_shl(u32::from(info.r_length)) else {
+            return Err("added Mach-O archive member unwind relocation size is invalid".to_owned());
+        };
+        if input_offset
+            .checked_add(width)
+            .is_none_or(|end| end > data.len())
+        {
+            return Err(
+                "added Mach-O archive member unwind relocation is outside its section".to_owned(),
+            );
+        }
+        let Some(field_value) = read_added_macho_unwind_pointer(data, input_offset, width as u8)
+        else {
+            return Err(
+                "added Mach-O archive member unwind relocation field is truncated".to_owned(),
+            );
+        };
+        pending.push(modeled);
+        let relocation = AddedMachOArchiveUnwindRelocation {
+            input_offset,
+            width: width as u8,
+            explicit_addend,
+            field_value,
+            raw: std::mem::take(&mut pending),
+        };
+        if relocations.insert(input_offset, relocation).is_some() {
+            return Err(
+                "added Mach-O archive member unwind relocation offset is ambiguous".to_owned(),
+            );
+        }
+        explicit_addend = 0;
+        has_explicit_addend = false;
+        has_subtractor = false;
+    }
+    if !pending.is_empty() {
+        return Err(
+            "added Mach-O archive member unwind ends with an incomplete relocation operation"
+                .to_owned(),
+        );
+    }
+    Ok(relocations)
+}
+
+impl From<object::macho::RelocationInfo> for AddedMachOArchiveRawRelocation {
+    fn from(info: object::macho::RelocationInfo) -> Self {
+        Self {
+            r_address: info.r_address,
+            r_symbolnum: info.r_symbolnum,
+            r_pcrel: info.r_pcrel,
+            r_length: info.r_length,
+            r_extern: info.r_extern,
+            r_type: info.r_type,
+        }
+    }
+}
+
+fn added_macho_archive_unwind_pointer_field(
+    file: &object::File<'_>,
+    data: &[u8],
+    relocations: &mut HashMap<usize, AddedMachOArchiveUnwindRelocation>,
+    input_offset: usize,
+    width: u8,
+    encoding: Option<u8>,
+    required: bool,
+) -> Result<std::result::Result<Option<AddedMachOArchiveUnwindPointerField>, String>> {
+    let Some(value) = read_added_macho_unwind_pointer(data, input_offset, width) else {
+        return Ok(Err(
+            "added Mach-O archive member unwind pointer field is truncated".to_owned(),
+        ));
+    };
+    let relocation = relocations.remove(&input_offset);
+    let Some(relocation) = relocation else {
+        if !required && value == 0 {
+            return Ok(Ok(None));
+        }
+        return Ok(Err(
+            "added Mach-O archive member unwind pointer field has no relocation".to_owned(),
+        ));
+    };
+    if relocation.width != width {
+        return Ok(Err(format!(
+            "added Mach-O archive member unwind pointer width {width} does not match relocation width {}",
+            relocation.width
+        )));
+    }
+    let Some(primary) = relocation.raw.last() else {
+        return Ok(Err(
+            "added Mach-O archive member unwind relocation operation is empty".to_owned(),
+        ));
+    };
+    let target = match added_macho_archive_raw_relocation_target(file, primary)? {
+        Ok(target) => target,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    Ok(Ok(Some(AddedMachOArchiveUnwindPointerField {
+        input_offset,
+        width,
+        encoding,
+        value,
+        target,
+        relocation,
+    })))
+}
+
+fn added_macho_archive_unwind_subtractor(
+    relocation: &AddedMachOArchiveUnwindRelocation,
+) -> Option<&AddedMachOArchiveRawRelocation> {
+    relocation
+        .raw
+        .iter()
+        .find(|raw| raw.r_type == object::macho::ARM64_RELOC_SUBTRACTOR)
+}
+
+fn added_macho_archive_raw_relocation_target(
+    file: &object::File<'_>,
+    relocation: &AddedMachOArchiveRawRelocation,
+) -> Result<std::result::Result<AddedMachOArchiveUnwindTarget, String>> {
+    if relocation.r_type == object::macho::ARM64_RELOC_ADDEND {
+        return Ok(Err(
+            "added Mach-O archive member ADDEND relocation has no target".to_owned(),
+        ));
+    }
+    if relocation.r_extern {
+        let symbol = file.symbol_by_index(object::SymbolIndex(relocation.r_symbolnum as usize))?;
+        if let Some(section_index) = symbol.section_index() {
+            let section = file.section_by_index(section_index)?;
+            Ok(Ok(AddedMachOArchiveUnwindTarget::Section(
+                AddedMachOArchiveUnwindSectionPosition {
+                    section_index: patch_section_record_index(file, section_index)?,
+                    section_offset: symbol
+                        .address()
+                        .checked_sub(section.address())
+                        .context("Added Mach-O unwind symbol precedes its section")?,
+                },
+            )))
+        } else if symbol.is_undefined()
+            && symbol.is_global()
+            && !symbol.is_weak()
+            && !symbol.name_bytes()?.is_empty()
+        {
+            Ok(Ok(AddedMachOArchiveUnwindTarget::UndefinedSymbol(
+                symbol.name_bytes()?.to_vec(),
+            )))
+        } else {
+            Ok(Err(
+                "added Mach-O archive member unwind target symbol is unsupported".to_owned(),
+            ))
+        }
+    } else {
+        let section_index = object::SectionIndex(relocation.r_symbolnum as usize);
+        file.section_by_index(section_index)?;
+        Ok(Ok(AddedMachOArchiveUnwindTarget::Section(
+            AddedMachOArchiveUnwindSectionPosition {
+                section_index: patch_section_record_index(file, section_index)?,
+                section_offset: 0,
+            },
+        )))
+    }
+}
+
+fn added_macho_archive_unwind_pointer_position(
+    field: &AddedMachOArchiveUnwindPointerField,
+    include_field_value: bool,
+) -> Result<std::result::Result<AddedMachOArchiveUnwindSectionPosition, String>> {
+    let AddedMachOArchiveUnwindTarget::Section(target) = &field.target else {
+        return Ok(Err(
+            "added Mach-O archive member unwind function target is not section-defined".to_owned(),
+        ));
+    };
+    let mut delta = i128::from(field.relocation.explicit_addend);
+    if include_field_value {
+        delta += i128::from(field.value);
+    }
+    let Some(section_offset) = add_signed_delta_u64(target.section_offset, delta) else {
+        return Ok(Err(
+            "added Mach-O archive member unwind function offset overflowed".to_owned(),
+        ));
+    };
+    Ok(Ok(AddedMachOArchiveUnwindSectionPosition {
+        section_index: target.section_index,
+        section_offset,
+    }))
+}
+
+fn read_added_macho_unwind_pointer(data: &[u8], offset: usize, width: u8) -> Option<u64> {
+    match width {
+        4 => data
+            .get(offset..offset + 4)
+            .and_then(read_u32_le)
+            .map(u64::from),
+        8 => data.get(offset..offset + 8).and_then(read_u64_le),
+        _ => None,
+    }
+}
+
 fn added_macho_archive_text_member(
     input_file_path: &str,
     added_member: PatchInputBytes<'_>,
@@ -14058,12 +15201,32 @@ fn added_macho_archive_text_member(
             "added Mach-O text archive member is not a supported arm64 object".to_owned(),
         ));
     }
+    let unwind = match added_macho_archive_unwind(&file)? {
+        Ok(unwind) => unwind,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let unwind_section_indices = unwind
+        .as_ref()
+        .into_iter()
+        .flat_map(|unwind| {
+            unwind
+                .compact_unwind
+                .iter()
+                .map(|section| section.section_index)
+                .chain(unwind.eh_frame.iter().map(|section| section.section_index))
+        })
+        .collect::<HashSet<_>>();
 
     let mut text_section_index = None;
     let mut allocated_sections = Vec::new();
     let mut allocated_section_indices = HashSet::new();
     let mut ignored_debug_section_indices = HashSet::new();
     for section in file.sections() {
+        let section_index = patch_section_record_index(&file, section.index())?;
+        if unwind_section_indices.contains(&section_index) {
+            ignored_debug_section_indices.insert(section.index());
+            continue;
+        }
         let segment_name = section.segment_name_bytes().ok().flatten();
         let section_name = section.name_bytes().ok();
         let object::SectionFlags::MachO { flags } = section.flags() else {
@@ -14110,7 +15273,6 @@ fn added_macho_archive_text_member(
             };
             let alignment = crate::alignment::Alignment::new(section.align().max(1))
                 .context("Invalid added Mach-O archive member section alignment")?;
-            let section_index = patch_section_record_index(&file, section.index())?;
             let data_size = u64::try_from(data.len())
                 .context("Added Mach-O archive member section is too large")?;
             allocated_section_indices.insert(section.index());
@@ -14267,6 +15429,7 @@ fn added_macho_archive_text_member(
     Ok(Ok(AddedMachOArchiveTextMember {
         input: current_input_ref,
         sections: allocated_sections,
+        unwind,
         text_section_index: section_index,
         text_object_section_index,
         definition_name,
@@ -27666,6 +28829,7 @@ mod tests {
         let member = AddedMachOArchiveTextMember {
             input: "new.o".to_owned(),
             sections: Vec::new(),
+            unwind: None,
             text_section_index: 1,
             text_object_section_index: 1,
             definition_name: b"_new".to_vec(),
@@ -28275,6 +29439,936 @@ mod tests {
         );
     }
 
+    #[test]
+    fn added_macho_archive_unwind_models_mixed_entries_and_shared_cies() {
+        let fixture = test_macho_unwind_object(TestMachOCompactFixture::Mixed, true);
+        let file = object::File::parse(fixture.bytes.as_slice()).unwrap();
+        let unwind = added_macho_archive_unwind(&file).unwrap().unwrap().unwrap();
+        let compact = unwind.compact_unwind.unwrap();
+        let eh_frame = unwind.eh_frame.unwrap();
+
+        assert_eq!(compact.entries.len(), 2);
+        assert_eq!(compact.entries[0].function.section_offset, 0);
+        assert_eq!(compact.entries[0].encoding, 0x0200_0000);
+        assert_eq!(compact.entries[0].fde_index, None);
+        assert_eq!(compact.entries[1].function.section_offset, 0x20);
+        assert_eq!(
+            compact.entries[1].encoding,
+            ADDED_MACHO_UNWIND_MODE_DWARF | 0x123
+        );
+        assert_eq!(compact.entries[1].fde_index, Some(0));
+        assert_eq!(
+            compact.entries[1].function_field.relocation.explicit_addend,
+            0x20
+        );
+        assert_eq!(
+            compact.entries[1]
+                .function_field
+                .relocation
+                .raw
+                .iter()
+                .map(|raw| raw.r_type)
+                .collect::<Vec<_>>(),
+            vec![
+                object::macho::ARM64_RELOC_ADDEND,
+                object::macho::ARM64_RELOC_UNSIGNED
+            ]
+        );
+
+        assert_eq!(eh_frame.cies.len(), 2);
+        assert_eq!(eh_frame.fdes.len(), 3);
+        assert_eq!(eh_frame.fdes[0].cie_index, 0);
+        assert_eq!(eh_frame.fdes[1].cie_index, 0);
+        assert_eq!(eh_frame.fdes[2].cie_index, 1);
+        assert_eq!(eh_frame.fdes[0].pc_begin.width, 4);
+        assert_eq!(
+            eh_frame.fdes[0].pc_begin.input_offset,
+            fixture.first_pc_field_offset.unwrap()
+        );
+        assert_eq!(eh_frame.fdes[0].pc_begin.relocation.explicit_addend, 0x20);
+        assert_eq!(
+            eh_frame.fdes[0]
+                .pc_begin
+                .relocation
+                .raw
+                .iter()
+                .map(|raw| raw.r_type)
+                .collect::<Vec<_>>(),
+            vec![
+                object::macho::ARM64_RELOC_ADDEND,
+                object::macho::ARM64_RELOC_SUBTRACTOR,
+                object::macho::ARM64_RELOC_UNSIGNED,
+            ]
+        );
+        assert_eq!(eh_frame.fdes[0].function.section_offset, 0x20);
+        let lsda = eh_frame.fdes[0].lsda.as_ref().unwrap();
+        assert_eq!(lsda.input_offset, fixture.first_lsda_field_offset.unwrap());
+        assert_eq!(lsda.width, 4);
+        assert_eq!(lsda.relocation.explicit_addend, 4);
+        assert_eq!(
+            lsda.relocation
+                .raw
+                .iter()
+                .map(|raw| raw.r_type)
+                .collect::<Vec<_>>(),
+            vec![
+                object::macho::ARM64_RELOC_ADDEND,
+                object::macho::ARM64_RELOC_SUBTRACTOR,
+                object::macho::ARM64_RELOC_UNSIGNED,
+            ]
+        );
+        let personality = eh_frame.cies[0].personality.as_ref().unwrap();
+        assert_eq!(
+            personality.input_offset,
+            fixture.personality_field_offset.unwrap()
+        );
+        assert_eq!(personality.width, 4);
+        assert_eq!(
+            personality.target,
+            AddedMachOArchiveUnwindTarget::UndefinedSymbol(b"_rust_eh_personality".to_vec())
+        );
+        assert_eq!(eh_frame.fdes[2].pc_begin.width, 8);
+    }
+
+    #[test]
+    fn added_macho_archive_unwind_accepts_independent_sections() {
+        let compact_only = test_macho_unwind_object(TestMachOCompactFixture::NativeOnly, false);
+        let file = object::File::parse(compact_only.bytes.as_slice()).unwrap();
+        let unwind = added_macho_archive_unwind(&file).unwrap().unwrap().unwrap();
+        assert!(unwind.compact_unwind.is_some());
+        assert!(unwind.eh_frame.is_none());
+
+        let eh_frame_only = test_macho_unwind_object(TestMachOCompactFixture::None, true);
+        let file = object::File::parse(eh_frame_only.bytes.as_slice()).unwrap();
+        let unwind = added_macho_archive_unwind(&file).unwrap().unwrap().unwrap();
+        assert!(unwind.compact_unwind.is_none());
+        assert_eq!(unwind.eh_frame.unwrap().fdes.len(), 3);
+    }
+
+    #[test]
+    fn added_macho_archive_unwind_rejects_only_unmatched_dwarf_compact_entries() {
+        let fixture = test_macho_unwind_object(TestMachOCompactFixture::Mixed, false);
+        let file = object::File::parse(fixture.bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            added_macho_archive_unwind(&file).unwrap(),
+            Err(
+                "added Mach-O archive member DWARF compact unwind entry has no matching FDE"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn added_macho_archive_unwind_rejects_malformed_augmentation_and_relocation_pairs() {
+        let mut bad_width = test_macho_unwind_object(TestMachOCompactFixture::Mixed, true);
+        bad_width.bytes[bad_width.cie_fde_encoding_offset.unwrap()] = 0x02;
+        let file = object::File::parse(bad_width.bytes.as_slice()).unwrap();
+        assert!(
+            added_macho_archive_unwind(&file)
+                .unwrap()
+                .unwrap_err()
+                .contains("unsupported DWARF pointer encoding")
+        );
+
+        let mut bad_augmentation = test_macho_unwind_object(TestMachOCompactFixture::Mixed, true);
+        bad_augmentation.bytes[bad_augmentation.cie_augmentation_size_offset.unwrap()] = 0x7f;
+        let file = object::File::parse(bad_augmentation.bytes.as_slice()).unwrap();
+        assert!(
+            added_macho_archive_unwind(&file)
+                .unwrap()
+                .unwrap_err()
+                .contains("augmentation extends past the entry")
+        );
+
+        let mut bad_pair = test_macho_unwind_object(TestMachOCompactFixture::Mixed, true);
+        let word_offset = bad_pair.first_pc_primary_relocation_word_offset.unwrap();
+        let word = u32::from_le_bytes(
+            bad_pair.bytes[word_offset..word_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        bad_pair.bytes[word_offset..word_offset + 4].copy_from_slice(
+            &((word & 0x0fff_ffff) | (u32::from(object::macho::ARM64_RELOC_BRANCH26) << 28))
+                .to_le_bytes(),
+        );
+        let file = object::File::parse(bad_pair.bytes.as_slice()).unwrap();
+        assert!(
+            added_macho_archive_unwind(&file)
+                .unwrap()
+                .unwrap_err()
+                .contains("SUBTRACTOR is not paired with UNSIGNED")
+        );
+    }
+
+    #[test]
+    fn added_macho_archive_unwind_rejects_mismatched_relocation_pair_offsets() {
+        let mut fixture = test_macho_unwind_object(TestMachOCompactFixture::Mixed, true);
+        let primary_word_offset = fixture.first_pc_primary_relocation_word_offset.unwrap();
+        let primary_address_offset = primary_word_offset - 4;
+        let primary_address = u32::from_le_bytes(
+            fixture.bytes[primary_address_offset..primary_word_offset]
+                .try_into()
+                .unwrap(),
+        );
+        fixture.bytes[primary_address_offset..primary_word_offset]
+            .copy_from_slice(&(primary_address + 4).to_le_bytes());
+        let file = object::File::parse(fixture.bytes.as_slice()).unwrap();
+
+        assert!(
+            added_macho_archive_unwind(&file)
+                .unwrap()
+                .unwrap_err()
+                .contains("relocation operation has mismatched offsets")
+        );
+    }
+
+    #[test]
+    fn added_macho_archive_unwind_parses_observed_049_shapes() {
+        for (
+            with_personality,
+            compact_size,
+            compact_relocation_count,
+            eh_frame_size,
+            eh_frame_relocation_count,
+            gcc_except_table_size,
+            cie_count,
+            fde_count,
+        ) in [
+            (false, 32, 1, 72, 2, 0, 1, 1),
+            (true, 64, 2, 168, 7, 28, 2, 2),
+        ] {
+            let bytes = test_observed_049_macho_unwind_object(with_personality);
+            let file = object::File::parse(bytes.as_slice()).unwrap();
+            let object::File::MachO64(macho_file) = &file else {
+                panic!("fixture is not Mach-O 64-bit");
+            };
+            let compact_section = macho_file.section_by_name("__compact_unwind").unwrap();
+            assert_eq!(compact_section.data().unwrap().len(), compact_size);
+            assert_eq!(
+                compact_section.macho_relocations().unwrap().len(),
+                compact_relocation_count
+            );
+            assert_eq!(
+                compact_section.flags(),
+                object::SectionFlags::MachO {
+                    flags: object::macho::S_REGULAR | object::macho::S_ATTR_DEBUG
+                }
+            );
+            let eh_frame_section = macho_file.section_by_name("__eh_frame").unwrap();
+            assert_eq!(eh_frame_section.data().unwrap().len(), eh_frame_size);
+            assert_eq!(
+                eh_frame_section.macho_relocations().unwrap().len(),
+                eh_frame_relocation_count
+            );
+            assert_eq!(
+                eh_frame_section.flags(),
+                object::SectionFlags::MachO { flags: 0x6800_000b }
+            );
+            assert_eq!(
+                macho_file
+                    .section_by_name("__gcc_except_tab")
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .len(),
+                gcc_except_table_size
+            );
+
+            let unwind = added_macho_archive_unwind(&file).unwrap().unwrap().unwrap();
+            let compact = unwind.compact_unwind.unwrap();
+            let eh_frame = unwind.eh_frame.unwrap();
+            assert_eq!(compact.entries.len(), fde_count);
+            assert!(
+                compact
+                    .entries
+                    .iter()
+                    .all(|entry| entry.fde_index.is_some())
+            );
+            assert_eq!(eh_frame.cies.len(), cie_count);
+            assert_eq!(eh_frame.fdes.len(), fde_count);
+            assert_eq!(
+                eh_frame
+                    .cies
+                    .iter()
+                    .filter(|cie| cie.personality.is_some())
+                    .count(),
+                usize::from(with_personality)
+            );
+            assert_eq!(
+                eh_frame
+                    .fdes
+                    .iter()
+                    .filter(|fde| fde.lsda.is_some())
+                    .count(),
+                usize::from(with_personality)
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestMachOCompactFixture {
+        None,
+        NativeOnly,
+        Mixed,
+    }
+
+    struct TestMachOUnwindFixture {
+        bytes: Vec<u8>,
+        personality_field_offset: Option<usize>,
+        first_pc_field_offset: Option<usize>,
+        first_lsda_field_offset: Option<usize>,
+        cie_fde_encoding_offset: Option<usize>,
+        cie_augmentation_size_offset: Option<usize>,
+        first_pc_primary_relocation_word_offset: Option<usize>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestMachORelocation {
+        offset: u32,
+        symbol: u32,
+        pcrel: bool,
+        length: u8,
+        external: bool,
+        r_type: u8,
+    }
+
+    fn test_macho_unwind_object(
+        compact_fixture: TestMachOCompactFixture,
+        include_eh_frame: bool,
+    ) -> TestMachOUnwindFixture {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let mut compact_unwind = Vec::new();
+        let mut compact_relocation_groups = Vec::new();
+        if !matches!(compact_fixture, TestMachOCompactFixture::None) {
+            compact_unwind.extend_from_slice(&0_u64.to_le_bytes());
+            compact_unwind.extend_from_slice(&0x20_u32.to_le_bytes());
+            compact_unwind.extend_from_slice(&0x0200_0000_u32.to_le_bytes());
+            compact_unwind.extend_from_slice(&[0; 16]);
+            compact_relocation_groups.push(vec![TestMachORelocation {
+                offset: 0,
+                symbol: 0,
+                pcrel: false,
+                length: 3,
+                external: true,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            }]);
+        }
+        if matches!(compact_fixture, TestMachOCompactFixture::Mixed) {
+            compact_unwind.extend_from_slice(&0_u64.to_le_bytes());
+            compact_unwind.extend_from_slice(&0x20_u32.to_le_bytes());
+            compact_unwind
+                .extend_from_slice(&(ADDED_MACHO_UNWIND_MODE_DWARF | 0x123).to_le_bytes());
+            compact_unwind.extend_from_slice(&[0; 16]);
+            compact_relocation_groups.push(vec![
+                test_macho_addend_relocation(0x20, 0x20, 3),
+                TestMachORelocation {
+                    offset: 0x20,
+                    symbol: 0,
+                    pcrel: false,
+                    length: 3,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_UNSIGNED,
+                },
+            ]);
+        }
+
+        let mut eh_frame = Vec::new();
+        let mut eh_relocation_groups = Vec::new();
+        let mut personality_field_offset = None;
+        let mut first_pc_field_offset = None;
+        let mut first_lsda_field_offset = None;
+        let mut cie_fde_encoding_section_offset = None;
+        let mut cie_augmentation_size_section_offset = None;
+        if include_eh_frame {
+            let cie_start = eh_frame.len();
+            push_u32(&mut eh_frame, 0);
+            push_u32(&mut eh_frame, 0);
+            eh_frame.push(1);
+            eh_frame.extend_from_slice(b"zPLR\0");
+            eh_frame.extend_from_slice(&[1, 0x78, 30]);
+            cie_augmentation_size_section_offset = Some(eh_frame.len());
+            eh_frame.push(7);
+            eh_frame.push(0x9b);
+            personality_field_offset = Some(eh_frame.len());
+            eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+            eh_frame.push(0x1b);
+            cie_fde_encoding_section_offset = Some(eh_frame.len());
+            eh_frame.push(0x1b);
+            eh_frame.extend_from_slice(&[0x0c, 0x1f, 0]);
+            write_test_eh_frame_length(&mut eh_frame, cie_start);
+
+            let fde_start = eh_frame.len();
+            push_u32(&mut eh_frame, 0);
+            push_u32(&mut eh_frame, (fde_start + 4 - cie_start) as u32);
+            first_pc_field_offset = Some(eh_frame.len());
+            eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+            eh_frame.extend_from_slice(&0x20_u32.to_le_bytes());
+            eh_frame.push(4);
+            first_lsda_field_offset = Some(eh_frame.len());
+            eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+            write_test_eh_frame_length(&mut eh_frame, fde_start);
+
+            let second_fde_start = eh_frame.len();
+            push_u32(&mut eh_frame, 0);
+            push_u32(&mut eh_frame, (second_fde_start + 4 - cie_start) as u32);
+            let second_pc_offset = eh_frame.len();
+            eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+            eh_frame.extend_from_slice(&0x20_u32.to_le_bytes());
+            eh_frame.push(4);
+            eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+            write_test_eh_frame_length(&mut eh_frame, second_fde_start);
+
+            let wide_cie_start = eh_frame.len();
+            push_u32(&mut eh_frame, 0);
+            push_u32(&mut eh_frame, 0);
+            eh_frame.push(1);
+            eh_frame.extend_from_slice(b"zR\0");
+            eh_frame.extend_from_slice(&[1, 0x78, 30, 1, 0x10, 0]);
+            write_test_eh_frame_length(&mut eh_frame, wide_cie_start);
+
+            let wide_fde_start = eh_frame.len();
+            push_u32(&mut eh_frame, 0);
+            push_u32(&mut eh_frame, (wide_fde_start + 4 - wide_cie_start) as u32);
+            let wide_pc_offset = eh_frame.len();
+            eh_frame.extend_from_slice(&0_u64.to_le_bytes());
+            eh_frame.extend_from_slice(&0x20_u64.to_le_bytes());
+            eh_frame.push(0);
+            write_test_eh_frame_length(&mut eh_frame, wide_fde_start);
+            push_u32(&mut eh_frame, 0);
+
+            let eh_symbol = 4;
+            let personality_symbol = 5;
+            eh_relocation_groups.push(vec![TestMachORelocation {
+                offset: personality_field_offset.unwrap() as u32,
+                symbol: personality_symbol,
+                pcrel: true,
+                length: 2,
+                external: true,
+                r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
+            }]);
+            eh_relocation_groups.push(vec![
+                test_macho_addend_relocation(first_pc_field_offset.unwrap() as u32, 0x20, 2),
+                test_macho_subtractor_relocation(
+                    first_pc_field_offset.unwrap() as u32,
+                    eh_symbol,
+                    2,
+                ),
+                test_macho_unsigned_relocation(first_pc_field_offset.unwrap() as u32, 0, 2),
+            ]);
+            eh_relocation_groups.push(vec![
+                test_macho_addend_relocation(first_lsda_field_offset.unwrap() as u32, 4, 2),
+                test_macho_subtractor_relocation(
+                    first_lsda_field_offset.unwrap() as u32,
+                    eh_symbol,
+                    2,
+                ),
+                test_macho_unsigned_relocation(first_lsda_field_offset.unwrap() as u32, 3, 2),
+            ]);
+            eh_relocation_groups.push(vec![
+                test_macho_subtractor_relocation(second_pc_offset as u32, eh_symbol, 2),
+                test_macho_unsigned_relocation(second_pc_offset as u32, 2, 2),
+            ]);
+            eh_relocation_groups.push(vec![
+                test_macho_subtractor_relocation(wide_pc_offset as u32, eh_symbol, 3),
+                test_macho_unsigned_relocation(wide_pc_offset as u32, 0, 3),
+            ]);
+        }
+
+        compact_relocation_groups.sort_by_key(|group| std::cmp::Reverse(group[0].offset));
+        eh_relocation_groups.sort_by_key(|group| std::cmp::Reverse(group[0].offset));
+        let compact_relocations = compact_relocation_groups
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let eh_relocations = eh_relocation_groups
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let text = vec![0; 0x80];
+        let gcc_except_table = vec![0; 0x10];
+        let has_compact = !compact_unwind.is_empty();
+        let section_count = 2 + usize::from(has_compact) + usize::from(include_eh_frame);
+        let commands_size =
+            SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let text_offset = HEADER_SIZE + commands_size;
+        let gcc_except_table_offset = text_offset + text.len();
+        let compact_unwind_offset = gcc_except_table_offset + gcc_except_table.len();
+        let eh_frame_offset = compact_unwind_offset + compact_unwind.len();
+        let compact_relocation_offset = (eh_frame_offset + eh_frame.len()).next_multiple_of(8);
+        let eh_relocation_offset = compact_relocation_offset + compact_relocations.len() * 8;
+        let symoff = (eh_relocation_offset + eh_relocations.len() * 8).next_multiple_of(8);
+        let symbol_count = 4 + usize::from(include_eh_frame) * 2;
+        let stroff = symoff + symbol_count * NLIST_64_SIZE;
+
+        let mut strings = vec![0];
+        let mut add_string = |name: &[u8]| {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(name);
+            strings.push(0);
+            offset
+        };
+        let function0_name = add_string(b"_function0");
+        let function1_name = add_string(b"_function1");
+        let function2_name = add_string(b"_function2");
+        let lsda_name = add_string(b"_lsda");
+        let eh_frame_name = include_eh_frame.then(|| add_string(b"_eh_frame"));
+        let personality_name = include_eh_frame.then(|| add_string(b"_rust_eh_personality"));
+
+        let text_address = 0;
+        let gcc_except_table_address = text.len() as u64;
+        let compact_unwind_address = gcc_except_table_address + gcc_except_table.len() as u64;
+        let eh_frame_address = compact_unwind_address + compact_unwind.len() as u64;
+        let segment_size =
+            text.len() + gcc_except_table.len() + compact_unwind.len() + eh_frame.len();
+        let eh_frame_section_index = include_eh_frame.then_some(3_u8 + u8::from(has_compact));
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(
+            &mut bytes,
+            (SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE) as u32,
+        );
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, segment_size as u64);
+        push_u64(&mut bytes, text_offset as u64);
+        push_u64(&mut bytes, segment_size as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, section_count as u32);
+        push_u32(&mut bytes, 0);
+
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__text",
+            b"__TEXT",
+            text_address,
+            text.len(),
+            text_offset,
+            0,
+            0,
+            object::macho::S_REGULAR
+                | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+        );
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__gcc_except_tab",
+            b"__TEXT",
+            gcc_except_table_address,
+            gcc_except_table.len(),
+            gcc_except_table_offset,
+            0,
+            0,
+            object::macho::S_REGULAR,
+        );
+        if has_compact {
+            push_macho_section_with_relocations(
+                &mut bytes,
+                b"__compact_unwind",
+                b"__LD",
+                compact_unwind_address,
+                compact_unwind.len(),
+                compact_unwind_offset,
+                compact_relocation_offset,
+                compact_relocations.len(),
+                object::macho::S_REGULAR | object::macho::S_ATTR_DEBUG,
+            );
+        }
+        if include_eh_frame {
+            push_macho_section_with_relocations(
+                &mut bytes,
+                b"__eh_frame",
+                b"__TEXT",
+                eh_frame_address,
+                eh_frame.len(),
+                eh_frame_offset,
+                eh_relocation_offset,
+                eh_relocations.len(),
+                object::macho::S_COALESCED,
+            );
+        }
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, symbol_count as u32);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), text_offset);
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&gcc_except_table);
+        bytes.extend_from_slice(&compact_unwind);
+        bytes.extend_from_slice(&eh_frame);
+        bytes.resize(compact_relocation_offset, 0);
+        for relocation in &compact_relocations {
+            push_test_macho_relocation(&mut bytes, *relocation);
+        }
+        assert_eq!(bytes.len(), eh_relocation_offset);
+        let mut first_pc_primary_relocation_word_offset = None;
+        for relocation in &eh_relocations {
+            let word_offset = bytes.len() + 4;
+            if Some(relocation.offset as usize) == first_pc_field_offset
+                && relocation.r_type == object::macho::ARM64_RELOC_UNSIGNED
+            {
+                first_pc_primary_relocation_word_offset = Some(word_offset);
+            }
+            push_test_macho_relocation(&mut bytes, *relocation);
+        }
+
+        bytes.resize(symoff, 0);
+        push_macho_symbol(&mut bytes, function0_name, 1, text_address);
+        push_macho_local_symbol(&mut bytes, function1_name, 1, text_address + 0x20);
+        push_macho_local_symbol(&mut bytes, function2_name, 1, text_address + 0x40);
+        push_macho_local_symbol(&mut bytes, lsda_name, 2, gcc_except_table_address);
+        if include_eh_frame {
+            push_macho_local_symbol(
+                &mut bytes,
+                eh_frame_name.unwrap(),
+                eh_frame_section_index.unwrap(),
+                eh_frame_address,
+            );
+            push_macho_undefined_symbol(&mut bytes, personality_name.unwrap());
+        }
+        bytes.extend_from_slice(&strings);
+
+        TestMachOUnwindFixture {
+            bytes,
+            personality_field_offset,
+            first_pc_field_offset,
+            first_lsda_field_offset,
+            cie_fde_encoding_offset: cie_fde_encoding_section_offset
+                .map(|offset| eh_frame_offset + offset),
+            cie_augmentation_size_offset: cie_augmentation_size_section_offset
+                .map(|offset| eh_frame_offset + offset),
+            first_pc_primary_relocation_word_offset,
+        }
+    }
+
+    fn test_observed_049_macho_unwind_object(with_personality: bool) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let text = vec![0; if with_personality { 0x2dc } else { 0x258 }];
+        let gcc_except_table = vec![0; if with_personality { 0x1c } else { 0 }];
+        let compact_unwind = if with_personality {
+            [
+                0_u64.to_le_bytes().as_slice(),
+                0x110_u32.to_le_bytes().as_slice(),
+                ADDED_MACHO_UNWIND_MODE_DWARF.to_le_bytes().as_slice(),
+                &[0; 16],
+                0x110_u64.to_le_bytes().as_slice(),
+                0x1cc_u32.to_le_bytes().as_slice(),
+                ADDED_MACHO_UNWIND_MODE_DWARF.to_le_bytes().as_slice(),
+                &[0; 16],
+            ]
+            .concat()
+        } else {
+            [
+                0_u64.to_le_bytes().as_slice(),
+                0x258_u32.to_le_bytes().as_slice(),
+                ADDED_MACHO_UNWIND_MODE_DWARF.to_le_bytes().as_slice(),
+                &[0; 16],
+            ]
+            .concat()
+        };
+        let eh_frame = if with_personality {
+            hex::decode(concat!(
+                "1000000000000000017a520001781e01100c1f00",
+                "3000000018000000e4ffffffffffffff100100000000000000440e40480c1d10",
+                "9e019d0202f80c1f40480e00dedd000000000000",
+                "1800000000000000017a504c520001781e079ba5ffffff10100c1f00",
+                "400000002000000094ffffffffffffffcc010000000000000883ffffffffffffff",
+                "ff440eb0024c0c1d109e019d029b039c040a0390010c1fb0024c0e00dedddbdc",
+                "440b00"
+            ))
+            .unwrap()
+        } else {
+            hex::decode(concat!(
+                "1000000000000000017a520001781e01100c1f00",
+                "3000000018000000e4ffffffffffffff580200000000000000440e40480c1d10",
+                "9e019d020340020c1f40480e00dedd0000000000"
+            ))
+            .unwrap()
+        };
+
+        let section_count = 4;
+        let commands_size =
+            SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let text_offset = HEADER_SIZE + commands_size;
+        let gcc_except_table_offset = text_offset + text.len();
+        let compact_unwind_offset = gcc_except_table_offset + gcc_except_table.len();
+        let eh_frame_offset = compact_unwind_offset + compact_unwind.len();
+        let compact_relocation_count = if with_personality { 2 } else { 1 };
+        let eh_frame_relocation_count = if with_personality { 7 } else { 2 };
+        let compact_relocation_offset = (eh_frame_offset + eh_frame.len()).next_multiple_of(8);
+        let eh_frame_relocation_offset = compact_relocation_offset + compact_relocation_count * 8;
+        let symoff =
+            (eh_frame_relocation_offset + eh_frame_relocation_count * 8).next_multiple_of(8);
+        let symbol_count = 5;
+        let stroff = symoff + symbol_count * NLIST_64_SIZE;
+
+        let mut strings = vec![0];
+        let mut add_string = |name: &[u8]| {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(name);
+            strings.push(0);
+            offset
+        };
+        let function0_name = add_string(b"_function0");
+        let function1_name = add_string(b"_function1");
+        let lsda_name = add_string(b"_lsda");
+        let eh_frame_name = add_string(b"_eh_frame");
+        let personality_name = add_string(b"_rust_eh_personality");
+
+        let text_address = 0;
+        let gcc_except_table_address = text.len() as u64;
+        let compact_unwind_address = gcc_except_table_address + gcc_except_table.len() as u64;
+        let eh_frame_address = compact_unwind_address + compact_unwind.len() as u64;
+        let segment_size =
+            text.len() + gcc_except_table.len() + compact_unwind.len() + eh_frame.len();
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(
+            &mut bytes,
+            (SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE) as u32,
+        );
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, segment_size as u64);
+        push_u64(&mut bytes, text_offset as u64);
+        push_u64(&mut bytes, segment_size as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, section_count as u32);
+        push_u32(&mut bytes, 0);
+
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__text",
+            b"__TEXT",
+            text_address,
+            text.len(),
+            text_offset,
+            0,
+            0,
+            object::macho::S_REGULAR
+                | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+        );
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__gcc_except_tab",
+            b"__TEXT",
+            gcc_except_table_address,
+            gcc_except_table.len(),
+            gcc_except_table_offset,
+            0,
+            0,
+            object::macho::S_REGULAR,
+        );
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__compact_unwind",
+            b"__LD",
+            compact_unwind_address,
+            compact_unwind.len(),
+            compact_unwind_offset,
+            compact_relocation_offset,
+            compact_relocation_count,
+            object::macho::S_REGULAR | object::macho::S_ATTR_DEBUG,
+        );
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__eh_frame",
+            b"__TEXT",
+            eh_frame_address,
+            eh_frame.len(),
+            eh_frame_offset,
+            eh_frame_relocation_offset,
+            eh_frame_relocation_count,
+            0x6800_000b,
+        );
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, symbol_count as u32);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), text_offset);
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&gcc_except_table);
+        bytes.extend_from_slice(&compact_unwind);
+        bytes.extend_from_slice(&eh_frame);
+        bytes.resize(compact_relocation_offset, 0);
+        if with_personality {
+            push_test_macho_relocation(
+                &mut bytes,
+                TestMachORelocation {
+                    offset: 0x20,
+                    symbol: 1,
+                    pcrel: false,
+                    length: 3,
+                    external: false,
+                    r_type: object::macho::ARM64_RELOC_UNSIGNED,
+                },
+            );
+        }
+        push_test_macho_relocation(
+            &mut bytes,
+            TestMachORelocation {
+                offset: 0,
+                symbol: 1,
+                pcrel: false,
+                length: 3,
+                external: false,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            },
+        );
+        assert_eq!(bytes.len(), eh_frame_relocation_offset);
+
+        let push_subtractor_pair = |bytes: &mut Vec<u8>, offset: u32, target_symbol: u32| {
+            push_test_macho_relocation(
+                bytes,
+                TestMachORelocation {
+                    offset,
+                    symbol: 3,
+                    pcrel: false,
+                    length: 3,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_SUBTRACTOR,
+                },
+            );
+            push_test_macho_relocation(
+                bytes,
+                TestMachORelocation {
+                    offset,
+                    symbol: target_symbol,
+                    pcrel: false,
+                    length: 3,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_UNSIGNED,
+                },
+            );
+        };
+        if with_personality {
+            push_subtractor_pair(&mut bytes, 0x7d, 2);
+            push_subtractor_pair(&mut bytes, 0x6c, 1);
+            push_test_macho_relocation(
+                &mut bytes,
+                TestMachORelocation {
+                    offset: 0x5b,
+                    symbol: 4,
+                    pcrel: true,
+                    length: 2,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
+                },
+            );
+        }
+        push_subtractor_pair(&mut bytes, 0x1c, 0);
+
+        bytes.resize(symoff, 0);
+        push_macho_symbol(&mut bytes, function0_name, 1, text_address);
+        push_macho_local_symbol(
+            &mut bytes,
+            function1_name,
+            1,
+            text_address + if with_personality { 0x110 } else { 0 },
+        );
+        push_macho_local_symbol(&mut bytes, lsda_name, 2, gcc_except_table_address);
+        push_macho_local_symbol(&mut bytes, eh_frame_name, 4, eh_frame_address);
+        push_macho_undefined_symbol(&mut bytes, personality_name);
+        bytes.extend_from_slice(&strings);
+        bytes
+    }
+
+    fn write_test_eh_frame_length(bytes: &mut [u8], entry_start: usize) {
+        let length = u32::try_from(bytes.len() - entry_start - 4).unwrap();
+        bytes[entry_start..entry_start + 4].copy_from_slice(&length.to_le_bytes());
+    }
+
+    fn test_macho_addend_relocation(offset: u32, addend: i32, length: u8) -> TestMachORelocation {
+        TestMachORelocation {
+            offset,
+            symbol: (addend as u32) & 0x00ff_ffff,
+            pcrel: false,
+            length,
+            external: false,
+            r_type: object::macho::ARM64_RELOC_ADDEND,
+        }
+    }
+
+    fn test_macho_subtractor_relocation(
+        offset: u32,
+        symbol: u32,
+        length: u8,
+    ) -> TestMachORelocation {
+        TestMachORelocation {
+            offset,
+            symbol,
+            pcrel: false,
+            length,
+            external: true,
+            r_type: object::macho::ARM64_RELOC_SUBTRACTOR,
+        }
+    }
+
+    fn test_macho_unsigned_relocation(offset: u32, symbol: u32, length: u8) -> TestMachORelocation {
+        TestMachORelocation {
+            offset,
+            symbol,
+            pcrel: false,
+            length,
+            external: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        }
+    }
+
+    fn push_test_macho_relocation(bytes: &mut Vec<u8>, relocation: TestMachORelocation) {
+        push_u32(bytes, relocation.offset);
+        push_u32(
+            bytes,
+            relocation.symbol
+                | u32::from(relocation.pcrel) << 24
+                | u32::from(relocation.length) << 25
+                | u32::from(relocation.external) << 27
+                | u32::from(relocation.r_type) << 28,
+        );
+    }
+
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
         test_macho_object_with_data_section_name(text, data, data_symbol_offset, b"__data")
     }
@@ -28536,12 +30630,46 @@ mod tests {
         push_u32(bytes, 0);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn push_macho_section_with_relocations(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        segment: &[u8],
+        address: u64,
+        size: usize,
+        offset: usize,
+        relocation_offset: usize,
+        relocation_count: usize,
+        flags: u32,
+    ) {
+        push_fixed_name(bytes, name);
+        push_fixed_name(bytes, segment);
+        push_u64(bytes, address);
+        push_u64(bytes, size as u64);
+        push_u32(bytes, offset as u32);
+        push_u32(bytes, 2);
+        push_u32(bytes, relocation_offset as u32);
+        push_u32(bytes, relocation_count as u32);
+        push_u32(bytes, flags);
+        push_u32(bytes, 0);
+        push_u32(bytes, 0);
+        push_u32(bytes, 0);
+    }
+
     fn push_macho_symbol(bytes: &mut Vec<u8>, name_offset: u32, section: u8, value: u64) {
         push_u32(bytes, name_offset);
         bytes.push(object::macho::N_SECT | object::macho::N_EXT);
         bytes.push(section);
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         push_u64(bytes, value);
+    }
+
+    fn push_macho_undefined_symbol(bytes: &mut Vec<u8>, name_offset: u32) {
+        push_u32(bytes, name_offset);
+        bytes.push(object::macho::N_UNDF | object::macho::N_EXT);
+        bytes.push(0);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        push_u64(bytes, 0);
     }
 
     fn push_macho_local_symbol(bytes: &mut Vec<u8>, name_offset: u32, section: u8, value: u64) {
@@ -28788,6 +30916,7 @@ mod tests {
         let member = |definition: &[u8], references: &[&[u8]]| AddedMachOArchiveTextMember {
             input: String::new(),
             sections: Vec::new(),
+            unwind: None,
             text_section_index: 0,
             text_object_section_index: 1,
             definition_name: definition.to_vec(),
