@@ -10,6 +10,7 @@ use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
 use crate::incremental::DeferredMachOSymbolResolution;
 use crate::incremental::PreparedState;
+use crate::layout::EpilogueLayout;
 use crate::layout::FileLayout;
 use crate::layout::HeaderInfo;
 use crate::layout::InternalSymbols;
@@ -1039,7 +1040,59 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
         FileLayout::LinkerScript(s) => {
             write_internal_symbols(&s.internal_symbols, buffers, layout, symbol_writer)?;
         }
-        FileLayout::Dynamic(_) | FileLayout::Epilogue(_) | FileLayout::NotLoaded => {}
+        FileLayout::Epilogue(epilogue) => {
+            write_incremental_reserves(
+                epilogue,
+                buffers,
+                incremental,
+                group_file_offsets,
+                group_file_sizes,
+            )?;
+        }
+        FileLayout::Dynamic(_) | FileLayout::NotLoaded => {}
+    }
+    Ok(())
+}
+
+fn write_incremental_reserves(
+    epilogue: &EpilogueLayout<MachO>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    incremental: &PreparedState<'_>,
+    group_file_offsets: &OutputSectionPartMap<usize>,
+    group_file_sizes: &OutputSectionPartMap<usize>,
+) -> Result {
+    let Some(reserves) = &epilogue.format_specific.incremental_reserves else {
+        return Ok(());
+    };
+    for (part_index, &size) in reserves.parts.iter().enumerate() {
+        if size == 0 {
+            continue;
+        }
+        let part_id = crate::part_id::PartId::from_usize(part_index);
+        let allocation_size =
+            usize::try_from(size).context("Mach-O incremental reserve exceeds usize")?;
+        let buffer = buffers.get_mut(part_id);
+        let consumed_in_group = group_file_sizes
+            .get(part_id)
+            .checked_sub(buffer.len())
+            .context("Incremental reserve buffer is larger than its group allocation")?;
+        let output_offset = group_file_offsets
+            .get(part_id)
+            .checked_add(consumed_in_group)
+            .context("Incremental reserve output offset overflow")?;
+        let reserve = buffer
+            .split_off_mut(..allocation_size)
+            .context("Insufficient space allocated to Mach-O incremental reserve")?;
+        reserve.fill(0);
+        let alignment = part_id
+            .regular_alignment()
+            .context("Mach-O incremental reserve uses a non-regular output section")?;
+        incremental.record_reserved_range(
+            part_id.output_section_id().as_usize() as u32,
+            alignment.exponent,
+            output_offset as u64,
+            size,
+        );
     }
     Ok(())
 }
