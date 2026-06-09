@@ -5008,11 +5008,16 @@ struct AddedMachOArchiveTextMember {
     unwind: Option<AddedMachOArchiveUnwind>,
     text_section_index: u32,
     text_object_section_index: u32,
-    definition_name: Vec<u8>,
-    definition_offset: u64,
-    definition_desc: u16,
-    definition_private_external: bool,
+    definitions: Vec<AddedMachOArchiveDefinition>,
     referenced_names: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedMachOArchiveDefinition {
+    name: Vec<u8>,
+    offset: u64,
+    desc: u16,
+    private_external: bool,
 }
 
 struct AddedMachOArchiveSection {
@@ -13338,15 +13343,21 @@ fn added_macho_archive_text_activations(
         members.push(member);
     }
 
-    let mut definitions = HashMap::<Vec<u8>, usize>::with_capacity(members.len());
+    let definition_count = members
+        .iter()
+        .map(|member| member.definitions.len())
+        .sum::<usize>();
+    let mut definitions = HashMap::<Vec<u8>, usize>::with_capacity(definition_count);
     for (member_index, member) in members.iter().enumerate() {
-        if definitions
-            .insert(member.definition_name.clone(), member_index)
-            .is_some()
-        {
-            return Ok(Err(
-                "added Mach-O archive member definition is ambiguous".to_owned()
-            ));
+        for definition in &member.definitions {
+            if definitions
+                .insert(definition.name.clone(), member_index)
+                .is_some()
+            {
+                return Ok(Err(
+                    "added Mach-O archive member definition is ambiguous".to_owned()
+                ));
+            }
         }
     }
     let seed_references = match added_macho_archive_seed_references(
@@ -13379,7 +13390,14 @@ fn added_macho_archive_text_activations(
         .sum();
     let mut sections = Vec::with_capacity(section_count);
     let mut records = Vec::with_capacity(section_count);
-    let mut symbol_resolutions = Vec::with_capacity(selected_indices.len());
+    let selected_definitions = selected_indices
+        .iter()
+        .flat_map(|&member_index| {
+            (0..members[member_index].definitions.len())
+                .map(move |definition_index| (member_index, definition_index))
+        })
+        .collect::<Vec<_>>();
+    let mut symbol_resolutions = Vec::with_capacity(selected_definitions.len());
     for &member_index in &selected_indices {
         let member = &members[member_index];
         for source_section in &member.sections {
@@ -13431,23 +13449,25 @@ fn added_macho_archive_text_activations(
                 "added Mach-O archive member text reserve has no output address".to_owned(),
             ));
         };
-        let definition_value = section_address
-            .checked_add(member.definition_offset)
-            .context("Added Mach-O archive member definition address overflow")?;
-        let target = RelocationTargetRecord {
-            input_file: input_file_path.into(),
-            input: member.input.clone().into(),
-            section_index: member.text_object_section_index,
-            section_offset: member.definition_offset,
-        };
-        symbol_resolutions.push(MachOSymbolResolutionRecord {
-            name: hex::encode(&member.definition_name).into(),
-            direct_value: Some(definition_value),
-            got_address: None,
-            stub_address: None,
-            thunk_addresses: Vec::new(),
-            target: Some(target),
-        });
+        for definition in &member.definitions {
+            let definition_value = section_address
+                .checked_add(definition.offset)
+                .context("Added Mach-O archive member definition address overflow")?;
+            let target = RelocationTargetRecord {
+                input_file: input_file_path.into(),
+                input: member.input.clone().into(),
+                section_index: member.text_object_section_index,
+                section_offset: definition.offset,
+            };
+            symbol_resolutions.push(MachOSymbolResolutionRecord {
+                name: hex::encode(&definition.name).into(),
+                direct_value: Some(definition_value),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(target),
+            });
+        }
     }
     if retiring_names.len() > symbol_resolutions.len() {
         return Ok(Err(
@@ -13459,7 +13479,7 @@ fn added_macho_archive_text_activations(
             previous_output,
             &output_file,
             &members,
-            &selected_indices[..retiring_names.len()],
+            &selected_definitions[..retiring_names.len()],
             &symbol_resolutions[..retiring_names.len()],
             retiring_names,
             resolutions,
@@ -13472,7 +13492,7 @@ fn added_macho_archive_text_activations(
         previous_output,
         &output_file,
         &members,
-        &selected_indices[retiring_names.len()..],
+        &selected_definitions[retiring_names.len()..],
         &symbol_resolutions[retiring_names.len()..],
         &mut remaining_reserved_ranges,
     )? {
@@ -13754,7 +13774,7 @@ fn macho_symbol_entry_range(
 }
 
 fn added_macho_symbol_entry(
-    member: &AddedMachOArchiveTextMember,
+    definition: &AddedMachOArchiveDefinition,
     text_section_index: u8,
     string_index: u32,
     value: u64,
@@ -13764,12 +13784,12 @@ fn added_macho_symbol_entry(
     >());
     entry.extend_from_slice(&string_index.to_le_bytes());
     let mut symbol_type = object::macho::N_SECT | object::macho::N_EXT;
-    if member.definition_private_external {
+    if definition.private_external {
         symbol_type |= object::macho::N_PEXT;
     }
     entry.push(symbol_type);
     entry.push(text_section_index);
-    entry.extend_from_slice(&member.definition_desc.to_le_bytes());
+    entry.extend_from_slice(&definition.desc.to_le_bytes());
     entry.extend_from_slice(&value.to_le_bytes());
     entry
 }
@@ -13778,7 +13798,7 @@ fn recycled_macho_symbol_table_patches(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     members: &[AddedMachOArchiveTextMember],
-    selected_indices: &[usize],
+    selected_definitions: &[(usize, usize)],
     resolutions: &[MachOSymbolResolutionRecord],
     retiring_names: &[SharedText],
     previous_resolutions: &[MachOSymbolResolutionRecord],
@@ -13810,14 +13830,17 @@ fn recycled_macho_symbol_table_patches(
         .context("Mach-O string table output section ID exceeds u32")?;
     let mut patches = Vec::with_capacity(retiring_names.len() * 2);
 
-    for ((&member_index, resolution), retiring_name) in
-        selected_indices.iter().zip(resolutions).zip(retiring_names)
+    for ((&(member_index, definition_index), resolution), retiring_name) in selected_definitions
+        .iter()
+        .zip(resolutions)
+        .zip(retiring_names)
     {
         let member = &members[member_index];
+        let definition = &member.definitions[definition_index];
         if output_file.symbols().any(|symbol| {
             symbol
                 .name_bytes()
-                .is_ok_and(|name| name == member.definition_name.as_slice())
+                .is_ok_and(|name| name == definition.name.as_slice())
         }) {
             return Ok(Err(
                 "added Mach-O archive member definition already exists in output".to_owned(),
@@ -13872,7 +13895,7 @@ fn recycled_macho_symbol_table_patches(
             ));
         }
 
-        let string_size = u64::try_from(member.definition_name.len() + 1)
+        let string_size = u64::try_from(definition.name.len() + 1)
             .context("Added Mach-O symbol name is too large")?;
         let Some(string_allocation) = allocate_reserved_range(
             remaining_reserved_ranges,
@@ -13902,12 +13925,12 @@ fn recycled_macho_symbol_table_patches(
         patches.push(SectionPatch {
             output_offset: symbol_range.start as u64,
             size: symbol_range.len() as u64,
-            data: added_macho_symbol_entry(member, text_section_index, string_index, value),
+            data: added_macho_symbol_entry(definition, text_section_index, string_index, value),
             deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
-        let mut name = member.definition_name.clone();
+        let mut name = definition.name.clone();
         name.push(0);
         patches.push(SectionPatch {
             output_offset: string_allocation.output_offset,
@@ -13925,7 +13948,7 @@ fn added_macho_symbol_table_patches(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     members: &[AddedMachOArchiveTextMember],
-    selected_indices: &[usize],
+    selected_definitions: &[(usize, usize)],
     resolutions: &[MachOSymbolResolutionRecord],
     remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
 ) -> Result<std::result::Result<Vec<SectionPatch>, String>> {
@@ -13953,10 +13976,13 @@ fn added_macho_symbol_table_patches(
         object::macho::Nlist64<object::Endianness>,
     >())
     .context("Mach-O symbol table entry size exceeds u64")?;
-    let mut patches = Vec::with_capacity(selected_indices.len() * 2);
+    let mut patches = Vec::with_capacity(selected_definitions.len() * 2);
 
-    for (&member_index, resolution) in selected_indices.iter().zip(resolutions) {
+    for (&(member_index, definition_index), resolution) in
+        selected_definitions.iter().zip(resolutions)
+    {
         let member = &members[member_index];
+        let definition = &member.definitions[definition_index];
         let Some(value) = resolution.direct_value else {
             return Ok(Err(
                 "added Mach-O archive member definition has no direct value".to_owned(),
@@ -13965,7 +13991,7 @@ fn added_macho_symbol_table_patches(
         if output_file.symbols().any(|symbol| {
             symbol
                 .name_bytes()
-                .is_ok_and(|name| name == member.definition_name.as_slice())
+                .is_ok_and(|name| name == definition.name.as_slice())
         }) {
             return Ok(Err(
                 "added Mach-O archive member definition already exists in output".to_owned(),
@@ -13982,7 +14008,7 @@ fn added_macho_symbol_table_patches(
                 "insufficient incremental reserve for added Mach-O symbol table entry".to_owned(),
             ));
         };
-        let string_size = u64::try_from(member.definition_name.len() + 1)
+        let string_size = u64::try_from(definition.name.len() + 1)
             .context("Added Mach-O symbol name is too large")?;
         let Some(string_allocation) = allocate_reserved_range(
             remaining_reserved_ranges,
@@ -14005,7 +14031,7 @@ fn added_macho_symbol_table_patches(
             ));
         };
 
-        let entry = added_macho_symbol_entry(member, text_section_index, string_index, value);
+        let entry = added_macho_symbol_entry(definition, text_section_index, string_index, value);
         debug_assert_eq!(entry.len() as u64, symbol_entry_size);
         patches.push(SectionPatch {
             output_offset: symbol_allocation.output_offset,
@@ -14016,7 +14042,7 @@ fn added_macho_symbol_table_patches(
             adjustments: Vec::new(),
         });
 
-        let mut name = member.definition_name.clone();
+        let mut name = definition.name.clone();
         name.push(0);
         patches.push(SectionPatch {
             output_offset: string_allocation.output_offset,
@@ -16821,7 +16847,7 @@ fn added_macho_archive_text_member(
         ));
     };
 
-    let mut definition = None;
+    let mut definitions = Vec::new();
     for symbol in file.symbols() {
         let name = symbol.name_bytes()?;
         if symbol.is_undefined() {
@@ -16847,70 +16873,79 @@ fn added_macho_archive_text_member(
                     "added Mach-O archive member definition has non-Mach-O flags".to_owned(),
                 ));
             };
-            if symbol.section_index() != Some(text.index())
-                || symbol.is_weak()
-                || name.is_empty()
-                || definition
-                    .replace((
-                        name.to_vec(),
-                        symbol.address(),
-                        n_desc,
-                        symbol.scope() == object::SymbolScope::Linkage,
-                    ))
-                    .is_some()
-            {
+            if symbol.section_index() != Some(text.index()) || symbol.is_weak() || name.is_empty() {
                 return Ok(Err(
-                    "added Mach-O archive member needs one strong global definition".to_owned(),
+                    "added Mach-O archive member has an unsupported strong global definition"
+                        .to_owned(),
                 ));
             }
+            definitions.push((
+                name.to_vec(),
+                symbol.address(),
+                n_desc,
+                symbol.scope() == object::SymbolScope::Linkage,
+            ));
         } else if symbol.scope() != object::SymbolScope::Compilation || symbol.is_weak() {
             return Ok(Err(
                 "added Mach-O archive member has unsupported local symbols".to_owned(),
             ));
         }
     }
-    let Some((definition_name, definition_address, definition_desc, definition_private_external)) =
-        definition
-    else {
+    if definitions.is_empty() {
         return Ok(Err(
             "added Mach-O archive member has no strong global definition".to_owned(),
         ));
-    };
-    let encoded_definition_name = hex::encode(&definition_name);
-    if resolutions
-        .iter()
-        .any(|resolution| resolution.name.as_str() == encoded_definition_name)
-    {
-        return Ok(Err(
-            "added Mach-O archive member definition already has a resolution".to_owned(),
-        ));
     }
-    for member in other_members {
-        let Ok(other) = object::File::parse(*member) else {
-            continue;
-        };
-        if other.symbols().any(|symbol| {
-            symbol.is_global()
-                && !symbol.is_undefined()
-                && symbol
-                    .name_bytes()
-                    .is_ok_and(|name| name == definition_name.as_slice())
-        }) {
-            return Ok(Err(
-                "added Mach-O archive member definition is not unique".to_owned()
-            ));
-        }
+    definitions.sort_by(|left, right| left.0.cmp(&right.0));
+    if definitions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Ok(Err(
+            "added Mach-O archive member definition is ambiguous".to_owned()
+        ));
     }
 
     let data_size =
         u64::try_from(data.len()).context("Added Mach-O archive member text is too large")?;
-    let definition_offset = definition_address
-        .checked_sub(text.address())
-        .context("Added Mach-O archive member definition precedes __text")?;
-    if definition_offset >= data_size {
-        return Ok(Err(
-            "added Mach-O archive member definition is outside __text".to_owned(),
-        ));
+    let mut parsed_definitions = Vec::with_capacity(definitions.len());
+    for (name, address, desc, private_external) in definitions {
+        let encoded_name = hex::encode(&name);
+        if resolutions
+            .iter()
+            .any(|resolution| resolution.name.as_str() == encoded_name)
+        {
+            return Ok(Err(
+                "added Mach-O archive member definition already has a resolution".to_owned(),
+            ));
+        }
+        for member in other_members {
+            let Ok(other) = object::File::parse(*member) else {
+                continue;
+            };
+            if other.symbols().any(|symbol| {
+                symbol.is_global()
+                    && !symbol.is_undefined()
+                    && symbol
+                        .name_bytes()
+                        .is_ok_and(|candidate| candidate == name.as_slice())
+            }) {
+                return Ok(Err(
+                    "added Mach-O archive member definition is not unique".to_owned()
+                ));
+            }
+        }
+        let offset = address
+            .checked_sub(text.address())
+            .context("Added Mach-O archive member definition precedes __text")?;
+        if offset >= data_size {
+            return Ok(Err(
+                "added Mach-O archive member definition is outside __text".to_owned(),
+            ));
+        }
+        parsed_definitions.push(AddedMachOArchiveDefinition {
+            name,
+            offset,
+            desc,
+            private_external,
+        });
     }
     let current_input_ref =
         resolved_patch_input_ref(input_file_path, input_file_path, added_member)?;
@@ -16935,10 +16970,7 @@ fn added_macho_archive_text_member(
         unwind,
         text_section_index: section_index,
         text_object_section_index,
-        definition_name,
-        definition_offset,
-        definition_desc,
-        definition_private_external,
+        definitions: parsed_definitions,
         referenced_names,
     }))
 }
@@ -30481,10 +30513,12 @@ mod tests {
             unwind: None,
             text_section_index: 1,
             text_object_section_index: 1,
-            definition_name: b"_new".to_vec(),
-            definition_offset: 0,
-            definition_desc: 0,
-            definition_private_external: false,
+            definitions: vec![AddedMachOArchiveDefinition {
+                name: b"_new".to_vec(),
+                offset: 0,
+                desc: 0,
+                private_external: false,
+            }],
             referenced_names: Vec::new(),
         };
         let new_resolution = MachOSymbolResolutionRecord {
@@ -30519,7 +30553,7 @@ mod tests {
             &output,
             &output_file,
             &[member],
-            &[0],
+            &[(0, 0)],
             &[new_resolution],
             std::slice::from_ref(&retiring_name),
             &[previous_resolution],
@@ -31936,10 +31970,12 @@ mod tests {
                 unwind: Some(unwind),
                 text_section_index,
                 text_object_section_index: relocation_target_record_index(text.index()).unwrap(),
-                definition_name: b"_function0".to_vec(),
-                definition_offset: 0,
-                definition_desc: 0,
-                definition_private_external: false,
+                definitions: vec![AddedMachOArchiveDefinition {
+                    name: b"_function0".to_vec(),
+                    offset: 0,
+                    desc: 0,
+                    private_external: false,
+                }],
                 referenced_names: Vec::new(),
             },
             sections,
@@ -33302,31 +33338,42 @@ mod tests {
 
     #[test]
     fn added_macho_archive_member_selection_follows_reference_closure() {
-        let member = |definition: &[u8], references: &[&[u8]]| AddedMachOArchiveTextMember {
+        let member = |definitions: &[&[u8]], references: &[&[u8]]| AddedMachOArchiveTextMember {
             input: String::new(),
             sections: Vec::new(),
             unwind: None,
             text_section_index: 0,
             text_object_section_index: 1,
-            definition_name: definition.to_vec(),
-            definition_offset: 0,
-            definition_desc: 0,
-            definition_private_external: false,
+            definitions: definitions
+                .iter()
+                .enumerate()
+                .map(|(index, definition)| AddedMachOArchiveDefinition {
+                    name: definition.to_vec(),
+                    offset: index as u64 * 4,
+                    desc: 0,
+                    private_external: false,
+                })
+                .collect(),
             referenced_names: references
                 .iter()
                 .map(|reference| reference.to_vec())
                 .collect(),
         };
         let members = vec![
-            member(b"_first", &[b"_second"]),
-            member(b"_second", &[b"_third"]),
-            member(b"_third", &[]),
-            member(b"_unused", &[]),
+            member(&[b"_first"], &[b"_second"]),
+            member(&[b"_second"], &[b"_third"]),
+            member(&[b"_third"], &[]),
+            member(&[b"_unused"], &[]),
         ];
         let definitions = members
             .iter()
             .enumerate()
-            .map(|(index, member)| (member.definition_name.clone(), index))
+            .flat_map(|(index, member)| {
+                member
+                    .definitions
+                    .iter()
+                    .map(move |definition| (definition.name.clone(), index))
+            })
             .collect::<HashMap<_, _>>();
 
         assert_eq!(
