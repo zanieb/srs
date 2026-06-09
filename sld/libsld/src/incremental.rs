@@ -1148,7 +1148,11 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
             .collect::<HashSet<_>>();
         let should_start_with_filtered_records = should_filter_records
-            && changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs_to_patch);
+            && (changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs_to_patch)
+                || changed_inputs_need_records_to_derive_patch_metadata(
+                    &previous,
+                    &changed_inputs_to_patch,
+                ));
         let result = if should_start_with_filtered_records {
             let complete_macho_symbol_resolutions =
                 previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
@@ -1966,6 +1970,19 @@ fn changed_inputs_have_macho_text_patch_sections(
                     .iter()
                     .any(|section| section.section_name.as_deref() == Some("__TEXT,__text"))
             })
+    })
+}
+
+fn changed_inputs_need_records_to_derive_patch_metadata(
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+) -> bool {
+    changed_inputs.iter().any(|(input_index, _)| {
+        previous.input_files.get(*input_index).is_some_and(|input| {
+            input.patch.as_ref().is_none_or(|patch| {
+                patch.sections.is_empty() && patch.raw_sections.as_deref().is_none_or(str::is_empty)
+            })
+        })
     })
 }
 
@@ -45063,6 +45080,56 @@ mod tests {
         assert_eq!(patch.sections[0].input_size, 4);
         assert_eq!(patch.sections[0].output_offset, 64);
         assert_eq!(patch.sections[0].output_size, 8);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_derives_missing_patch_metadata_from_indexed_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let input = dir.path().join("input.o");
+        let previous_bytes = growable_data_elf();
+        let mut current_bytes = previous_bytes.clone();
+        current_bytes[0x40..0x44].copy_from_slice(&[5, 6, 7, 8]);
+        let output_bytes = previous_bytes.clone();
+        std::fs::write(&output, &output_bytes).unwrap();
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut previous = publishing_metadata_state(&args, &output, &input);
+        previous
+            .sections
+            .push(section_record(input.to_str().unwrap(), 1, 0x40, 8));
+        previous.write(&state_dir).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let sections_file = PersistedState::read_metadata(&state_dir)
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        let previous_sections = std::fs::read(state_dir.join(&sections_file)).unwrap();
+
+        let replacement = dir.path().join("input.replacement.o");
+        std::fs::write(&replacement, &current_bytes).unwrap();
+        std::fs::rename(replacement, &input).unwrap();
+
+        assert!(maybe_reuse_output_before_loading(&args).unwrap());
+
+        let updated = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        assert!(updated.input_files[0].patch.is_some());
+        assert_eq!(&std::fs::read(&output).unwrap()[0x40..0x44], &[5, 6, 7, 8]);
+        assert_eq!(
+            std::fs::read(state_dir.join(&sections_file)).unwrap(),
+            previous_sections
+        );
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains("loaded records for 1 changed input file before loading inputs"));
+        assert!(log.contains("patched 1 changed input file before loading inputs"));
+        assert!(!log.contains("metadata-only changed-input patch unavailable"));
+        assert!(!log.contains("filtered-record changed-input patch unavailable"));
     }
 
     #[test]
