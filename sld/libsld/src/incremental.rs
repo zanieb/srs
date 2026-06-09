@@ -35008,6 +35008,182 @@ mod tests {
         (output, text_range, written_value)
     }
 
+    fn test_macho_import_branch_object() -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let commands_size = SEGMENT_COMMAND_SIZE + SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let text_offset = HEADER_SIZE + commands_size;
+        let relocation_offset = (text_offset + 4).next_multiple_of(8);
+        let symoff = (relocation_offset + 8).next_multiple_of(8);
+        let stroff = symoff + 2 * NLIST_64_SIZE;
+        let strings = b"\0_caller\0_Unwind_Resume\0";
+        let mut bytes = Vec::new();
+
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(&mut bytes, (SEGMENT_COMMAND_SIZE + SECTION_SIZE) as u32);
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, 4);
+        push_u64(&mut bytes, text_offset as u64);
+        push_u64(&mut bytes, 4);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 0);
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__text",
+            b"__TEXT",
+            0,
+            4,
+            text_offset,
+            relocation_offset,
+            1,
+            object::macho::S_REGULAR
+                | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+        );
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), text_offset);
+        bytes.extend_from_slice(&0x1400_0000_u32.to_le_bytes());
+        bytes.resize(relocation_offset, 0);
+        push_test_macho_relocation(
+            &mut bytes,
+            TestMachORelocation {
+                offset: 0,
+                symbol: 1,
+                pcrel: true,
+                length: 2,
+                external: true,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            },
+        );
+        bytes.resize(symoff, 0);
+        push_macho_symbol(&mut bytes, 1, 1, 0);
+        push_macho_undefined_symbol(&mut bytes, 9);
+        bytes.extend_from_slice(strings);
+        bytes
+    }
+
+    #[test]
+    fn rematerialized_macho_import_branch_reuses_recorded_stub() {
+        let recorded_stub = 0x1000;
+        let (previous_output, text_range, written_value) =
+            recorded_branch_output(0, recorded_stub, 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut relocation = relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(written_value),
+            0,
+            Some("_Unwind_Resume"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            branch_kind,
+            0,
+        );
+        relocation.applied_target_value = Some(recorded_stub);
+
+        let current = test_macho_import_branch_object();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let text = current_file.section_by_name("__text").unwrap();
+        let contexts =
+            macho_aarch64_text_relocation_contexts(&current_file, &text, text.data().unwrap())
+                .unwrap();
+        let current_input = hex::encode("current.o");
+        let matched = [MatchedPatchSection::same(PatchSection {
+            input: current_input.clone(),
+            section_index: patch_section_record_index(&current_file, text.index()).unwrap(),
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: text.size(),
+            output_offset: text_range.start as u64,
+            output_size: text.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        })];
+        let input = state("args", b"output", &[("lib.rlib", b"input")])
+            .input_files
+            .remove(0);
+
+        let replay = rematerialized_macho_text_relocation_replay(
+            std::slice::from_ref(&relocation),
+            &[],
+            &input,
+            &matched[0],
+            &current_file,
+            &contexts[0],
+            &matched,
+            &previous_output,
+            &output_file,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(replay.current_target_value, 0);
+        assert_eq!(
+            replay.current_relocation_target_candidates,
+            vec![recorded_stub, 0]
+        );
+        assert_eq!(
+            replay.target_name,
+            Some(SharedText::from(hex::encode("_Unwind_Resume")))
+        );
+        assert!(replay.target_is_global);
+        assert!(replay.target.is_none());
+
+        let mut resolutions = Vec::new();
+        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &[relocation],
+            std::slice::from_ref(&replay),
+            &[(
+                input.path.clone().into(),
+                current_input.clone(),
+                matched[0].previous.section_index,
+                current_input,
+                matched[0].current.section_index,
+            )],
+            &[],
+            &input,
+        )
+        .unwrap();
+
+        assert!(output_symbols.is_empty());
+        assert!(!changed);
+        assert!(resolutions.is_empty());
+    }
+
     #[test]
     fn rematerialized_macho_branch_reuses_matching_recorded_stub() {
         let target_name = SharedText::from(hex::encode("_target"));
