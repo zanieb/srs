@@ -102,7 +102,8 @@ const INDEX_FILE: &str = "index";
 const LOG_FILE: &str = "log";
 const GLOBAL_LOG_FILE: &str = "incremental.log";
 const METADATA_UPDATE_FILE: &str = "metadata-update";
-const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v7";
+const METADATA_UPDATE_VERSION: &str = "sld-incremental-metadata-update-v8";
+const METADATA_UPDATE_VERSION_V7: &str = "sld-incremental-metadata-update-v7";
 const METADATA_UPDATE_VERSION_V6: &str = "sld-incremental-metadata-update-v6";
 const METADATA_UPDATE_VERSION_V5: &str = "sld-incremental-metadata-update-v5";
 const METADATA_UPDATE_VERSION_V4: &str = "sld-incremental-metadata-update-v4";
@@ -431,6 +432,8 @@ struct PersistedState {
     patch_records_file: Option<String>,
     patch_record_locations: Vec<PatchRecordLocation>,
     raw_patch_record_locations: Option<String>,
+    record_overrides_file: Option<String>,
+    record_override_inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2982,6 +2985,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut hashless_atomic_replacement_snapshot_count = 0;
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
+    let mut record_override_input_files = HashSet::new();
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
@@ -4854,7 +4858,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     "changed input needs complete section records".to_owned(),
                 ));
             }
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if !retired_macho_archive_activations.is_empty() {
             let retired_section_keys = retired_macho_archive_activations
@@ -4868,7 +4872,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     || !retired_section_keys
                         .contains(&(record.input.as_str(), record.section_index))
             });
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if let Some(activation) = macho_text_section_activation {
             if !records_complete {
@@ -4899,7 +4903,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &previous.reserved_ranges,
                 &previous.sections,
             )?;
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if let Some(activation) = added_macho_archive_text_activation {
             if !records_complete {
@@ -4915,7 +4919,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &previous.reserved_ranges,
                 &previous.sections,
             )?;
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
             previous.macho_symbol_resolutions_file = None;
         }
         if let Some(activation) = changed_macho_archive_unwind_activation {
@@ -4929,7 +4933,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &previous.reserved_ranges,
                 &previous.sections,
             )?;
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if !added_dynamic_relocations.is_empty() {
             if !records_complete {
@@ -4942,7 +4946,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .extend(added_dynamic_relocations);
             previous.dynamic_relocations.sort();
             previous.dynamic_relocations.dedup();
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if !removed_dynamic_relocations.is_empty() {
             if !records_complete {
@@ -4954,7 +4958,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 !removed_dynamic_relocations.contains(record)
                     || record.has_restorable_rela_output_info()
             });
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if !removed_fdes.is_empty() {
             if !records_complete {
@@ -4965,7 +4969,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             previous
                 .fdes
                 .retain(|record| !removed_fdes.contains(record));
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         if !updated_fdes.is_empty() {
             if !records_complete {
@@ -4974,7 +4978,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 ));
             }
             update_fde_records(&mut previous.fdes, updated_fdes);
-            previous.sections_file = None;
+            record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
         previous.input_files[*input_index].content = input_content;
         previous.input_files[*input_index].snapshot_identity = None;
@@ -5143,12 +5147,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             patched_section_count += resolved_fdes.len();
             for resolved in resolved_fdes {
+                record_override_input_files.insert(resolved.record.input_file.to_string());
                 previous.fdes.push(resolved.record);
                 patches.push(resolved.patch);
                 if let Some(change) = resolved.eh_frame_hdr_change {
                     eh_frame_hdr_changes.push(change);
                 }
-                previous.sections_file = None;
             }
         }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -5371,7 +5375,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     }
     {
         timing_phase!("Persist changed incremental patch metadata");
-        PersistedState {
+        let mut state = PersistedState {
             args_hash: previous.args_hash,
             link_options_hash: previous.link_options_hash,
             input_order_hash: previous.input_order_hash,
@@ -5391,8 +5395,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             patch_records_file: previous.patch_records_file,
             patch_record_locations: previous.patch_record_locations,
             raw_patch_record_locations: previous.raw_patch_record_locations,
+            record_overrides_file: previous.record_overrides_file,
+            record_override_inputs: previous.record_override_inputs,
+        };
+        if state.sections_file.is_some() && !record_override_input_files.is_empty() {
+            state.write_record_overrides_for_inputs(
+                state_dir,
+                record_override_input_files.into_iter(),
+            )?;
         }
-        .write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
+        state.write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
     }
     clear_incremental_update_marker(state_dir)?;
 
@@ -7361,6 +7373,8 @@ impl<'data> PreparedState<'data> {
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
+            record_overrides_file: None,
+            record_override_inputs: Vec::new(),
         };
 
         Ok(Some(PendingStateWrite {
@@ -7819,6 +7833,7 @@ impl PersistedState {
         }
         state.apply_metadata_update(state_dir, patch_section_mode)?;
         if load_sections {
+            state.apply_record_overrides(state_dir, None)?;
             validate_reserved_ranges_against_sections(&state.reserved_ranges, &state.sections)?;
         }
         Ok(Some(state))
@@ -7839,6 +7854,7 @@ impl PersistedState {
                 self.relocations = records.relocations;
                 self.fdes = records.fdes;
                 self.dynamic_relocations = records.dynamic_relocations;
+                self.apply_record_overrides(state_dir, Some(input_files))?;
                 return Ok(());
             }
             if canonical_index {
@@ -7846,6 +7862,7 @@ impl PersistedState {
                 self.relocations.clear();
                 self.fdes.clear();
                 self.dynamic_relocations.clear();
+                self.apply_record_overrides(state_dir, Some(input_files))?;
                 return Ok(());
             }
             if self.patch_record_locations.is_empty() {
@@ -7863,11 +7880,13 @@ impl PersistedState {
                     self.relocations = records.relocations;
                     self.fdes = records.fdes;
                     self.dynamic_relocations = records.dynamic_relocations;
+                    self.apply_record_overrides(state_dir, Some(input_files))?;
                     return Ok(());
                 }
             }
         }
         let Some(sections_file) = self.sections_file.as_deref() else {
+            self.apply_record_overrides(state_dir, Some(input_files))?;
             return Ok(());
         };
         timing_phase!("Read incremental sidecar records");
@@ -7877,6 +7896,89 @@ impl PersistedState {
         self.relocations = records.relocations;
         self.fdes = records.fdes;
         self.dynamic_relocations = records.dynamic_relocations;
+        self.apply_record_overrides(state_dir, Some(input_files))?;
+        Ok(())
+    }
+
+    fn apply_record_overrides(
+        &mut self,
+        state_dir: &Path,
+        input_files: Option<&HashSet<String>>,
+    ) -> Result {
+        if self.record_override_inputs.is_empty() {
+            return Ok(());
+        }
+        let override_inputs = self
+            .record_override_inputs
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.sections
+            .retain(|record| !override_inputs.contains(record.input_file.as_str()));
+        self.relocations
+            .retain(|record| !override_inputs.contains(record.input_file.as_str()));
+        self.fdes
+            .retain(|record| !override_inputs.contains(record.input_file.as_str()));
+        self.dynamic_relocations
+            .retain(|record| !override_inputs.contains(record.input_file.as_str()));
+
+        if let Some(file_name) = self.record_overrides_file.as_deref() {
+            timing_phase!("Read incremental record overrides");
+            let contents = read_sections_sidecar(state_dir, file_name)?;
+            let records = parse_compact_records_block(contents.lines())?;
+            if records
+                .sections
+                .iter()
+                .map(|record| record.input_file.as_str())
+                .chain(
+                    records
+                        .relocations
+                        .iter()
+                        .map(|record| record.input_file.as_str()),
+                )
+                .chain(records.fdes.iter().map(|record| record.input_file.as_str()))
+                .chain(
+                    records
+                        .dynamic_relocations
+                        .iter()
+                        .map(|record| record.input_file.as_str()),
+                )
+                .any(|input_file| !override_inputs.contains(input_file))
+            {
+                return Err(crate::error!(
+                    "Incremental record override contains an unexpected input"
+                ));
+            }
+            self.sections.extend(records.sections);
+            self.relocations.extend(records.relocations);
+            self.fdes.extend(records.fdes);
+            self.dynamic_relocations.extend(records.dynamic_relocations);
+        }
+
+        self.sections.sort();
+        self.sections.dedup();
+        self.relocations.sort();
+        self.relocations.dedup();
+        self.fdes.sort();
+        self.fdes.dedup();
+        self.dynamic_relocations.sort();
+        self.dynamic_relocations.dedup();
+
+        if let Some(input_files) = input_files {
+            self.sections
+                .retain(|record| input_files.contains(record.input_file.as_str()));
+            self.relocations.retain(|record| {
+                input_files.contains(record.input_file.as_str())
+                    || record
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| input_files.contains(target.input_file.as_str()))
+            });
+            self.fdes
+                .retain(|record| input_files.contains(record.input_file.as_str()));
+            self.dynamic_relocations
+                .retain(|record| input_files.contains(record.input_file.as_str()));
+        }
         Ok(())
     }
 
@@ -8068,6 +8170,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V7
             && version != METADATA_UPDATE_VERSION_V6
             && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
@@ -8083,6 +8186,7 @@ impl PersistedState {
         let output = parse_content_line(lines.next(), "output")?;
         let _ = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V7
             || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
@@ -8092,12 +8196,16 @@ impl PersistedState {
             let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V7
             || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
         {
             let _ = parse_reserved_range_table(&mut lines, output.len)?;
+        }
+        if version == METADATA_UPDATE_VERSION {
+            let _ = parse_record_override_metadata(&mut lines)?;
         }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
@@ -8518,6 +8626,8 @@ impl PersistedState {
             patch_records_file,
             patch_record_locations,
             raw_patch_record_locations,
+            record_overrides_file: None,
+            record_override_inputs: Vec::new(),
         })
     }
 
@@ -8566,6 +8676,105 @@ impl PersistedState {
         }
     }
 
+    fn write_record_overrides_for_inputs(
+        &mut self,
+        state_dir: &Path,
+        input_files: impl IntoIterator<Item = String>,
+    ) -> Result {
+        let mut changed_input_files = input_files.into_iter().collect::<Vec<_>>();
+        changed_input_files.sort();
+        changed_input_files.dedup();
+        if changed_input_files.is_empty() {
+            return Ok(());
+        }
+        let changed_input_files_set = changed_input_files
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut records = if let Some(file_name) = self.record_overrides_file.as_deref() {
+            let contents = read_sections_sidecar(state_dir, file_name)?;
+            parse_compact_records_block(contents.lines())?
+        } else {
+            CompactRecords::default()
+        };
+        records
+            .sections
+            .retain(|record| !changed_input_files_set.contains(record.input_file.as_str()));
+        records
+            .relocations
+            .retain(|record| !changed_input_files_set.contains(record.input_file.as_str()));
+        records
+            .fdes
+            .retain(|record| !changed_input_files_set.contains(record.input_file.as_str()));
+        records
+            .dynamic_relocations
+            .retain(|record| !changed_input_files_set.contains(record.input_file.as_str()));
+        records.sections.extend(
+            self.sections
+                .iter()
+                .filter(|record| changed_input_files_set.contains(record.input_file.as_str()))
+                .cloned(),
+        );
+        records.relocations.extend(
+            self.relocations
+                .iter()
+                .filter(|record| changed_input_files_set.contains(record.input_file.as_str()))
+                .cloned(),
+        );
+        records.fdes.extend(
+            self.fdes
+                .iter()
+                .filter(|record| changed_input_files_set.contains(record.input_file.as_str()))
+                .cloned(),
+        );
+        records.dynamic_relocations.extend(
+            self.dynamic_relocations
+                .iter()
+                .filter(|record| changed_input_files_set.contains(record.input_file.as_str()))
+                .cloned(),
+        );
+
+        self.record_override_inputs
+            .extend(changed_input_files.iter().cloned());
+        self.record_override_inputs.sort();
+        self.record_override_inputs.dedup();
+        records.sections.sort();
+        records.sections.dedup();
+        records.relocations.sort();
+        records.relocations.dedup();
+        records.fdes.sort();
+        records.fdes.dedup();
+        records.dynamic_relocations.sort();
+        records.dynamic_relocations.dedup();
+        let mut sections = records.sections.iter().collect::<Vec<_>>();
+        let mut relocations = records.relocations.iter().collect::<Vec<_>>();
+        let mut fdes = records.fdes.iter().collect::<Vec<_>>();
+        let mut dynamic_relocations = records.dynamic_relocations.iter().collect::<Vec<_>>();
+        sections.sort_unstable();
+        relocations.sort_unstable();
+        fdes.sort_unstable();
+        dynamic_relocations.sort_unstable();
+        if sections.is_empty()
+            && relocations.is_empty()
+            && fdes.is_empty()
+            && dynamic_relocations.is_empty()
+        {
+            self.record_overrides_file = None;
+            return Ok(());
+        }
+        let mut contents = String::new();
+        write_rendered_records(
+            &mut contents,
+            &sections,
+            &relocations,
+            &fdes,
+            &dynamic_relocations,
+        )
+        .expect("writing incremental record overrides to String should not fail");
+        self.record_overrides_file = Some(write_compressed_sections_sidecar(state_dir, &contents)?);
+        Ok(())
+    }
+
     fn write_metadata_update_for_inputs(
         &self,
         state_dir: &Path,
@@ -8604,6 +8813,9 @@ impl PersistedState {
     }
 
     fn write_index(&self, state_dir: &Path) -> Result {
+        if !self.record_override_inputs.is_empty() {
+            return self.write(state_dir);
+        }
         let sections_file = self.sections_file.as_deref().unwrap_or(SECTIONS_FILE);
         self.write_index_with_sections_files(
             state_dir,
@@ -8747,6 +8959,23 @@ impl PersistedState {
         )
         .unwrap();
         render_required_reserved_range_table(&mut out, &self.reserved_ranges);
+        writeln!(
+            &mut out,
+            "record-overrides-file\t{}",
+            self.record_overrides_file
+                .as_deref()
+                .unwrap_or(ABSENT_FIELD)
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "record-override-inputs\t{}",
+            self.record_override_inputs.len()
+        )
+        .unwrap();
+        for input_file in &self.record_override_inputs {
+            writeln!(&mut out, "record-override-input\t{input_file}").unwrap();
+        }
         let mut input_indices = input_indices.to_vec();
         input_indices.sort_unstable();
         input_indices.dedup();
@@ -8847,6 +9076,7 @@ impl PersistedState {
             .next()
             .context("Missing incremental metadata update header")?;
         if version != METADATA_UPDATE_VERSION
+            && version != METADATA_UPDATE_VERSION_V7
             && version != METADATA_UPDATE_VERSION_V6
             && version != METADATA_UPDATE_VERSION_V5
             && version != METADATA_UPDATE_VERSION_V4
@@ -8862,6 +9092,7 @@ impl PersistedState {
         self.output = parse_content_line(lines.next(), "output")?;
         self.build_id_hashes = parse_build_id_hash_line(lines.next())?;
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V7
             || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
@@ -8878,12 +9109,20 @@ impl PersistedState {
             self.macho_symbol_resolutions.clear();
         }
         if version == METADATA_UPDATE_VERSION
+            || version == METADATA_UPDATE_VERSION_V7
             || version == METADATA_UPDATE_VERSION_V6
             || version == METADATA_UPDATE_VERSION_V5
             || version == METADATA_UPDATE_VERSION_V4
             || version == METADATA_UPDATE_VERSION_V3
         {
             self.reserved_ranges = parse_reserved_range_table(&mut lines, self.output.len)?;
+        }
+        if version == METADATA_UPDATE_VERSION {
+            (self.record_overrides_file, self.record_override_inputs) =
+                parse_record_override_metadata(&mut lines)?;
+        } else {
+            self.record_overrides_file = None;
+            self.record_override_inputs.clear();
         }
         let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
             .parse()
@@ -9326,6 +9565,36 @@ fn read_sections_sidecar(state_dir: &Path, file_name: &str) -> Result<String> {
         }
     }
     Ok(contents)
+}
+
+fn write_compressed_sections_sidecar(state_dir: &Path, contents: &str) -> Result<String> {
+    std::fs::create_dir_all(state_dir).with_context(|| {
+        format!(
+            "Failed to create incremental state directory `{}`",
+            state_dir.display()
+        )
+    })?;
+    let compressed = zstd::stream::encode_all(contents.as_bytes(), SECTIONS_COMPRESSION_LEVEL)
+        .context("Failed to compress incremental sections")?;
+    let file_name = compressed_section_sidecar_file_name(&compressed);
+    let path = state_dir.join(&file_name);
+    if !path.exists() {
+        let tmp_path = state_dir.join(format!("{file_name}.tmp"));
+        std::fs::write(&tmp_path, &compressed).with_context(|| {
+            format!(
+                "Failed to write compressed incremental sections `{}`",
+                tmp_path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to install compressed incremental sections `{}`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(file_name)
 }
 
 fn write_macho_resolutions_sidecar(
@@ -25360,6 +25629,41 @@ fn parse_patch_record_location_line(line: Option<&str>) -> Result<PatchRecordLoc
     })
 }
 
+fn parse_record_override_metadata<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Option<String>, Vec<String>)> {
+    let file = parse_prefixed_line(lines.next(), "record-overrides-file")?;
+    let file = if file == ABSENT_FIELD {
+        None
+    } else {
+        validate_sections_file_name(file)?;
+        Some(file.to_owned())
+    };
+    let input_count: usize = parse_prefixed_line(lines.next(), "record-override-inputs")?
+        .parse()
+        .context("Invalid incremental record override input count")?;
+    let mut input_files = Vec::with_capacity(input_count);
+    for _ in 0..input_count {
+        input_files.push(parse_prefixed_line(lines.next(), "record-override-input")?.to_owned());
+    }
+    if !input_files.is_sorted() {
+        return Err(crate::error!(
+            "Incremental record override inputs are not sorted"
+        ));
+    }
+    if input_files.windows(2).any(|inputs| inputs[0] == inputs[1]) {
+        return Err(crate::error!(
+            "Incremental record override inputs contain duplicates"
+        ));
+    }
+    if input_files.is_empty() && file.is_some() {
+        return Err(crate::error!(
+            "Incremental record override sidecar has no overridden inputs"
+        ));
+    }
+    Ok((file, input_files))
+}
+
 fn parse_patch_record_location_table<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     parse_locations: bool,
@@ -28214,6 +28518,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         .next()
         .context("Missing incremental metadata update header")?;
     if version != METADATA_UPDATE_VERSION
+        && version != METADATA_UPDATE_VERSION_V7
         && version != METADATA_UPDATE_VERSION_V6
         && version != METADATA_UPDATE_VERSION_V5
         && version != METADATA_UPDATE_VERSION_V4
@@ -28229,6 +28534,7 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
     let output = parse_content_line(lines.next(), "output")?;
     let _ = parse_build_id_hash_line(lines.next())?;
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V7
         || version == METADATA_UPDATE_VERSION_V6
         || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
@@ -28238,12 +28544,16 @@ fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
         let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
     }
     if version == METADATA_UPDATE_VERSION
+        || version == METADATA_UPDATE_VERSION_V7
         || version == METADATA_UPDATE_VERSION_V6
         || version == METADATA_UPDATE_VERSION_V5
         || version == METADATA_UPDATE_VERSION_V4
         || version == METADATA_UPDATE_VERSION_V3
     {
         let _ = parse_reserved_range_table(&mut lines, output.len)?;
+    }
+    if version == METADATA_UPDATE_VERSION {
+        let _ = parse_record_override_metadata(&mut lines)?;
     }
     let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
         .parse()
@@ -28719,6 +29029,8 @@ mod tests {
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
+            record_overrides_file: None,
+            record_override_inputs: Vec::new(),
         }
     }
 
@@ -43514,6 +43826,8 @@ mod tests {
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
+            record_overrides_file: None,
+            record_override_inputs: Vec::new(),
         };
 
         let result = patch_changed_inputs(
@@ -43906,6 +44220,184 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn metadata_record_overrides_replace_owner_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(
+            "args",
+            b"output",
+            &[("a.o", b"a"), ("b.o", b"b"), ("c.o", b"c")],
+        );
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(section_record("b.o", 1, 200, 8));
+        state.sections.push(section_record("c.o", 1, 300, 8));
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("b.o", 1, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        ));
+        state.fdes.push(fde_record("a.o", 1, 2, 0, 120, 24));
+        state
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 1, 0, 160, 24));
+        state.write(dir.path()).unwrap();
+        let base_index = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        let base_sections_file = PersistedState::read_metadata(dir.path())
+            .unwrap()
+            .unwrap()
+            .sections_file
+            .unwrap();
+        let base_sections = std::fs::read(dir.path().join(&base_sections_file)).unwrap();
+
+        let mut updated = PersistedState::read(dir.path()).unwrap().unwrap();
+        updated
+            .sections
+            .retain(|record| record.input_file != hex::encode("a.o"));
+        updated.sections.push(section_record("a.o", 2, 104, 12));
+        updated.relocations.clear();
+        updated.relocations.push(relocation_record(
+            "a.o",
+            2,
+            5,
+            Some(0x3000),
+            0x4000,
+            Some("new-target"),
+            Some(("c.o", 1, 4)),
+            4,
+            104,
+            8,
+            1,
+            0,
+        ));
+        updated.fdes.clear();
+        updated.fdes.push(fde_record("a.o", 2, 3, 0, 140, 24));
+        updated.dynamic_relocations.clear();
+        updated
+            .dynamic_relocations
+            .push(dynamic_relocation_record("a.o", 2, 4, 180, 24));
+        updated
+            .write_record_overrides_for_inputs(dir.path(), [hex::encode("a.o")])
+            .unwrap();
+        updated
+            .write_metadata_update_for_inputs(dir.path(), &[0])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join(INDEX_FILE)).unwrap(),
+            base_index
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&base_sections_file)).unwrap(),
+            base_sections
+        );
+        let restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .sections
+                .iter()
+                .filter(|record| record.input_file == hex::encode("a.o"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![section_record("a.o", 2, 104, 12)]
+        );
+        assert_eq!(restored.relocations, updated.relocations);
+        assert_eq!(restored.fdes, updated.fdes);
+        assert_eq!(restored.dynamic_relocations, updated.dynamic_relocations);
+
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let b_inputs = [hex::encode("b.o")].into_iter().collect::<HashSet<_>>();
+        metadata
+            .read_records_for_input_files(dir.path(), &b_inputs)
+            .unwrap();
+        assert_eq!(metadata.sections, vec![section_record("b.o", 1, 200, 8)]);
+        assert!(metadata.relocations.is_empty());
+
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let c_inputs = [hex::encode("c.o")].into_iter().collect::<HashSet<_>>();
+        metadata
+            .read_records_for_input_files(dir.path(), &c_inputs)
+            .unwrap();
+        assert_eq!(metadata.sections, vec![section_record("c.o", 1, 300, 8)]);
+        assert_eq!(metadata.relocations, updated.relocations);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn metadata_record_overrides_preserve_deletions_and_successive_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.sections.push(section_record("b.o", 1, 200, 8));
+        state.relocations.push(relocation_record(
+            "a.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("b.o", 1, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        ));
+        state.write(dir.path()).unwrap();
+
+        let mut updated = PersistedState::read(dir.path()).unwrap().unwrap();
+        let a = hex::encode("a.o");
+        updated
+            .sections
+            .retain(|record| record.input_file.as_str() != a);
+        updated
+            .relocations
+            .retain(|record| record.input_file.as_str() != a);
+        updated
+            .write_record_overrides_for_inputs(dir.path(), [a.clone()])
+            .unwrap();
+        assert!(updated.record_overrides_file.is_none());
+        updated
+            .write_metadata_update_for_inputs(dir.path(), &[0])
+            .unwrap();
+
+        let deleted = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert!(
+            deleted
+                .sections
+                .iter()
+                .all(|record| record.input_file.as_str() != a)
+        );
+        assert!(deleted.relocations.is_empty());
+
+        let mut updated = deleted;
+        let b = hex::encode("b.o");
+        updated
+            .sections
+            .retain(|record| record.input_file.as_str() != b);
+        updated.sections.push(section_record("b.o", 2, 208, 16));
+        updated
+            .write_record_overrides_for_inputs(dir.path(), [b])
+            .unwrap();
+        updated
+            .write_metadata_update_for_inputs(dir.path(), &[1])
+            .unwrap();
+
+        let restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert_eq!(restored.sections, vec![section_record("b.o", 2, 208, 16)]);
+        assert!(restored.relocations.is_empty());
+        assert_eq!(restored.record_override_inputs.len(), 2);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn v2_metadata_update_preserves_index_reserved_ranges() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", &[0; 16], &[("a.o", b"a")]);
@@ -43920,7 +44412,12 @@ mod tests {
             .render_metadata_update(&[0])
             .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V2, 1)
             .lines()
-            .filter(|line| !line.starts_with("reserves\t") && !line.starts_with("reserve\t"))
+            .filter(|line| {
+                !line.starts_with("reserves\t")
+                    && !line.starts_with("reserve\t")
+                    && !line.starts_with("record-overrides-file\t")
+                    && !line.starts_with("record-override-")
+            })
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
                 out
@@ -43944,17 +44441,50 @@ mod tests {
             size: 8,
         }];
         state.write(dir.path()).unwrap();
-        let rendered = state.render_metadata_update(&[0]).replacen(
-            METADATA_UPDATE_VERSION,
-            METADATA_UPDATE_VERSION_V3,
-            1,
-        );
+        let rendered = state
+            .render_metadata_update(&[0])
+            .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V3, 1)
+            .lines()
+            .filter(|line| {
+                !line.starts_with("record-overrides-file\t")
+                    && !line.starts_with("record-override-")
+            })
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
         std::fs::write(metadata_update_path(dir.path()), rendered).unwrap();
 
         let parsed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
 
         assert_eq!(parsed.reserved_ranges, state.reserved_ranges);
         assert!(parsed.input_files[0].rustc_raw_object_manifest.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn v7_metadata_update_is_accepted_without_record_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state("args", b"output", &[("a.o", b"a")]);
+        state.write(dir.path()).unwrap();
+        let rendered = state
+            .render_metadata_update(&[0])
+            .replacen(METADATA_UPDATE_VERSION, METADATA_UPDATE_VERSION_V7, 1)
+            .lines()
+            .filter(|line| {
+                !line.starts_with("record-overrides-file\t")
+                    && !line.starts_with("record-override-")
+            })
+            .fold(String::new(), |mut out, line| {
+                writeln!(&mut out, "{line}").unwrap();
+                out
+            });
+        std::fs::write(metadata_update_path(dir.path()), rendered).unwrap();
+
+        let parsed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+
+        assert!(parsed.record_overrides_file.is_none());
+        assert!(parsed.record_override_inputs.is_empty());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -43973,6 +44503,8 @@ mod tests {
                 !line.starts_with("macho-resolutions-file\t")
                     && !line.starts_with("reserves\t")
                     && !line.starts_with("reserve\t")
+                    && !line.starts_with("record-overrides-file\t")
+                    && !line.starts_with("record-override-")
             })
             .fold(String::new(), |mut out, line| {
                 writeln!(&mut out, "{line}").unwrap();
@@ -45375,6 +45907,8 @@ mod tests {
             patch_records_file: None,
             patch_record_locations: Vec::new(),
             raw_patch_record_locations: None,
+            record_overrides_file: None,
+            record_override_inputs: Vec::new(),
         }
     }
 
