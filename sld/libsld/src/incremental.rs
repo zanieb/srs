@@ -10184,6 +10184,17 @@ fn macho_relocation_target_identity(
     }
 }
 
+fn macho_relocation_target_is_global(
+    file: &object::File<'_>,
+    target: object::RelocationTarget,
+) -> bool {
+    let object::RelocationTarget::Symbol(symbol_index) = target else {
+        return false;
+    };
+    file.symbol_by_index(symbol_index)
+        .is_ok_and(|symbol| symbol.is_global())
+}
+
 struct MachORelocationSymbolPosition {
     name: Vec<u8>,
     symbol_index: object::SymbolIndex,
@@ -11523,7 +11534,10 @@ fn macho_text_relocation_replays_for_input(
                         .unwrap_or_default(),
                     target_symbol_id: relocation.target_symbol_id,
                     target_name: relocation.target_name.clone(),
-                    target_is_global: false,
+                    target_is_global: macho_relocation_target_is_global(
+                        &current_file,
+                        current_context.target,
+                    ),
                     target: replay_target,
                     addend: relocation.addend,
                     chained_rebase_output_offset: None,
@@ -39108,6 +39122,18 @@ mod tests {
             ),
             Some(data.address() + section_offset)
         );
+    }
+
+    #[test]
+    fn macho_relocation_target_preserves_external_symbol_scope() {
+        let current = test_macho_import_branch_object();
+        let file = object::File::parse(current.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let contexts =
+            macho_aarch64_text_relocation_contexts(&file, &text, text.data().unwrap()).unwrap();
+
+        assert_eq!(contexts.len(), 1);
+        assert!(macho_relocation_target_is_global(&file, contexts[0].target));
     }
 
     #[test]
