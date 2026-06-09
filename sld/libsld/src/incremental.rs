@@ -2795,29 +2795,43 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .map_or(previous.reserved_ranges.as_slice(), |activation| {
                     activation.remaining_reserved_ranges.as_slice()
                 });
-            let mut added_macho_archive_text_activation =
-                if let Some(added_identifiers) = added_archive_member_identifiers.as_deref() {
-                    match added_macho_archive_text_activations(
-                        &bytes,
-                        input.path.as_str(),
-                        added_identifiers,
-                        &matched_sections,
-                        &current_resolver,
-                        activation_reserved_ranges,
-                        args.common().incremental_padding_percent,
-                        previous_output.get()?,
-                        &previous.relocations,
-                        &previous.macho_symbol_resolutions,
-                        &macho_resolution_updates.retiring_names,
-                    )? {
-                        Ok(activation) => Some(activation),
-                        Err(reason) => {
-                            return Ok(ChangedInputPatchResult::Unsupported(reason));
-                        }
-                    }
-                } else {
-                    None
+            let mut added_macho_archive_text_activation = if let Some(added_identifiers) =
+                added_archive_member_identifiers.as_deref()
+            {
+                let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive member needs the previous input snapshot".to_owned(),
+                    ));
                 };
+                let excluded_unwind_identifiers = macho_text_section_activation
+                    .as_ref()
+                    .and_then(|activation| activation.normalized_archive_identifier.clone())
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                match added_macho_archive_text_activations(
+                    previous_bytes,
+                    &bytes,
+                    input.path.as_str(),
+                    added_identifiers,
+                    &matched_sections,
+                    &current_sections,
+                    &current_resolver,
+                    &excluded_unwind_identifiers,
+                    activation_reserved_ranges,
+                    args.common().incremental_padding_percent,
+                    previous_output.get()?,
+                    &previous.relocations,
+                    &previous.macho_symbol_resolutions,
+                    &macho_resolution_updates.retiring_names,
+                )? {
+                    Ok(activation) => Some(activation),
+                    Err(reason) => {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
+                    }
+                }
+            } else {
+                None
+            };
             if let Some(activation) = &added_macho_archive_text_activation {
                 previous
                     .macho_symbol_resolutions
@@ -3063,6 +3077,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .iter()
                         .flat_map(|candidate| candidate.input_ranges.iter().cloned()),
                 )
+                .chain(
+                    added_macho_archive_text_activation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|activation| {
+                            activation.current_unwind_input_ranges.iter().cloned()
+                        }),
+                )
                 .collect::<Vec<_>>();
             let Some((mut fingerprint, mut archive_member_patch_fingerprints)) = ({
                 timing_phase!("Fingerprint changed patch input");
@@ -3139,6 +3161,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .chain(&ignored_archive_identifiers)
                             .cloned()
                             .collect::<Vec<_>>(),
+                        added_macho_archive_text_activation
+                            .as_ref()
+                            .map_or(&[], |activation| {
+                                activation.previous_unwind_input_ranges.as_slice()
+                            }),
+                        added_macho_archive_text_activation
+                            .as_ref()
+                            .map_or(&[], |activation| {
+                                activation.current_unwind_input_ranges.as_slice()
+                            }),
                         &macho_resolution_updates.retiring_names,
                     )?
                 } else {
@@ -3453,7 +3485,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .chain(relocation_addend_ranges)
                             .chain(relocation_target_ranges)
                             .chain(macho_symbol_resolution_ranges)
-                            .chain(fde_relocation_ranges),
+                            .chain(fde_relocation_ranges)
+                            .chain(
+                                added_macho_archive_text_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.current_unwind_input_ranges.iter().cloned()
+                                    }),
+                            ),
                         normalize_rust_archive_patch_inputs,
                     )?
                 else {
@@ -5000,7 +5040,16 @@ struct AddedMachOArchiveTextActivations {
     unwind_patches: Vec<SectionPatch>,
     relocation_replays: Vec<MachOTextRelocationReplay>,
     provisional_relocations: Vec<(usize, RelocationRecord)>,
+    previous_unwind_input_ranges: Vec<std::ops::Range<usize>>,
+    current_unwind_input_ranges: Vec<std::ops::Range<usize>>,
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
+}
+
+struct ChangedMachOArchiveUnwindMembers {
+    members: Vec<AddedMachOArchiveTextMember>,
+    retired_entries: Vec<MachOUnwindFunctionIdentity>,
+    previous_input_ranges: Vec<std::ops::Range<usize>>,
+    current_input_ranges: Vec<std::ops::Range<usize>>,
 }
 
 struct AddedMachOArchiveTextMember {
@@ -12549,6 +12598,8 @@ fn archive_diff_allows_retired_macho_symbols(
     current_resolver: &PatchInputResolver<'_>,
     ignored_previous_identifiers: &[Vec<u8>],
     ignored_current_identifiers: &[Vec<u8>],
+    previous_extra_ranges: &[std::ops::Range<usize>],
+    current_extra_ranges: &[std::ops::Range<usize>],
     retiring_names: &[SharedText],
 ) -> Result<bool> {
     if retiring_names.is_empty() {
@@ -12583,7 +12634,7 @@ fn archive_diff_allows_retired_macho_symbols(
         return Ok(false);
     }
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
-    let Some(previous_ranges) = patch_ranges_with_resolver(
+    let Some(mut previous_ranges) = patch_ranges_with_resolver(
         previous_bytes,
         input_file_path,
         matched_sections
@@ -12595,7 +12646,7 @@ fn archive_diff_allows_retired_macho_symbols(
     else {
         return Ok(false);
     };
-    let Some(current_ranges) = patch_ranges_with_resolver(
+    let Some(mut current_ranges) = patch_ranges_with_resolver(
         current_bytes,
         input_file_path,
         matched_sections
@@ -12607,6 +12658,8 @@ fn archive_diff_allows_retired_macho_symbols(
     else {
         return Ok(false);
     };
+    previous_ranges.extend(previous_extra_ranges.iter().cloned());
+    current_ranges.extend(current_extra_ranges.iter().cloned());
     let previous_fingerprint = archive_retired_macho_symbols_proof_fingerprint(
         previous_bytes,
         &previous_ranges,
@@ -13308,12 +13361,285 @@ fn macho_text_section_activation(
     })))
 }
 
+fn macho_archive_unwind_input_ranges(
+    input: PatchInputBytes<'_>,
+    file: &object::File<'_>,
+    unwind: &AddedMachOArchiveUnwind,
+) -> Result<std::result::Result<Vec<std::ops::Range<usize>>, String>> {
+    let mut ranges = Vec::new();
+    for section_index in unwind
+        .compact_unwind
+        .iter()
+        .map(|compact| compact.section_index)
+        .chain(
+            unwind
+                .eh_frame
+                .iter()
+                .map(|eh_frame| eh_frame.section_index),
+        )
+    {
+        let object_section_index = patch_section_object_index(file, section_index)?;
+        let section = file.section_by_index(object_section_index)?;
+        let Some((offset, size)) = section.file_range() else {
+            return Ok(Err(
+                "changed Mach-O unwind section has no input file range".to_owned()
+            ));
+        };
+        let start = input
+            .file_offset
+            .checked_add(
+                usize::try_from(offset)
+                    .context("Changed Mach-O unwind section offset exceeds usize")?,
+            )
+            .context("Changed Mach-O unwind section offset overflow")?;
+        let end = start
+            .checked_add(
+                usize::try_from(size)
+                    .context("Changed Mach-O unwind section size exceeds usize")?,
+            )
+            .context("Changed Mach-O unwind section range overflow")?;
+        ranges.push(start..end);
+    }
+    ranges.sort_by_key(|range| range.start);
+    Ok(Ok(ranges))
+}
+
+fn macho_unwind_function_identities(
+    input: &str,
+    unwind: &AddedMachOArchiveUnwind,
+    sections: &[PatchSection],
+    output_file: &object::File<'_>,
+) -> std::result::Result<Vec<MachOUnwindFunctionIdentity>, String> {
+    let mut functions = Vec::new();
+    if let Some(compact_unwind) = &unwind.compact_unwind {
+        functions.extend(
+            compact_unwind
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF
+                })
+                .map(|entry| (entry.function.clone(), entry.function_length)),
+        );
+    }
+    if let Some(eh_frame) = &unwind.eh_frame {
+        functions.extend(eh_frame.fdes.iter().filter_map(|fde| {
+            let has_compact_entry = unwind.compact_unwind.as_ref().is_some_and(|compact| {
+                compact.entries.iter().any(|entry| {
+                    entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF
+                        && entry.function == fde.function
+                        && entry.function_length == fde.function_length
+                })
+            });
+            (!has_compact_entry).then(|| (fde.function.clone(), fde.function_length))
+        }));
+    }
+
+    let mut identities = Vec::with_capacity(functions.len());
+    for (function, length) in functions {
+        let section = sections
+            .iter()
+            .find(|section| {
+                section.input == input && section.section_index == function.section_index
+            })
+            .ok_or_else(|| {
+                "changed Mach-O unwind function section has no previous output mapping".to_owned()
+            })?;
+        if function.section_offset >= section.input_size {
+            return Err("changed Mach-O unwind function is outside its section".to_owned());
+        }
+        let section_address =
+            macho_output_address_for_file_offset(output_file, section.output_offset).ok_or_else(
+                || "changed Mach-O unwind function section has no output address".to_owned(),
+            )?;
+        let function_address = section_address
+            .checked_add(function.section_offset)
+            .ok_or_else(|| "changed Mach-O unwind function address overflowed".to_owned())?;
+        identities.push(MachOUnwindFunctionIdentity {
+            function_offset: added_macho_archive_image_offset(function_address)?,
+            length,
+        });
+    }
+    identities.sort_by_key(|identity| (identity.function_offset, identity.length));
+    identities.dedup();
+    for pair in identities.windows(2) {
+        if added_macho_archive_unwind_ranges_overlap(
+            pair[0].function_offset,
+            pair[0].length,
+            pair[1].function_offset,
+            pair[1].length,
+        ) {
+            return Err("changed Mach-O unwind function identities overlap or conflict".to_owned());
+        }
+    }
+    Ok(identities)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn changed_macho_archive_unwind_members(
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    output_file: &object::File<'_>,
+    excluded_identifiers: &[Vec<u8>],
+) -> Result<std::result::Result<ChangedMachOArchiveUnwindMembers, String>> {
+    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let mut input_pairs = matched_sections
+        .iter()
+        .map(|matched| {
+            (
+                matched.previous.input.clone(),
+                matched.current.input.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    input_pairs.sort_unstable();
+    input_pairs.dedup();
+    let previous_sections = matched_sections
+        .iter()
+        .map(|matched| matched.previous.clone())
+        .collect::<Vec<_>>();
+
+    let mut members = Vec::new();
+    let mut retired_entries = Vec::new();
+    let mut previous_input_ranges = Vec::new();
+    let mut current_input_ranges = Vec::new();
+    for (previous_input_ref, current_input_ref) in input_pairs {
+        let Some(previous_input) = previous_resolver.resolve(
+            input_file_path,
+            previous_input_ref.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(Err(
+                "could not resolve previous changed Mach-O unwind member".to_owned(),
+            ));
+        };
+        let Some(current_input) = current_resolver.resolve(
+            input_file_path,
+            current_input_ref.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(Err(
+                "could not resolve current changed Mach-O unwind member".to_owned(),
+            ));
+        };
+        if current_input.archive_identifier.is_some_and(|identifier| {
+            let identifier = archive_member_patch_identifier(identifier);
+            excluded_identifiers
+                .iter()
+                .any(|excluded| excluded == &identifier)
+        }) {
+            continue;
+        }
+
+        let Ok(previous_file) = object::File::parse(previous_input.bytes) else {
+            continue;
+        };
+        let Ok(current_file) = object::File::parse(current_input.bytes) else {
+            continue;
+        };
+        if !is_supported_incremental_macho_object(&previous_file)
+            || !is_supported_incremental_macho_object(&current_file)
+        {
+            continue;
+        }
+        let previous_unwind = match added_macho_archive_unwind(&previous_file)? {
+            Ok(unwind) => unwind,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let current_unwind = match added_macho_archive_unwind(&current_file)? {
+            Ok(unwind) => unwind,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if previous_unwind == current_unwind {
+            continue;
+        }
+        let (Some(previous_unwind), Some(current_unwind)) = (previous_unwind, current_unwind)
+        else {
+            return Ok(Err(
+                "changed Mach-O member added or removed all unwind metadata".to_owned(),
+            ));
+        };
+
+        let previous_ranges = match macho_archive_unwind_input_ranges(
+            previous_input,
+            &previous_file,
+            &previous_unwind,
+        )? {
+            Ok(ranges) => ranges,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let current_ranges =
+            match macho_archive_unwind_input_ranges(current_input, &current_file, &current_unwind)?
+            {
+                Ok(ranges) => ranges,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        previous_input_ranges.extend(previous_ranges);
+        current_input_ranges.extend(current_ranges);
+        retired_entries.extend(
+            match macho_unwind_function_identities(
+                previous_input_ref.as_str(),
+                &previous_unwind,
+                &previous_sections,
+                output_file,
+            ) {
+                Ok(identities) => identities,
+                Err(reason) => return Ok(Err(reason)),
+            },
+        );
+
+        let Some(text) = current_file.section_by_name("__text") else {
+            return Ok(Err(
+                "changed Mach-O unwind member has no __text section".to_owned()
+            ));
+        };
+        members.push(AddedMachOArchiveTextMember {
+            input: current_input_ref,
+            sections: Vec::new(),
+            unwind: Some(current_unwind),
+            text_section_index: patch_section_record_index(&current_file, text.index())?,
+            text_object_section_index: relocation_target_record_index(text.index())?,
+            definitions: Vec::new(),
+            referenced_names: Vec::new(),
+        });
+    }
+
+    retired_entries.sort_by_key(|identity| (identity.function_offset, identity.length));
+    if retired_entries.windows(2).any(|pair| {
+        added_macho_archive_unwind_ranges_overlap(
+            pair[0].function_offset,
+            pair[0].length,
+            pair[1].function_offset,
+            pair[1].length,
+        )
+    }) {
+        return Ok(Err(
+            "changed Mach-O unwind retirement identities overlap or are duplicated".to_owned(),
+        ));
+    }
+    previous_input_ranges.sort_by_key(|range| range.start);
+    current_input_ranges.sort_by_key(|range| range.start);
+    Ok(Ok(ChangedMachOArchiveUnwindMembers {
+        members,
+        retired_entries,
+        previous_input_ranges,
+        current_input_ranges,
+    }))
+}
+
 fn added_macho_archive_text_activations(
+    previous_bytes: &[u8],
     current_bytes: &[u8],
     input_file_path: &str,
     added_identifiers: &[Vec<u8>],
     matched_sections: &[MatchedPatchSection],
+    existing_current_sections: &[PatchSection],
     current_resolver: &PatchInputResolver<'_>,
+    excluded_unwind_identifiers: &[Vec<u8>],
     reserved_ranges: &[ReservedRangeRecord],
     padding_percent: u32,
     previous_output: &[u8],
@@ -13568,12 +13894,33 @@ fn added_macho_archive_text_activations(
         }
     }
     combined_resolutions.sort_unstable();
+    let changed_unwind = match changed_macho_archive_unwind_members(
+        previous_bytes,
+        input_file_path,
+        matched_sections,
+        current_resolver,
+        &output_file,
+        excluded_unwind_identifiers,
+    )? {
+        Ok(changed) => changed,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let changed_unwind_member_start = members.len();
+    members.extend(changed_unwind.members);
+    let unwind_selected_indices = selected_indices
+        .iter()
+        .copied()
+        .chain(changed_unwind_member_start..members.len())
+        .collect::<Vec<_>>();
+    let mut unwind_sections = sections.clone();
+    unwind_sections.extend(existing_current_sections.iter().cloned());
     let unwind_patches = match added_macho_archive_unwind_activation(
         &members,
-        &selected_indices,
-        &sections,
+        &unwind_selected_indices,
+        &unwind_sections,
         &output_file,
         &combined_resolutions,
+        &changed_unwind.retired_entries,
         &mut remaining_reserved_ranges,
     )? {
         Ok(activation) => activation
@@ -13617,6 +13964,8 @@ fn added_macho_archive_text_activations(
         unwind_patches,
         relocation_replays,
         provisional_relocations,
+        previous_unwind_input_ranges: changed_unwind.previous_input_ranges,
+        current_unwind_input_ranges: changed_unwind.current_input_ranges,
         remaining_reserved_ranges,
     }))
 }
@@ -15272,6 +15621,7 @@ fn added_macho_archive_unwind_activation(
     sections: &[PatchSection],
     output_file: &object::File<'_>,
     resolutions: &[MachOSymbolResolutionRecord],
+    retired_entries: &[MachOUnwindFunctionIdentity],
     remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
 ) -> Result<std::result::Result<Option<AddedMachOArchiveUnwindActivation>, String>> {
     if selected_indices
@@ -15726,7 +16076,7 @@ fn added_macho_archive_unwind_activation(
         }
     };
     let existing_entries =
-        match merge_macho_unwind_info_entries(existing_entries, &[], added_entries) {
+        match merge_macho_unwind_info_entries(existing_entries, retired_entries, added_entries) {
             Ok(entries) => entries,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -31932,6 +32282,109 @@ mod tests {
     }
 
     #[test]
+    fn changed_macho_archive_unwind_members_record_exact_replacement_proof() {
+        let previous_object = test_observed_049_macho_unwind_object(false);
+        let current_object = test_observed_049_macho_unwind_object(true);
+        let input_file_path = hex::encode("input.rlib");
+        let archive = |identifier: &[u8], object: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            let bytes = builder.into_inner().unwrap();
+            let mut entries = ArchiveIterator::from_archive_bytes(&bytes).unwrap();
+            let ArchiveEntry::Regular(member) = entries.next().unwrap().unwrap() else {
+                panic!("expected regular archive member");
+            };
+            let input_ref = resolved_patch_input_ref(
+                &input_file_path,
+                &input_file_path,
+                PatchInputBytes {
+                    bytes: member.entry_data,
+                    file_offset: member.data_offset,
+                    archive_identifier: Some(member.ident.as_slice()),
+                },
+            )
+            .unwrap();
+            (bytes, input_ref)
+        };
+        let previous_identifier = b"crate-hash.codegen.previous.rcgu.o";
+        let current_identifier = b"crate-hash.codegen.current.rcgu.o";
+        let (previous_archive, previous_input) = archive(previous_identifier, &previous_object);
+        let (current_archive, current_input) = archive(current_identifier, &current_object);
+
+        let previous_file = object::File::parse(previous_object.as_slice()).unwrap();
+        let current_file = object::File::parse(current_object.as_slice()).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let output = test_macho_unwind_output(0x1000);
+        let matched = vec![MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_input,
+                section_index: patch_section_record_index(&previous_file, previous_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: output.text_offset + 0x100,
+                output_size: previous_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: current_input,
+                section_index: patch_section_record_index(&current_file, current_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: output.text_offset + 0x100,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+
+        let changed = changed_macho_archive_unwind_members(
+            &previous_archive,
+            &input_file_path,
+            &matched,
+            &current_resolver,
+            &output_file,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(changed.members.len(), 1);
+        assert_eq!(changed.previous_input_ranges.len(), 2);
+        assert_eq!(changed.current_input_ranges.len(), 2);
+        assert_eq!(changed.retired_entries.len(), 1);
+        assert!(
+            changed.retired_entries.windows(2).all(|pair| {
+                pair[0].function_offset + pair[0].length <= pair[1].function_offset
+            })
+        );
+
+        let excluded = changed_macho_archive_unwind_members(
+            &previous_archive,
+            &input_file_path,
+            &matched,
+            &current_resolver,
+            &output_file,
+            &[archive_member_patch_identifier(current_identifier)],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(excluded.members.is_empty());
+        assert!(excluded.retired_entries.is_empty());
+        assert!(excluded.previous_input_ranges.is_empty());
+        assert!(excluded.current_input_ranges.is_empty());
+    }
+
+    #[test]
     fn added_macho_archive_unwind_activation_advances_terminator_and_rolls_back() {
         let (mut member, mut sections) = test_added_macho_unwind_member(false);
         let compact = member
@@ -31960,6 +32413,7 @@ mod tests {
                 &[0],
                 &sections,
                 &output_file,
+                &[],
                 &[],
                 &mut reserves,
             )
@@ -32023,6 +32477,7 @@ mod tests {
                 &sections,
                 &output_file,
                 &[],
+                &[],
                 &mut reserves,
             )
             .unwrap()
@@ -32042,6 +32497,7 @@ mod tests {
                 &[0],
                 &sections,
                 &output_file,
+                &[],
                 &[],
                 &mut reserves,
             )
@@ -32082,6 +32538,7 @@ mod tests {
                 &[0],
                 &sections,
                 &output_file,
+                &[],
                 &[],
                 &mut gapped_reserves,
             )
@@ -32130,6 +32587,7 @@ mod tests {
                 &sections,
                 &output_file,
                 &[],
+                &[],
                 &mut insufficient_capacity_reserves,
             )
             .unwrap()
@@ -32177,6 +32635,7 @@ mod tests {
                 &sections,
                 &output_file,
                 std::slice::from_ref(&resolution),
+                &[],
                 &mut reserves,
             )
             .unwrap()
