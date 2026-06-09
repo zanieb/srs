@@ -180,18 +180,88 @@ if [[ "$verify_native_sld_replay" == 1 ]]; then
         printf 'cargo +%s metadata-only edit changed executable bytes\n' "$toolchain" >&2
         exit 1
     fi
-    if ! grep -Fq \
-        'reused 1 unchanged Rust archive input file by rustc link-content digest before loading inputs' \
+    if grep -Eq \
+        '^changed-input patch unavailable before loading inputs:|^full relink: input file changed:' \
         "$metadata_rebuild_log"
     then
-        printf 'cargo +%s metadata-only edit did not reuse the rlib link-content digest\n' \
+        printf 'cargo +%s metadata-only edit fell back from incremental reuse\n' \
             "$toolchain" >&2
         cat "$metadata_rebuild_log" >&2
         exit 1
     fi
-    if ! grep -Fq 'reused existing output before loading inputs' "$metadata_rebuild_log"; then
-        printf 'cargo +%s metadata-only edit did not reuse the executable\n' "$toolchain" >&2
-        cat "$metadata_rebuild_log" >&2
+    if grep -Fq \
+        'reused 1 unchanged Rust archive input file by rustc link-content digest before loading inputs' \
+        "$metadata_rebuild_log"
+    then
+        if ! grep -Fq 'reused existing output before loading inputs' "$metadata_rebuild_log"; then
+            printf 'cargo +%s metadata-only digest reuse did not reuse the executable\n' \
+                "$toolchain" >&2
+            cat "$metadata_rebuild_log" >&2
+            exit 1
+        fi
+    else
+        if ! grep -Fq 'patched 1 changed input file before loading inputs' \
+            "$metadata_rebuild_log"
+        then
+            printf 'cargo +%s metadata-only edit did not update its changed rlib input\n' \
+                "$toolchain" >&2
+            cat "$metadata_rebuild_log" >&2
+            exit 1
+        fi
+        if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' \
+            "$metadata_rebuild_log"
+        then
+            printf 'cargo +%s metadata-only edit did not refresh its relocation records\n' \
+                "$toolchain" >&2
+            cat "$metadata_rebuild_log" >&2
+            exit 1
+        fi
+    fi
+    log_offset="$(wc -c < "$incremental_log")"
+fi
+
+cat > "$scratch/replay-lib/src/lib.rs" <<'EOF'
+pub static VALUE: i32 = 43;
+pub const UNUSED_METADATA: &str = "after!";
+
+pub fn value() -> i32 {
+    VALUE
+}
+EOF
+
+CARGO_INCREMENTAL="$cargo_incremental" CARGO_TARGET_DIR="$target_dir" \
+    cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
+if [[ "$("$binary")" != "VALUE=43" ]]; then
+    printf 'post-metadata cargo +%s binary did not print VALUE=43\n' "$toolchain" >&2
+    exit 1
+fi
+
+if [[ "$verify_native_sld_replay" == 1 ]]; then
+    post_metadata_rebuild_log="$scratch/post-metadata-rebuild.log"
+    dd if="$incremental_log" bs=1 skip="$log_offset" 2>/dev/null > "$post_metadata_rebuild_log"
+    if grep -Eq \
+        '^changed-input patch unavailable before loading inputs:|^full relink: input file changed:' \
+        "$post_metadata_rebuild_log"
+    then
+        printf 'cargo +%s post-metadata __text edit fell back from changed-input patching\n' \
+            "$toolchain" >&2
+        cat "$post_metadata_rebuild_log" >&2
+        exit 1
+    fi
+    if ! grep -Fq 'patched 1 changed input file before loading inputs' \
+        "$post_metadata_rebuild_log"
+    then
+        printf 'cargo +%s post-metadata __text edit did not patch its changed rlib input\n' \
+            "$toolchain" >&2
+        cat "$post_metadata_rebuild_log" >&2
+        exit 1
+    fi
+    if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' \
+        "$post_metadata_rebuild_log"
+    then
+        printf 'cargo +%s post-metadata __text edit did not patch changed input sections\n' \
+            "$toolchain" >&2
+        cat "$post_metadata_rebuild_log" >&2
         exit 1
     fi
 
