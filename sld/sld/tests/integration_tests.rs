@@ -234,9 +234,9 @@
 //! TestIncrementalChangedInput:{filename} Which input object to mutate for TestIncrementalChanged.
 //! Can be repeated to mutate multiple inputs. Defaults to the last linker input.
 //!
-//! TestIncrementalChangedCompArgs:{args} Extra compiler arguments used to rebuild the changed input
-//! from its original source. This exercises a real compiler-produced object change instead of
-//! mutating bytes in the previous object.
+//! TestIncrementalChangedCompArgs:{args} Extra compiler arguments used to rebuild the changed
+//! object, or every member of a changed archive, from its original source. This exercises a real
+//! compiler-produced input change instead of mutating bytes in the previous input.
 //!
 //! TestIncrementalChangedSection:{section} Section to mutate for TestIncrementalChanged. Can be
 //! repeated to mutate multiple sections in each changed input. Defaults to .data.
@@ -272,9 +272,17 @@
 //! input object, then check that a second incremental update returns to the original output.
 //! Defaults to false.
 //!
+//! TestIncrementalChangedRestoreCompareOriginal:{bool} Whether the restored-input incremental
+//! output should be byte-compared to the original incremental output. Defaults to true. Disable
+//! this when a persistent activated layout is semantically restored without reclaiming its
+//! previous allocation.
+//!
 //! TestIncrementalChangedReapply:{bool} Whether the changed-input restore test should reapply the
 //! exact changed input bytes, then check that the update returns to the changed output and the
 //! resulting state can be reused. Requires TestIncrementalChangedRestore. Defaults to false.
+//!
+//! TestIncrementalChangedRestoreSymbolBytes:{symbol_name}=0x{hex_bytes} Checks that bytes at the
+//! restored incremental output symbol address match the specified bytes.
 //!
 //! TestIncrementalChangedSectionPrefix:{section_name}=0x{hex_bytes} Checks that the changed-input
 //! incremental output section starts with the specified bytes.
@@ -929,7 +937,9 @@ struct Config {
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
+    test_incremental_changed_restore_compare_original: bool,
     test_incremental_changed_reapply: bool,
+    test_incremental_changed_restore_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_incremental_changed_no_sym: HashSet<String>,
@@ -1682,7 +1692,9 @@ impl Config {
             test_incremental_changed_compare_full: true,
             test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
+            test_incremental_changed_restore_compare_original: true,
             test_incremental_changed_reapply: false,
+            test_incremental_changed_restore_symbol_bytes: None,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
             test_incremental_changed_no_sym: HashSet::new(),
@@ -1869,7 +1881,7 @@ fn replace_changed_object_from_source(
     Ok(())
 }
 
-fn rebuild_changed_archive_with_added_members(
+fn rebuild_changed_archive(
     archive_path: &Path,
     config: &Config,
     changed_comp_args: &ArgumentSet,
@@ -1880,7 +1892,7 @@ fn rebuild_changed_archive_with_added_members(
         archive_path
             .extension()
             .is_some_and(|extension| extension == "a"),
-        "Incremental added archive member requires an archive input, got `{}`",
+        "Incremental changed archive rebuild requires an archive input, got `{}`",
         archive_path.display()
     );
     let archive_stem = archive_path
@@ -2467,8 +2479,22 @@ fn process_directive(
         "TestIncrementalChangedRestore" => {
             config.test_incremental_changed_restore = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalChangedRestoreCompareOriginal" => {
+            config.test_incremental_changed_restore_compare_original =
+                parse_bool(arg, "TestIncrementalChangedRestoreCompareOriginal")?;
+        }
         "TestIncrementalChangedReapply" => {
             config.test_incremental_changed_reapply = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedRestoreSymbolBytes" => {
+            let (symbol_name, expected_bytes) = parse_named_bytes_directive(
+                "TestIncrementalChangedRestoreSymbolBytes",
+                arg.trim(),
+            )?;
+            config.test_incremental_changed_restore_symbol_bytes = Some(ExpectedSymbolBytes {
+                symbol_name,
+                expected_bytes,
+            });
         }
         "TestIncrementalChangedSectionPrefix" => {
             let (section_name, expected_bytes) =
@@ -3174,8 +3200,12 @@ impl ProgramInputs {
                     if !config
                         .test_incremental_changed_added_archive_members
                         .is_empty()
+                        || changed_input
+                            .path
+                            .extension()
+                            .is_some_and(|extension| extension == "a")
                     {
-                        rebuild_changed_archive_with_added_members(
+                        rebuild_changed_archive(
                             &changed_input.path,
                             config,
                             changed_comp_args,
@@ -3641,13 +3671,42 @@ impl ProgramInputs {
                             link_output_restored.binary.display()
                         )
                     })?;
-                if restored_content != final_content {
+                if config.test_incremental_changed_restore_compare_original
+                    && restored_content != final_content
+                {
                     let diffs = sections_with_diffs(&restored_content, &final_content)?;
                     bail!(
                         "Incremental test failed for {}: restored changed-input output differs \
                         from the original incremental output. Diffs:\n{diffs:#?}",
                         self.name()
                     );
+                }
+                if config.platform == PlatformKind::MachO
+                    && !config.test_incremental_unsigned_macho_output
+                {
+                    verify_macho_signature(&link_output_restored.binary)?;
+                }
+                if config.test_incremental_changed_run {
+                    run_binary(&link_output_restored.binary, cross_arch).with_context(|| {
+                        format!(
+                            "Failed to run restored incremental output `{}`",
+                            link_output_restored.binary.display()
+                        )
+                    })?;
+                }
+                if let Some(expected) = &config.test_incremental_changed_restore_symbol_bytes {
+                    assert_output_symbol_bytes(
+                        &restored_content,
+                        &expected.symbol_name,
+                        &expected.expected_bytes,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Incremental test failed for {}: restored-input output symbol bytes \
+                             assertion failed",
+                            self.name()
+                        )
+                    })?;
                 }
 
                 let restored_log = std::fs::read_to_string(&log_path).with_context(|| {
