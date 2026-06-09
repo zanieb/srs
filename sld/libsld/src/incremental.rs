@@ -1979,6 +1979,7 @@ fn relocation_target_patches_for_input(
     let mut output_symbols = Vec::new();
     let mut macho_target_moves = Vec::new();
     let mut macho_cross_input_target_moves = Vec::new();
+    let mut changed_relocation_indices = Vec::new();
     for (relocation_index, relocation) in relocations.iter_mut().enumerate() {
         let Some(target) = relocation.target.as_mut() else {
             continue;
@@ -2064,6 +2065,7 @@ fn relocation_target_patches_for_input(
                 display_hex_path(&input.path)
             )));
         };
+        changed_relocation_indices.push(relocation_index);
         if file.format() == object::BinaryFormat::MachO
             && file.architecture() == object::Architecture::Aarch64
             && let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind)
@@ -2163,6 +2165,7 @@ fn relocation_target_patches_for_input(
         output_symbols,
         macho_target_moves,
         macho_cross_input_target_moves,
+        changed_relocation_indices,
     }))
 }
 
@@ -3228,6 +3231,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut record_override_input_files = HashSet::new();
+    let changed_input_files = changed_inputs
+        .iter()
+        .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
+        .collect::<HashSet<_>>();
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
@@ -3700,17 +3707,25 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
             };
-            if !records_complete
-                && (!relocation_target_patches.output_patches.is_empty()
-                    || !relocation_target_patches.output_symbols.is_empty()
-                    || !relocation_target_patches.macho_target_moves.is_empty()
-                    || !relocation_target_patches
-                        .macho_cross_input_target_moves
-                        .is_empty())
-            {
-                return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
-                    "changed relocation targets need complete relocation records".to_owned(),
-                ));
+            match changed_relocation_target_record_owners(
+                &relocation_target_patches,
+                &previous.relocations,
+                &changed_input_files,
+                records_complete,
+            ) {
+                Ok(changed_record_owners) => {
+                    record_override_input_files.extend(changed_record_owners);
+                }
+                Err(RelocationTargetRecordCoverageError::MissingOwner) => {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "changed relocation target has no recorded owner".to_owned(),
+                    ));
+                }
+                Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords) => {
+                    return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
+                        "changed relocation targets need complete relocation records".to_owned(),
+                    ));
+                }
             }
             if input_has_records_requiring_previous_bytes(&previous, input) {
                 timing_phase!("Read previous incremental input snapshot");
@@ -6100,6 +6115,41 @@ struct RelocationTargetPatches {
     output_symbols: Vec<RelocationTargetSymbolPatch>,
     macho_target_moves: Vec<MachORelocationTargetMove>,
     macho_cross_input_target_moves: Vec<MachORelocationTargetMove>,
+    changed_relocation_indices: Vec<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RelocationTargetRecordCoverageError {
+    MissingOwner,
+    RequiresCompleteRecords,
+}
+
+fn changed_relocation_target_record_owners(
+    target_patches: &RelocationTargetPatches,
+    relocations: &[RelocationRecord],
+    changed_input_files: &HashSet<String>,
+    records_complete: bool,
+) -> std::result::Result<HashSet<String>, RelocationTargetRecordCoverageError> {
+    let changed_record_owners = target_patches
+        .changed_relocation_indices
+        .iter()
+        .map(|index| {
+            relocations
+                .get(*index)
+                .map(|relocation| relocation.input_file.to_string())
+                .ok_or(RelocationTargetRecordCoverageError::MissingOwner)
+        })
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    // Selective reads contain complete owner blocks for changed inputs, but only incoming
+    // relocation aliases for other owners.
+    if !records_complete
+        && !changed_record_owners
+            .iter()
+            .all(|owner| changed_input_files.contains(owner))
+    {
+        return Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords);
+    }
+    Ok(changed_record_owners)
 }
 
 struct MachOSymbolResolutionUpdates {
@@ -45734,6 +45784,98 @@ mod tests {
                 "changed bytes outside patchable sections in `input.o`".to_owned()
             )
         ));
+    }
+
+    #[test]
+    fn filtered_records_cover_changed_relocation_target_owners() {
+        let relocations = vec![
+            relocation_record(
+                "a.o",
+                1,
+                4,
+                Some(0x1000),
+                0x2000,
+                Some("target-a"),
+                Some(("a.o", 1, 0)),
+                0,
+                100,
+                8,
+                1,
+                0,
+            ),
+            relocation_record(
+                "b.o",
+                1,
+                4,
+                Some(0x1000),
+                0x2000,
+                Some("target-b"),
+                Some(("b.o", 1, 0)),
+                0,
+                200,
+                8,
+                1,
+                0,
+            ),
+        ];
+        let target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            changed_relocation_indices: vec![0, 1],
+        };
+        let changed_input_files = [hex::encode("a.o"), hex::encode("b.o")]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            changed_relocation_target_record_owners(
+                &target_patches,
+                &relocations,
+                &changed_input_files,
+                false,
+            ),
+            Ok(changed_input_files)
+        );
+    }
+
+    #[test]
+    fn filtered_records_require_complete_relocation_target_owner() {
+        let relocations = vec![relocation_record(
+            "caller.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("target.o", 1, 0)),
+            0,
+            100,
+            8,
+            1,
+            0,
+        )];
+        let target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            changed_relocation_indices: vec![0],
+        };
+        let changed_input_files = [hex::encode("target.o")].into_iter().collect();
+
+        assert_eq!(
+            changed_relocation_target_record_owners(
+                &target_patches,
+                &relocations,
+                &changed_input_files,
+                false,
+            ),
+            Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords)
+        );
     }
 
     #[test]
