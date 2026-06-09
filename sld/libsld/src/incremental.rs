@@ -2989,6 +2989,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
+        let normalize_rust_archive_patch_inputs = args.should_normalize_rust_archive_patch_inputs();
         let can_reuse_rustc_link_content_digest = can_reuse_rustc_link_content_digest(args, path);
         let can_normalize_rust_archive_patch =
             can_normalize_rust_archive_patch(args, &previous, *input_index, path);
@@ -3188,8 +3189,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let mut previous_snapshot_bytes =
                 LazyInputSnapshotBytes::new(|| read_verified_input_snapshot(state_dir, input));
             timing_phase!("Resolve changed incremental patches");
-            let normalize_rust_archive_patch_inputs =
-                args.should_normalize_rust_archive_patch_inputs();
             let current_resolver = {
                 timing_phase!("Parse changed patch input");
                 PatchInputResolver::new(&bytes, normalize_rust_archive_patch_inputs)?
@@ -3959,6 +3958,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     MachOTextRelocationReplays {
                         replays: Vec::new(),
                         rematerialized_sections: Vec::new(),
+                        normalize_rust_archive_patch_inputs: false,
                         symbol_resolutions_changed: false,
                     }
                 }
@@ -3978,6 +3978,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &previous.relocations,
                 &macho_text_relocation_replays.replays,
                 &macho_text_relocation_replays.rematerialized_sections,
+                macho_text_relocation_replays.normalize_rust_archive_patch_inputs,
                 &macho_resolution_updates.retiring_names,
                 &recycled_resolution_names,
                 input,
@@ -4850,7 +4851,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             previous.input_files[*input_index].path.as_str(),
             &matched_sections,
             &mut previous.sections,
-            can_normalize_rust_archive_patch,
+            normalize_rust_archive_patch_inputs,
         )?;
         if sections_changed {
             if !records_complete {
@@ -5398,6 +5399,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             record_overrides_file: previous.record_overrides_file,
             record_override_inputs: previous.record_override_inputs,
         };
+        if state.sections_file.is_some() {
+            state.persist_macho_symbol_resolutions_for_metadata_update(state_dir)?;
+        }
         if state.sections_file.is_some() && !record_override_input_files.is_empty() {
             state.write_record_overrides_for_inputs(
                 state_dir,
@@ -6739,6 +6743,21 @@ fn matched_patch_section_preserves_relocation_record_locations(
         && section.previous.output_offset == section.current.output_offset
 }
 
+fn patch_input_refs_match(
+    input_file_path: &str,
+    previous_input: &str,
+    current_input: &str,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    Ok(previous_input == current_input
+        || (normalize_rust_archive_patch_inputs
+            && normalized_archive_input_refs_match(
+                input_file_path,
+                previous_input,
+                current_input,
+            )?))
+}
+
 fn matched_normalized_archive_section_preserves_relocation_record_locations(
     input_file_path: &str,
     section: &MatchedPatchSection,
@@ -6749,22 +6768,46 @@ fn matched_normalized_archive_section_preserves_relocation_record_locations(
     {
         return Ok(false);
     }
-    if section.previous.input == section.current.input {
-        return Ok(true);
-    }
-    if !normalize_rust_archive_patch_inputs {
-        return Ok(false);
-    }
-    let Some(previous) = parse_patch_input_ref(input_file_path, &section.previous.input)? else {
-        return Ok(false);
-    };
-    let Some(current) = parse_patch_input_ref(input_file_path, &section.current.input)? else {
-        return Ok(false);
-    };
-    Ok(!previous.identifier.is_empty()
-        && !current.identifier.is_empty()
-        && archive_member_patch_identifier(&previous.identifier)
-            == archive_member_patch_identifier(&current.identifier))
+    patch_input_refs_match(
+        input_file_path,
+        &section.previous.input,
+        &section.current.input,
+        normalize_rust_archive_patch_inputs,
+    )
+}
+
+fn section_record_matches_patch_section(
+    input_file_path: &str,
+    record: &SectionRecord,
+    section: &PatchSection,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    Ok(record.input_file == input_file_path
+        && record.section_index == section.section_index
+        && record.output_offset == section.output_offset
+        && record.size == section.output_size
+        && patch_input_refs_match(
+            input_file_path,
+            record.input.as_str(),
+            section.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?)
+}
+
+fn macho_relocation_record_matches_patch_section(
+    input_file_path: &str,
+    relocation: &RelocationRecord,
+    section: &PatchSection,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    Ok(relocation.input_file == input_file_path
+        && relocation.section_index == section.section_index
+        && patch_input_refs_match(
+            input_file_path,
+            relocation.input.as_str(),
+            section.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?)
 }
 
 fn update_section_records_for_matched_patches(
@@ -6782,25 +6825,38 @@ fn update_section_records_for_matched_patches(
         );
     }
 
-    let updates = matched_sections
-        .iter()
-        .map(|matched| {
-            (
-                section_record_update_key(input_file, &matched.previous),
-                &matched.current,
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    let mut updates = HashMap::<(u32, u64, u64), Vec<&MatchedPatchSection>>::new();
+    for matched in matched_sections {
+        updates
+            .entry((
+                matched.previous.section_index,
+                matched.previous.output_offset,
+                matched.previous.output_size,
+            ))
+            .or_default()
+            .push(matched);
+    }
 
     let mut changed = false;
     for record in records {
-        let Some(current) = updates.get(&(
-            record.input_file.as_str(),
-            record.input.as_str(),
-            record.section_index,
-            record.output_offset,
-            record.size,
-        )) else {
+        let Some(candidates) =
+            updates.get(&(record.section_index, record.output_offset, record.size))
+        else {
+            continue;
+        };
+        let mut current = None;
+        for matched in candidates {
+            if section_record_matches_patch_section(
+                input_file,
+                record,
+                &matched.previous,
+                normalize_rust_archive_patch_inputs,
+            )? {
+                current = Some(&matched.current);
+                break;
+            }
+        }
+        let Some(current) = current else {
             continue;
         };
 
@@ -6822,34 +6878,27 @@ fn update_section_record_for_matched_patch(
     records: &mut [SectionRecord],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
-    let Some(record) = records.iter_mut().find(|record| {
-        record.input_file == input_file
-            && record.input == matched.previous.input
-            && record.section_index == matched.previous.section_index
-            && record.output_offset == matched.previous.output_offset
-            && record.size == matched.previous.output_size
-    }) else {
+    let mut record_index = None;
+    for (index, record) in records.iter().enumerate() {
+        if section_record_matches_patch_section(
+            input_file,
+            record,
+            &matched.previous,
+            normalize_rust_archive_patch_inputs,
+        )? {
+            record_index = Some(index);
+            break;
+        }
+    }
+    let Some(record_index) = record_index else {
         return Ok(false);
     };
 
     update_section_record(
         input_file,
-        record,
+        &mut records[record_index],
         &matched.current,
         normalize_rust_archive_patch_inputs,
-    )
-}
-
-fn section_record_update_key<'a>(
-    input_file: &'a str,
-    section: &'a PatchSection,
-) -> (&'a str, &'a str, u32, u64, u64) {
-    (
-        input_file,
-        section.input.as_str(),
-        section.section_index,
-        section.output_offset,
-        section.output_size,
     )
 }
 
@@ -6859,13 +6908,12 @@ fn update_section_record(
     current: &PatchSection,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
-    let input_is_stable = record.input == current.input
-        || (normalize_rust_archive_patch_inputs
-            && normalized_archive_input_refs_match(
-                input_file,
-                record.input.as_str(),
-                current.input.as_str(),
-            )?);
+    let input_is_stable = patch_input_refs_match(
+        input_file,
+        record.input.as_str(),
+        current.input.as_str(),
+        normalize_rust_archive_patch_inputs,
+    )?;
     if input_is_stable
         && record.section_index == current.section_index
         && record.output_offset == current.output_offset
@@ -6874,7 +6922,9 @@ fn update_section_record(
         return Ok(false);
     }
 
-    record.input = current.input.clone().into();
+    if !input_is_stable {
+        record.input = current.input.clone().into();
+    }
     record.section_index = current.section_index;
     record.output_offset = current.output_offset;
     record.size = current.output_size;
@@ -8676,6 +8726,17 @@ impl PersistedState {
         }
     }
 
+    fn persist_macho_symbol_resolutions_for_metadata_update(&mut self, state_dir: &Path) -> Result {
+        if self.macho_symbol_resolutions_file.is_none() && !self.macho_symbol_resolutions.is_empty()
+        {
+            self.macho_symbol_resolutions_file = Some(write_macho_resolutions_sidecar(
+                state_dir,
+                &self.macho_symbol_resolutions,
+            )?);
+        }
+        Ok(())
+    }
+
     fn write_record_overrides_for_inputs(
         &mut self,
         state_dir: &Path,
@@ -8814,7 +8875,12 @@ impl PersistedState {
 
     fn write_index(&self, state_dir: &Path) -> Result {
         if !self.record_override_inputs.is_empty() {
-            return self.write(state_dir);
+            let mut state = self.clone();
+            state.persist_macho_symbol_resolutions_for_metadata_update(state_dir)?;
+            return state.write_metadata_update_for_inputs(
+                state_dir,
+                &(0..state.input_files.len()).collect::<Vec<_>>(),
+            );
         }
         let sections_file = self.sections_file.as_deref().unwrap_or(SECTIONS_FILE);
         self.write_index_with_sections_files(
@@ -10998,6 +11064,7 @@ struct MachOTextRelocationReplay {
 struct MachOTextRelocationReplays {
     replays: Vec<MachOTextRelocationReplay>,
     rematerialized_sections: Vec<(SharedText, String, u32, String, u32)>,
+    normalize_rust_archive_patch_inputs: bool,
     symbol_resolutions_changed: bool,
 }
 
@@ -11731,14 +11798,24 @@ fn rematerialized_macho_text_relocation_replay(
 fn relocation_is_in_rematerialized_macho_text_section(
     relocation: &RelocationRecord,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
-) -> bool {
-    rematerialized_sections.iter().any(
-        |(previous_input_file, previous_input, previous_section_index, _, _)| {
-            relocation.input_file == *previous_input_file
-                && relocation.input == *previous_input
-                && relocation.section_index == *previous_section_index
-        },
-    )
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    for (previous_input_file, previous_input, previous_section_index, _, _) in
+        rematerialized_sections
+    {
+        if relocation.input_file == *previous_input_file
+            && relocation.section_index == *previous_section_index
+            && patch_input_refs_match(
+                previous_input_file.as_str(),
+                relocation.input.as_str(),
+                previous_input,
+                normalize_rust_archive_patch_inputs,
+            )?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn reconcile_rematerialized_macho_symbol_resolutions(
@@ -11746,6 +11823,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
     relocations: &[RelocationRecord],
     replays: &[MachOTextRelocationReplay],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    normalize_rust_archive_patch_inputs: bool,
     retiring_names: &[SharedText],
     input: &FileState,
 ) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool), String> {
@@ -11757,7 +11835,13 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
         let Some(target_name) = relocation.target_name.as_ref() else {
             continue;
         };
-        if relocation_is_in_rematerialized_macho_text_section(relocation, rematerialized_sections) {
+        if relocation_is_in_rematerialized_macho_text_section(
+            relocation,
+            rematerialized_sections,
+            normalize_rust_archive_patch_inputs,
+        )
+        .map_err(|error| error.to_string())?
+        {
             affected_names.insert(target_name.clone());
         } else {
             current_references
@@ -11898,6 +11982,7 @@ fn retire_missing_macho_symbol_resolutions(
     relocations: &[RelocationRecord],
     replays: &[MachOTextRelocationReplay],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    normalize_rust_archive_patch_inputs: bool,
     retiring_names: &[SharedText],
     recycled_names: &HashSet<SharedText>,
     input: &FileState,
@@ -11937,15 +12022,24 @@ fn retire_missing_macho_symbol_resolutions(
                 display_hex_path(&input.path)
             ));
         }
-        if relocations.iter().any(|relocation| {
-            relocation.target_name.as_ref() == Some(name)
+        let mut has_live_relocation = false;
+        for relocation in relocations {
+            if relocation.target_name.as_ref() == Some(name)
                 && !relocation_is_in_rematerialized_macho_text_section(
                     relocation,
                     rematerialized_sections,
+                    normalize_rust_archive_patch_inputs,
                 )
-        }) || replays
-            .iter()
-            .any(|replay| replay.target_name.as_ref() == Some(name))
+                .map_err(|error| error.to_string())?
+            {
+                has_live_relocation = true;
+                break;
+            }
+        }
+        if has_live_relocation
+            || replays
+                .iter()
+                .any(|replay| replay.target_name.as_ref() == Some(name))
         {
             return Err(format!(
                 "missing Mach-O symbol resolution `{}` is still referenced in {}",
@@ -12045,6 +12139,8 @@ fn macho_text_relocation_replays_for_input(
     let mut same_object_target_moves = Vec::new();
     let mut target_input_ranges = Vec::new();
     let mut target_output_symbols = Vec::new();
+    let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
+        && current_resolver.normalize_rust_archive_patch_inputs;
     let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
         sections_by_input
@@ -12137,17 +12233,19 @@ fn macho_text_relocation_replays_for_input(
                 )));
             };
 
-            let mut relocation_indices = relocations
-                .iter()
-                .enumerate()
-                .filter_map(|(index, relocation)| {
-                    (relocation.input_file == input.path
-                        && relocation.input == patch_section.previous.input
-                        && relocation.section_index == patch_section.previous.section_index
-                        && decode_macho_aarch64_relocation_kind(relocation.kind).is_some())
-                    .then_some(index)
-                })
-                .collect::<Vec<_>>();
+            let mut relocation_indices = Vec::new();
+            for (index, relocation) in relocations.iter().enumerate() {
+                if decode_macho_aarch64_relocation_kind(relocation.kind).is_some()
+                    && macho_relocation_record_matches_patch_section(
+                        input.path.as_str(),
+                        relocation,
+                        &patch_section.previous,
+                        normalize_rust_archive_patch_inputs,
+                    )?
+                {
+                    relocation_indices.push(index);
+                }
+            }
             relocation_indices.sort_by_key(|index| relocations[*index].relocation_offset);
             let has_moved_target = relocation_indices
                 .iter()
@@ -12162,13 +12260,19 @@ fn macho_text_relocation_replays_for_input(
                     .iter()
                     .filter(|relocation| relocation.input_file == input.path)
                     .count();
-                let recorded_input_relocations = relocations
-                    .iter()
-                    .filter(|relocation| {
-                        relocation.input_file == input.path
-                            && relocation.input == patch_section.previous.input
-                    })
-                    .count();
+                let mut recorded_input_relocations = 0;
+                for relocation in relocations {
+                    if relocation.input_file == input.path
+                        && patch_input_refs_match(
+                            input.path.as_str(),
+                            relocation.input.as_str(),
+                            patch_section.previous.input.as_str(),
+                            normalize_rust_archive_patch_inputs,
+                        )?
+                    {
+                        recorded_input_relocations += 1;
+                    }
+                }
                 return Ok(Err(format!(
                     "changed Mach-O text relocation count in {}: object {}, recorded {} \
                      (input file {}, member {}, section {})",
@@ -12336,12 +12440,25 @@ fn macho_text_relocation_replays_for_input(
                 }
 
                 let mut replay_target = relocation.target.clone();
-                let same_object_target_move = if let Some(target) =
-                    relocation.target.as_ref().filter(|target| {
-                        target.input_file == input.path
-                            && target.input == patch_section.previous.input
-                            && relocation.input == target.input
-                    }) {
+                let same_object_target = if let Some(target) = relocation.target.as_ref() {
+                    (target.input_file == input.path
+                        && patch_input_refs_match(
+                            input.path.as_str(),
+                            target.input.as_str(),
+                            patch_section.previous.input.as_str(),
+                            normalize_rust_archive_patch_inputs,
+                        )?
+                        && patch_input_refs_match(
+                            input.path.as_str(),
+                            relocation.input.as_str(),
+                            target.input.as_str(),
+                            normalize_rust_archive_patch_inputs,
+                        )?)
+                    .then_some(target)
+                } else {
+                    None
+                };
+                let same_object_target_move = if let Some(target) = same_object_target {
                     let Some(previous_position) =
                         macho_relocation_symbol_position(&previous_file, previous_context.target)?
                     else {
@@ -12541,7 +12658,11 @@ fn macho_text_relocation_replays_for_input(
             }
             if patch_section.previous.data_hash == patch_section.current.data_hash
                 && !section_has_moved_target
-                && matched_patch_section_preserves_relocation_record_locations(patch_section)
+                && matched_normalized_archive_section_preserves_relocation_record_locations(
+                    input.path.as_str(),
+                    patch_section,
+                    normalize_rust_archive_patch_inputs,
+                )?
                 && replays[replay_start..]
                     .iter()
                     .all(|replay| replay.previous_range.as_ref() == Some(&replay.current_range))
@@ -12569,6 +12690,7 @@ fn macho_text_relocation_replays_for_input(
             relocations,
             &replays,
             &rematerialized_sections,
+            normalize_rust_archive_patch_inputs,
             retiring_names,
             input,
         ) {
@@ -12581,6 +12703,7 @@ fn macho_text_relocation_replays_for_input(
     Ok(Ok(MachOTextRelocationReplays {
         replays,
         rematerialized_sections,
+        normalize_rust_archive_patch_inputs,
         symbol_resolutions_changed,
     }))
 }
@@ -12600,6 +12723,8 @@ fn validate_macho_data_relocations_are_stable(
         .iter()
         .map(|target_move| target_move.relocation_index)
         .collect::<HashSet<_>>();
+    let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
+        && current_resolver.normalize_rust_archive_patch_inputs;
     let mut changed = false;
     let mut sections_by_input = HashMap::<&str, Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
@@ -12660,20 +12785,24 @@ fn validate_macho_data_relocations_are_stable(
             let previous_section = previous_file
                 .section_by_index(previous_index)
                 .context("Missing previous Mach-O data relocation section")?;
-            let mut relocation_indices = relocations
-                .iter()
-                .enumerate()
-                .filter_map(|(index, relocation)| {
-                    let raw = decode_macho_aarch64_relocation_kind(relocation.kind)?;
-                    (relocation.input_file == input.path
-                        && relocation.input == patch_section.previous.input
-                        && relocation.section_index == patch_section.previous.section_index
-                        && raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
-                        && !raw.r_pcrel
-                        && raw.r_length == 3)
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
+            let mut relocation_indices = Vec::new();
+            for (index, relocation) in relocations.iter().enumerate() {
+                let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+                    continue;
+                };
+                if raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                    && !raw.r_pcrel
+                    && raw.r_length == 3
+                    && macho_relocation_record_matches_patch_section(
+                        input.path.as_str(),
+                        relocation,
+                        &patch_section.previous,
+                        normalize_rust_archive_patch_inputs,
+                    )?
+                {
+                    relocation_indices.push(index);
+                }
+            }
             relocation_indices.sort_by_key(|index| relocations[*index].relocation_offset);
             // Newly activated sections are present in `matched_sections` before their
             // provisional relocation records are materialized. Only validate sections
@@ -12734,8 +12863,7 @@ fn validate_macho_data_relocations_are_stable(
                 matched_normalized_archive_section_preserves_relocation_record_locations(
                     input.path.as_str(),
                     patch_section,
-                    previous_resolver.normalize_rust_archive_patch_inputs
-                        && current_resolver.normalize_rust_archive_patch_inputs,
+                    normalize_rust_archive_patch_inputs,
                 )?,
             ) {
                 return Ok(Err(format!(
@@ -12817,13 +12945,22 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let expected_target = RelocationTargetRecord {
-                    input_file: input.path.clone().into(),
-                    input: patch_section.previous.input.clone().into(),
-                    section_index: relocation_target_record_index(previous_target.section_index)?,
-                    section_offset: previous_target.section_offset,
+                let expected_target_section_index =
+                    relocation_target_record_index(previous_target.section_index)?;
+                let target_matches = if let Some(target) = relocation.target.as_ref() {
+                    target.input_file == input.path
+                        && target.section_index == expected_target_section_index
+                        && target.section_offset == previous_target.section_offset
+                        && patch_input_refs_match(
+                            input.path.as_str(),
+                            target.input.as_str(),
+                            patch_section.previous.input.as_str(),
+                            normalize_rust_archive_patch_inputs,
+                        )?
+                } else {
+                    false
                 };
-                if relocation.target.as_ref() != Some(&expected_target) {
+                if !target_matches {
                     return Ok(Err(format!(
                         "previous Mach-O data relocation target changed in {}",
                         display_hex_path(&input.path)
@@ -12862,22 +12999,29 @@ fn validate_macho_data_relocations_are_stable(
                     )));
                 }
 
-                if relocation.input != patch_section.current.input
-                    || relocation.section_index != patch_section.current.section_index
-                    || relocation
-                        .target
-                        .as_ref()
-                        .is_none_or(|target| target.input != patch_section.current.input)
-                {
+                let previous_record = relocation.clone();
+                if !patch_input_refs_match(
+                    input.path.as_str(),
+                    relocation.input.as_str(),
+                    patch_section.current.input.as_str(),
+                    normalize_rust_archive_patch_inputs,
+                )? {
                     relocation.input = patch_section.current.input.clone().into();
-                    relocation.section_index = patch_section.current.section_index;
-                    let target = relocation.target.as_mut().unwrap();
-                    target.input = patch_section.current.input.clone().into();
-                    target.section_index =
-                        relocation_target_record_index(current_target.section_index)?;
-                    target.section_offset = current_target.section_offset;
-                    changed = true;
                 }
+                relocation.section_index = patch_section.current.section_index;
+                let target = relocation.target.as_mut().unwrap();
+                if !patch_input_refs_match(
+                    input.path.as_str(),
+                    target.input.as_str(),
+                    patch_section.current.input.as_str(),
+                    normalize_rust_archive_patch_inputs,
+                )? {
+                    target.input = patch_section.current.input.clone().into();
+                }
+                target.section_index =
+                    relocation_target_record_index(current_target.section_index)?;
+                target.section_offset = current_target.section_offset;
+                changed |= *relocation != previous_record;
             }
         }
     }
@@ -13510,16 +13654,20 @@ fn apply_macho_text_relocation_replays(
     }
     if !replays.rematerialized_sections.is_empty() {
         let previous_len = relocations.len();
-        relocations.retain(|relocation| {
-            !replays.rematerialized_sections.iter().any(
-                |(input_file, previous_input, previous_section_index, _, _)| {
-                    relocation.input_file == *input_file
-                        && relocation.input == *previous_input
-                        && relocation.section_index == *previous_section_index
-                        && decode_macho_aarch64_relocation_kind(relocation.kind).is_some()
-                },
-            )
-        });
+        let mut retained = Vec::with_capacity(previous_len);
+        for relocation in relocations.drain(..) {
+            let is_rematerialized = decode_macho_aarch64_relocation_kind(relocation.kind).is_some()
+                && relocation_is_in_rematerialized_macho_text_section(
+                    &relocation,
+                    &replays.rematerialized_sections,
+                    replays.normalize_rust_archive_patch_inputs,
+                )
+                .map_err(|error| error.to_string())?;
+            if !is_rematerialized {
+                retained.push(relocation);
+            }
+        }
+        *relocations = retained;
         records_changed |= relocations.len() != previous_len;
     }
     if !rematerialized_records.is_empty() {
@@ -31277,8 +31425,11 @@ mod tests {
     #[test]
     fn normalized_archive_member_rename_preserves_persisted_section_identity() {
         let input_file = hex::encode("libarchive.rlib");
-        let previous_input = hex::encode("libarchive.rlib\0crate-hash.cgu.old.rcgu.o\0100:200");
-        let current_input = hex::encode("libarchive.rlib\0crate-hash.cgu.new.rcgu.o\0300:400");
+        let persisted_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.persisted.rcgu.o\0100:200");
+        let previous_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.previous.rcgu.o\0300:400");
+        let current_input = hex::encode("libarchive.rlib\0crate-hash.cgu.current.rcgu.o\0500:600");
         let previous = PatchSection {
             input: previous_input.clone(),
             section_index: 3,
@@ -31297,7 +31448,7 @@ mod tests {
         let matched = MatchedPatchSection { previous, current };
         let original = SectionRecord {
             input_file: input_file.clone().into(),
-            input: previous_input.clone().into(),
+            input: persisted_input.clone().into(),
             section_index: 3,
             output_offset: 64,
             size: 16,
@@ -31315,12 +31466,33 @@ mod tests {
         );
         assert_eq!(normalized, vec![original.clone()]);
 
+        let mut moved = vec![original.clone()];
+        let mut moved_match = matched.clone();
+        moved_match.current.section_index = 7;
+        assert!(
+            update_section_records_for_matched_patches(
+                &input_file,
+                &[moved_match],
+                &mut moved,
+                true,
+            )
+            .unwrap()
+        );
+        assert_eq!(moved[0].input, persisted_input);
+        assert_eq!(moved[0].section_index, 7);
+
         let mut exact = vec![original];
         assert!(
-            update_section_records_for_matched_patches(&input_file, &[matched], &mut exact, false,)
-                .unwrap()
+            !update_section_records_for_matched_patches(
+                &input_file,
+                &[matched],
+                &mut exact,
+                false,
+            )
+            .unwrap()
         );
-        assert_eq!(exact[0].input, current_input);
+        assert_eq!(exact[0].input, persisted_input);
+        assert_eq!(exact[0].section_index, 3);
     }
 
     #[test]
@@ -33610,6 +33782,92 @@ mod tests {
     }
 
     #[test]
+    fn macho_relocation_record_matches_normalized_archive_patch_section() {
+        let input_file = hex::encode("libarchive.rlib");
+        let persisted_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.persisted.rcgu.o\0100:200");
+        let previous_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.previous.rcgu.o\0300:400");
+        let mut relocation = relocation_record(
+            "unused.o",
+            2,
+            1,
+            Some(0),
+            0,
+            None,
+            None,
+            0,
+            64,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_PAGE21,
+            }),
+            0,
+        );
+        relocation.input_file = input_file.clone().into();
+        relocation.input = persisted_input.into();
+        let section = PatchSection {
+            input: previous_input,
+            section_index: 2,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+
+        assert!(
+            macho_relocation_record_matches_patch_section(
+                &input_file,
+                &relocation,
+                &section,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(
+            !macho_relocation_record_matches_patch_section(
+                &input_file,
+                &relocation,
+                &section,
+                false,
+            )
+            .unwrap()
+        );
+
+        let mut different_section = section.clone();
+        different_section.section_index += 1;
+        assert!(
+            !macho_relocation_record_matches_patch_section(
+                &input_file,
+                &relocation,
+                &different_section,
+                true,
+            )
+            .unwrap()
+        );
+
+        let mut different_member = section;
+        different_member.input =
+            hex::encode("libarchive.rlib\0other-hash.cgu.previous.rcgu.o\0300:400");
+        assert!(
+            !macho_relocation_record_matches_patch_section(
+                &input_file,
+                &relocation,
+                &different_member,
+                true,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn matched_rust_archive_section_refreshes_member_identity() {
         fn archive(
             input_file: &str,
@@ -33790,6 +34048,54 @@ mod tests {
             !matched_normalized_archive_section_preserves_relocation_record_locations(
                 &input_file,
                 &MatchedPatchSection { previous, current },
+                true,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn rematerialized_macho_text_section_matches_older_normalized_archive_identity() {
+        let input_file = hex::encode("libarchive.rlib");
+        let persisted_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.persisted.rcgu.o\0100:200");
+        let previous_input =
+            hex::encode("libarchive.rlib\0crate-hash.cgu.previous.rcgu.o\0300:400");
+        let mut relocation =
+            relocation_record("unused.o", 2, 0, None, 0, None, None, 0, 64, 4, 0, 0);
+        relocation.input_file = input_file.clone().into();
+        relocation.input = persisted_input.into();
+        let rematerialized_sections = [(
+            SharedText::from(input_file),
+            previous_input,
+            2,
+            hex::encode("libarchive.rlib\0crate-hash.cgu.current.rcgu.o\0500:600"),
+            2,
+        )];
+
+        assert!(
+            relocation_is_in_rematerialized_macho_text_section(
+                &relocation,
+                &rematerialized_sections,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(
+            !relocation_is_in_rematerialized_macho_text_section(
+                &relocation,
+                &rematerialized_sections,
+                false,
+            )
+            .unwrap()
+        );
+
+        let mut different_section = relocation;
+        different_section.section_index += 1;
+        assert!(
+            !relocation_is_in_rematerialized_macho_text_section(
+                &different_section,
+                &rematerialized_sections,
                 true,
             )
             .unwrap()
@@ -35463,6 +35769,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                false,
                 std::slice::from_ref(&name),
                 &HashSet::new(),
                 &input,
@@ -35482,6 +35789,7 @@ mod tests {
                 &[surviving],
                 &[],
                 &[],
+                false,
                 std::slice::from_ref(&name),
                 &HashSet::from([name.clone()]),
                 &input,
@@ -35499,6 +35807,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                false,
                 std::slice::from_ref(&name),
                 &HashSet::from([name.clone()]),
                 &input,
@@ -41684,6 +41993,7 @@ mod tests {
                 current_input,
                 matched[0].current.section_index,
             )],
+            false,
             &[],
             &input,
         )
@@ -41892,6 +42202,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut patches = vec![ResolvedSectionPatch {
@@ -41984,6 +42295,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: true,
             symbol_resolutions_changed: false,
         };
         let mut patches = vec![ResolvedSectionPatch {
@@ -42074,6 +42386,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut patches = vec![ResolvedSectionPatch {
@@ -42163,6 +42476,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut patches = vec![ResolvedSectionPatch {
@@ -42228,6 +42542,7 @@ mod tests {
         let next_replays = MachOTextRelocationReplays {
             replays: vec![next_replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut next_patches = vec![ResolvedSectionPatch {
@@ -42302,6 +42617,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut patches = vec![ResolvedSectionPatch {
@@ -42390,6 +42706,7 @@ mod tests {
         let next_replays = MachOTextRelocationReplays {
             replays: vec![next_replay],
             rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
         let mut next_patches = vec![ResolvedSectionPatch {
@@ -42448,6 +42765,7 @@ mod tests {
                 hex::encode("input.o"),
                 1,
             )],
+            false,
             &[],
             &input,
         )
@@ -42517,6 +42835,7 @@ mod tests {
                 hex::encode("input.o"),
                 1,
             )],
+            false,
             &[],
             &input,
         );
@@ -42541,6 +42860,7 @@ mod tests {
                 hex::encode("input.o"),
                 1,
             )],
+            false,
             std::slice::from_ref(&retiring_name),
             &input,
         )
@@ -44311,6 +44631,18 @@ mod tests {
         assert_eq!(restored.relocations, updated.relocations);
         assert_eq!(restored.fdes, updated.fdes);
         assert_eq!(restored.dynamic_relocations, updated.dynamic_relocations);
+        restored.write_index(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(INDEX_FILE)).unwrap(),
+            base_index
+        );
+        assert_eq!(
+            PersistedState::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .relocations,
+            updated.relocations
+        );
 
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let b_inputs = [hex::encode("b.o")].into_iter().collect::<HashSet<_>>();
@@ -44394,6 +44726,73 @@ mod tests {
         assert_eq!(restored.sections, vec![section_record("b.o", 2, 208, 16)]);
         assert!(restored.relocations.is_empty());
         assert_eq!(restored.record_override_inputs.len(), 2);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn metadata_record_overrides_validate_sidecar_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+        let mut updated = PersistedState::read(dir.path()).unwrap().unwrap();
+        updated.sections = vec![section_record("a.o", 2, 104, 12)];
+        updated
+            .write_record_overrides_for_inputs(dir.path(), [hex::encode("a.o")])
+            .unwrap();
+        let override_file = updated.record_overrides_file.clone().unwrap();
+        updated
+            .write_metadata_update_for_inputs(dir.path(), &[0])
+            .unwrap();
+        let path = dir.path().join(override_file);
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(path, contents).unwrap();
+
+        let error = PersistedState::read(dir.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("do not match their content hash")
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn metadata_record_overrides_persist_changed_macho_resolutions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state("args", b"output", &[("a.o", b"a")]);
+        state.sections.push(section_record("a.o", 1, 100, 8));
+        state.write(dir.path()).unwrap();
+        let mut updated = PersistedState::read(dir.path()).unwrap().unwrap();
+        updated.sections = vec![section_record("a.o", 2, 104, 12)];
+        updated
+            .write_record_overrides_for_inputs(dir.path(), [hex::encode("a.o")])
+            .unwrap();
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: vec![0x1800],
+            target: Some(RelocationTargetRecord {
+                input_file: SharedText::from(hex::encode("a.o")),
+                input: SharedText::from(hex::encode("a.o")),
+                section_index: 2,
+                section_offset: 4,
+            }),
+        };
+        updated.macho_symbol_resolutions = vec![resolution.clone()];
+        updated.macho_symbol_resolutions_file = None;
+
+        updated.write_index(dir.path()).unwrap();
+
+        let mut restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert!(restored.macho_symbol_resolutions_file.is_some());
+        restored.load_macho_symbol_resolutions(dir.path()).unwrap();
+        assert_eq!(restored.macho_symbol_resolutions, vec![resolution]);
+        assert_eq!(restored.sections, updated.sections);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
