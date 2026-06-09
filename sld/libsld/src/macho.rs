@@ -101,15 +101,16 @@ fn incremental_reserve_sizes(
         output_section_id::TEXT,
         output_section_id::RODATA,
         output_section_id::GCC_EXCEPT_TABLE,
+        output_section_id::EH_FRAME,
+        output_section_id::DATA,
     ] {
         for part_id in section_id.parts() {
             let current_size = *current_sizes.get(part_id);
             if current_size == 0 {
                 continue;
             }
-            let alignment = part_id
-                .regular_alignment()
-                .context("Mach-O incremental reserve requires a regular output section")?;
+            let alignment = incremental_reserve_alignment(part_id)
+                .context("Mach-O incremental reserve requires a supported output section")?;
             let bytes = (u128::from(current_size) * u128::from(padding_percent)).div_ceil(100);
             let alignment = u128::from(alignment.value());
             let aligned = bytes.max(1).div_ceil(alignment) * alignment;
@@ -137,7 +138,9 @@ pub(crate) fn incremental_reserve_alignment(
     part_id: crate::part_id::PartId,
 ) -> Option<crate::alignment::Alignment> {
     part_id.regular_alignment().or_else(|| {
-        if part_id == crate::part_id::SYMTAB_GLOBAL {
+        if part_id == crate::part_id::EH_FRAME {
+            Some(crate::alignment::Alignment { exponent: 3 })
+        } else if part_id == crate::part_id::SYMTAB_GLOBAL {
             Some(crate::alignment::SYMTAB_ENTRY)
         } else if part_id == crate::part_id::STRTAB {
             Some(crate::alignment::Alignment { exponent: 0 })
@@ -321,10 +324,12 @@ mod tests {
         let gcc_except =
             output_section_id::GCC_EXCEPT_TABLE.part_id_with_alignment(Alignment { exponent: 2 });
         let data = output_section_id::DATA.part_id_with_alignment(Alignment { exponent: 2 });
+        let eh_frame = part_id::EH_FRAME;
         *current_sizes.get_mut(text) = 401;
         *current_sizes.get_mut(rodata) = 800;
         *current_sizes.get_mut(gcc_except) = 1;
         *current_sizes.get_mut(data) = 100;
+        *current_sizes.get_mut(eh_frame) = 72;
         *current_sizes.get_mut(part_id::SYMTAB_GLOBAL) = 160;
         *current_sizes.get_mut(part_id::STRTAB) = 100;
 
@@ -333,7 +338,8 @@ mod tests {
         assert_eq!(*reserves.get(text), 44);
         assert_eq!(*reserves.get(rodata), 80);
         assert_eq!(*reserves.get(gcc_except), 4);
-        assert_eq!(*reserves.get(data), 0);
+        assert_eq!(*reserves.get(data), 12);
+        assert_eq!(*reserves.get(eh_frame), 8);
         assert_eq!(*reserves.get(part_id::SYMTAB_GLOBAL), 16);
         assert_eq!(*reserves.get(part_id::STRTAB), 10);
     }
