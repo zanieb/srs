@@ -719,18 +719,25 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::UNWIND_ARM64_MODE_DWARF;
+    use super::UNWIND_HAS_LSDA;
+    use super::UnwindInfoEntry;
     use super::aligned_incremental_reserve_range;
     use super::chained_fixup_page_count;
     use super::chained_fixup_slot_is_file_backed;
     use super::compact_unwind_dwarf_offset_hint;
     use super::compact_unwind_section_addend;
     use super::encode_chained_rebase;
+    use super::parse_macho_unwind_info;
     use super::path_matches_library;
+    use super::read_u32;
     use super::rewrite_compacted_macho_eh_frame_cie_pointers;
     use super::section_may_contain_data_fixup;
+    use super::serialize_macho_unwind_info;
     use super::sorted_ranges_contain;
     use crate::alignment::Alignment;
     use crate::macho::MACHO_START_MEM_ADDRESS;
+    use crate::macho::macho_unwind_info_allocation_size;
     use linker_utils::relaxation::SectionRelaxDeltas;
 
     #[test]
@@ -801,6 +808,120 @@ mod tests {
             0x10e24
         );
         assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
+    }
+
+    fn unwind_entry(function_offset: u32, length: u32, encoding: u32) -> UnwindInfoEntry {
+        UnwindInfoEntry {
+            function_offset,
+            length,
+            encoding,
+            personality_offset: None,
+            lsda_offset: None,
+        }
+    }
+
+    #[test]
+    fn unwind_info_empty_round_trips_as_zero_capacity() {
+        let mut out = vec![0xaa; 64];
+        serialize_macho_unwind_info(&mut out, Vec::new(), 0x100).unwrap();
+
+        assert!(out.iter().all(|byte| *byte == 0));
+        assert!(parse_macho_unwind_info(&out).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unwind_info_round_trip_preserves_gaps_personality_and_lsda() {
+        let mut entries = vec![
+            unwind_entry(0x100, 0x10, 0x0200_0000),
+            unwind_entry(0x120, 0x08, UNWIND_ARM64_MODE_DWARF | 0x28),
+        ];
+        entries[1].personality_offset = Some(0x1234);
+        entries[1].lsda_offset = Some(0x5678);
+
+        let mut first = vec![0; 256];
+        serialize_macho_unwind_info(&mut first, entries, 0x140).unwrap();
+        let parsed = parse_macho_unwind_info(&first).unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![
+                unwind_entry(0x100, 0x10, 0x0200_0000),
+                unwind_entry(0x110, 0x10, 0),
+                UnwindInfoEntry {
+                    function_offset: 0x120,
+                    length: 0x08,
+                    encoding: UNWIND_ARM64_MODE_DWARF | 0x28,
+                    personality_offset: Some(0x1234),
+                    lsda_offset: Some(0x5678),
+                },
+                unwind_entry(0x128, 0x18, 0),
+            ]
+        );
+
+        let mut second = vec![0xaa; first.len()];
+        serialize_macho_unwind_info(&mut second, parsed, 0x140).unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn unwind_info_round_trip_spans_multiple_regular_pages() {
+        let entries = (0..512)
+            .map(|index| unwind_entry(0x100 + index * 4, 4, 0x0200_0000))
+            .collect::<Vec<_>>();
+        let text_end = 0x100 + 512 * 4;
+        let mut first = vec![0; macho_unwind_info_allocation_size(entries.len()) as usize];
+        serialize_macho_unwind_info(&mut first, entries.clone(), text_end).unwrap();
+
+        assert_eq!(read_u32(&first, 24).unwrap(), 3);
+        let parsed = parse_macho_unwind_info(&first).unwrap();
+        assert_eq!(parsed, entries);
+
+        let mut second = vec![0xaa; first.len()];
+        serialize_macho_unwind_info(&mut second, parsed, text_end).unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn unwind_info_codec_rejects_malformed_offsets_pages_and_capacity() {
+        let entry = unwind_entry(0x100, 0x10, 0x0200_0000);
+        assert!(serialize_macho_unwind_info(&mut [], vec![entry], 0x110).is_err());
+
+        let mut too_small = vec![0x5a; 40];
+        let original = too_small.clone();
+        assert!(serialize_macho_unwind_info(&mut too_small, vec![entry], 0x110).is_err());
+        assert_eq!(too_small, original);
+
+        let mut valid = vec![0; 128];
+        serialize_macho_unwind_info(&mut valid, vec![entry], 0x110).unwrap();
+
+        let mut bad_index = valid.clone();
+        bad_index[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_macho_unwind_info(&bad_index).is_err());
+
+        let index_offset = read_u32(&valid, 20).unwrap() as usize;
+        let page_offset = read_u32(&valid, index_offset + 4).unwrap() as usize;
+        let encoding_offset = page_offset + 12;
+
+        let mut compressed_page = valid.clone();
+        compressed_page[page_offset..page_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(parse_macho_unwind_info(&compressed_page).is_err());
+
+        let mut bad_personality = valid.clone();
+        let encoding = read_u32(&bad_personality, encoding_offset).unwrap();
+        bad_personality[encoding_offset..encoding_offset + 4]
+            .copy_from_slice(&(encoding | (1 << 28)).to_le_bytes());
+        assert!(parse_macho_unwind_info(&bad_personality).is_err());
+
+        let mut missing_lsda = valid;
+        let encoding = read_u32(&missing_lsda, encoding_offset).unwrap();
+        missing_lsda[encoding_offset..encoding_offset + 4]
+            .copy_from_slice(&(encoding | UNWIND_HAS_LSDA).to_le_bytes());
+        assert!(parse_macho_unwind_info(&missing_lsda).is_err());
+
+        let mut nonzero_padding = vec![0; 128];
+        serialize_macho_unwind_info(&mut nonzero_padding, vec![entry], 0x110).unwrap();
+        *nonzero_padding.last_mut().unwrap() = 1;
+        assert!(parse_macho_unwind_info(&nonzero_padding).is_err());
     }
 
     #[test]
@@ -2312,13 +2433,13 @@ struct CompactUnwindEntry {
     lsda: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct UnwindInfoEntry {
-    function_offset: u32,
-    length: u32,
-    encoding: u32,
-    personality_offset: Option<u32>,
-    lsda_offset: Option<u32>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnwindInfoEntry {
+    pub(crate) function_offset: u32,
+    pub(crate) length: u32,
+    pub(crate) encoding: u32,
+    pub(crate) personality_offset: Option<u32>,
+    pub(crate) lsda_offset: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2338,21 +2459,38 @@ const UNWIND_COMMON_ENCODINGS: [u32; 3] = [0x0200_0000, 0x0400_0000, 0];
 const MAX_UNWIND_PERSONALITIES: usize = 3;
 
 fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
-    out.fill(0);
-    if out.is_empty() {
-        return Ok(());
-    }
+    let entries = collect_unwind_info_entries(layout)?;
+    let text = layout.section_layouts.get(output_section_id::TEXT);
+    let text_end = macho_image_offset(text.mem_offset + text.mem_size)?;
+    serialize_macho_unwind_info(out, entries, text_end)
+}
 
-    let mut entries = collect_unwind_info_entries(layout)?;
+pub(crate) fn serialize_macho_unwind_info(
+    out: &mut [u8],
+    entries: Vec<UnwindInfoEntry>,
+    text_end: u32,
+) -> Result {
+    let mut encoded = vec![0; out.len()];
+    serialize_macho_unwind_info_into(&mut encoded, entries, text_end)?;
+    out.copy_from_slice(&encoded);
+    Ok(())
+}
+
+fn serialize_macho_unwind_info_into(
+    out: &mut [u8],
+    mut entries: Vec<UnwindInfoEntry>,
+    text_end: u32,
+) -> Result {
     if entries.is_empty() {
         return Ok(());
     }
+    ensure!(
+        !out.is_empty(),
+        "Mach-O __unwind_info allocation too small. Need nonzero capacity"
+    );
 
     entries.sort_by_key(|entry| entry.function_offset);
     entries.dedup_by_key(|entry| entry.function_offset);
-
-    let text = layout.section_layouts.get(output_section_id::TEXT);
-    let text_end = macho_image_offset(text.mem_offset + text.mem_size)?;
     add_unwind_info_gap_entries(&mut entries, text_end);
 
     let mut personalities = Vec::new();
@@ -2499,6 +2637,267 @@ fn write_unwind_info(out: &mut [u8], layout: &MachOLayout<'_>) -> Result {
     )?;
 
     Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_macho_unwind_info(data: &[u8]) -> Result<Vec<UnwindInfoEntry>> {
+    if data.iter().all(|byte| *byte == 0) {
+        return Ok(Vec::new());
+    }
+
+    const HEADER_SIZE: usize = 7 * size_of::<u32>();
+    const INDEX_ENTRY_SIZE: usize = 3 * size_of::<u32>();
+    const REGULAR_PAGE_HEADER_SIZE: usize = size_of::<u32>() + 2 * size_of::<u16>();
+    const REGULAR_PAGE_ENTRY_SIZE: usize = 2 * size_of::<u32>();
+    const LSDA_ENTRY_SIZE: usize = 2 * size_of::<u32>();
+
+    ensure!(
+        data.len() >= HEADER_SIZE,
+        "Mach-O __unwind_info is smaller than its header"
+    );
+    ensure!(
+        read_u32(data, 0)? == 1,
+        "Mach-O __unwind_info has an unsupported version"
+    );
+
+    let common_encodings_offset = read_u32(data, 4)? as usize;
+    let common_encodings_count = read_u32(data, 8)? as usize;
+    let personality_array_offset = read_u32(data, 12)? as usize;
+    let personality_array_count = read_u32(data, 16)? as usize;
+    let index_offset = read_u32(data, 20)? as usize;
+    let index_count = read_u32(data, 24)? as usize;
+
+    ensure!(
+        common_encodings_offset == HEADER_SIZE
+            && common_encodings_count == UNWIND_COMMON_ENCODINGS.len(),
+        "Mach-O __unwind_info has a non-canonical common encoding table"
+    );
+    let common_encodings_end = checked_macho_unwind_table_end(
+        common_encodings_offset,
+        common_encodings_count,
+        size_of::<u32>(),
+        data.len(),
+        "common encoding",
+    )?;
+    for (index, expected) in UNWIND_COMMON_ENCODINGS.into_iter().enumerate() {
+        ensure!(
+            read_u32(data, common_encodings_offset + index * size_of::<u32>())? == expected,
+            "Mach-O __unwind_info has an unexpected common encoding"
+        );
+    }
+
+    ensure!(
+        personality_array_offset == common_encodings_end
+            && personality_array_count <= MAX_UNWIND_PERSONALITIES,
+        "Mach-O __unwind_info has an invalid personality array"
+    );
+    let personality_array_end = checked_macho_unwind_table_end(
+        personality_array_offset,
+        personality_array_count,
+        size_of::<u32>(),
+        data.len(),
+        "personality",
+    )?;
+    let personalities = (0..personality_array_count)
+        .map(|index| read_u32(data, personality_array_offset + index * size_of::<u32>()))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        personalities
+            .iter()
+            .enumerate()
+            .all(|(index, personality)| !personalities[..index].contains(personality)),
+        "Mach-O __unwind_info has duplicate personalities"
+    );
+
+    ensure!(
+        index_offset == personality_array_end && index_count >= 2,
+        "Mach-O __unwind_info has an invalid first-level index"
+    );
+    let index_end = checked_macho_unwind_table_end(
+        index_offset,
+        index_count,
+        INDEX_ENTRY_SIZE,
+        data.len(),
+        "first-level index",
+    )?;
+    let mut indices = Vec::with_capacity(index_count);
+    for index in 0..index_count {
+        let offset = index_offset + index * INDEX_ENTRY_SIZE;
+        indices.push((
+            read_u32(data, offset)?,
+            read_u32(data, offset + size_of::<u32>())? as usize,
+            read_u32(data, offset + 2 * size_of::<u32>())? as usize,
+        ));
+    }
+    ensure!(
+        indices.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "Mach-O __unwind_info first-level functions are not strictly ordered"
+    );
+    let sentinel = *indices.last().unwrap();
+    ensure!(
+        sentinel.1 == 0,
+        "Mach-O __unwind_info sentinel has a second-level page"
+    );
+    ensure!(
+        sentinel.2 >= index_end && sentinel.2 <= data.len(),
+        "Mach-O __unwind_info has an invalid second-level page offset"
+    );
+    ensure!(
+        indices[0].2 == index_end,
+        "Mach-O __unwind_info LSDA index does not follow the first-level index"
+    );
+
+    let mut raw_entries = Vec::new();
+    let mut lsda_offsets = HashMap::new();
+    let mut expected_page_offset = sentinel.2;
+    for page_index in 0..index_count - 1 {
+        let (page_function_offset, page_offset, page_lsda_offset) = indices[page_index];
+        let (next_function_offset, _, next_page_lsda_offset) = indices[page_index + 1];
+        ensure!(
+            page_lsda_offset <= next_page_lsda_offset
+                && next_page_lsda_offset <= sentinel.2
+                && (next_page_lsda_offset - page_lsda_offset) % LSDA_ENTRY_SIZE == 0,
+            "Mach-O __unwind_info has an invalid LSDA index range"
+        );
+        let mut previous_lsda_function = None;
+        for offset in (page_lsda_offset..next_page_lsda_offset).step_by(LSDA_ENTRY_SIZE) {
+            let function_offset = read_u32(data, offset)?;
+            let lsda_offset = read_u32(data, offset + size_of::<u32>())?;
+            ensure!(
+                function_offset >= page_function_offset
+                    && function_offset < next_function_offset
+                    && previous_lsda_function.is_none_or(|previous| previous < function_offset)
+                    && lsda_offsets.insert(function_offset, lsda_offset).is_none(),
+                "Mach-O __unwind_info has an invalid LSDA entry"
+            );
+            previous_lsda_function = Some(function_offset);
+        }
+
+        ensure!(
+            page_offset == expected_page_offset,
+            "Mach-O __unwind_info second-level pages are not contiguous"
+        );
+        ensure!(
+            read_u32(data, page_offset)? == MACHO_UNWIND_SECOND_LEVEL_REGULAR,
+            "Mach-O __unwind_info uses an unsupported second-level page"
+        );
+        ensure!(
+            read_u16(data, page_offset + size_of::<u32>())? as usize == REGULAR_PAGE_HEADER_SIZE,
+            "Mach-O __unwind_info has an invalid regular-page entry offset"
+        );
+        let entry_count =
+            read_u16(data, page_offset + size_of::<u32>() + size_of::<u16>())? as usize;
+        ensure!(
+            entry_count > 0 && entry_count <= MACHO_UNWIND_REGULAR_SECOND_LEVEL_ENTRY_COUNT,
+            "Mach-O __unwind_info has an invalid regular-page entry count"
+        );
+        let entries_offset = page_offset + REGULAR_PAGE_HEADER_SIZE;
+        let page_end = checked_macho_unwind_table_end(
+            entries_offset,
+            entry_count,
+            REGULAR_PAGE_ENTRY_SIZE,
+            data.len(),
+            "regular-page entry",
+        )?;
+        for entry_index in 0..entry_count {
+            let offset = entries_offset + entry_index * REGULAR_PAGE_ENTRY_SIZE;
+            let function_offset = read_u32(data, offset)?;
+            let encoding = read_u32(data, offset + size_of::<u32>())?;
+            ensure!(
+                function_offset >= page_function_offset
+                    && function_offset < next_function_offset
+                    && raw_entries
+                        .last()
+                        .is_none_or(|(previous, _)| *previous < function_offset),
+                "Mach-O __unwind_info regular-page functions are not strictly ordered"
+            );
+            raw_entries.push((function_offset, encoding));
+        }
+        ensure!(
+            raw_entries
+                .get(raw_entries.len() - entry_count)
+                .is_some_and(|entry| entry.0 == page_function_offset),
+            "Mach-O __unwind_info page index does not match its first entry"
+        );
+        expected_page_offset = page_end;
+    }
+    ensure!(
+        expected_page_offset <= data.len(),
+        "Mach-O __unwind_info pages extend past the section"
+    );
+    ensure!(
+        data[expected_page_offset..].iter().all(|byte| *byte == 0),
+        "Mach-O __unwind_info has nonzero bytes after its regular pages"
+    );
+    ensure!(
+        raw_entries.last().is_some_and(|entry| entry.0 < sentinel.0),
+        "Mach-O __unwind_info sentinel does not follow its entries"
+    );
+
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    let mut used_personalities = vec![false; personalities.len()];
+    for (index, (function_offset, encoding)) in raw_entries.iter().copied().enumerate() {
+        let next_function_offset = raw_entries
+            .get(index + 1)
+            .map_or(sentinel.0, |entry| entry.0);
+        let length = next_function_offset
+            .checked_sub(function_offset)
+            .context("Mach-O __unwind_info function range underflow")?;
+        let personality_index = ((encoding & UNWIND_PERSONALITY_MASK) >> 28) as usize;
+        let personality_offset = if personality_index == 0 {
+            None
+        } else {
+            let used = used_personalities
+                .get_mut(personality_index - 1)
+                .context("Mach-O __unwind_info personality index is out of bounds")?;
+            *used = true;
+            Some(
+                *personalities
+                    .get(personality_index - 1)
+                    .context("Mach-O __unwind_info personality index is out of bounds")?,
+            )
+        };
+        let lsda_offset = lsda_offsets.remove(&function_offset);
+        ensure!(
+            lsda_offset.is_some() == (encoding & UNWIND_HAS_LSDA != 0),
+            "Mach-O __unwind_info LSDA flag does not match its index"
+        );
+        entries.push(UnwindInfoEntry {
+            function_offset,
+            length,
+            encoding: encoding & !(UNWIND_PERSONALITY_MASK | UNWIND_HAS_LSDA),
+            personality_offset,
+            lsda_offset,
+        });
+    }
+    ensure!(
+        lsda_offsets.is_empty(),
+        "Mach-O __unwind_info LSDA index references a missing function"
+    );
+    ensure!(
+        used_personalities.iter().all(|used| *used),
+        "Mach-O __unwind_info has an unused personality"
+    );
+    Ok(entries)
+}
+
+#[allow(dead_code)]
+fn checked_macho_unwind_table_end(
+    offset: usize,
+    count: usize,
+    entry_size: usize,
+    data_len: usize,
+    description: &str,
+) -> Result<usize> {
+    let end = count
+        .checked_mul(entry_size)
+        .and_then(|size| offset.checked_add(size))
+        .with_context(|| format!("Mach-O __unwind_info {description} table overflow"))?;
+    ensure!(
+        end <= data_len,
+        "Mach-O __unwind_info {description} table extends past the section"
+    );
+    Ok(end)
 }
 
 fn add_unwind_info_gap_entries(entries: &mut Vec<UnwindInfoEntry>, text_end: u32) {
