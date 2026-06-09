@@ -5,6 +5,5 @@ _incremental_added_archive_value:
 #ifdef ACTIVATE_ADDED_MEMBER
     b _incremental_added_archive_extra
 #else
-    mov w0, #42
-    ret
+    b _incremental_added_archive_retired
 #endif

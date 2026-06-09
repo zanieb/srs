@@ -1,7 +1,7 @@
 //#Config:incremental-added-archive-text
 //#Object:runtime.c
 //#Object:incremental-added-archive-reserve.S
-//#Archive:incremental-added-archive-root.S
+//#Archive:incremental-added-archive-root.S,incremental-added-archive-zz-retired.S
 //#RunEnabled:true
 //#DiffEnabled:false
 //#SldExtraLinkArgs:--incremental-padding-percent=300 -dead_strip
@@ -19,6 +19,7 @@
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedSymbolBytes:_incremental_added_archive_extra_second=0xc0028052
+//#TestIncrementalChangedNoSym:_incremental_added_archive_retired
 
 #include "../common/runtime.h"
 
