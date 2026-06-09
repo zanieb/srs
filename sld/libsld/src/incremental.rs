@@ -13768,6 +13768,12 @@ struct MachOChainedFixupPlan {
     new_values: Vec<(usize, u64)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MachOChainedFixupPlanSlot {
+    Existing { output_offset: u64, value: u64 },
+    New { target: u64, replay_index: usize },
+}
+
 fn plan_macho_chained_fixup_slots(
     old_slots: &[MachOChainedFixupSlot],
     new_slots: &[(u64, u64, usize)],
@@ -13779,7 +13785,15 @@ fn plan_macho_chained_fixup_slots(
         .ok_or_else(|| "Mach-O __DATA address range overflowed".to_owned())?;
     let mut slots = old_slots
         .iter()
-        .map(|slot| (slot.address, None))
+        .map(|slot| {
+            (
+                slot.address,
+                MachOChainedFixupPlanSlot::Existing {
+                    output_offset: slot.output_offset,
+                    value: slot.value,
+                },
+            )
+        })
         .collect::<Vec<_>>();
     for &(address, target, replay_index) in new_slots {
         if address < data_address || address.checked_add(8).is_none_or(|end| end > data_end) {
@@ -13788,19 +13802,25 @@ fn plan_macho_chained_fixup_slots(
         if !address.is_multiple_of(8) {
             return Err("added Mach-O chained rebase is not 8-byte aligned".to_owned());
         }
-        if slots.iter().any(|(slot, _)| *slot == address) {
-            return Err("added Mach-O chained rebase overlaps an existing slot".to_owned());
-        }
-        slots.push((address, Some((target, replay_index))));
+        slots.push((
+            address,
+            MachOChainedFixupPlanSlot::New {
+                target,
+                replay_index,
+            },
+        ));
     }
     slots.sort_by_key(|(address, _)| *address);
+    if slots.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("added Mach-O chained rebase overlaps an existing slot".to_owned());
+    }
 
     let page_count = usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
         .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
     let mut page_starts = vec![MACHO_CHAINED_PTR_START_NONE; page_count];
     let mut existing_values = Vec::new();
     let mut new_values = Vec::new();
-    for (slot_index, (address, new_slot)) in slots.iter().enumerate() {
+    for (slot_index, (address, slot)) in slots.iter().enumerate() {
         let offset_in_segment = address - data_address;
         let page_index = usize::try_from(offset_in_segment / crate::macho::MACHO_PAGE_SIZE)
             .map_err(|_| "Mach-O chained fixup page index is too large".to_owned())?;
@@ -13825,20 +13845,25 @@ fn plan_macho_chained_fixup_slots(
         if next_stride >= 0x1000 {
             return Err("Mach-O chained fixup next stride is invalid".to_owned());
         }
-        if let Some((target, replay_index)) = new_slot {
-            new_values.push((
-                *replay_index,
-                encode_incremental_macho_chained_rebase(*target, next_stride)?,
-            ));
-        } else {
-            let old = old_slots
-                .iter()
-                .find(|slot| slot.address == *address)
-                .ok_or_else(|| "missing previous Mach-O chained fixup slot".to_owned())?;
-            let value = (old.value & !MACHO_CHAINED_PTR_NEXT_MASK)
-                | (next_stride << MACHO_CHAINED_PTR_NEXT_SHIFT);
-            if value != old.value {
-                existing_values.push((old.output_offset, value));
+        match *slot {
+            MachOChainedFixupPlanSlot::New {
+                target,
+                replay_index,
+            } => {
+                new_values.push((
+                    replay_index,
+                    encode_incremental_macho_chained_rebase(target, next_stride)?,
+                ));
+            }
+            MachOChainedFixupPlanSlot::Existing {
+                output_offset,
+                value,
+            } => {
+                let updated = (value & !MACHO_CHAINED_PTR_NEXT_MASK)
+                    | (next_stride << MACHO_CHAINED_PTR_NEXT_SHIFT);
+                if updated != value {
+                    existing_values.push((output_offset, updated));
+                }
             }
         }
     }
