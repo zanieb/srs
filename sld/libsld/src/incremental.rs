@@ -3924,6 +3924,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         records_complete,
                     )? {
                         Ok(replays) => replays,
+                        Err(reason)
+                            if reason
+                                == "changed input needs complete Mach-O text relocation records" =>
+                        {
+                            return Ok(ChangedInputPatchResult::RequiresCompleteRecords(reason));
+                        }
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                     };
                     match validate_macho_data_relocations_are_stable(
@@ -4424,11 +4430,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 } else {
                     &mut previous.reserved_ranges
                 };
-            if (!macho_text_relocation_replays.replays.is_empty()
+            let relocation_records_changed = if !macho_text_relocation_replays.replays.is_empty()
                 || !macho_text_relocation_replays
                     .rematerialized_sections
-                    .is_empty())
-                && let Err(reason) = apply_macho_text_relocation_replays(
+                    .is_empty()
+            {
+                match apply_macho_text_relocation_replays(
                     &mut resolved_patches,
                     &macho_text_relocation_replays,
                     previous_output.get()?,
@@ -4436,16 +4443,19 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &mut previous.macho_symbol_resolutions,
                     remaining_reserved_ranges,
                     &mut macho_reserved_thunk_patches,
-                )
-            {
-                return Ok(ChangedInputPatchResult::Unsupported(reason));
-            }
+                ) {
+                    Ok(changed) => changed,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                }
+            } else {
+                false
+            };
             if !macho_reserved_thunk_patches.is_empty() {
                 previous.macho_symbol_resolutions.sort_unstable();
                 previous.macho_symbol_resolutions.dedup();
                 previous.macho_symbol_resolutions_file = None;
             }
-            if !macho_text_relocation_replays.replays.is_empty() {
+            if relocation_records_changed {
                 previous.relocations.sort_unstable();
                 previous.relocations.dedup();
                 previous.sections_file = None;
@@ -12874,12 +12884,13 @@ fn apply_macho_text_relocation_replays(
     resolutions: &mut [MachOSymbolResolutionRecord],
     reserved_ranges: &mut Vec<ReservedRangeRecord>,
     reserved_thunk_patches: &mut Vec<SectionPatch>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let output_file = object::File::parse(previous_output)
         .map_err(|error| format!("failed to parse previous Mach-O output: {error}"))?;
     let thunk_size = <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config()
         .ok_or_else(|| "Mach-O text thunks are unavailable for this architecture".to_owned())?
         .thunk_size as usize;
+    let mut records_changed = false;
     let mut local_thunks = Vec::<(usize, u64, u64, std::ops::Range<usize>)>::new();
     for replay in &replays.replays {
         if replay.r_type != object::macho::ARM64_RELOC_BRANCH26 {
@@ -13157,17 +13168,51 @@ fn apply_macho_text_relocation_replays(
             let relocation = relocations
                 .get_mut(relocation_index)
                 .ok_or_else(|| "missing recorded Mach-O text relocation".to_owned())?;
-            relocation.input = replay.input.clone().into();
+            let previous_record = relocation.clone();
+            let current_input: SharedText = replay.input.clone().into();
+            if relocation.input != current_input
+                && !normalized_archive_input_refs_match(
+                    replay.input_file.as_str(),
+                    relocation.input.as_str(),
+                    current_input.as_str(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "failed to compare normalized Mach-O relocation input identity: {error:#}"
+                    )
+                })?
+            {
+                relocation.input = current_input;
+            }
             relocation.section_index = replay.section_index;
             relocation.relocation_offset = replay.current_range.start as u64;
             relocation.output_offset = current_output_offset;
             relocation.written_value = Some(written_value);
             relocation.target_value = replay.current_target_value;
             relocation.applied_target_value = Some(applied_target_value);
+            let previous_target = relocation.target.clone();
             relocation.target = replay.target.clone();
+            if let (Some(previous_target), Some(current_target)) =
+                (previous_target.as_ref(), relocation.target.as_mut())
+                && previous_target.input_file == current_target.input_file
+                && previous_target.input != current_target.input
+                && normalized_archive_input_refs_match(
+                    current_target.input_file.as_str(),
+                    previous_target.input.as_str(),
+                    current_target.input.as_str(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "failed to compare normalized Mach-O relocation target identity: {error:#}"
+                    )
+                })?
+            {
+                current_target.input = previous_target.input.clone();
+            }
             if let Some(target) = relocation.target.as_mut() {
                 target.section_offset = replay.current_target_section_offset;
             }
+            records_changed |= *relocation != previous_record;
         } else {
             rematerialized_records.push(RelocationRecord {
                 target_symbol_id: replay.target_symbol_id,
@@ -13195,6 +13240,7 @@ fn apply_macho_text_relocation_replays(
         return Err("missing recorded Mach-O text relocation for replay".to_owned());
     }
     if !replays.rematerialized_sections.is_empty() {
+        let previous_len = relocations.len();
         relocations.retain(|relocation| {
             !replays.rematerialized_sections.iter().any(
                 |(input_file, previous_input, previous_section_index, _, _)| {
@@ -13205,13 +13251,15 @@ fn apply_macho_text_relocation_replays(
                 },
             )
         });
+        records_changed |= relocations.len() != previous_len;
     }
     if !rematerialized_records.is_empty() {
+        records_changed = true;
         relocations.extend(rematerialized_records);
         relocations.sort_unstable();
         relocations.dedup();
     }
-    Ok(())
+    Ok(records_changed)
 }
 
 fn macho_output_address_for_file_offset(file: &object::File<'_>, file_offset: u64) -> Option<u64> {
@@ -41576,16 +41624,18 @@ mod tests {
             0,
         )];
 
-        apply_macho_text_relocation_replays(
-            &mut patches,
-            &replays,
-            &previous_output,
-            &mut relocations,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        assert!(
+            apply_macho_text_relocation_replays(
+                &mut patches,
+                &replays,
+                &previous_output,
+                &mut relocations,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
 
         assert_eq!(relocations[0].input, hex::encode(current_input));
         assert_eq!(relocations[0].target.as_ref(), Some(&current_target));
@@ -41593,6 +41643,102 @@ mod tests {
             relocations[0].output_offset,
             current_text_range.start as u64
         );
+    }
+
+    #[test]
+    fn macho_text_relocation_replay_preserves_normalized_archive_member_identity() {
+        let previous_output = test_macho_object(b"\0\0\0\0", b"\x01\x02\x03\x04", 0);
+        let text_range = test_macho_section_range(&previous_output, "__text");
+        let input_file = hex::encode("libarchive.rlib");
+        let previous_input = hex::encode("libarchive.rlib\0crate-hash.cgu.old.rcgu.o\0100:200");
+        let current_input = hex::encode("libarchive.rlib\0crate-hash.cgu.new.rcgu.o\0300:400");
+        let current_target = RelocationTargetRecord {
+            input_file: input_file.clone().into(),
+            input: current_input.clone().into(),
+            section_index: 2,
+            section_offset: 8,
+        };
+        let mut replay =
+            rematerialized_macho_replay("unused.o", "_target", 0, current_target.clone());
+        replay.relocation_index = Some(0);
+        replay.input_file = input_file.clone().into();
+        replay.input = current_input.clone();
+        replay.previous_output_offset = Some(text_range.start as u64);
+        replay.previous_range = Some(0..4);
+        replay.previous_written_value = Some(0);
+        replay.previous_applied_target_value = Some(0);
+        replay.current_target_section_offset = 8;
+        replay.target_is_global = false;
+        let replays = MachOTextRelocationReplays {
+            replays: vec![replay],
+            rematerialized_sections: Vec::new(),
+            symbol_resolutions_changed: false,
+        };
+        let mut patches = vec![ResolvedSectionPatch {
+            section: PatchSection {
+                input: current_input,
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: text_range.start as u64,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 4,
+                data: vec![0; 4],
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+        let previous_target = RelocationTargetRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input.clone().into(),
+            ..current_target
+        };
+        let mut relocations = vec![relocation_record(
+            "unused.o",
+            1,
+            1,
+            Some(0),
+            0,
+            Some("_target"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_PAGE21,
+            }),
+            0,
+        )];
+        relocations[0].input_file = input_file.into();
+        relocations[0].input = previous_input.into();
+        relocations[0].target = Some(previous_target);
+        relocations[0].applied_target_value = Some(0);
+        let previous_record = relocations[0].clone();
+
+        assert!(
+            !apply_macho_text_relocation_replays(
+                &mut patches,
+                &replays,
+                &previous_output,
+                &mut relocations,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
+        assert_eq!(relocations, vec![previous_record]);
     }
 
     #[test]
