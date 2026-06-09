@@ -239,6 +239,11 @@
 //! supplied archive member name. Can be repeated; members are sorted by archive identifier with
 //! the rebuilt original members. Requires TestIncrementalChangedCompArgs.
 //!
+//! TestIncrementalChangedRenameAddedArchiveMembers:{bool} Whether the repeated changed-input link
+//! should first rename the configured added Rust archive members to a new invocation suffix while
+//! preserving their normalized identities and bytes. The repeated link must patch the changed
+//! input, preserve output, reuse the updated state, and run when TestIncrementalChangedRun is true.
+//!
 //! TestIncrementalChangedCompareFull:{bool} Whether the changed-input incremental output should be
 //! byte-compared to a fresh full relink. Defaults to true. Disable this when the initial
 //! incremental link intentionally reserves capacity and the changed incremental output should
@@ -897,6 +902,7 @@ struct Config {
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
     test_incremental_changed_added_archive_members: Vec<IncrementalAddedArchiveMember>,
+    test_incremental_changed_rename_added_archive_members: bool,
     test_incremental_changed_compare_full: bool,
     test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
@@ -1643,6 +1649,7 @@ impl Config {
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
             test_incremental_changed_added_archive_members: Vec::new(),
+            test_incremental_changed_rename_added_archive_members: false,
             test_incremental_changed_compare_full: true,
             test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
@@ -2401,6 +2408,10 @@ fn process_directive(
                 },
             );
         }
+        "TestIncrementalChangedRenameAddedArchiveMembers" => {
+            config.test_incremental_changed_rename_added_archive_members =
+                arg.to_lowercase().parse()?;
+        }
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
         }
@@ -3054,6 +3065,17 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.test_incremental_changed_rename_added_archive_members
+                && config
+                    .test_incremental_changed_added_archive_members
+                    .is_empty()
+            {
+                bail!(
+                    "Incremental renamed added-archive-member test for {} requires \
+                     TestIncrementalChangedAddedArchiveMember",
+                    self.name()
+                );
+            }
             if config.test_incremental_changed_restore
                 && config.test_incremental_changed_compare_full
             {
@@ -3177,6 +3199,20 @@ impl ProgramInputs {
                 "reused existing output"
             };
             let reuse_count_before = log.matches(reuse_message).count();
+            let repeated_patched_input_message =
+                format!("patched {} changed input file", changed_inputs.len());
+            let repeated_patched_input_count_before =
+                log.matches(&repeated_patched_input_message).count();
+            if config.test_incremental_changed_rename_added_archive_members {
+                let identifiers = config
+                    .test_incremental_changed_added_archive_members
+                    .iter()
+                    .map(|member| member.identifier.as_str())
+                    .collect::<Vec<_>>();
+                for changed_input in &changed_inputs {
+                    rename_rust_archive_member_invocations(&changed_input.path, &identifiers)?;
+                }
+            }
             let link_output_5 =
                 Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
             let repeated_changed_content =
@@ -3197,13 +3233,70 @@ impl ProgramInputs {
             {
                 verify_macho_signature(&link_output_5.binary)?;
             }
+            if config.test_incremental_changed_rename_added_archive_members
+                && config.test_incremental_changed_run
+            {
+                run_binary(&link_output_5.binary, cross_arch).with_context(|| {
+                    format!(
+                        "Failed to run renamed-member incremental output `{}`",
+                        link_output_5.binary.display()
+                    )
+                })?;
+            }
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
-            if log.matches(reuse_message).count() <= reuse_count_before {
+            if config.test_incremental_changed_rename_added_archive_members
+                && log.matches(&repeated_patched_input_message).count()
+                    <= repeated_patched_input_count_before
+            {
+                bail!(
+                    "Incremental test failed for {}: renamed-member link did not patch the \
+                     changed input before loading inputs. Log:\n{}",
+                    self.name(),
+                    log
+                );
+            }
+            if config.test_incremental_changed_rename_added_archive_members {
+                let renamed_reuse_count_before = log.matches(reuse_message).count();
+                let link_output_6 =
+                    Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
+                let repeated_renamed_content =
+                    std::fs::read(&link_output_6.binary).with_context(|| {
+                        format!(
+                            "Failed to read repeated renamed-member incremental output: {}",
+                            link_output_6.binary.display()
+                        )
+                    })?;
+                if repeated_renamed_content != repeated_changed_content {
+                    bail!(
+                        "Incremental test failed for {}: repeated renamed-member link changed \
+                         output",
+                        self.name()
+                    );
+                }
+                if config.platform == PlatformKind::MachO
+                    && !config.test_incremental_unsigned_macho_output
+                {
+                    verify_macho_signature(&link_output_6.binary)?;
+                }
+                let repeated_renamed_log =
+                    std::fs::read_to_string(&log_path).with_context(|| {
+                        format!("Failed to read incremental log `{}`", log_path.display())
+                    })?;
+                if repeated_renamed_log.matches(reuse_message).count() <= renamed_reuse_count_before
+                {
+                    bail!(
+                        "Incremental test failed for {}: repeated renamed-member link did not \
+                         reuse the updated incremental state. Log:\n{}",
+                        self.name(),
+                        repeated_renamed_log
+                    );
+                }
+            } else if log.matches(reuse_message).count() <= reuse_count_before {
                 bail!(
                     "Incremental test failed for {}: repeated changed-input link did not reuse \
-                    the updated incremental state. Log:\n{}",
+                     the updated incremental state. Log:\n{}",
                     self.name(),
                     log
                 );
@@ -3872,6 +3965,110 @@ fn append_archive_member(path: &Path) -> Result {
         path.display()
     );
     Ok(())
+}
+
+fn rename_rust_archive_member_invocations(path: &Path, identifiers: &[&str]) -> Result {
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    let mut archive = ar::Archive::new(std::io::Cursor::new(bytes.as_slice()));
+    let identifiers = identifiers.iter().copied().collect::<HashSet<_>>();
+    let mut original_members = HashMap::<Vec<u8>, Vec<u8>>::new();
+    while let Some(entry) = archive.next_entry() {
+        let mut entry = entry
+            .with_context(|| format!("Failed to read archive entry in `{}`", path.display()))?;
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .with_context(|| format!("Failed to read archive member in `{}`", path.display()))?;
+        original_members.insert(entry.header().identifier().to_vec(), data);
+    }
+
+    let mut renamed = HashMap::<Vec<u8>, Vec<u8>>::new();
+    for identifier in identifiers {
+        let stem = identifier
+            .strip_suffix(".rcgu.o")
+            .with_context(|| format!("Added archive member `{identifier}` is not a CGU"))?;
+        let (module, invocation) = stem.rsplit_once('.').with_context(|| {
+            format!("Added archive member `{identifier}` has no invocation suffix")
+        })?;
+        ensure!(
+            !module.is_empty() && !invocation.is_empty(),
+            "Added archive member `{identifier}` has an invalid invocation suffix"
+        );
+        let replacement = format!("{module}.{}.rcgu.o", "r".repeat(invocation.len()));
+        ensure!(
+            replacement.len() == identifier.len() && replacement != identifier,
+            "Added archive member `{identifier}` cannot be renamed in place"
+        );
+        ensure!(
+            original_members.contains_key(identifier.as_bytes()),
+            "Added archive member `{identifier}` is missing from `{}`",
+            path.display()
+        );
+
+        let mut occurrences = 0;
+        let mut offset = 0;
+        while let Some(index) = bytes[offset..]
+            .windows(identifier.len())
+            .position(|window| window == identifier.as_bytes())
+        {
+            let start = offset + index;
+            bytes[start..start + identifier.len()].copy_from_slice(replacement.as_bytes());
+            occurrences += 1;
+            offset = start + identifier.len();
+        }
+        ensure!(
+            occurrences == 1,
+            "Added archive member `{identifier}` has {occurrences} encoded identifiers in `{}`",
+            path.display()
+        );
+        renamed.insert(identifier.as_bytes().to_vec(), replacement.into_bytes());
+    }
+
+    let mut renamed_archive = ar::Archive::new(std::io::Cursor::new(bytes.as_slice()));
+    let mut renamed_members = HashMap::<Vec<u8>, Vec<u8>>::new();
+    while let Some(entry) = renamed_archive.next_entry() {
+        let mut entry = entry.with_context(|| {
+            format!(
+                "Failed to read renamed archive entry in `{}`",
+                path.display()
+            )
+        })?;
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).with_context(|| {
+            format!(
+                "Failed to read renamed archive member in `{}`",
+                path.display()
+            )
+        })?;
+        renamed_members.insert(entry.header().identifier().to_vec(), data);
+    }
+    ensure!(
+        original_members.len() == renamed_members.len(),
+        "Renaming archive members changed the entry count in `{}`",
+        path.display()
+    );
+    for (identifier, data) in &original_members {
+        let current_identifier = renamed.get(identifier).unwrap_or(identifier);
+        ensure!(
+            renamed_members.get(current_identifier) == Some(data),
+            "Renaming archive member `{}` changed its bytes in `{}`",
+            String::from_utf8_lossy(identifier),
+            path.display()
+        );
+    }
+
+    let tmp_path = append_to_path(path, ".renamed");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write renamed archive `{}`", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to replace `{}` with renamed archive `{}`",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    rewrite_file_with_same_contents(path)
 }
 
 #[derive(Clone)]
