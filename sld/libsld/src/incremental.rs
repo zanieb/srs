@@ -1649,6 +1649,7 @@ fn relocation_target_patches_for_input(
     let mut output_patches = Vec::new();
     let mut output_symbols = Vec::new();
     let mut macho_target_moves = Vec::new();
+    let mut macho_cross_input_target_moves = Vec::new();
     for (relocation_index, relocation) in relocations.iter_mut().enumerate() {
         let Some(target) = relocation.target.as_mut() else {
             continue;
@@ -1728,9 +1729,6 @@ fn relocation_target_patches_for_input(
         };
         let delta = i128::from(current.section_offset) - i128::from(target.section_offset);
         let previous_target_value = relocation.target_value;
-        let previous_applied_target_value = relocation
-            .applied_target_value
-            .unwrap_or(previous_target_value);
         let Some(target_value) = add_signed_delta_u64(previous_target_value, delta) else {
             return Ok(Err(format!(
                 "relocation target value overflowed in {}",
@@ -1752,66 +1750,11 @@ fn relocation_target_patches_for_input(
                     display_hex_path(&input.path)
                 )));
             }
-            let rel_info =
-                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
-                    raw_relocation,
-                )
-                .map_err(|error| {
-                    crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
-                })?;
             if relocation.input_file != input.path {
-                if previous_applied_target_value != previous_target_value {
-                    return Ok(Err(format!(
-                        "moved Mach-O stub or thunk target in {}",
-                        display_hex_path(&input.path)
-                    )));
-                }
-                let Some(written_value) = macho_aarch64_relocated_value_after_target_move(
-                    raw_relocation.r_type,
-                    previous_written_value,
-                    previous_target_value,
-                    target_value,
-                    relocation.addend,
-                ) else {
-                    return Ok(Err(format!(
-                        "unsupported cross-input Mach-O relocation target patch in {}",
-                        display_hex_path(&input.path)
-                    )));
-                };
-                let applied_target_value = target_value;
-                let Some(deferred_relocation) = deferred_instruction_relocation_patch(
-                    rel_info,
-                    previous_written_value,
-                    written_value,
-                ) else {
-                    return Ok(Err(format!(
-                        "unsupported cross-input Mach-O relocation instruction in {}",
-                        display_hex_path(&input.path)
-                    )));
-                };
-                let Ok(size) = usize::try_from(relocation.size) else {
-                    return Ok(Err(format!(
-                        "unsupported cross-input Mach-O relocation size in {}",
-                        display_hex_path(&input.path)
-                    )));
-                };
-                output_patches.push(SectionPatch {
-                    output_offset: relocation.output_offset,
-                    size: relocation.size,
-                    data: vec![0; size],
-                    deferred_relocation: Some(deferred_relocation),
-                    preserve_ranges: Vec::new(),
-                    adjustments: Vec::new(),
-                });
-                relocation.written_value = Some(written_value);
-                relocation.target_value = target_value;
-                relocation.applied_target_value = Some(applied_target_value);
-                target.section_offset = current.section_offset;
-                output_symbols.push(RelocationTargetSymbolPatch {
-                    target_name: target_name.to_owned(),
-                    previous_target_value,
-                    target_value,
-                    allow_missing: true,
+                macho_cross_input_target_moves.push(MachORelocationTargetMove {
+                    relocation_index,
+                    current_section_offset: current.section_offset,
+                    current_target_value: target_value,
                 });
                 continue;
             }
@@ -1893,7 +1836,143 @@ fn relocation_target_patches_for_input(
         output_patches,
         output_symbols,
         macho_target_moves,
+        macho_cross_input_target_moves,
     }))
+}
+
+fn finish_macho_cross_input_target_moves(
+    relocations: &mut [RelocationRecord],
+    target_patches: &mut RelocationTargetPatches,
+    resolution_moves: &[MachOSymbolResolutionMove],
+    input: &FileState,
+) -> Result<std::result::Result<(), String>> {
+    for target_move in std::mem::take(&mut target_patches.macho_cross_input_target_moves) {
+        let Some(relocation) = relocations.get_mut(target_move.relocation_index) else {
+            return Ok(Err(format!(
+                "missing cross-input Mach-O relocation for moved target in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(target_name) = relocation.target_name.as_deref().map(str::to_owned) else {
+            return Ok(Err(format!(
+                "missing cross-input Mach-O relocation target name in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(previous_target) = relocation.target.clone() else {
+            return Ok(Err(format!(
+                "missing cross-input Mach-O relocation target in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let previous_target_value = relocation.target_value;
+        let previous_applied_target_value = relocation
+            .applied_target_value
+            .unwrap_or(previous_target_value);
+        let Some(previous_written_value) = relocation.written_value else {
+            return Ok(Err(format!(
+                "missing written cross-input Mach-O relocation value in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+            return Ok(Err(format!(
+                "invalid cross-input Mach-O relocation kind in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+
+        let mut matching_moves = resolution_moves.iter().filter(|moved| {
+            moved.name.as_str() == target_name.as_str()
+                && moved.previous_target == previous_target
+                && moved.previous_value == previous_target_value
+                && moved.current_target.section_offset == target_move.current_section_offset
+        });
+        let forwarding_move = matching_moves.next();
+        if matching_moves.next().is_some() {
+            return Ok(Err(format!(
+                "ambiguous moved Mach-O symbol for cross-input relocation in {}",
+                display_hex_path(&input.path)
+            )));
+        }
+        if let Some(moved) = forwarding_move {
+            if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
+                || previous_applied_target_value != previous_target_value
+            {
+                return Ok(Err(format!(
+                    "unsupported moved Mach-O forwarding target in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
+            relocation.target_value = moved.current_value;
+            relocation.applied_target_value = Some(moved.previous_value);
+            relocation.target = Some(moved.current_target.clone());
+            continue;
+        }
+
+        if previous_applied_target_value != previous_target_value {
+            return Ok(Err(format!(
+                "moved Mach-O stub or thunk target in {}",
+                display_hex_path(&input.path)
+            )));
+        }
+        let Some(written_value) = macho_aarch64_relocated_value_after_target_move(
+            raw_relocation.r_type,
+            previous_written_value,
+            previous_target_value,
+            target_move.current_target_value,
+            relocation.addend,
+        ) else {
+            return Ok(Err(format!(
+                "unsupported cross-input Mach-O relocation target patch in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                raw_relocation,
+            )
+            .map_err(|error| {
+                crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
+            })?;
+        let Some(deferred_relocation) =
+            deferred_instruction_relocation_patch(rel_info, previous_written_value, written_value)
+        else {
+            return Ok(Err(format!(
+                "unsupported cross-input Mach-O relocation instruction in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Ok(size) = usize::try_from(relocation.size) else {
+            return Ok(Err(format!(
+                "unsupported cross-input Mach-O relocation size in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        target_patches.output_patches.push(SectionPatch {
+            output_offset: relocation.output_offset,
+            size: relocation.size,
+            data: vec![0; size],
+            deferred_relocation: Some(deferred_relocation),
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        relocation.written_value = Some(written_value);
+        relocation.target_value = target_move.current_target_value;
+        relocation.applied_target_value = Some(target_move.current_target_value);
+        if let Some(target) = relocation.target.as_mut() {
+            target.section_offset = target_move.current_section_offset;
+        }
+        target_patches
+            .output_symbols
+            .push(RelocationTargetSymbolPatch {
+                target_name,
+                previous_target_value,
+                target_value: target_move.current_target_value,
+                allow_missing: true,
+            });
+    }
+    Ok(Ok(()))
 }
 
 fn update_macho_symbol_resolutions_for_input(
@@ -2225,6 +2304,35 @@ fn macho_forwarding_thunk_patches(
         }
     }
     Ok(Ok(patches))
+}
+
+fn record_macho_forwarding_thunk_addresses(
+    resolutions: &mut [MachOSymbolResolutionRecord],
+    moves: &[MachOSymbolResolutionMove],
+) -> std::result::Result<(), String> {
+    for moved in moves {
+        let matching_indices = resolutions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resolution)| {
+                (resolution.name == moved.name
+                    && resolution.direct_value == Some(moved.current_value)
+                    && resolution.target.as_ref() == Some(&moved.current_target))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [resolution_index] = matching_indices.as_slice() else {
+            return Err(
+                "moved Mach-O symbol has no unique current resolution for forwarding thunk"
+                    .to_owned(),
+            );
+        };
+        let thunk_addresses = &mut resolutions[*resolution_index].thunk_addresses;
+        thunk_addresses.push(moved.previous_value);
+        thunk_addresses.sort_unstable();
+        thunk_addresses.dedup();
+    }
+    Ok(())
 }
 
 fn deferred_instruction_relocation_patch(
@@ -2998,6 +3106,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
             };
+            match finish_macho_cross_input_target_moves(
+                &mut previous.relocations,
+                &mut relocation_target_patches,
+                &macho_resolution_updates.moves,
+                input,
+            )? {
+                Ok(()) => {}
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            }
             relocation_target_patches
                 .input_ranges
                 .extend(macho_resolution_updates.input_ranges.iter().cloned());
@@ -3026,7 +3143,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &matched_sections,
                     previous_output.get()?,
                 )? {
-                    Ok(patches) => patches,
+                    Ok(patches) => {
+                        if let Err(reason) = record_macho_forwarding_thunk_addresses(
+                            &mut previous.macho_symbol_resolutions,
+                            &macho_resolution_updates.moves,
+                        ) {
+                            return Ok(ChangedInputPatchResult::Unsupported(reason));
+                        }
+                        patches
+                    }
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
             } else {
@@ -4638,6 +4763,7 @@ struct RelocationTargetPatches {
     output_patches: Vec<SectionPatch>,
     output_symbols: Vec<RelocationTargetSymbolPatch>,
     macho_target_moves: Vec<MachORelocationTargetMove>,
+    macho_cross_input_target_moves: Vec<MachORelocationTargetMove>,
 }
 
 struct MachOSymbolResolutionUpdates {
@@ -31274,6 +31400,9 @@ mod tests {
         assert_eq!(patch.output_offset, previous_output_offset);
         assert_eq!(patch.size, config.thunk_size);
         assert_eq!(patch.data, expected);
+        record_macho_forwarding_thunk_addresses(&mut resolutions, &updates.moves).unwrap();
+        record_macho_forwarding_thunk_addresses(&mut resolutions, &updates.moves).unwrap();
+        assert_eq!(resolutions[0].thunk_addresses, vec![previous_value]);
 
         let mut too_small = matched.clone();
         too_small[0].previous.output_size = config.thunk_size - 1;
@@ -41086,6 +41215,103 @@ mod tests {
         .unwrap();
 
         assert_eq!(data, [0xfe, 0xff, 0xff, 0x17]);
+    }
+
+    #[test]
+    fn macho_cross_input_branch_reuses_forwarding_target() {
+        let previous = test_macho_object(&[0; 4], &[0; 8], 0);
+        let current = test_macho_object(&[0; 4], &[0; 8], 4);
+        let mut state = state("args", b"output", &[("target.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let previous_target_value = 0x2000;
+        let current_target_value = 0x8000;
+        let previous_target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("target.o")),
+            input: SharedText::from(hex::encode("target.o")),
+            section_index: 2,
+            section_offset: 0,
+        };
+        let current_target = RelocationTargetRecord {
+            section_offset: 4,
+            ..previous_target.clone()
+        };
+        let relocation = relocation_record(
+            "caller.o",
+            1,
+            42,
+            Some(0x1000),
+            previous_target_value,
+            Some("_data"),
+            Some(("target.o", 2, 0)),
+            0,
+            300,
+            4,
+            encode_macho_aarch64_relocation_kind(raw_relocation),
+            0,
+        );
+        let mut relocations = vec![relocation.clone()];
+        let mut patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        assert!(patches.output_patches.is_empty());
+        assert_eq!(patches.macho_cross_input_target_moves.len(), 1);
+        assert_eq!(relocations[0].target_value, previous_target_value);
+        finish_macho_cross_input_target_moves(
+            &mut relocations,
+            &mut patches,
+            &[MachOSymbolResolutionMove {
+                name: SharedText::from(hex::encode("_data")),
+                previous_value: previous_target_value,
+                current_value: current_target_value,
+                previous_target,
+                current_target: current_target.clone(),
+            }],
+            &input,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(patches.output_patches.is_empty());
+        assert!(patches.macho_cross_input_target_moves.is_empty());
+        assert_eq!(relocations[0].written_value, Some(0x1000));
+        assert_eq!(relocations[0].target_value, current_target_value);
+        assert_eq!(
+            relocations[0].applied_target_value,
+            Some(previous_target_value)
+        );
+        assert_eq!(relocations[0].target.as_ref(), Some(&current_target));
+
+        let mut direct_relocations = vec![relocation];
+        let mut direct_patches =
+            relocation_target_patches_for_input(&mut direct_relocations, &input, &current)
+                .unwrap()
+                .unwrap();
+        finish_macho_cross_input_target_moves(
+            &mut direct_relocations,
+            &mut direct_patches,
+            &[],
+            &input,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct_patches.output_patches.len(), 1);
+        assert_eq!(
+            direct_relocations[0].target_value,
+            previous_target_value + 4
+        );
+        assert_eq!(
+            direct_relocations[0].applied_target_value,
+            Some(previous_target_value + 4)
+        );
     }
 
     #[test]
