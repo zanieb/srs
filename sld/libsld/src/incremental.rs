@@ -2594,7 +2594,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             };
             let added_archive_member_identifiers = if archive_members_match {
                 None
-            } else if args.should_activate_macho_text_sections() {
+            } else if args.should_activate_macho_archive_members() {
                 let previous_bytes = {
                     timing_phase!("Read previous incremental input snapshot");
                     previous_snapshot_bytes.get()?
