@@ -3206,30 +3206,23 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 previous.sections_file = None;
             }
             if !matched_from_snapshot {
-                if resolved_patches.len() == current_sections.len() {
-                    current_sections = resolved_patches
+                let Some(resolved_sections) = resolve_current_patch_sections_with_resolver(
+                    input.path.as_str(),
+                    current_sections.iter().cloned(),
+                    dynamic_relocation_patches.iter().map(|patch| &patch.record),
+                    previous
+                        .relocations
                         .iter()
-                        .map(|resolved| resolved.section.clone())
-                        .collect();
-                } else {
-                    let Some(resolved_sections) = resolve_current_patch_sections_with_resolver(
-                        input.path.as_str(),
-                        current_sections.iter().cloned(),
-                        dynamic_relocation_patches.iter().map(|patch| &patch.record),
-                        previous
-                            .relocations
-                            .iter()
-                            .filter(|record| record.input_file == input.path),
-                        &current_resolver,
-                    )?
-                    else {
-                        return Ok(ChangedInputPatchResult::Unsupported(format!(
-                            "changed patchable section size in `{}`",
-                            path.display()
-                        )));
-                    };
-                    current_sections = resolved_sections;
-                }
+                        .filter(|record| record.input_file == input.path),
+                    &current_resolver,
+                )?
+                else {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "changed patchable section size in `{}`",
+                        path.display()
+                    )));
+                };
+                current_sections = resolved_sections;
             }
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
             patched_section_count += dynamic_relocation_patches.len();
@@ -23361,6 +23354,70 @@ mod tests {
         assert_eq!(resolved[0].section_index, 1);
         assert_eq!(resolved[0].input_size, 5);
         assert_eq!(resolved[0].output_size, 8);
+    }
+
+    #[test]
+    fn resolve_current_patch_sections_preserves_canonical_archive_order() {
+        let object = growable_data_elf();
+        let mut builder = ar::Builder::new(Vec::new());
+        for name in [b"first.o".as_slice(), b"second.o".as_slice()] {
+            builder
+                .append(
+                    &ar::Header::new(name.to_vec(), object.len() as u64),
+                    object.as_slice(),
+                )
+                .unwrap();
+        }
+        let archive = builder.into_inner().unwrap();
+        let input_ref = encode_path(Path::new("libobjects.a"));
+        let member_ref = |identifier: &[u8]| {
+            let ArchiveMemberMatch::Unique(member) =
+                patch_archive_member_bytes(&archive, identifier).unwrap()
+            else {
+                panic!("expected unique archive member");
+            };
+            resolved_patch_input_ref(&input_ref, &input_ref, member).unwrap()
+        };
+        let second_ref = member_ref(b"second.o");
+        let first_ref = member_ref(b"first.o");
+        let section = |input: String, output_offset| PatchSection {
+            input,
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset,
+            output_size: 8,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+
+        let resolved = resolve_current_patch_sections(
+            &archive,
+            &input_ref,
+            [
+                section(second_ref.clone(), 128),
+                section(first_ref.clone(), 64),
+            ],
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|section| section.input.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_ref.as_str(), first_ref.as_str()]
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|section| section.output_offset)
+                .collect::<Vec<_>>(),
+            vec![128, 64]
+        );
     }
 
     fn growable_data_elf() -> Vec<u8> {
