@@ -6087,7 +6087,9 @@ impl PersistedState {
 
         let path = metadata_update_path(state_dir);
         let tmp_path = state_dir.join(format!("{METADATA_UPDATE_FILE}.tmp"));
-        std::fs::write(&tmp_path, self.render_metadata_update(input_indices)).with_context(
+        let mut input_indices = input_indices.to_vec();
+        input_indices.extend(metadata_update_input_indices_from_path(&path)?);
+        std::fs::write(&tmp_path, self.render_metadata_update(&input_indices)).with_context(
             || {
                 format!(
                     "Failed to write incremental metadata update `{}`",
@@ -17055,6 +17057,54 @@ fn metadata_update_path(state_dir: &Path) -> PathBuf {
     state_dir.join(METADATA_UPDATE_FILE)
 }
 
+fn metadata_update_input_indices_from_path(path: &Path) -> Result<Vec<usize>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut lines = contents.lines();
+    let version = lines
+        .next()
+        .context("Missing incremental metadata update header")?;
+    if version != METADATA_UPDATE_VERSION && version != METADATA_UPDATE_VERSION_V1 {
+        return Err(crate::error!(
+            "Unsupported incremental metadata update version `{version}`"
+        ));
+    }
+    let _ = parse_link_start_line(lines.next())?;
+    let _ = parse_content_line(lines.next(), "output")?;
+    let _ = parse_build_id_hash_line(lines.next())?;
+    if version == METADATA_UPDATE_VERSION {
+        let _ = parse_prefixed_line(lines.next(), "macho-resolutions-file")?;
+    }
+    let input_count: usize = parse_prefixed_line(lines.next(), "inputs")?
+        .parse()
+        .context("Invalid incremental metadata update input count")?;
+    let mut indices = Vec::with_capacity(input_count);
+    for _ in 0..input_count {
+        let rest = parse_prefixed_line(lines.next(), "input")?;
+        let (index, input_line) = rest
+            .split_once('\t')
+            .context("Malformed incremental metadata update input")?;
+        indices.push(
+            index
+                .parse()
+                .context("Invalid incremental metadata update input index")?,
+        );
+        let _ = parse_input_line(
+            &format!("input\t{input_line}"),
+            PatchSectionReadMode::PreserveRaw,
+        )?;
+    }
+    if lines.next().is_some() {
+        return Err(crate::error!(
+            "Unexpected trailing incremental metadata update data"
+        ));
+    }
+    Ok(indices)
+}
+
 fn should_filter_sections_sidecar(state_dir: &Path, sections_file: &str) -> bool {
     const LARGE_SECTIONS_SIDECAR: u64 = 64 * 1024 * 1024;
     if validate_sections_file_name(sections_file).is_err() {
@@ -24584,7 +24634,7 @@ mod tests {
             base_index
         );
         assert!(metadata_update_path(dir.path()).exists());
-        let metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         assert_eq!(metadata.output, updated.output);
         assert!(metadata.macho_symbol_resolutions_file.is_none());
         assert_eq!(
@@ -24605,7 +24655,28 @@ mod tests {
         );
         assert_eq!(metadata.input_files[1], state.input_files[1]);
 
-        metadata.write_index(dir.path()).unwrap();
+        metadata.input_files[1].content = FileContentState::from_bytes(b"bb");
+        metadata
+            .write_metadata_update_for_inputs(dir.path(), &[1])
+            .unwrap();
+        let composed = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            composed.input_files[0].content,
+            updated.input_files[0].content
+        );
+        assert_eq!(
+            composed.input_files[0]
+                .patch
+                .as_ref()
+                .map(|patch| patch.fingerprint.as_str()),
+            Some("new-patch-hash")
+        );
+        assert_eq!(
+            composed.input_files[1].content,
+            metadata.input_files[1].content
+        );
+
+        composed.write_index(dir.path()).unwrap();
         assert!(!metadata_update_path(dir.path()).exists());
         let persisted = PersistedState::read(dir.path()).unwrap().unwrap();
         assert_eq!(persisted.input_files[0].patch, updated.input_files[0].patch);
