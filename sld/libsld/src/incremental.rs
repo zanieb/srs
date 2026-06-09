@@ -1768,6 +1768,7 @@ fn relocation_target_patches_for_input(
                 previous_target_value,
                 target_value,
                 allow_missing: true,
+                source: "relocation target movement",
             });
             continue;
         }
@@ -1828,6 +1829,7 @@ fn relocation_target_patches_for_input(
             previous_target_value,
             target_value,
             allow_missing: false,
+            source: "relocation target movement",
         });
     }
     dedup_ranges(&mut input_ranges);
@@ -1984,6 +1986,7 @@ fn finish_macho_cross_input_target_moves(
                 previous_target_value,
                 target_value: current_target_value,
                 allow_missing: true,
+                source: "cross-input Mach-O relocation target movement",
             });
     }
     target_patches.macho_cross_input_target_moves = remaining_moves;
@@ -2149,6 +2152,7 @@ fn update_macho_symbol_resolutions_for_input(
                 previous_target_value: previous_value,
                 target_value: current_value,
                 allow_missing: true,
+                source: "Mach-O symbol catalog refresh",
             });
             moves.push(MachOSymbolResolutionMove {
                 name: resolution.name.clone(),
@@ -2710,22 +2714,25 @@ fn output_symbol_value_patches(
 
     let file = object::File::parse(output)
         .context("Failed to parse output for incremental symbol value patching")?;
-    let mut values_by_previous_name_and_value = HashMap::<(&str, u64), (u64, bool)>::new();
+    let mut values_by_previous_name_and_value =
+        HashMap::<(&str, u64), (u64, bool, &'static str)>::new();
     for symbol in symbols {
         let key = (symbol.target_name.as_str(), symbol.previous_target_value);
         match values_by_previous_name_and_value.entry(key) {
             hashbrown::hash_map::Entry::Vacant(entry) => {
-                entry.insert((symbol.target_value, symbol.allow_missing));
+                entry.insert((symbol.target_value, symbol.allow_missing, symbol.source));
             }
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get().0 != symbol.target_value {
                     return Ok(Err(format!(
                         "conflicting incremental symbol value patches for `{}` from {:#x} to \
-                         {:#x} and {:#x}",
+                         {:#x} ({}) and {:#x} ({})",
                         display_hex_text(symbol.target_name.as_str()),
                         symbol.previous_target_value,
                         entry.get().0,
+                        entry.get().2,
                         symbol.target_value,
+                        symbol.source,
                     )));
                 }
                 entry.get_mut().1 &= symbol.allow_missing;
@@ -2734,7 +2741,7 @@ fn output_symbol_value_patches(
     }
 
     let mut patches = Vec::with_capacity(values_by_previous_name_and_value.len());
-    for ((target_name, previous_target_value), (target_value, allow_missing)) in
+    for ((target_name, previous_target_value), (target_value, allow_missing, _)) in
         values_by_previous_name_and_value
     {
         let symbol = symbol_position_by_name_and_value(
@@ -5038,6 +5045,7 @@ struct RelocationTargetSymbolPatch {
     previous_target_value: u64,
     target_value: u64,
     allow_missing: bool,
+    source: &'static str,
 }
 
 struct FdeRelocationPatch {
@@ -10751,6 +10759,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                     previous_target_value: resolution.direct_value.unwrap_or_default(),
                     target_value: current_target_value,
                     allow_missing: true,
+                    source: "rematerialized Mach-O symbol resolution",
                 });
                 resolution.direct_value = Some(current_target_value);
                 if resolution.target.is_none() {
@@ -10770,6 +10779,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 previous_target_value: 0,
                 target_value: current_target_value,
                 allow_missing: true,
+                source: "new rematerialized Mach-O symbol resolution",
             });
             resolutions.push(MachOSymbolResolutionRecord {
                 name: target_name,
@@ -11255,6 +11265,7 @@ fn macho_text_relocation_replays_for_input(
                             previous_target_value: relocation.target_value,
                             target_value: current_target_value,
                             allow_missing: true,
+                            source: "same-object Mach-O text relocation replay",
                         });
                         Some(target_move)
                     } else {
@@ -26760,6 +26771,7 @@ mod tests {
                 previous_target_value: 0x200,
                 target_value: 0x208,
                 allow_missing: false,
+                source: "test",
             }],
         )
         .unwrap()
@@ -26783,6 +26795,7 @@ mod tests {
                 previous_target_value: 0x200,
                 target_value: 0x208,
                 allow_missing: false,
+                source: "test",
             }],
         )
         .unwrap();
@@ -26805,12 +26818,14 @@ mod tests {
                     previous_target_value: 0x200,
                     target_value: 0x208,
                     allow_missing: false,
+                    source: "first test producer",
                 },
                 RelocationTargetSymbolPatch {
                     target_name: hex::encode(b"duplicate"),
                     previous_target_value: 0x200,
                     target_value: 0x210,
                     allow_missing: true,
+                    source: "second test producer",
                 },
             ],
         )
@@ -26821,7 +26836,7 @@ mod tests {
             Err(reason)
                 if reason
                     == "conflicting incremental symbol value patches for `duplicate` from 0x200 \
-                        to 0x208 and 0x210"
+                        to 0x208 (first test producer) and 0x210 (second test producer)"
         ));
     }
 
@@ -26836,6 +26851,7 @@ mod tests {
                 previous_target_value: 8,
                 target_value: 12,
                 allow_missing: true,
+                source: "test",
             }],
         )
         .unwrap();
@@ -26857,6 +26873,7 @@ mod tests {
                 previous_target_value: 8,
                 target_value: 12,
                 allow_missing: true,
+                source: "test",
             }],
         )
         .unwrap()
@@ -33321,6 +33338,7 @@ mod tests {
                 previous_target_value: 4,
                 target_value: 8,
                 allow_missing: true,
+                source: "test",
             }],
         )
         .unwrap()
