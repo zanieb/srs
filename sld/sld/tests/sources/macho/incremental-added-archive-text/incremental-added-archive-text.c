@@ -11,10 +11,9 @@
 //#TestIncrementalChangedInput:incremental-added-archive-root.a
 //#TestIncrementalChangedCompArgs:-DACTIVATE_ADDED_MEMBER=1
 //#TestIncrementalChangedAddedArchiveMember:incremental_added_archive.1.changed.rcgu.o=incremental-added-archive-extra.S
-//#TestIncrementalChangedExpectPatch:false
-//#TestIncrementalChangedFallbackReason:archive members changed
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:2
 //#TestIncrementalChangedCompareFull:false
-//#TestIncrementalChangedRestore:true
 //#TestIncrementalChangedRun:true
 
 #include "../common/runtime.h"
