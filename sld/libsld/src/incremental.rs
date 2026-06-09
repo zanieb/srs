@@ -3878,10 +3878,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             patched_section_count += patch_sections.len();
 
-            let patch_sections_for_diagnostic = patch_sections.clone();
-            let Some(mut resolved_patches) = ({
+            let mut resolved_patches = match {
                 timing_phase!("Materialize changed section patches");
-                resolved_patch_sections_for_input_with_resolver(
+                resolved_patch_sections_for_input_with_resolver_detailed(
                     input.path.as_str(),
                     patch_sections,
                     dynamic_relocation_patches.iter().map(|patch| &patch.record),
@@ -3891,16 +3890,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .filter(|record| record.input_file == input.path),
                     &current_resolver,
                 )?
-            }) else {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "{} in `{}`",
-                    unresolved_patch_section_reason_with_resolver(
-                        input.path.as_str(),
-                        &patch_sections_for_diagnostic,
-                        &current_resolver,
-                    )?,
-                    path.display(),
-                )));
+            } {
+                Ok(patches) => patches,
+                Err(reason) => {
+                    return Ok(ChangedInputPatchResult::Unsupported(format!(
+                        "{reason} in `{}`",
+                        path.display(),
+                    )));
+                }
             };
             if !macho_text_relocation_replays.replays.is_empty() && !records_complete {
                 return Ok(ChangedInputPatchResult::Unsupported(
@@ -19633,6 +19630,23 @@ fn resolved_patch_sections_for_input_with_resolver<'a>(
     relocations: impl IntoIterator<Item = &'a RelocationRecord>,
     resolver: &PatchInputResolver<'_>,
 ) -> Result<Option<Vec<ResolvedSectionPatch>>> {
+    Ok(resolved_patch_sections_for_input_with_resolver_detailed(
+        input_file_path,
+        sections,
+        dynamic_relocations,
+        relocations,
+        resolver,
+    )?
+    .ok())
+}
+
+fn resolved_patch_sections_for_input_with_resolver_detailed<'a>(
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
+    relocations: impl IntoIterator<Item = &'a RelocationRecord>,
+    resolver: &PatchInputResolver<'_>,
+) -> Result<std::result::Result<Vec<ResolvedSectionPatch>, String>> {
     let sections = sections.into_iter().collect::<Vec<_>>();
     let dynamic_relocation_offsets =
         dynamic_relocation_offsets_by_input_section(dynamic_relocations);
@@ -19655,7 +19669,10 @@ fn resolved_patch_sections_for_input_with_resolver<'a>(
             PatchInputLookup::MatchArchiveMember,
         )?
         else {
-            return Ok(None);
+            return Ok(Err(format!(
+                "could not resolve changed patch input `{}`",
+                display_hex_path(input_ref).replace('\0', "\\0"),
+            )));
         };
         let file = object::File::parse(input_bytes.bytes)
             .context("Failed to parse changed incremental input")?;
@@ -19663,7 +19680,13 @@ fn resolved_patch_sections_for_input_with_resolver<'a>(
         for stored_section_index in section_indices {
             let patch_section = &sections[stored_section_index];
             let Some(section_index) = patch_section_index(&file, patch_section)? else {
-                return Ok(None);
+                return Ok(Err(format!(
+                    "could not resolve changed patch section {}",
+                    patch_section
+                        .section_name
+                        .as_deref()
+                        .unwrap_or("<anonymous>"),
+                )));
             };
             let section = file
                 .section_by_index(section_index)
@@ -19681,15 +19704,39 @@ fn resolved_patch_sections_for_input_with_resolver<'a>(
                 dynamic_relocations,
                 relocations,
             ) else {
-                return Ok(None);
+                return Ok(Err(format!(
+                    "changed patch section {} cannot be directly patched",
+                    patch_section
+                        .section_name
+                        .as_deref()
+                        .unwrap_or("<anonymous>"),
+                )));
             };
             if !section_size_allows_direct_patching(
                 section.name().ok().map(str::as_bytes),
                 patch_section.input_size,
                 data.len(),
-            ) || data.len() > patch_section.output_size as usize
-            {
-                return Ok(None);
+            ) {
+                return Ok(Err(format!(
+                    "changed patch section {} changed size from {} to {} bytes",
+                    patch_section
+                        .section_name
+                        .as_deref()
+                        .unwrap_or("<anonymous>"),
+                    patch_section.input_size,
+                    data.len(),
+                )));
+            }
+            if data.len() > patch_section.output_size as usize {
+                return Ok(Err(format!(
+                    "changed patch section {} needs {} bytes but has {} bytes of output capacity",
+                    patch_section
+                        .section_name
+                        .as_deref()
+                        .unwrap_or("<anonymous>"),
+                    data.len(),
+                    patch_section.output_size,
+                )));
             }
             let mut resolved_section = patch_section.clone();
             resolved_section.input.clone_from(&current_input_ref);
@@ -19711,85 +19758,10 @@ fn resolved_patch_sections_for_input_with_resolver<'a>(
             });
         }
     }
-    Ok(Some(
-        patches
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .context("Missing resolved incremental patch section")?,
-    ))
-}
-
-fn unresolved_patch_section_reason_with_resolver(
-    input_file_path: &str,
-    sections: &[PatchSection],
-    resolver: &PatchInputResolver<'_>,
-) -> Result<String> {
-    for patch_section in sections {
-        let Some(input_bytes) = resolver.resolve(
-            input_file_path,
-            patch_section.input.as_str(),
-            PatchInputLookup::MatchArchiveMember,
-        )?
-        else {
-            return Ok(format!(
-                "could not resolve changed patch input `{}`",
-                display_hex_path(&patch_section.input).replace('\0', "\\0"),
-            ));
-        };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse changed patch input diagnostic")?;
-        let Some(section_index) = patch_section_index(&file, patch_section)? else {
-            return Ok(format!(
-                "could not resolve changed patch section {}",
-                patch_section
-                    .section_name
-                    .as_deref()
-                    .unwrap_or("<anonymous>"),
-            ));
-        };
-        let section = file
-            .section_by_index(section_index)
-            .context("Missing changed patch diagnostic section")?;
-        let data = section
-            .data()
-            .context("Failed to read changed patch diagnostic section")?;
-        if section_direct_patch_preserve_ranges(&file, &section, data, None, None).is_none() {
-            return Ok(format!(
-                "changed patch section {} cannot be directly patched",
-                patch_section
-                    .section_name
-                    .as_deref()
-                    .unwrap_or("<anonymous>"),
-            ));
-        }
-        if !section_size_allows_direct_patching(
-            section.name().ok().map(str::as_bytes),
-            patch_section.input_size,
-            data.len(),
-        ) {
-            return Ok(format!(
-                "changed patch section {} changed size from {} to {} bytes",
-                patch_section
-                    .section_name
-                    .as_deref()
-                    .unwrap_or("<anonymous>"),
-                patch_section.input_size,
-                data.len(),
-            ));
-        }
-        if data.len() > patch_section.output_size as usize {
-            return Ok(format!(
-                "changed patch section {} needs {} bytes but has {} bytes of output capacity",
-                patch_section
-                    .section_name
-                    .as_deref()
-                    .unwrap_or("<anonymous>"),
-                data.len(),
-                patch_section.output_size,
-            ));
-        }
-    }
-    Ok("could not materialize changed patch sections".to_owned())
+    Ok(Ok(patches
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("Missing resolved incremental patch section")?))
 }
 
 fn dynamic_relocation_patches_for_input<'a>(
@@ -30552,6 +30524,39 @@ mod tests {
             patch_sections_for_input(&bytes, &input_ref, [patch_section])
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn detailed_patch_section_resolution_reports_output_capacity() {
+        let bytes = test_macho_object(&[0; 8], &[0; 4], 0);
+        let input = hex::encode("input.o");
+        let resolver = PatchInputResolver::new(&bytes, true).unwrap();
+        let section = PatchSection {
+            input: input.clone(),
+            section_index: 0,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+
+        let reason = resolved_patch_sections_for_input_with_resolver_detailed(
+            &input,
+            [section],
+            std::iter::empty(),
+            std::iter::empty(),
+            &resolver,
+        )
+        .unwrap()
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            reason,
+            "changed patch section __TEXT,__text needs 8 bytes but has 4 bytes of output capacity"
         );
     }
 
