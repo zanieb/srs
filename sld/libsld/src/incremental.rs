@@ -8731,16 +8731,14 @@ fn macho_text_relocation_target_candidates(
     target_name: Option<&str>,
     r_type: u8,
     target_value: u64,
-    previous_applied_target_value: Option<u64>,
+    previous_applied_target_values: &[u64],
 ) -> Vec<u64> {
     let resolution = target_name
         .and_then(|name| hex::decode(name).ok())
         .as_deref()
         .and_then(|name| macho_symbol_resolution_for_name(resolutions, name));
     let mut candidates = if r_type == object::macho::ARM64_RELOC_BRANCH26 {
-        previous_applied_target_value
-            .into_iter()
-            .collect::<Vec<_>>()
+        previous_applied_target_values.to_vec()
     } else {
         Vec::new()
     };
@@ -8759,6 +8757,67 @@ fn macho_text_relocation_target_candidates(
     let mut seen = HashSet::new();
     candidates.retain(|candidate| seen.insert(*candidate));
     candidates
+}
+
+fn recorded_macho_branch_target_candidates(
+    relocations: &[RelocationRecord],
+    target_name: Option<&SharedText>,
+    target_is_global: bool,
+    target: Option<&RelocationTargetRecord>,
+    target_value: u64,
+    addend: i64,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> Vec<u64> {
+    relocations
+        .iter()
+        .filter_map(|relocation| {
+            let raw_relocation = decode_macho_aarch64_relocation_kind(relocation.kind)?;
+            if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
+                || relocation.addend != addend
+                || relocation.target_value != target_value
+                || if target_is_global {
+                    target_name.is_none() || relocation.target_name.as_ref() != target_name
+                } else {
+                    target.is_none() || relocation.target.as_ref() != target
+                }
+            {
+                return None;
+            }
+            let applied_target_value = relocation.applied_target_value?;
+            let written_value = relocation.written_value?;
+            let start = usize::try_from(relocation.output_offset).ok()?;
+            let size = usize::try_from(relocation.size).ok()?;
+            let end = start.checked_add(size)?;
+            let previous_bytes = previous_output.get(start..end)?;
+            let rel_info =
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw_relocation,
+                )
+                .ok()?;
+            let mut replayed_previous = previous_bytes.to_vec();
+            rel_info
+                .write_to_buffer(written_value, &mut replayed_previous)
+                .ok()?;
+            if replayed_previous != previous_bytes {
+                return None;
+            }
+            let previous_place =
+                macho_output_address_for_file_offset(output_file, relocation.output_offset)?;
+            (macho_aarch64_relocated_value(
+                raw_relocation.r_type,
+                applied_target_value,
+                macho_aarch64_applied_target_addend(
+                    raw_relocation.r_type,
+                    relocation.target_value,
+                    applied_target_value,
+                    relocation.addend,
+                ),
+                previous_place,
+            ) == Some(written_value))
+            .then_some(applied_target_value)
+        })
+        .collect()
 }
 
 fn macho_aarch64_applied_target_addend(
@@ -8782,6 +8841,7 @@ fn rematerialized_macho_text_relocation_replay(
     current_file: &object::File<'_>,
     current_context: &MachOTextRelocationContext,
     matched_sections: &[MatchedPatchSection],
+    previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Result<std::result::Result<MachOTextRelocationReplay, String>> {
     if current_context.subtractor.is_some() {
@@ -8891,12 +8951,22 @@ fn rematerialized_macho_text_relocation_replay(
         }
     };
 
+    let recorded_target_candidates = recorded_macho_branch_target_candidates(
+        relocations,
+        target_name.as_ref(),
+        target_is_global,
+        target.as_ref(),
+        current_target_value,
+        current_context.addend,
+        previous_output,
+        output_file,
+    );
     let current_relocation_target_candidates = macho_text_relocation_target_candidates(
         resolutions,
         target_name.as_deref(),
         current_context.r_type,
         current_target_value,
-        None,
+        &recorded_target_candidates,
     );
 
     let target_symbol_id = relocations
@@ -9264,6 +9334,7 @@ fn macho_text_relocation_replays_for_input(
                         &current_file,
                         current_context,
                         matched_sections,
+                        previous_output,
                         &output_file,
                     )? {
                         Ok(replay) => replay,
@@ -9475,14 +9546,17 @@ fn macho_text_relocation_replays_for_input(
                         display_hex_path(&input.path)
                     )));
                 }
+                let previous_applied_target_values = target_move
+                    .is_none()
+                    .then_some(previous_applied_target_value)
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let current_relocation_target_candidates = macho_text_relocation_target_candidates(
                     resolutions,
                     relocation.target_name.as_deref(),
                     raw_relocation.r_type,
                     current_target_value,
-                    target_move
-                        .is_none()
-                        .then_some(previous_applied_target_value),
+                    &previous_applied_target_values,
                 );
 
                 replays.push(MachOTextRelocationReplay {
@@ -25266,7 +25340,7 @@ mod tests {
             Some(&hex::encode("_Unwind_Resume")),
             object::macho::ARM64_RELOC_BRANCH26,
             direct_target,
-            Some(recorded_stub),
+            &[recorded_stub],
         );
         let raw_relocation = object::macho::RelocationInfo {
             r_address: 0,
@@ -25301,10 +25375,181 @@ mod tests {
             Some(&hex::encode("_target")),
             object::macho::ARM64_RELOC_BRANCH26,
             0x1000_1000,
-            Some(0x1000_1000),
+            &[0x1000_1000],
         );
 
         assert_eq!(candidates, vec![0x1000_1000]);
+    }
+
+    fn recorded_branch_output(
+        target_value: u64,
+        applied_target_value: u64,
+        addend: i64,
+    ) -> (Vec<u8>, std::ops::Range<usize>, u64) {
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                raw_relocation,
+            )
+            .unwrap();
+        let mut output = test_macho_object(&0x1400_0000_u32.to_le_bytes(), &[0; 4], 0);
+        let text_range = test_macho_section_range(&output, "__text");
+        let file = object::File::parse(output.as_slice()).unwrap();
+        let place = macho_output_address_for_file_offset(&file, text_range.start as u64).unwrap();
+        let written_value = macho_aarch64_relocated_value(
+            raw_relocation.r_type,
+            applied_target_value,
+            macho_aarch64_applied_target_addend(
+                raw_relocation.r_type,
+                target_value,
+                applied_target_value,
+                addend,
+            ),
+            place,
+        )
+        .unwrap();
+        let mut instruction = 0x1400_0000_u32.to_le_bytes();
+        rel_info
+            .write_to_buffer(written_value, &mut instruction)
+            .unwrap();
+        output[text_range.clone()].copy_from_slice(&instruction);
+        (output, text_range, written_value)
+    }
+
+    #[test]
+    fn rematerialized_macho_branch_reuses_matching_recorded_stub() {
+        let target_name = SharedText::from(hex::encode("_target"));
+        let target_value = 0;
+        let recorded_stub = 0x1000;
+        let (previous_output, text_range, written_value) =
+            recorded_branch_output(target_value, recorded_stub, 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut relocation = relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(written_value),
+            target_value,
+            Some("_target"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            branch_kind,
+            0,
+        );
+        relocation.applied_target_value = Some(recorded_stub);
+
+        let recorded = recorded_macho_branch_target_candidates(
+            &[relocation],
+            Some(&target_name),
+            true,
+            None,
+            target_value,
+            0,
+            &previous_output,
+            &output_file,
+        );
+        let candidates = macho_text_relocation_target_candidates(
+            &[],
+            Some(target_name.as_str()),
+            object::macho::ARM64_RELOC_BRANCH26,
+            target_value,
+            &recorded,
+        );
+
+        assert_eq!(recorded, vec![recorded_stub]);
+        assert_eq!(candidates, vec![recorded_stub, target_value]);
+    }
+
+    #[test]
+    fn recorded_macho_branch_candidates_reject_mismatched_or_stale_records() {
+        let target_value = 0;
+        let applied_target_value = 0x1000;
+        let (previous_output, text_range, written_value) =
+            recorded_branch_output(target_value, applied_target_value, 0);
+        let output_file = object::File::parse(previous_output.as_slice()).unwrap();
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut relocation = relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(written_value),
+            target_value,
+            Some("_target"),
+            None,
+            0,
+            text_range.start as u64,
+            4,
+            branch_kind,
+            0,
+        );
+        relocation.applied_target_value = Some(applied_target_value);
+        let target_name = SharedText::from(hex::encode("_target"));
+
+        assert!(
+            recorded_macho_branch_target_candidates(
+                &[relocation.clone()],
+                Some(&target_name),
+                true,
+                None,
+                target_value + 4,
+                0,
+                &previous_output,
+                &output_file,
+            )
+            .is_empty()
+        );
+        assert!(
+            recorded_macho_branch_target_candidates(
+                &[relocation.clone()],
+                Some(&target_name),
+                true,
+                None,
+                target_value,
+                4,
+                &previous_output,
+                &output_file,
+            )
+            .is_empty()
+        );
+
+        relocation.written_value = Some(written_value + 4);
+        assert!(
+            recorded_macho_branch_target_candidates(
+                &[relocation],
+                Some(&target_name),
+                true,
+                None,
+                target_value,
+                0,
+                &previous_output,
+                &output_file,
+            )
+            .is_empty()
+        );
     }
 
     fn rematerialized_macho_replay(
