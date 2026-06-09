@@ -30521,6 +30521,66 @@ mod tests {
     }
 
     #[test]
+    fn macho_chained_fixup_plan_scales_with_existing_slots() {
+        const PAGE_COUNT: u64 = 32;
+        const SLOT_SPACING: u64 = 16;
+
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let slots_per_page = crate::macho::MACHO_PAGE_SIZE / SLOT_SPACING;
+        let old_slots = (0..PAGE_COUNT)
+            .flat_map(|page_index| {
+                (0..slots_per_page).map(move |slot_index| {
+                    let offset =
+                        page_index * crate::macho::MACHO_PAGE_SIZE + slot_index * SLOT_SPACING;
+                    let next_stride = u64::from(slot_index + 1 < slots_per_page) * 4;
+                    MachOChainedFixupSlot {
+                        address: data_address + offset,
+                        output_offset: 0x100 + offset,
+                        value: encode_incremental_macho_chained_rebase(
+                            data_address + 0x200,
+                            next_stride,
+                        )
+                        .unwrap(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let new_slots = (0..PAGE_COUNT)
+            .map(|page_index| {
+                (
+                    data_address + page_index * crate::macho::MACHO_PAGE_SIZE + 8,
+                    data_address + 0x300,
+                    usize::try_from(page_index).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let plan = plan_macho_chained_fixup_slots(
+            &old_slots,
+            &new_slots,
+            data_address,
+            PAGE_COUNT * crate::macho::MACHO_PAGE_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.page_starts,
+            vec![0; usize::try_from(PAGE_COUNT).unwrap()]
+        );
+        assert_eq!(
+            plan.existing_values.len(),
+            usize::try_from(PAGE_COUNT).unwrap()
+        );
+        assert!(plan.existing_values.iter().all(|(_, value)| {
+            (value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT == 2
+        }));
+        assert_eq!(plan.new_values.len(), usize::try_from(PAGE_COUNT).unwrap());
+        assert!(plan.new_values.iter().all(|(_, value)| {
+            (value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT == 2
+        }));
+    }
+
+    #[test]
     fn macho_data_relocation_semantics_reject_changed_addend_or_target() {
         let previous = MachODataRelocationContext {
             range: 8..16,
