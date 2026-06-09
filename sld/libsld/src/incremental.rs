@@ -35488,8 +35488,9 @@ mod tests {
 
     #[test]
     fn macho_text_relocation_replay_refreshes_source_and_target_identity() {
-        let previous_output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let previous_output = test_macho_object(b"\0\0\0\0", b"\x01\x02\x03\x04", 0);
         let text_range = test_macho_section_range(&previous_output, "__text");
+        let current_text_range = test_macho_section_range(&previous_output, "__data");
         let previous_input = "crate-hash.cgu.old.rcgu.o";
         let current_input = "crate-hash.cgu.new.rcgu.o";
         let current_target = RelocationTargetRecord {
@@ -35501,6 +35502,7 @@ mod tests {
         let mut replay =
             rematerialized_macho_replay(current_input, "_target", 0, current_target.clone());
         replay.relocation_index = Some(0);
+        replay.previous_output_offset = Some(text_range.start as u64);
         replay.previous_range = Some(0..4);
         replay.previous_written_value = Some(0);
         replay.previous_applied_target_value = Some(0);
@@ -35516,13 +35518,13 @@ mod tests {
                 section_index: 1,
                 section_name: Some("__TEXT,__text".to_owned()),
                 input_size: 4,
-                output_offset: text_range.start as u64,
+                output_offset: current_text_range.start as u64,
                 output_size: 4,
                 data_hash: None,
                 cstring_nul_boundaries_hash: None,
             },
             patch: SectionPatch {
-                output_offset: text_range.start as u64,
+                output_offset: current_text_range.start as u64,
                 size: 4,
                 data: vec![0; 4],
                 deferred_relocation: None,
@@ -35562,6 +35564,10 @@ mod tests {
 
         assert_eq!(relocations[0].input, hex::encode(current_input));
         assert_eq!(relocations[0].target.as_ref(), Some(&current_target));
+        assert_eq!(
+            relocations[0].output_offset,
+            current_text_range.start as u64
+        );
     }
 
     #[test]
