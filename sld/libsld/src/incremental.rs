@@ -1763,13 +1763,8 @@ fn relocation_target_patches_for_input(
                 current_section_offset: current.section_offset,
                 current_target_value: target_value,
             });
-            output_symbols.push(RelocationTargetSymbolPatch {
-                target_name: target_name.to_owned(),
-                previous_target_value,
-                target_value,
-                allow_missing: true,
-                source: "relocation target movement",
-            });
+            // A grown section may be rematerialized elsewhere. Defer the symbol patch until
+            // text replay can reconcile this provisional offset with the final output mapping.
             continue;
         }
 
@@ -1842,6 +1837,48 @@ fn relocation_target_patches_for_input(
     }))
 }
 
+fn matching_macho_symbol_resolution_move<'a>(
+    resolution_moves: &'a [MachOSymbolResolutionMove],
+    target_name: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_target_value: u64,
+    current_section_offset: u64,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, ()> {
+    let mut matching_moves = resolution_moves.iter().filter(|moved| {
+        moved.name.as_str() == target_name
+            && moved.previous_target == *previous_target
+            && moved.previous_value == previous_target_value
+            && moved.current_target.section_offset == current_section_offset
+    });
+    let matching_move = matching_moves.next();
+    if matching_moves.next().is_some() {
+        return Err(());
+    }
+    Ok(matching_move)
+}
+
+fn resolved_macho_relocation_target(
+    previous_target_value: u64,
+    mut target: Option<RelocationTargetRecord>,
+    target_move: Option<MachORelocationTargetMove>,
+    resolution_move: Option<&MachOSymbolResolutionMove>,
+) -> (u64, Option<RelocationTargetRecord>) {
+    if let Some(moved) = resolution_move {
+        return (moved.current_value, Some(moved.current_target.clone()));
+    }
+    if let Some(target_move) = target_move
+        && let Some(target) = target.as_mut()
+    {
+        target.section_offset = target_move.current_section_offset;
+    }
+    (
+        target_move.map_or(previous_target_value, |target_move| {
+            target_move.current_target_value
+        }),
+        target,
+    )
+}
+
 fn finish_macho_cross_input_target_moves(
     relocations: &mut [RelocationRecord],
     target_patches: &mut RelocationTargetPatches,
@@ -1887,19 +1924,21 @@ fn finish_macho_cross_input_target_moves(
             )));
         };
 
-        let mut matching_moves = resolution_moves.iter().filter(|moved| {
-            moved.name.as_str() == target_name.as_str()
-                && moved.previous_target == previous_target
-                && moved.previous_value == previous_target_value
-                && moved.current_target.section_offset == target_move.current_section_offset
-        });
-        let forwarding_move = matching_moves.next();
-        if matching_moves.next().is_some() {
-            return Ok(Err(format!(
-                "ambiguous moved Mach-O symbol for cross-input relocation in {}",
-                display_hex_path(&input.path)
-            )));
-        }
+        let forwarding_move = match matching_macho_symbol_resolution_move(
+            resolution_moves,
+            target_name.as_str(),
+            &previous_target,
+            previous_target_value,
+            target_move.current_section_offset,
+        ) {
+            Ok(moved) => moved,
+            Err(()) => {
+                return Ok(Err(format!(
+                    "ambiguous moved Mach-O symbol for cross-input relocation in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
+        };
         if let Some(moved) = forwarding_move {
             if reuse_previous_target {
                 if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
@@ -3364,6 +3403,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
             }
+            let macho_resolution_moves = macho_resolution_updates
+                .moves
+                .iter()
+                .chain(&migrated_macho_resolution_moves)
+                .cloned()
+                .collect::<Vec<_>>();
             match finish_macho_cross_input_target_moves(
                 &mut previous.relocations,
                 &mut relocation_target_patches,
@@ -3464,6 +3509,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &current_resolver,
                         previous_output.get()?,
                         &mut relocation_target_patches,
+                        &macho_resolution_moves,
                         records_complete,
                     )? {
                         Ok(replays) => replays,
@@ -10892,6 +10938,7 @@ fn macho_text_relocation_replays_for_input(
     current_resolver: &PatchInputResolver<'_>,
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
+    resolution_moves: &[MachOSymbolResolutionMove],
     records_complete: bool,
 ) -> Result<std::result::Result<MachOTextRelocationReplays, String>> {
     let mut replays = Vec::new();
@@ -10903,6 +10950,45 @@ fn macho_text_relocation_replays_for_input(
         .iter()
         .map(|target_move| (target_move.relocation_index, *target_move))
         .collect::<HashMap<_, _>>();
+    let mut target_resolution_moves = HashMap::new();
+    for target_move in &target_patches.macho_target_moves {
+        let Some(relocation) = relocations.get(target_move.relocation_index) else {
+            return Ok(Err(format!(
+                "missing Mach-O text relocation for moved target in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(target_name) = relocation.target_name.as_deref() else {
+            return Ok(Err(format!(
+                "missing Mach-O text relocation target name in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        let Some(previous_target) = relocation.target.as_ref() else {
+            return Ok(Err(format!(
+                "missing Mach-O text relocation target in {}",
+                display_hex_path(&input.path)
+            )));
+        };
+        match matching_macho_symbol_resolution_move(
+            resolution_moves,
+            target_name,
+            previous_target,
+            relocation.target_value,
+            target_move.current_section_offset,
+        ) {
+            Ok(Some(moved)) => {
+                target_resolution_moves.insert(target_move.relocation_index, moved.clone());
+            }
+            Ok(None) => {}
+            Err(()) => {
+                return Ok(Err(format!(
+                    "ambiguous moved Mach-O symbol for text relocation in {}",
+                    display_hex_path(&input.path)
+                )));
+            }
+        }
+    }
     let mut consumed_target_moves = HashSet::new();
     let mut same_object_target_moves = Vec::new();
     let mut target_input_ranges = Vec::new();
@@ -11307,19 +11393,31 @@ fn macho_text_relocation_replays_for_input(
                         display_hex_path(&input.path)
                     )));
                 };
-                let target_move = target_moves.get(&relocation_index);
-                if target_move.is_some() {
+                let recorded_target_move = target_moves.get(&relocation_index);
+                if recorded_target_move.is_some() {
                     consumed_target_moves.insert(relocation_index);
                 }
-                let target_move = target_move.copied().or(same_object_target_move);
-                let current_target_value = target_move
-                    .map_or(relocation.target_value, |target_move| {
-                        target_move.current_target_value
+                let target_move = recorded_target_move.copied().or(same_object_target_move);
+                let resolution_move = target_resolution_moves.get(&relocation_index);
+                let (current_target_value, current_target) = resolved_macho_relocation_target(
+                    relocation.target_value,
+                    replay_target,
+                    target_move,
+                    resolution_move,
+                );
+                replay_target = current_target;
+                if recorded_target_move.is_some() {
+                    target_output_symbols.push(RelocationTargetSymbolPatch {
+                        target_name: relocation
+                            .target_name
+                            .as_deref()
+                            .context("Missing recorded Mach-O relocation target name")?
+                            .to_owned(),
+                        previous_target_value: relocation.target_value,
+                        target_value: current_target_value,
+                        allow_missing: true,
+                        source: "resolved Mach-O relocation target movement",
                     });
-                if let Some(target_move) = target_move
-                    && let Some(target) = replay_target.as_mut()
-                {
-                    target.section_offset = target_move.current_section_offset;
                 }
                 let previous_applied_target_value = relocation
                     .applied_target_value
@@ -42994,6 +43092,133 @@ mod tests {
         .unwrap();
 
         assert_eq!(data, [0xfe, 0xff, 0xff, 0x17]);
+    }
+
+    #[test]
+    fn macho_target_move_prefers_layout_aware_symbol_resolution() {
+        let previous = test_macho_object(&[0; 4], &[0; 8], 0);
+        let current = test_macho_object(&[0; 4], &[0; 8], 124);
+        let mut state = state("args", b"output", &[("target.o", &previous)]);
+        let input = state.input_files.remove(0);
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let name = SharedText::from(hex::encode("_data"));
+        let previous_target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("target.o")),
+            input: SharedText::from(hex::encode("target.o")),
+            section_index: 2,
+            section_offset: 0,
+        };
+        let current_target = RelocationTargetRecord {
+            input: SharedText::from(hex::encode("current.o")),
+            section_offset: 124,
+            ..previous_target.clone()
+        };
+        let previous_value = 0x101b_24f0c;
+        let provisional_value = previous_value + 124;
+        let moved_value = 0x10e7_e18bc;
+        let mut relocation = relocation_record(
+            "target.o",
+            1,
+            42,
+            Some(0),
+            previous_value,
+            Some("_data"),
+            Some(("target.o", 2, 0)),
+            0,
+            300,
+            4,
+            encode_macho_aarch64_relocation_kind(raw_relocation),
+            0,
+        );
+        relocation.input = hex::encode("caller.o").into();
+        let mut relocations = [relocation];
+        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.macho_target_moves.len(), 1);
+        assert!(patches.output_symbols.is_empty());
+
+        let moves = vec![MachOSymbolResolutionMove {
+            name: name.clone(),
+            previous_value,
+            current_value: moved_value,
+            previous_target: previous_target.clone(),
+            current_target: current_target.clone(),
+        }];
+
+        let moved = matching_macho_symbol_resolution_move(
+            &moves,
+            name.as_str(),
+            &previous_target,
+            previous_value,
+            124,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(provisional_value, moved.current_value);
+        assert_eq!(moved.current_value, moved_value);
+        assert_eq!(moved.current_target, current_target);
+        let target_move = MachORelocationTargetMove {
+            relocation_index: 0,
+            current_section_offset: 124,
+            current_target_value: provisional_value,
+        };
+        let (resolved_value, resolved_target) = resolved_macho_relocation_target(
+            previous_value,
+            Some(previous_target.clone()),
+            Some(target_move),
+            Some(moved),
+        );
+        assert_eq!(resolved_value, moved_value);
+        assert_eq!(resolved_target, Some(current_target.clone()));
+
+        let (provisional_value, provisional_target) = resolved_macho_relocation_target(
+            previous_value,
+            Some(previous_target.clone()),
+            Some(target_move),
+            None,
+        );
+        assert_eq!(provisional_value, previous_value + 124);
+        assert_eq!(
+            provisional_target,
+            Some(RelocationTargetRecord {
+                section_offset: 124,
+                ..previous_target.clone()
+            })
+        );
+        assert!(
+            matching_macho_symbol_resolution_move(
+                &moves,
+                name.as_str(),
+                &previous_target,
+                previous_value,
+                120,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let mut ambiguous = moves.clone();
+        ambiguous.extend(moves);
+        assert!(
+            matching_macho_symbol_resolution_move(
+                &ambiguous,
+                name.as_str(),
+                &previous_target,
+                previous_value,
+                124,
+            )
+            .is_err()
+        );
     }
 
     #[test]
