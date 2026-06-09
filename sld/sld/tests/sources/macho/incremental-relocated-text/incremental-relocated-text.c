@@ -15,10 +15,17 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedSymbolBytes:_incremental_relocated_text_value=0x40068052
+//#TestIncrementalChangedLogContains:loaded records for 1 changed input file before loading inputs
+//#TestIncrementalChangedLogNotContains:filtered-record changed-input patch unavailable before loading inputs
+//#TestIncrementalChangedPreservesIndexedRecords:true
 //#TestIncrementalStateContains:\t4\t2684354771\t0\t
 //#TestIncrementalStateContains:\t4\t2684354756\t0\t
 //#TestIncrementalStateContains:\t4\t2684354770\t0\t
 //#TestIncrementalStateContains:5f696e6372656d656e74616c5f72656c6f63617465645f746578745f746172676574
+//#Config:stable-relocations-repeated:stable-relocations
+//#TestIncrementalChangedCompareFull:false
+//#TestIncrementalChangedRestore:true
+//#TestIncrementalChangedReapply:true
 //#Config:changed-relocation-word:incremental-relocated-text-base
 //#RunEnabled:false
 //#TestIncrementalUnsignedMachOOutput:true
@@ -32,6 +39,7 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:1
 //#TestIncrementalChangedRun:true
+//#TestIncrementalChangedPreservesIndexedRecords:true
 //#Config:moved-target:incremental-relocated-text-base
 //#RunEnabled:true
 //#TestIncrementalPrivateSignedMachOOutput:true
@@ -71,6 +79,10 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:1
 //#TestIncrementalChangedRun:true
+//#TestIncrementalChangedLogContains:metadata-only changed-input patch unavailable before loading inputs: missing patch metadata for
+//#TestIncrementalChangedLogContains:loaded records for 1 changed input file before loading inputs
+//#TestIncrementalChangedLogContains:filtered-record changed-input patch unavailable before loading inputs: changed Mach-O text symbol resolutions need complete relocation records
+//#TestIncrementalChangedLogNotContains:full relink: input file changed:
 //#Config:removed-relocations:incremental-relocated-text-base
 //#RunEnabled:true
 //#TestIncrementalPrivateSignedMachOOutput:true

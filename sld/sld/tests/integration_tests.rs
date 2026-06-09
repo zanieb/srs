@@ -208,6 +208,15 @@
 //! fallback is accepted as an explicitly allowed alternative to the patch fast path. Can be
 //! repeated to accept compiler-dependent fallback alternatives.
 //!
+//! TestIncrementalChangedLogContains:{string} Substring expected in the changed-input incremental
+//! link's log. Can be repeated.
+//!
+//! TestIncrementalChangedLogNotContains:{string} Substring forbidden in the changed-input
+//! incremental link's log. Can be repeated.
+//!
+//! TestIncrementalChangedPreservesIndexedRecords:{bool} Whether the changed-input incremental link
+//! must leave the canonical indexed record sidecar unchanged. Defaults to false.
+//!
 //! TestIncrementalChangedPatchedSectionCount:{count} Acceptable changed-section patch count for a
 //! changed-input relink. Can be repeated. Defaults to the exact count implied by
 //! TestIncrementalChangedSection.
@@ -903,6 +912,9 @@ struct Config {
     test_incremental_reordered_inputs: bool,
     test_incremental_changed_expect_patch: bool,
     test_incremental_changed_fallback_reasons: Vec<String>,
+    test_incremental_changed_log_contains: Vec<String>,
+    test_incremental_changed_log_not_contains: Vec<String>,
+    test_incremental_changed_preserves_indexed_records: bool,
     test_incremental_changed_patched_section_counts: Vec<usize>,
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
@@ -1653,6 +1665,9 @@ impl Config {
             test_incremental_reordered_inputs: false,
             test_incremental_changed_expect_patch: true,
             test_incremental_changed_fallback_reasons: Vec::new(),
+            test_incremental_changed_log_contains: Vec::new(),
+            test_incremental_changed_log_not_contains: Vec::new(),
+            test_incremental_changed_preserves_indexed_records: false,
             test_incremental_changed_patched_section_counts: Vec::new(),
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
@@ -2358,6 +2373,20 @@ fn process_directive(
                 .test_incremental_changed_fallback_reasons
                 .push(arg.to_owned());
         }
+        "TestIncrementalChangedLogContains" => {
+            config
+                .test_incremental_changed_log_contains
+                .push(arg.to_owned());
+        }
+        "TestIncrementalChangedLogNotContains" => {
+            config
+                .test_incremental_changed_log_not_contains
+                .push(arg.to_owned());
+        }
+        "TestIncrementalChangedPreservesIndexedRecords" => {
+            config.test_incremental_changed_preserves_indexed_records =
+                parse_bool(arg, "TestIncrementalChangedPreservesIndexedRecords")?;
+        }
         "TestIncrementalChangedPatchedSectionCount" => {
             config.test_incremental_changed_patched_section_counts.push(
                 arg.parse()
@@ -3034,6 +3063,12 @@ impl ProgramInputs {
         }
 
         if config.test_incremental_changed {
+            let indexed_records_before_changed =
+                if config.test_incremental_changed_preserves_indexed_records {
+                    Some(read_incremental_indexed_records(&link_output_2.binary)?)
+                } else {
+                    None
+                };
             let changed_inputs = if config.test_incremental_changed_inputs.is_empty() {
                 vec![inputs.last().cloned().with_context(|| {
                     format!(
@@ -3184,6 +3219,17 @@ impl ProgramInputs {
                     link_output_3.binary.display()
                 )
             })?;
+            if let Some(indexed_records_before_changed) = indexed_records_before_changed {
+                let indexed_records_after_changed =
+                    read_incremental_indexed_records(&link_output_3.binary)?;
+                if indexed_records_after_changed != indexed_records_before_changed {
+                    bail!(
+                        "Incremental test failed for {}: changed-input link replaced the canonical \
+                         indexed record sidecar",
+                        self.name()
+                    );
+                }
+            }
 
             if final_content == changed_content {
                 bail!(
@@ -3424,6 +3470,28 @@ impl ProgramInputs {
             let changed_link_log = log
                 .strip_prefix(&changed_log_before)
                 .unwrap_or(log.as_str());
+            for expected in &config.test_incremental_changed_log_contains {
+                if !changed_link_log.contains(expected) {
+                    bail!(
+                        "Incremental test failed for {}: changed-input log did not contain `{}`. \
+                         Log:\n{}",
+                        self.name(),
+                        expected,
+                        changed_link_log
+                    );
+                }
+            }
+            for unexpected in &config.test_incremental_changed_log_not_contains {
+                if changed_link_log.contains(unexpected) {
+                    bail!(
+                        "Incremental test failed for {}: changed-input log contained forbidden \
+                         text `{}`. Log:\n{}",
+                        self.name(),
+                        unexpected,
+                        changed_link_log
+                    );
+                }
+            }
             let fallback_message = "changed-input patch unavailable before loading inputs";
             let fallback_recorded = changed_link_log.contains(fallback_message)
                 && changed_link_log.contains("full relink: input file changed:");
@@ -6322,6 +6390,35 @@ fn append_to_path(path: &Path, extra: &str) -> PathBuf {
 }
 
 const PUBLISHING_SECTIONS_FILE: &str = "sections-publishing";
+
+fn read_incremental_indexed_records(output: &Path) -> Result<(String, Vec<u8>)> {
+    let state_dir = append_to_path(output, ".incr");
+    let index_path = state_dir.join("index");
+    let index = std::fs::read_to_string(&index_path).with_context(|| {
+        format!(
+            "Failed to read incremental state `{}`",
+            index_path.display()
+        )
+    })?;
+    let sections_file = index
+        .lines()
+        .find_map(|line| line.strip_prefix("indexed-sections-file\t"))
+        .with_context(|| {
+            format!(
+                "Incremental state `{}` has no indexed record sidecar",
+                index_path.display()
+            )
+        })?
+        .to_owned();
+    let sections_path = state_dir.join(&sections_file);
+    let sections = std::fs::read(&sections_path).with_context(|| {
+        format!(
+            "Failed to read indexed record sidecar `{}`",
+            sections_path.display()
+        )
+    })?;
+    Ok((sections_file, sections))
+}
 
 fn read_incremental_state_text(output: &Path) -> Result<String> {
     let state_dir = append_to_path(output, ".incr");
