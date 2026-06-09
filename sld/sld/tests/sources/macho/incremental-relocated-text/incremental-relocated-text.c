@@ -16,6 +16,7 @@
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedSymbolBytes:_incremental_relocated_text_value=0x40068052
 //#TestIncrementalChangedLogContains:loaded records for 1 changed input file before loading inputs
+//#TestIncrementalChangedLogNotContains:metadata-only changed-input patch unavailable before loading inputs
 //#TestIncrementalChangedLogNotContains:filtered-record changed-input patch unavailable before loading inputs
 //#TestIncrementalChangedPreservesIndexedRecords:true
 //#TestIncrementalStateContains:\t4\t2684354771\t0\t

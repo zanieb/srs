@@ -1098,7 +1098,37 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 });
         let should_retry_with_full_state = should_filter_records;
         let mut attempted_filtered_records = false;
-        let result = if should_filter_records {
+        let changed_input_files = changed_inputs
+            .iter()
+            .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
+            .collect::<HashSet<_>>();
+        let should_start_with_filtered_records = should_filter_records
+            && changed_inputs_have_macho_text_patch_sections(&previous, &changed_inputs);
+        let result = if should_start_with_filtered_records {
+            previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+            append_log(
+                &state_dir,
+                &format!(
+                    "loaded records for {} changed input file{} before loading inputs",
+                    changed_input_files.len(),
+                    if changed_input_files.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ),
+            )?;
+            attempted_filtered_records = true;
+            patch_changed_inputs(
+                args,
+                &state_dir,
+                previous,
+                current_link_start.clone(),
+                ChangedInputRecordCoverage::ChangedInputs,
+                &changed_inputs,
+                &metadata_update_input_indices,
+            )?
+        } else if should_filter_records {
             let result = patch_changed_inputs(
                 args,
                 &state_dir,
@@ -1111,7 +1141,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             if changed_input_patch_should_retry_with_filtered_records(&result) {
                 let reason = match result {
                     ChangedInputPatchResult::Unsupported(reason)
-                    | ChangedInputPatchResult::RequiresCompleteRecords(reason) => reason,
+                    | ChangedInputPatchResult::RequiresChangedInputRecords(reason) => reason,
                     _ => unreachable!("filtered-record retry requires a record-dependent result"),
                 };
                 append_log(
@@ -1130,10 +1160,6 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
-                let changed_input_files = changed_inputs
-                    .iter()
-                    .map(|(input_index, _)| previous.input_files[*input_index].path.clone())
-                    .collect::<HashSet<_>>();
                 previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
                 append_log(
                     &state_dir,
@@ -1184,7 +1210,8 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             )?
         };
         let result = match result {
-            ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
+            ChangedInputPatchResult::RequiresChangedInputRecords(reason)
+            | ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
                 if attempted_filtered_records {
                     append_log(
                         &state_dir,
@@ -1250,6 +1277,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         match result {
             ChangedInputPatchResult::Patched => return Ok(true),
             ChangedInputPatchResult::Unsupported(reason)
+            | ChangedInputPatchResult::RequiresChangedInputRecords(reason)
             | ChangedInputPatchResult::RequiresCompleteRecords(reason) => {
                 append_log(
                     &state_dir,
@@ -1727,6 +1755,7 @@ fn refresh_rewritten_input_identities(
 enum ChangedInputPatchResult {
     Patched,
     Unsupported(String),
+    RequiresChangedInputRecords(String),
     RequiresCompleteRecords(String),
     StartedUnsupported(String),
 }
@@ -1754,18 +1783,35 @@ impl ChangedInputRecordCoverage {
 fn changed_input_patch_should_retry_with_filtered_records(
     result: &ChangedInputPatchResult,
 ) -> bool {
-    matches!(result, ChangedInputPatchResult::Unsupported(_))
-        || matches!(
-            result,
-            ChangedInputPatchResult::RequiresCompleteRecords(reason)
-                if reason == MACHO_TEXT_RELOCATION_RECORDS_REQUIRED
-        )
+    matches!(
+        result,
+        ChangedInputPatchResult::Unsupported(_)
+            | ChangedInputPatchResult::RequiresChangedInputRecords(_)
+    )
 }
 
 fn changed_input_patch_retry_may_benefit_from_complete_records(reason: &str) -> bool {
     // The anonymous-section identity result is independent of global record coverage. Other
     // refusals remain conservative: complete generated-section state can enable dynamic changes.
     !reason.starts_with("could not match anonymous patch sections in `")
+}
+
+fn changed_inputs_have_macho_text_patch_sections(
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+) -> bool {
+    changed_inputs.iter().any(|(input_index, path)| {
+        previous
+            .input_files
+            .get(*input_index)
+            .and_then(|input| patch_sections_from_previous_state(input, path).ok())
+            .is_some_and(|patch| {
+                patch
+                    .sections
+                    .iter()
+                    .any(|section| section.section_name.as_deref() == Some("__TEXT,__text"))
+            })
+    })
 }
 
 fn relocation_target_patches_for_input(
@@ -3525,7 +3571,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             };
             if relocation_addend_patches.records_changed {
                 if !record_coverage.has_changed_input_records() {
-                    return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
+                    return Ok(ChangedInputPatchResult::RequiresChangedInputRecords(
                         "changed relocation addends need relocation records".to_owned(),
                     ));
                 }
@@ -4003,7 +4049,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )? {
                         Ok(replays) => replays,
                         Err(reason) if reason == MACHO_TEXT_RELOCATION_RECORDS_REQUIRED => {
-                            return Ok(ChangedInputPatchResult::RequiresCompleteRecords(reason));
+                            return Ok(ChangedInputPatchResult::RequiresChangedInputRecords(
+                                reason,
+                            ));
                         }
                         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                     };
@@ -4518,11 +4566,22 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 || !macho_text_relocation_replays
                     .rematerialized_sections
                     .is_empty())
-                && (!record_coverage.has_changed_input_records()
-                    || (!records_complete && !filtered_records_cover_macho_text_replays))
+                && !record_coverage.has_changed_input_records()
+            {
+                return Ok(ChangedInputPatchResult::RequiresChangedInputRecords(
+                    MACHO_TEXT_RELOCATION_RECORDS_REQUIRED.to_owned(),
+                ));
+            }
+            if (!macho_text_relocation_replays.replays.is_empty()
+                || !macho_text_relocation_replays
+                    .rematerialized_sections
+                    .is_empty())
+                && !records_complete
+                && !filtered_records_cover_macho_text_replays
             {
                 return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
-                    MACHO_TEXT_RELOCATION_RECORDS_REQUIRED.to_owned(),
+                    "changed Mach-O text relocation replay needs complete relocation records"
+                        .to_owned(),
                 ));
             }
             let mut macho_reserved_thunk_patches = Vec::new();
@@ -45126,7 +45185,7 @@ mod tests {
     #[test]
     fn record_requirement_retries_with_filtered_records() {
         assert!(changed_input_patch_should_retry_with_filtered_records(
-            &ChangedInputPatchResult::RequiresCompleteRecords(
+            &ChangedInputPatchResult::RequiresChangedInputRecords(
                 MACHO_TEXT_RELOCATION_RECORDS_REQUIRED.to_owned()
             )
         ));
@@ -45139,6 +45198,74 @@ mod tests {
             &ChangedInputPatchResult::Unsupported(
                 "changed bytes outside patchable sections in `input.o`".to_owned()
             )
+        ));
+    }
+
+    #[test]
+    fn macho_text_patch_metadata_starts_with_changed_input_records() {
+        let input = PathBuf::from("input.o");
+        let mut previous = state("args", b"output", &[("input.o", b"input")]);
+        let text_section = FilePatchSectionState {
+            input: hex::encode("input.o"),
+            section_index: 1,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 4,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+        previous.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "fingerprint".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: vec![text_section.clone()],
+            raw_sections: None,
+        });
+        let changed_inputs = vec![(0, input.clone())];
+
+        assert!(changed_inputs_have_macho_text_patch_sections(
+            &previous,
+            &changed_inputs
+        ));
+
+        let patch = previous.input_files[0].patch.as_mut().unwrap();
+        patch.raw_sections = Some(render_patch_sections(patch));
+        patch.sections.clear();
+        assert!(changed_inputs_have_macho_text_patch_sections(
+            &previous,
+            &changed_inputs
+        ));
+
+        let patch = previous.input_files[0].patch.as_mut().unwrap();
+        patch.raw_sections = None;
+        patch.sections = vec![FilePatchSectionState {
+            section_name: Some("__DATA,__data".to_owned()),
+            ..text_section
+        }];
+        assert!(!changed_inputs_have_macho_text_patch_sections(
+            &previous,
+            &changed_inputs
+        ));
+
+        previous.input_files[0].patch = None;
+        assert!(!changed_inputs_have_macho_text_patch_sections(
+            &previous,
+            &changed_inputs
+        ));
+
+        previous.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "fingerprint".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: Vec::new(),
+            raw_sections: Some("invalid patch metadata".to_owned()),
+        });
+        assert!(!changed_inputs_have_macho_text_patch_sections(
+            &previous,
+            &changed_inputs
         ));
     }
 
