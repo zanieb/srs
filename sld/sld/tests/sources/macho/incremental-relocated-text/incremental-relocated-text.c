@@ -39,6 +39,17 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedPatchedSectionCount:2
 //#TestIncrementalChangedRun:true
+//#Config:grown-text:incremental-relocated-text-base
+//#RunEnabled:true
+//#SldExtraLinkArgs:--incremental-padding-percent=100
+//#TestIncrementalPrivateSignedMachOOutput:true
+//#TestIncrementalCompareFull:false
+//#TestIncrementalChangedCompArgs:-DGROW_TEXT=1
+//#TestIncrementalChangedExpectPatch:true
+//#TestIncrementalChangedPatchedSectionCount:1
+//#TestIncrementalChangedCompareFull:false
+//#TestIncrementalChangedRestore:true
+//#TestIncrementalChangedRun:true
 //#Config:retargeted-relocation:incremental-relocated-text-base
 //#RunEnabled:true
 //#TestIncrementalPrivateSignedMachOOutput:true

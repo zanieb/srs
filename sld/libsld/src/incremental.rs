@@ -8315,7 +8315,8 @@ pub(crate) fn section_name_allows_direct_patching(name: &[u8]) -> bool {
 }
 
 pub(crate) fn section_name_allows_incremental_padding(name: &[u8]) -> bool {
-    (name.starts_with(b".") || name == b"__const") && section_name_allows_direct_patching(name)
+    (name.starts_with(b".") || matches!(name, b"__const" | b"__text"))
+        && section_name_allows_direct_patching(name)
 }
 
 fn section_direct_patch_preserve_ranges<'data>(
@@ -9650,7 +9651,7 @@ fn section_size_allows_direct_patching(
     previous_input_size: u64,
     current_input_size: usize,
 ) -> bool {
-    (section_name != Some(b"__cstring".as_slice()) && section_name != Some(b"__text".as_slice()))
+    section_name != Some(b"__cstring".as_slice())
         || u64::try_from(current_input_size).is_ok_and(|size| size == previous_input_size)
 }
 
@@ -24099,14 +24100,14 @@ mod tests {
     }
 
     #[test]
-    fn start_stop_sections_are_not_padded() {
+    fn incremental_padding_supports_patchable_data_and_text_sections() {
         assert!(section_name_allows_incremental_padding(b".text.foo"));
         assert!(section_name_allows_incremental_padding(b".data.foo"));
         assert!(section_name_allows_incremental_padding(b"__const"));
+        assert!(section_name_allows_incremental_padding(b"__text"));
         assert!(!section_name_allows_incremental_padding(b"foo"));
         assert!(!section_name_allows_incremental_padding(b"bar"));
         assert!(!section_name_allows_incremental_padding(b"__cstring"));
-        assert!(!section_name_allows_incremental_padding(b"__text"));
         assert!(!section_name_allows_incremental_padding(b".init_array"));
         assert!(!section_name_allows_incremental_padding(b".eh_frame"));
     }
@@ -27862,7 +27863,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_layout_macho_patches_require_a_stable_input_size() {
+    fn macho_cstring_patches_require_a_stable_input_size() {
         assert!(section_size_allows_direct_patching(
             Some(b"__cstring"),
             4,
@@ -27874,8 +27875,8 @@ mod tests {
             5
         ));
         assert!(section_size_allows_direct_patching(Some(b"__text"), 4, 4));
-        assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 3));
-        assert!(!section_size_allows_direct_patching(Some(b"__text"), 4, 5));
+        assert!(section_size_allows_direct_patching(Some(b"__text"), 4, 3));
+        assert!(section_size_allows_direct_patching(Some(b"__text"), 4, 5));
         assert!(section_size_allows_direct_patching(Some(b"__data"), 4, 5));
     }
 
