@@ -10749,14 +10749,27 @@ fn archive_member_patch_identifier(identifier: &[u8]) -> Vec<u8> {
     let Ok(filename) = std::str::from_utf8(identifier) else {
         return identifier.to_vec();
     };
-    let parts = filename.split('.').collect::<Vec<_>>();
-    let [crate_name, codegen_unit, invocation, "rcgu", "o"] = parts.as_slice() else {
+    let Some(stem) = filename.strip_suffix(".rcgu.o") else {
         return identifier.to_vec();
     };
-    if crate_name.is_empty() || codegen_unit.is_empty() || invocation.is_empty() {
+    let Some((module_name, invocation)) = stem.rsplit_once('.') else {
+        return identifier.to_vec();
+    };
+    let mut module_parts = module_name.split('.');
+    let Some(crate_name) = module_parts.next() else {
+        return identifier.to_vec();
+    };
+    let Some(codegen_unit) = module_parts.next() else {
+        return identifier.to_vec();
+    };
+    if crate_name.is_empty()
+        || codegen_unit.is_empty()
+        || invocation.is_empty()
+        || module_parts.any(str::is_empty)
+    {
         return identifier.to_vec();
     }
-    format!("{crate_name}.{codegen_unit}.rcgu.o").into_bytes()
+    format!("{module_name}.rcgu.o").into_bytes()
 }
 
 #[cfg(test)]
@@ -24481,6 +24494,10 @@ mod tests {
             b"crate-hash.cgu.rcgu.o".to_vec()
         );
         assert_eq!(
+            archive_member_patch_identifier(b"crate-hash.cgu.0.session.rcgu.o"),
+            b"crate-hash.cgu.0.rcgu.o".to_vec()
+        );
+        assert_eq!(
             archive_member_patch_identifier(b"foreign-member.o"),
             b"foreign-member.o".to_vec()
         );
@@ -24625,9 +24642,22 @@ mod tests {
     fn rustc_rlib_provenance_validates_raw_object_manifest_against_archive() {
         let digest_a = "a".repeat(blake3::OUT_LEN * 2);
         let digest_b = "b".repeat(blake3::OUT_LEN * 2);
+        let mut producer_contents = b"rustc-rlib-link-content-v1".to_vec();
+        producer_contents.extend_from_slice(&1_u64.to_le_bytes());
+        producer_contents.extend_from_slice(&(b"crate-hash.cgu.0".len() as u64).to_le_bytes());
+        producer_contents.extend_from_slice(b"crate-hash.cgu.0");
+        producer_contents.extend_from_slice(digest_a.as_bytes());
+        assert_eq!(
+            rustc_rlib_link_content_digest_from_raw_objects(&[RustcRlibRawObjectDigest {
+                identifier: b"crate-hash.cgu.0.old.rcgu.o".to_vec(),
+                digest: digest_a.clone(),
+            }]),
+            Some(blake3::hash(&producer_contents).to_hex().to_string())
+        );
+
         let (archive, expected) = rustc_rlib_with_raw_object_manifest(&[
-            (b"crate-hash.a.old.rcgu.o", digest_a.as_str(), b"first"),
-            (b"crate-hash.b.old.rcgu.o", digest_b.as_str(), b"second"),
+            (b"crate-hash.cgu.0.old.rcgu.o", digest_a.as_str(), b"first"),
+            (b"crate-hash.cgu.1.old.rcgu.o", digest_b.as_str(), b"second"),
         ]);
 
         let provenance = rustc_rlib_provenance(&archive).unwrap();
@@ -24636,16 +24666,16 @@ mod tests {
         assert_eq!(provenance.raw_object_manifest, Some(expected));
 
         let (reordered_archive, _) = rustc_rlib_with_raw_object_manifest(&[
-            (b"crate-hash.b.old.rcgu.o", digest_b.as_str(), b"second"),
-            (b"crate-hash.a.old.rcgu.o", digest_a.as_str(), b"first"),
+            (b"crate-hash.cgu.1.old.rcgu.o", digest_b.as_str(), b"second"),
+            (b"crate-hash.cgu.0.old.rcgu.o", digest_a.as_str(), b"first"),
         ]);
         let mut mismatched = reordered_archive;
         let first = mismatched
-            .windows(b"crate-hash.b.old.rcgu.o".len())
-            .position(|bytes| bytes == b"crate-hash.b.old.rcgu.o")
+            .windows(b"crate-hash.cgu.1.old.rcgu.o".len())
+            .position(|bytes| bytes == b"crate-hash.cgu.1.old.rcgu.o")
             .unwrap();
-        mismatched[first..first + b"crate-hash.b.old.rcgu.o".len()]
-            .copy_from_slice(b"crate-hash.a.old.rcgu.o");
+        mismatched[first..first + b"crate-hash.cgu.1.old.rcgu.o".len()]
+            .copy_from_slice(b"crate-hash.cgu.0.old.rcgu.o");
         assert!(
             rustc_rlib_provenance(&mismatched)
                 .unwrap()
