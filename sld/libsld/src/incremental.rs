@@ -13178,7 +13178,7 @@ fn apply_macho_text_relocation_replays(
                 )
                 .map_err(|error| {
                     format!(
-                        "failed to compare normalized Mach-O relocation input identity: {error:#}"
+                        "failed to compare normalized Mach-O relocation input identity: {error:#?}"
                     )
                 })?
             {
@@ -13203,7 +13203,7 @@ fn apply_macho_text_relocation_replays(
                 )
                 .map_err(|error| {
                     format!(
-                        "failed to compare normalized Mach-O relocation target identity: {error:#}"
+                        "failed to compare normalized Mach-O relocation target identity: {error:#?}"
                     )
                 })?
             {
