@@ -215,6 +215,10 @@
 //! TestIncrementalChangedNoSym:{symbol_name} Checks that a symbol is absent from the changed and
 //! repeated changed incremental outputs.
 //!
+//! TestIncrementalChangedExpectMachODwarfUnwindInfo:{symbol-name} Checks that the changed and
+//! repeated changed-input Mach-O outputs contain a DWARF-mode `__unwind_info` entry for the
+//! specified symbol's final image offset.
+//!
 //! TestIncrementalChangedExpectReuse:{bool} Whether the changed-input incremental relink should
 //! log reuse of unchanged input sections. Defaults to false.
 //!
@@ -912,6 +916,7 @@ struct Config {
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
     test_incremental_changed_no_sym: HashSet<String>,
+    test_incremental_changed_expected_macho_dwarf_unwind_info: Vec<String>,
     test_incremental_state_contains: Vec<String>,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
@@ -1660,6 +1665,7 @@ impl Config {
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
             test_incremental_changed_no_sym: HashSet::new(),
+            test_incremental_changed_expected_macho_dwarf_unwind_info: Vec::new(),
             test_incremental_state_contains: Vec::new(),
             test_config: test_config.clone(),
             tracked_files: Default::default(),
@@ -2447,6 +2453,9 @@ fn process_directive(
                 .test_incremental_changed_no_sym
                 .insert(arg.trim().to_owned());
         }
+        "TestIncrementalChangedExpectMachODwarfUnwindInfo" => config
+            .test_incremental_changed_expected_macho_dwarf_unwind_info
+            .push(arg.trim().to_owned()),
         "TestIncrementalStateContains" => {
             config
                 .test_incremental_state_contains
@@ -3207,6 +3216,17 @@ impl ProgramInputs {
                         self.name()
                     )
                 })?;
+            assert_output_macho_dwarf_unwind_info(
+                &changed_content,
+                &config.test_incremental_changed_expected_macho_dwarf_unwind_info,
+            )
+            .with_context(|| {
+                format!(
+                    "Incremental test failed for {}: changed-input Mach-O DWARF unwind assertion \
+                     failed",
+                    self.name()
+                )
+            })?;
 
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
@@ -3253,6 +3273,17 @@ impl ProgramInputs {
             .with_context(|| {
                 format!(
                     "Incremental test failed for {}: repeated changed-input output symbol absence \
+                     assertion failed",
+                    self.name()
+                )
+            })?;
+            assert_output_macho_dwarf_unwind_info(
+                &repeated_changed_content,
+                &config.test_incremental_changed_expected_macho_dwarf_unwind_info,
+            )
+            .with_context(|| {
+                format!(
+                    "Incremental test failed for {}: repeated changed-input Mach-O DWARF unwind \
                      assertion failed",
                     self.name()
                 )
@@ -3304,6 +3335,17 @@ impl ProgramInputs {
                         self.name()
                     );
                 }
+                assert_output_macho_dwarf_unwind_info(
+                    &repeated_renamed_content,
+                    &config.test_incremental_changed_expected_macho_dwarf_unwind_info,
+                )
+                .with_context(|| {
+                    format!(
+                        "Incremental test failed for {}: repeated renamed-member Mach-O DWARF \
+                         unwind assertion failed",
+                        self.name()
+                    )
+                })?;
                 if config.platform == PlatformKind::MachO
                     && !config.test_incremental_unsigned_macho_output
                 {
@@ -4227,12 +4269,12 @@ fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn macho_regular_unwind_function_offsets(bytes: &[u8]) -> Result<HashSet<u32>> {
+fn macho_regular_unwind_entries(bytes: &[u8]) -> Result<HashMap<u32, u32>> {
     const MACHO_UNWIND_REGULAR_SECOND_LEVEL: u32 = 2;
 
     let index_offset = read_macho_unwind_u32(bytes, 20, "index offset")? as usize;
     let index_count = read_macho_unwind_u32(bytes, 24, "index count")? as usize;
-    let mut function_offsets = HashSet::new();
+    let mut entries = HashMap::new();
 
     for index in 0..index_count.saturating_sub(1) {
         let index_entry_offset = index_offset + index * 3 * size_of::<u32>();
@@ -4256,16 +4298,78 @@ fn macho_regular_unwind_function_offsets(bytes: &[u8]) -> Result<HashSet<u32>> {
         )? as usize;
 
         for page_entry in 0..page_entry_count {
-            let function_offset = read_macho_unwind_u32(
+            let entry_offset =
+                second_level_offset + page_entry_offset + page_entry * 2 * size_of::<u32>();
+            let function_offset =
+                read_macho_unwind_u32(bytes, entry_offset, "regular unwind function offset")?;
+            let encoding = read_macho_unwind_u32(
                 bytes,
-                second_level_offset + page_entry_offset + page_entry * 2 * size_of::<u32>(),
-                "regular unwind function offset",
+                entry_offset + size_of::<u32>(),
+                "regular unwind encoding",
             )?;
-            function_offsets.insert(function_offset);
+            ensure!(
+                entries.insert(function_offset, encoding).is_none(),
+                "Mach-O __unwind_info repeats function offset {function_offset:#x}"
+            );
         }
     }
 
-    Ok(function_offsets)
+    Ok(entries)
+}
+
+fn assert_output_macho_dwarf_unwind_info(bytes: &[u8], symbol_names: &[String]) -> Result {
+    const MACHO_UNWIND_MODE_MASK: u32 = 0x0f00_0000;
+    const MACHO_UNWIND_MODE_DWARF: u32 = 0x0300_0000;
+
+    if symbol_names.is_empty() {
+        return Ok(());
+    }
+
+    let object::File::MachO64(obj) = object::File::parse(bytes)? else {
+        bail!("Expected changed incremental output to be Mach-O 64-bit");
+    };
+    let unwind_info = obj
+        .section_by_name("__unwind_info")
+        .context("Expected changed Mach-O __unwind_info section")?
+        .data()
+        .context("Failed to read changed Mach-O __unwind_info section")?;
+    let unwind_entries = macho_regular_unwind_entries(unwind_info)?;
+
+    for symbol_name in symbol_names {
+        let symbol = obj
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some(symbol_name.as_str()))
+            .with_context(|| {
+                format!("Expected changed Mach-O unwind symbol `{symbol_name}` to exist")
+            })?;
+        let image_offset = macho_symbol_image_offset(symbol.address(), symbol_name)?;
+        let encoding = unwind_entries.get(&image_offset).with_context(|| {
+            format!(
+                "Expected changed Mach-O __unwind_info to contain `{symbol_name}` at image offset \
+                 {image_offset:#x}, got offsets {:#x?}",
+                unwind_entries.keys().collect::<Vec<_>>()
+            )
+        })?;
+        ensure!(
+            encoding & MACHO_UNWIND_MODE_MASK == MACHO_UNWIND_MODE_DWARF,
+            "Expected changed Mach-O __unwind_info entry for `{symbol_name}` at image offset \
+             {image_offset:#x} to use DWARF mode, got encoding {encoding:#010x}"
+        );
+    }
+
+    Ok(())
+}
+
+fn macho_symbol_image_offset(address: u64, symbol_name: &str) -> Result<u32> {
+    address
+        .checked_sub(0x1_0000_0000)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .with_context(|| {
+            format!(
+                "Mach-O unwind symbol `{symbol_name}` address {address:#x} is outside the 32-bit \
+                 image range"
+            )
+        })
 }
 
 fn read_macho_unwind_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
@@ -6375,7 +6479,7 @@ impl Assertions {
             .context("Expected Mach-O __unwind_info section")?
             .data()
             .context("Failed to read Mach-O __unwind_info section")?;
-        let unwind_function_offsets = macho_regular_unwind_function_offsets(unwind_info)?;
+        let unwind_entries = macho_regular_unwind_entries(unwind_info)?;
 
         for symbol_name in &self.expected_sld_macho_unwind_info {
             let symbol = obj
@@ -6384,20 +6488,12 @@ impl Assertions {
                 .with_context(|| {
                     format!("Expected Mach-O unwind symbol `{symbol_name}` to exist")
                 })?;
-            let image_offset = symbol
-                .address()
-                .checked_sub(0x1_0000_0000)
-                .and_then(|offset| u32::try_from(offset).ok())
-                .with_context(|| {
-                    format!(
-                        "Mach-O unwind symbol `{symbol_name}` address {:#x} is outside the 32-bit image range",
-                        symbol.address()
-                    )
-                })?;
+            let image_offset = macho_symbol_image_offset(symbol.address(), symbol_name)?;
 
             ensure!(
-                unwind_function_offsets.contains(&image_offset),
-                "Expected sld Mach-O __unwind_info to contain `{symbol_name}` at image offset {image_offset:#x}, got offsets {unwind_function_offsets:#x?}"
+                unwind_entries.contains_key(&image_offset),
+                "Expected sld Mach-O __unwind_info to contain `{symbol_name}` at image offset {image_offset:#x}, got offsets {:#x?}",
+                unwind_entries.keys().collect::<Vec<_>>()
             );
         }
 
