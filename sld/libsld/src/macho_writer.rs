@@ -1874,9 +1874,16 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         }
         _ => todo!(),
     };
-    let mut used_thunk = false;
+    let mut applied_target_value = if rel.r_type == macho::ARM64_RELOC_BRANCH26 {
+        resolution
+            .format_specific
+            .stub_address
+            .map_or(target_resolution_value, |address| address.get())
+    } else {
+        target_resolution_value
+    };
     if let Some(local_symbol_id) = local_symbol_id
-        && let Some(thunked_value) = maybe_get_thunk_for_relocation::<A>(
+        && let Some((thunked_value, thunk_address)) = maybe_get_thunk_for_relocation::<A>(
             object_layout,
             layout,
             section_part_id,
@@ -1887,7 +1894,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         )?
     {
         value = thunked_value;
-        used_thunk = true;
+        applied_target_value = thunk_address;
     }
     if let Some(import_index) = chained_rebases.bind_import_index(place) {
         value = encode_chained_bind(import_index, chained_rebases.next_stride(place)?)?;
@@ -1930,7 +1937,6 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     if let Some(incremental_relocations) = incremental_relocations
         && let Some(section_output_offset) = section_output_offset
         && let Some(local_symbol_id) = local_symbol_id
-        && !used_thunk
         && matches!(
             rel.r_type,
             macho::ARM64_RELOC_BRANCH26 | macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_PAGEOFF12
@@ -1939,7 +1945,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         let target_symbol = layout.symbol_db.definition(local_symbol_id);
         let target_symbol_id = u32::try_from(target_symbol.as_usize())
             .context("Incremental Mach-O relocation target symbol ID overflow")?;
-        if let Some(record) = PreparedState::deferred_relocation_record(
+        if let Some(record) = PreparedState::deferred_relocation_record_with_applied_target(
             object_layout.input,
             section_index,
             target_symbol_id,
@@ -1950,6 +1956,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             paired_addend,
             value,
             target_resolution_value,
+            Some(applied_target_value),
             || {
                 Ok((
                     layout
@@ -2014,7 +2021,7 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
     local_symbol_id: SymbolId,
     place: u64,
     value: u64,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, u64)>> {
     let Some(config) = A::thunk_config() else {
         return Ok(None);
     };
@@ -2063,7 +2070,7 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
         "Using Mach-O thunk instead of out-of-range branch"
     );
 
-    Ok(Some(new_value))
+    Ok(Some((new_value, thunk_address)))
 }
 
 fn rewrite_pageoff_load_to_add(out: &mut [u8]) -> Result {
