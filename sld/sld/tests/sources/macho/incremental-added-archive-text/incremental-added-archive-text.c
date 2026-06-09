@@ -14,7 +14,7 @@
 //#TestIncrementalChangedAddedArchiveMember:aaa_incremental_added_archive.1.changed.rcgu.o=incremental-added-archive-extra.S
 //#TestIncrementalChangedAddedArchiveMember:zzz_incremental_added_archive.2.changed.rcgu.o=incremental-added-archive-extra-second.S
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:4
+//#TestIncrementalChangedPatchedSectionCount:5
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedSymbolBytes:_incremental_added_archive_extra_second=0xc0028052
