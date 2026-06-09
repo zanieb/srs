@@ -5005,6 +5005,34 @@ fn matched_patch_section_preserves_relocation_record_locations(
         && section.previous.output_offset == section.current.output_offset
 }
 
+fn matched_normalized_archive_section_preserves_relocation_record_locations(
+    input_file_path: &str,
+    section: &MatchedPatchSection,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    if section.previous.section_index != section.current.section_index
+        || section.previous.output_offset != section.current.output_offset
+    {
+        return Ok(false);
+    }
+    if section.previous.input == section.current.input {
+        return Ok(true);
+    }
+    if !normalize_rust_archive_patch_inputs {
+        return Ok(false);
+    }
+    let Some(previous) = parse_patch_input_ref(input_file_path, &section.previous.input)? else {
+        return Ok(false);
+    };
+    let Some(current) = parse_patch_input_ref(input_file_path, &section.current.input)? else {
+        return Ok(false);
+    };
+    Ok(!previous.identifier.is_empty()
+        && !current.identifier.is_empty()
+        && archive_member_patch_identifier(&previous.identifier)
+            == archive_member_patch_identifier(&current.identifier))
+}
+
 fn update_section_records_for_matched_patches(
     input_file: &str,
     matched_sections: &[MatchedPatchSection],
@@ -10283,7 +10311,12 @@ fn validate_macho_data_relocations_are_stable(
                 previous_contexts.len(),
                 current_contexts.len(),
                 relocation_indices.len(),
-                matched_patch_section_preserves_relocation_record_locations(patch_section),
+                matched_normalized_archive_section_preserves_relocation_record_locations(
+                    input.path.as_str(),
+                    patch_section,
+                    previous_resolver.normalize_rust_archive_patch_inputs
+                        && current_resolver.normalize_rust_archive_patch_inputs,
+                )?,
             ) {
                 return Ok(Err(format!(
                     "changed Mach-O data relocation layout in {}: previous={}, current={}, \
@@ -25806,6 +25839,14 @@ mod tests {
         assert_eq!(matched.sections[0].current.input, current_input_ref);
         assert!(matched.changed_sections.is_empty());
         assert!(!matched_patch_section_preserves_relocation_record_locations(&matched.sections[0]));
+        assert!(
+            matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &matched.sections[0],
+                true,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -25840,6 +25881,83 @@ mod tests {
                 previous,
                 current
             })
+        );
+    }
+
+    #[test]
+    fn normalized_archive_member_rename_preserves_relocation_record_locations() {
+        let input_file = hex::encode("libarchive.rlib");
+        let previous = PatchSection {
+            input: hex::encode("libarchive.rlib\0crate-hash.cgu.old.rcgu.o\0100:200"),
+            section_index: 2,
+            section_name: Some("__DATA,__const".to_owned()),
+            input_size: 8,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: Some("same".to_owned()),
+            cstring_nul_boundaries_hash: None,
+        };
+        let mut current = previous.clone();
+        current.input = hex::encode("libarchive.rlib\0crate-hash.cgu.new.rcgu.o\0300:400");
+        let matched = MatchedPatchSection {
+            previous: previous.clone(),
+            current: current.clone(),
+        };
+
+        assert!(
+            matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &matched,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(
+            !matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &matched,
+                false,
+            )
+            .unwrap()
+        );
+
+        current.output_offset += 8;
+        assert!(
+            !matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &MatchedPatchSection {
+                    previous: previous.clone(),
+                    current,
+                },
+                true,
+            )
+            .unwrap()
+        );
+
+        let mut current = previous.clone();
+        current.input = hex::encode("libarchive.rlib\0crate-hash.cgu.new.rcgu.o\0300:400");
+        current.section_index += 1;
+        assert!(
+            !matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &MatchedPatchSection {
+                    previous: previous.clone(),
+                    current,
+                },
+                true,
+            )
+            .unwrap()
+        );
+
+        let mut current = previous.clone();
+        current.input = hex::encode("libarchive.rlib\0other-hash.cgu.new.rcgu.o\0300:400");
+        assert!(
+            !matched_normalized_archive_section_preserves_relocation_record_locations(
+                &input_file,
+                &MatchedPatchSection { previous, current },
+                true,
+            )
+            .unwrap()
         );
     }
 
