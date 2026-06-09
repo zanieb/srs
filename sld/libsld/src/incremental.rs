@@ -9703,6 +9703,7 @@ fn rematerialized_macho_text_relocation_replay(
     let mut target_is_global = false;
     let target;
     let mut resolution = None;
+    let mut recorded_import_stub_candidates = Vec::new();
     let current_target_value = match current_context.target {
         object::RelocationTarget::Symbol(symbol_index) => {
             let symbol = current_file
@@ -9742,15 +9743,44 @@ fn rematerialized_macho_text_relocation_replay(
                 target = Some(current_target);
                 value
             } else {
-                let Some(value) = resolution.and_then(|resolution| resolution.direct_value) else {
+                if let Some(value) = resolution.and_then(|resolution| resolution.direct_value) {
+                    target = resolution.and_then(|resolution| resolution.target.clone());
+                    value
+                } else if symbol.is_undefined()
+                    && symbol.is_global()
+                    && symbol.address() == 0
+                    && current_context.r_type == object::macho::ARM64_RELOC_BRANCH26
+                    && current_context.r_pcrel
+                    && let Some(encoded_name) = target_name.as_ref()
+                {
+                    if resolution
+                        .and_then(|resolution| resolution.stub_address)
+                        .is_none()
+                    {
+                        recorded_import_stub_candidates = recorded_macho_import_stub_candidates(
+                            relocations,
+                            encoded_name,
+                            current_context.addend,
+                            previous_output,
+                            output_file,
+                        );
+                        if recorded_import_stub_candidates.is_empty() {
+                            return Ok(Err(format!(
+                                "missing Mach-O symbol resolution for {} in {}",
+                                display_hex_text(&hex::encode(&name)),
+                                display_hex_path(&input.path)
+                            )));
+                        }
+                    }
+                    target = None;
+                    0
+                } else {
                     return Ok(Err(format!(
                         "missing Mach-O symbol resolution for {} in {}",
                         display_hex_text(&hex::encode(&name)),
                         display_hex_path(&input.path)
                     )));
-                };
-                target = resolution.and_then(|resolution| resolution.target.clone());
-                value
+                }
             }
         }
         object::RelocationTarget::Section(section_index) => {
@@ -9784,16 +9814,20 @@ fn rematerialized_macho_text_relocation_replay(
         }
     };
 
-    let recorded_target_candidates = recorded_macho_branch_target_candidates(
-        relocations,
-        target_name.as_ref(),
-        target_is_global,
-        target.as_ref(),
-        current_target_value,
-        current_context.addend,
-        previous_output,
-        output_file,
-    );
+    let recorded_target_candidates = if recorded_import_stub_candidates.is_empty() {
+        recorded_macho_branch_target_candidates(
+            relocations,
+            target_name.as_ref(),
+            target_is_global,
+            target.as_ref(),
+            current_target_value,
+            current_context.addend,
+            previous_output,
+            output_file,
+        )
+    } else {
+        recorded_import_stub_candidates
+    };
     let current_relocation_target_candidates = macho_text_relocation_target_candidates(
         resolutions,
         target_name.as_deref(),
@@ -9945,6 +9979,15 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
             }
             continue;
         };
+        if current_target_value == 0
+            && current_target.is_none()
+            && resolution_index.is_none_or(|index| {
+                resolutions[index].direct_value.is_none()
+                    && resolutions[index].stub_address.is_some()
+            })
+        {
+            continue;
+        }
 
         if let Some(resolution_index) = resolution_index {
             let resolution = &mut resolutions[resolution_index];
