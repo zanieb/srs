@@ -7817,7 +7817,7 @@ fn macho_relocation_record_matches_patch_section(
 
 struct MachORelocationSectionIndex {
     exact: HashMap<u32, HashMap<SharedText, Vec<usize>>>,
-    normalized: HashMap<u32, HashMap<Vec<u8>, Vec<usize>>>,
+    normalized: HashMap<u32, HashMap<Arc<[u8]>, Vec<usize>>>,
 }
 
 impl MachORelocationSectionIndex {
@@ -7830,6 +7830,7 @@ impl MachORelocationSectionIndex {
             exact: HashMap::new(),
             normalized: HashMap::new(),
         };
+        let mut normalized_inputs = HashMap::<&str, Option<Arc<[u8]>>>::new();
         for (relocation_index, relocation) in relocations.iter().enumerate() {
             if relocation.input_file != input_file_path
                 || decode_macho_aarch64_relocation_kind(relocation.kind).is_none()
@@ -7843,16 +7844,30 @@ impl MachORelocationSectionIndex {
                 .entry(relocation.input.clone())
                 .or_default()
                 .push(relocation_index);
-            if normalize_rust_archive_patch_inputs
-                && let Some(parsed) =
-                    parse_patch_input_ref(input_file_path, relocation.input.as_str())?
-                && !parsed.identifier.is_empty()
-            {
+            let normalized_input = if normalize_rust_archive_patch_inputs {
+                if let Some(cached) = normalized_inputs.get(relocation.input.as_str()) {
+                    cached.clone()
+                } else {
+                    let identifier =
+                        parse_patch_input_ref(input_file_path, relocation.input.as_str())?
+                            .filter(|parsed| !parsed.identifier.is_empty())
+                            .map(|parsed| {
+                                Arc::<[u8]>::from(archive_member_patch_identifier(
+                                    &parsed.identifier,
+                                ))
+                            });
+                    normalized_inputs.insert(relocation.input.as_str(), identifier.clone());
+                    identifier
+                }
+            } else {
+                None
+            };
+            if let Some(identifier) = normalized_input {
                 index
                     .normalized
                     .entry(relocation.section_index)
                     .or_default()
-                    .entry(archive_member_patch_identifier(&parsed.identifier))
+                    .entry(identifier)
                     .or_default()
                     .push(relocation_index);
             }
@@ -36093,15 +36108,18 @@ mod tests {
             )
             .unwrap()
         );
-        let relocations = [relocation.clone()];
+        let mut second_relocation = relocation.clone();
+        second_relocation.relocation_offset += 1;
+        let relocations = [relocation.clone(), second_relocation];
         let relocation_index =
             MachORelocationSectionIndex::new(&relocations, &input_file, true).unwrap();
         assert_eq!(
             relocation_index
                 .indices(&input_file, &section, true)
                 .unwrap(),
-            &[0]
+            &[0, 1]
         );
+        assert_eq!(relocation_index.normalized.get(&2).unwrap().len(), 1);
         assert!(
             relocation_index
                 .indices(&input_file, &section, false)
