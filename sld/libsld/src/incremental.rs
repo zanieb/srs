@@ -12756,15 +12756,13 @@ fn macho_symbol_resolution_index_for_name(
 
 fn macho_text_relocation_target_candidates(
     resolutions: &[MachOSymbolResolutionRecord],
+    resolution_lookup: &MachOSymbolResolutionLookup<'_>,
     target_name: Option<&str>,
     r_type: u8,
     target_value: u64,
     previous_applied_target_values: &[u64],
 ) -> Vec<u64> {
-    let resolution = target_name
-        .and_then(|name| hex::decode(name).ok())
-        .as_deref()
-        .and_then(|name| macho_symbol_resolution_for_name(resolutions, name));
+    let resolution = target_name.and_then(|name| resolution_lookup.get_encoded(resolutions, name));
     macho_text_relocation_target_candidates_for_resolution(
         resolution,
         r_type,
@@ -14089,6 +14087,7 @@ fn macho_text_relocation_replays_for_input(
                     .collect::<Vec<_>>();
                 let current_relocation_target_candidates = macho_text_relocation_target_candidates(
                     resolutions,
+                    &resolution_lookup,
                     relocation.target_name.as_deref(),
                     raw_relocation.r_type,
                     current_target_value,
@@ -22966,6 +22965,7 @@ fn added_macho_archive_text_relocation_replays(
     resolutions: &[MachOSymbolResolutionRecord],
 ) -> Result<std::result::Result<Vec<MachOTextRelocationReplay>, String>> {
     let resolver = PatchInputResolver::new(current_bytes, true)?;
+    let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for added text relocations")?;
     let mut replays = Vec::new();
@@ -23140,6 +23140,7 @@ fn added_macho_archive_text_relocation_replays(
             };
             let current_relocation_target_candidates = macho_text_relocation_target_candidates(
                 resolutions,
+                &resolution_lookup,
                 target_name.as_deref(),
                 context.r_type,
                 current_target_value,
@@ -44528,12 +44529,39 @@ mod tests {
     }
 
     #[test]
+    fn macho_text_relocation_candidates_use_indexed_resolution() {
+        let target_name = SharedText::from(hex::encode("_target"));
+        let resolutions = [MachOSymbolResolutionRecord {
+            name: target_name.clone(),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: Some(0x2000),
+            thunk_addresses: vec![0x3000],
+            target: None,
+        }];
+        let lookup = MachOSymbolResolutionLookup::new(&resolutions);
+
+        assert_eq!(
+            macho_text_relocation_target_candidates(
+                &resolutions,
+                &lookup,
+                Some(target_name.as_str()),
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x1000,
+                &[0x4000],
+            ),
+            vec![0x4000, 0x2000, 0x3000]
+        );
+    }
+
+    #[test]
     fn macho_text_relocation_candidates_reuse_uncatalogued_import_stub() {
         let place = 0x1_01b2_240c;
         let direct_target = 0;
         let recorded_stub = 0x1_0000_395c;
         let candidates = macho_text_relocation_target_candidates(
             &[],
+            &MachOSymbolResolutionLookup::new(&[]),
             Some(&hex::encode("_Unwind_Resume")),
             object::macho::ARM64_RELOC_BRANCH26,
             direct_target,
@@ -44569,6 +44597,7 @@ mod tests {
     fn macho_text_relocation_candidates_deduplicate_recorded_direct_target() {
         let candidates = macho_text_relocation_target_candidates(
             &[],
+            &MachOSymbolResolutionLookup::new(&[]),
             Some(&hex::encode("_target")),
             object::macho::ARM64_RELOC_BRANCH26,
             0x1000_1000,
@@ -44618,6 +44647,7 @@ mod tests {
         );
         let candidates = macho_text_relocation_target_candidates(
             &[],
+            &MachOSymbolResolutionLookup::new(&[]),
             Some(target_name.as_str()),
             object::macho::ARM64_RELOC_BRANCH26,
             0,
@@ -45205,6 +45235,7 @@ mod tests {
         );
         let candidates = macho_text_relocation_target_candidates(
             &[],
+            &MachOSymbolResolutionLookup::new(&[]),
             Some(target_name.as_str()),
             object::macho::ARM64_RELOC_BRANCH26,
             target_value,
