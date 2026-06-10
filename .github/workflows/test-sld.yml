@@ -1,0 +1,42 @@
+name: SLD tests
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  test:
+    name: SLD (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: macOS arm64
+            runner: macos-15
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/sld-incremental-tests
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify native SLD incremental regressions
+        run: |
+          trap 'cargo +stable clean --manifest-path sld/Cargo.toml' EXIT
+          cargo +stable test --manifest-path sld/Cargo.toml -p libsld --lib
+          case "$RUNNER_OS" in
+            Linux)
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/incremental
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/custom-section/incremental-padding -- --exact
+              ;;
+            macOS)
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests macho/aarch64/incremental
+              ;;
+          esac

@@ -7,163 +7,102 @@ on:
       - main
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build SRS and workloads (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x86_64
-            os: ubuntu-24.04
-          - name: macOS arm64
-            os: macos-15
-    env:
-      # Keep the workload builds from growing debug incremental caches on CI.
-      CARGO_INCREMENTAL: 0
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: srs-self-build-v1
+  test-scripts:
+    uses: ./.github/workflows/test-scripts.yml
 
+  test-cargo:
+    uses: ./.github/workflows/test-cargo.yml
+
+  test-sld:
+    uses: ./.github/workflows/test-sld.yml
+
+  build-linux:
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      name: Linux x86_64
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      sha: ${{ github.sha }}
+
+  build-macos:
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      name: macOS arm64
+      runner: macos-15
+      target: aarch64-apple-darwin
+      sha: ${{ github.sha }}
+
+  installed-tests-linux:
+    needs: build-linux
+    uses: ./.github/workflows/test-installed.yml
+    with:
+      name: Linux x86_64
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      sha: ${{ github.sha }}
+
+  installed-tests-macos:
+    needs: build-macos
+    uses: ./.github/workflows/test-installed.yml
+    with:
+      name: macOS arm64
+      runner: macos-15
+      target: aarch64-apple-darwin
+      sha: ${{ github.sha }}
+
+  workloads-linux:
+    needs: build-linux
+    uses: ./.github/workflows/test-workloads.yml
+    with:
+      name: Linux x86_64
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      sha: ${{ github.sha }}
+
+  workloads-macos:
+    needs: build-macos
+    uses: ./.github/workflows/test-workloads.yml
+    with:
+      name: macOS arm64
+      runner: macos-15
+      target: aarch64-apple-darwin
+      sha: ${{ github.sha }}
+
+  required-checks-passed:
+    name: Required checks passed
+    if: always()
+    needs:
+      - test-scripts
+      - test-cargo
+      - test-sld
+      - build-linux
+      - build-macos
+      - installed-tests-linux
+      - installed-tests-macos
+      - workloads-linux
+      - workloads-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-        with:
-          version: v0.15.0
-
-      - name: Verify immutable installer snapshot
-        run: ./scripts/test-install-snapshot.sh
-
-      - name: Verify SRS Cargo wrapper
-        run: ./scripts/test-cargo-srs-wrapper.sh
-
-      - name: Verify Cargo shared artifact cache
-        working-directory: rust/src/tools/cargo
-        run: |
-          cargo test --lib artifact_cache
-          cargo test --lib util::flock
-          cargo test -p cargo-util atomic
-          cargo test --test testsuite artifact_cache -- --ignored --test-threads=1 \
-            --skip artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact \
-            --skip artifact_cache::same_mtime_input_changed_after_compilation_is_not_published \
-            --skip artifact_cache::same_mtime_input_changed_during_publication_is_not_published
-          cargo test --test testsuite rustup::artifact_cache -- --test-threads=1
-          cargo test --test testsuite freshness::workspace_member_dependency_stays_fresh_when_selected_directly -- --exact
-
-      - name: Verify native SLD incremental regressions
+      - name: Check required jobs
         env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/sld-incremental-tests
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          trap 'cargo +stable clean --manifest-path sld/Cargo.toml' EXIT
-          cargo +stable test --manifest-path sld/Cargo.toml -p libsld --lib
-          case "$RUNNER_OS" in
-            Linux)
-              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/incremental
-              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/custom-section/incremental-padding -- --exact
-              ;;
-            macOS)
-              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests macho/aarch64/incremental
-              ;;
-          esac
-
-      - name: Verify unsupported native SLD Cargo warning
-        if: runner.os == 'Linux'
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo-native-incremental-tests
-        run: |
-          trap 'cargo +stable clean --manifest-path rust/src/tools/cargo/Cargo.toml' EXIT
-          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite sld_native_incremental_warns_on_unsupported_host
-
-      - name: Verify Cargo native incremental regressions
-        if: runner.os == 'macOS'
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo-native-incremental-tests
-        run: |
-          trap 'cargo +stable clean --manifest-path rust/src/tools/cargo/Cargo.toml' EXIT
-          rustup target add --toolchain stable x86_64-apple-darwin
-          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite sld_native_incremental
-          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite srs_target_rustflags_
-
-      - name: Build SRS
-        # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
-        env:
-          RUSTC_WRAPPER: sccache
-        run: |
-          ./build.sh \
-            --ci false \
-            --set=build.ccache=sccache \
-            --set=rust.incremental=false \
-            --set=rust.debuginfo-level=0
-
-      - name: Show SRS build cache statistics
-        if: always()
-        run: '"$SCCACHE_PATH" --show-adv-stats'
-
-      - name: Install SRS
-        run: ./install.sh
-
-      - name: Verify checksum freshness artifact cache composition
-        run: |
-          case "$RUNNER_OS" in
-            Linux) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc ;;
-            macOS) export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang ;;
-          esac
-          export SLD_INCREMENTAL=0
-          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
-            artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact -- --exact
-          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
-            artifact_cache::same_mtime_input_changed_after_compilation_is_not_published -- --exact
-          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
-            artifact_cache::same_mtime_input_changed_during_publication_is_not_published -- --exact
-
-      - name: Verify Rust SRS regressions
-        working-directory: rust
-        run: |
-          ./x test --config ../bootstrap.toml --ci false \
-            --set=rust.incremental=false --set=rust.debuginfo-level=0 \
-            --stage 2 \
-            tests/run-make/separate-link-fail \
-            tests/codegen-llvm/preserve_duplicate_constants.rs
-
-      - name: Verify SRS default backend
-        run: |
-          rustc +srs -Vv
-          rustc +srs -Z unstable-options --print target-spec-json \
-            | grep -q '"default-codegen-backend": "cranelift"'
-
-      - name: Verify cargo +srs installed dependency-edit replay
-        run: ./scripts/test-cargo-srs-native-incremental.sh
-
-      - uses: actions/checkout@v6
-        with:
-          repository: astral-sh/uv
-          persist-credentials: false
-          path: workloads/uv
-
-      - name: Build uv
-        working-directory: workloads/uv
-        run: cargo +srs build --locked -p uv
-
-      - uses: actions/checkout@v6
-        with:
-          repository: astral-sh/ruff
-          persist-credentials: false
-          path: workloads/ruff
-
-      - name: Build Ruff and ty
-        working-directory: workloads/ruff
-        run: cargo +srs build --locked -p ruff -p ty
+          failures="$(
+            jq -r '
+              to_entries[]
+              | select(.value.result != "success")
+              | "\(.key): \(.value.result)"
+            ' <<< "$NEEDS"
+          )"
+          if [[ -n "$failures" ]]; then
+            printf 'Required jobs did not succeed:\n%s\n' "$failures" >&2
+            exit 1
+          fi

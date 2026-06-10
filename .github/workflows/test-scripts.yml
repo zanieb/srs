@@ -1,0 +1,31 @@
+name: Script tests
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  test:
+    name: Scripts (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: macOS arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify immutable installer snapshot
+        run: ./scripts/test-install-snapshot.sh
+
+      - name: Verify SRS Cargo wrapper
+        run: ./scripts/test-cargo-srs-wrapper.sh

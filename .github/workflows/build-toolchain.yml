@@ -1,0 +1,110 @@
+name: Build toolchain
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build toolchain (${{ inputs.name }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: 0
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: srs-self-build-v1
+      SRS_CI_TARGET: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.15.0
+
+      - name: Build SRS
+        # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          ./build.sh \
+            --ci false \
+            --set=build.ccache=sccache \
+            --set=rust.incremental=false \
+            --set=rust.debuginfo-level=0
+
+      - name: Show SRS build cache statistics
+        if: always()
+        run: '"$SCCACHE_PATH" --show-adv-stats'
+
+      - name: Package installed SRS snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_name="srs-ci-$SRS_CI_TARGET"
+          install_root="$RUNNER_TEMP/srs-toolchains"
+          snapshot="$install_root/$release_name"
+
+          SRS_INSTALL_ROOT="$install_root" ./install.sh "$release_name"
+
+          rustc +"$release_name" -Vv
+          cargo +"$release_name" -Vv
+          host="$(rustc +"$release_name" --print host-tuple)"
+          if [[ "$host" != "$SRS_CI_TARGET" ]]; then
+            printf 'built host %s does not match expected target %s\n' \
+              "$host" "$SRS_CI_TARGET" >&2
+            exit 2
+          fi
+          test -x "$snapshot/bin/cargo-clippy"
+          test -x "$snapshot/bin/clippy-driver"
+          test -x "$snapshot/lib/rustlib/$host/bin/sld"
+
+          COPYFILE_DISABLE=1 tar \
+            -C "$install_root" \
+            -czf "$RUNNER_TEMP/$release_name.tar.gz" \
+            "$release_name"
+
+      - name: Upload installed SRS snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: srs-toolchain-${{ inputs.target }}-${{ inputs.sha }}
+          path: ${{ runner.temp }}/srs-ci-${{ inputs.target }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      - name: Remove local packaged snapshot
+        run: |
+          release_name="srs-ci-$SRS_CI_TARGET"
+          rustup toolchain uninstall "$release_name"
+          rm -rf \
+            "$RUNNER_TEMP/srs-toolchains" \
+            "$RUNNER_TEMP/$release_name.tar.gz"
+
+      - name: Verify Rust SRS regressions
+        working-directory: rust
+        run: |
+          ./x test --config ../bootstrap.toml --ci false \
+            --set=rust.incremental=false --set=rust.debuginfo-level=0 \
+            --stage 2 \
+            tests/run-make/separate-link-fail \
+            tests/codegen-llvm/preserve_duplicate_constants.rs
