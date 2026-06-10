@@ -13782,7 +13782,7 @@ fn macho_text_relocation_replays_for_input(
             } else {
                 false
             };
-            let replaces_resolved_target = previous_signatures.len() == current_signatures.len()
+            let replaces_external_target = previous_signatures.len() == current_signatures.len()
                 && previous_signatures
                     .iter()
                     .zip(&current_signatures)
@@ -13805,7 +13805,7 @@ fn macho_text_relocation_replays_for_input(
                             current_type,
                             current_pcrel,
                             current_addend,
-                            Some((current_name, current_section)),
+                            Some((_current_name, current_section)),
                         ) = current
                         else {
                             return false;
@@ -13815,15 +13815,28 @@ fn macho_text_relocation_replays_for_input(
                             && previous_addend == current_addend
                             && previous_section.is_none()
                             && current_section.is_none()
-                            && resolution_lookup
-                                .get_name(resolutions, current_name)
-                                .is_some()
                     },
                 );
+            if replaces_external_target
+                && let Some((current_name, _)) = current_signatures
+                    .iter()
+                    .filter_map(|signature| signature.3.as_ref())
+                    .find(|(current_name, _)| {
+                        resolution_lookup
+                            .get_name(resolutions, current_name)
+                            .is_none()
+                    })
+            {
+                return Ok(Err(format!(
+                    "{MACHO_SYMBOL_RESOLUTIONS_REQUIRED} for {} in {}",
+                    String::from_utf8_lossy(current_name),
+                    display_hex_path(&input.path)
+                )));
+            }
             if relocation_set_changed
                 && (previous_signatures.len() != current_signatures.len()
                     || is_reordering
-                    || replaces_resolved_target)
+                    || replaces_external_target)
             {
                 for relocation_index in &relocation_indices {
                     if target_moves.contains_key(relocation_index) {
@@ -45050,6 +45063,38 @@ mod tests {
             0,
         );
         relocation.applied_target_value = Some(previous_target_value);
+        let previous_resolver = PatchInputResolver::new(&previous, false).unwrap();
+        let current_resolver = PatchInputResolver::new(&current, false).unwrap();
+        let mut resolutions = Vec::new();
+        let mut target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            changed_relocation_indices: Vec::new(),
+        };
+
+        let result = macho_text_relocation_replays_for_input(
+            std::slice::from_ref(&relocation),
+            &mut resolutions,
+            &[],
+            &input,
+            &matched,
+            &previous_resolver,
+            &current_resolver,
+            &previous_output,
+            &mut target_patches,
+            &[],
+            true,
+        )
+        .unwrap();
+        let Err(reason) = result else {
+            panic!("missing replacement resolution should require the complete catalog");
+        };
+
+        assert!(reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED));
+
         let mut resolutions = vec![MachOSymbolResolutionRecord {
             name: SharedText::from(hex::encode("_new_target")),
             direct_value: Some(current_target_value),
@@ -45063,8 +45108,6 @@ mod tests {
                 section_offset: 0,
             }),
         }];
-        let previous_resolver = PatchInputResolver::new(&previous, false).unwrap();
-        let current_resolver = PatchInputResolver::new(&current, false).unwrap();
         let mut target_patches = RelocationTargetPatches {
             input_ranges: Vec::new(),
             output_patches: Vec::new(),
