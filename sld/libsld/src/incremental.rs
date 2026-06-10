@@ -13909,22 +13909,12 @@ fn validate_macho_data_relocations_are_stable(
                 }
 
                 let previous_record = relocation.clone();
-                if !patch_input_refs_match(
-                    input.path.as_str(),
-                    relocation.input.as_str(),
-                    patch_section.current.input.as_str(),
-                    normalize_rust_archive_patch_inputs,
-                )? {
+                if relocation.input != patch_section.current.input {
                     relocation.input = patch_section.current.input.clone().into();
                 }
                 relocation.section_index = patch_section.current.section_index;
                 let target = relocation.target.as_mut().unwrap();
-                if !patch_input_refs_match(
-                    input.path.as_str(),
-                    target.input.as_str(),
-                    patch_section.current.input.as_str(),
-                    normalize_rust_archive_patch_inputs,
-                )? {
+                if target.input != patch_section.current.input {
                     target.input = patch_section.current.input.clone().into();
                 }
                 target.section_index =
