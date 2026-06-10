@@ -542,17 +542,18 @@ unmodeled dependency search paths, inherited SLD work-product provenance
 controls, or unsupported native-link or extra-output inputs.
 The modeled unstable rustc options are named sysroot codegen backends and
 `-Zpreserve-duplicate-constants={yes,no}`.
-Cache keys preserve source-location and a content identity for modeled
-Cargo-selected compiler paths, installed sysroot compiler and target library
-file identity, cache-safe installed codegen backend contents, and compiler-visible
-dynamic library search inputs. Installed sysroot library identity follows ordinary
-toolchain publication metadata; overwriting a sysroot file's contents in place
-while preserving its identity, size, and modification time is outside this
-model, as is mutating installed toolchain files in place during an active Cargo
-invocation.
-For ordinary publication that replaces watched installed files or directory
-trees, file and directory identity metadata are included in the cache identity
-and rechecked before cache restoration and publication.
+Cache keys preserve source-location and a portable BLAKE3 content identity for
+modeled Cargo-selected compiler paths, installed sysroot compiler and target
+library files, cache-safe installed codegen backend contents, and
+compiler-visible dynamic library search inputs. Compiler and Cargo executable
+locations and extraction-assigned device and inode numbers are excluded from the
+persistent identity so identical toolchain snapshots can reuse entries after
+restoration at another location. Sysroot content changes completed before Cargo
+starts are detected even when file sizes and modification times are preserved.
+File and directory identity metadata, including Unix change time, remain in a
+process-local witness that detects ordinary completed replacement after identity
+calculation. Concurrent mutation or publication of a toolchain during an active
+Cargo invocation remains outside this model.
 Token-bearing dynamic library search paths, such as Linux `$ORIGIN` or macOS
 `@loader_path`, run normally without restoration rather than being interpreted
 for cache identity. Linux builds with nonempty `GLIBC_TUNABLES` also run

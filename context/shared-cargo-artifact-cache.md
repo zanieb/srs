@@ -70,22 +70,25 @@ an older modification time is outside the cache model.
 
 ## Compiler Identity
 
-Each cache key includes sysroot compiler and target library file identity,
+Each cache key includes the BLAKE3 contents and relative paths of the sysroot
+compiler and target library files,
 named sysroot codegen backend contents including SRS's Cranelift backend, and
-compiler-visible dynamic library search inputs.
+compiler-visible dynamic library search inputs. Compiler and Cargo executable
+locations and extraction-assigned device and inode numbers are excluded from the
+persistent identity so an otherwise identical toolchain snapshot can reuse
+entries after restoration on another runner.
 
 Linux runs with nonempty `GLIBC_TUNABLES` or nested shared objects in compiler
 loader roots execute normally without restoration. This includes glibc
 hardware-capability candidates in configured or installed compiler loader
 roots, because they can change the selected compiler library.
 
-Sysroot library identity assumes ordinary toolchain publication updates file
-identity metadata. Overwriting a watched file in place while preserving
-identity, size, and modification time, or mutating installed toolchain files
-during an active Cargo invocation, is outside the cache model. For ordinary
-publication that replaces watched installed files or directory trees, file
-and directory identity metadata are included in the cache identity and
-rechecked before restoration and publication.
+Sysroot content changes completed before Cargo starts are detected even when
+file sizes and modification times are preserved. Device, inode, size,
+modification-time, and Unix change-time metadata remain part of a process-local
+witness and detect ordinary completed replacement of watched installed files or
+directory trees after identity calculation. Concurrent mutation or publication
+of a toolchain during an active Cargo invocation remains outside the cache model.
 
 ## Capacity And Concurrency
 

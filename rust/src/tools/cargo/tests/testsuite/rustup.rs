@@ -47,6 +47,49 @@ fn isolated_artifact_cache_loader_path() -> PathBuf {
     root().join("empty-compiler-loader-path")
 }
 
+fn copy_directory_tree(source: &Path, destination: &Path) {
+    destination.mkdir_p();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory_tree(&source, &destination);
+        } else {
+            fs::copy(source, destination).unwrap();
+        }
+    }
+}
+
+fn single_rlib_under(path: &Path) -> PathBuf {
+    fn visit(path: &Path, rlibs: &mut Vec<PathBuf>) {
+        if !path.exists() {
+            return;
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                {
+                    visit(&path, rlibs);
+                }
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "rlib")
+            {
+                rlibs.push(path);
+            }
+        }
+    }
+
+    let mut rlibs = Vec::new();
+    visit(path, &mut rlibs);
+    assert_eq!(rlibs.len(), 1, "expected one rlib under {}", path.display());
+    rlibs.pop().unwrap()
+}
+
 struct RustupEnvironment {
     /// Path for ~/.cargo/bin
     cargo_bin: PathBuf,
@@ -341,6 +384,88 @@ fn artifact_cache_models_rustup_proxy_with_default_home() {
     assert!(
         cache.join(".cargo-artifact-cache-size").exists(),
         "a rustup proxy with a selected default-home toolchain should publish artifacts"
+    );
+}
+
+#[cargo_test(ignore_windows = "PATH can't be overridden on Windows")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn artifact_cache_restores_across_relocated_rustup_toolchains() {
+    let RustupEnvironment {
+        cargo_bin,
+        rustup_home,
+        ..
+    } = RustupEnvironmentBuilder::new().build();
+    let cache = root().join("shared-cache");
+    let relocated_rustup_home = root().join("relocated-rustup-home");
+    copy_directory_tree(
+        &rustup_home.join("toolchains").join("test-toolchain"),
+        &relocated_rustup_home
+            .join("toolchains")
+            .join("test-toolchain"),
+    );
+    let original_rustc = rustup_home
+        .join("toolchains")
+        .join("test-toolchain")
+        .join("bin")
+        .join("rustc")
+        .with_extension(EXE_EXTENSION);
+    let relocated_rustc = relocated_rustup_home
+        .join("toolchains")
+        .join("test-toolchain")
+        .join("bin")
+        .join("rustc")
+        .with_extension(EXE_EXTENSION);
+    assert!(
+        !same_file::is_same_file(&original_rustc, &relocated_rustc).unwrap(),
+        "the relocated toolchain should be a fresh extraction"
+    );
+
+    let proxy_only_bin = root().join("proxy-only-bin");
+    proxy_only_bin.mkdir_p();
+    fs::hard_link(
+        cargo_bin.join("rustc").with_extension(EXE_EXTENSION),
+        proxy_only_bin.join("rustc").with_extension(EXE_EXTENSION),
+    )
+    .unwrap();
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+                cache.display()
+            ),
+        )
+        .file("src/lib.rs", "")
+        .build();
+    let producer_target = p.root().join("producer-target");
+    let consumer_target = p.root().join("consumer-target");
+    let build = |target: &Path, rustup_home: &Path| {
+        p.cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env("RUSTUP_HOME", rustup_home)
+            .env("RUSTUP_TOOLCHAIN", "test-toolchain")
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_artifact_cache_loader_path(),
+            )
+            .env("PATH", &proxy_only_bin)
+            .run();
+    };
+
+    build(&producer_target, &rustup_home);
+    build(&consumer_target, &relocated_rustup_home);
+
+    let stored = single_rlib_under(&cache);
+    let restored = single_rlib_under(&consumer_target.join("debug").join("deps"));
+    assert!(
+        same_file::is_same_file(stored, restored).unwrap(),
+        "the relocated rustup toolchain should restore the producer artifact"
     );
 }
 

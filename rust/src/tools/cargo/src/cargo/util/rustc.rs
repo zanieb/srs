@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context as _;
 use cargo_util::{ProcessBuilder, ProcessError, paths};
@@ -25,6 +25,35 @@ struct ArtifactCacheIdentity {
     witness: ArtifactCacheIdentityWitness,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ArtifactCacheIdentityProvider {
+    program: Option<PathBuf>,
+    identity: Arc<OnceLock<Option<ArtifactCacheIdentity>>>,
+}
+
+impl ArtifactCacheIdentityProvider {
+    pub(crate) fn program(&self) -> Option<&Path> {
+        self.program.as_deref()
+    }
+
+    pub(crate) fn identity(&self) -> Option<blake3::Hash> {
+        self.snapshot().map(|identity| identity.digest)
+    }
+
+    pub(crate) fn witness(&self) -> Option<ArtifactCacheIdentityWitness> {
+        self.snapshot().map(|identity| identity.witness.clone())
+    }
+
+    fn snapshot(&self) -> Option<&ArtifactCacheIdentity> {
+        self.identity
+            .get_or_init(|| {
+                let path = self.program.as_ref()?;
+                artifact_cache_identity_for_program(path)
+            })
+            .as_ref()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ArtifactCacheIdentityWitness {
     directories: Vec<ArtifactCacheDirectoryWitness>,
@@ -39,6 +68,10 @@ struct ArtifactCacheDirectoryWitness {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 impl ArtifactCacheDirectoryWitness {
@@ -50,7 +83,11 @@ impl ArtifactCacheDirectoryWitness {
             return false;
         }
         #[cfg(unix)]
-        if metadata.dev() != self.device || metadata.ino() != self.inode {
+        if metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.ctime() != self.changed_seconds
+            || metadata.ctime_nsec() != self.changed_nanoseconds
+        {
             return false;
         }
         true
@@ -66,6 +103,10 @@ struct ArtifactCacheFileWitness {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 impl ArtifactCacheFileWitness {
@@ -81,6 +122,10 @@ impl ArtifactCacheFileWitness {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
 
@@ -95,7 +140,11 @@ impl ArtifactCacheFileWitness {
             return false;
         }
         #[cfg(unix)]
-        if metadata.dev() != self.device || metadata.ino() != self.inode {
+        if metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.ctime() != self.changed_seconds
+            || metadata.ctime_nsec() != self.changed_nanoseconds
+        {
             return false;
         }
         true
@@ -110,51 +159,10 @@ impl ArtifactCacheIdentityWitness {
             && self.files.iter().all(ArtifactCacheFileWitness::is_current)
     }
 
-    fn update_digest(&self, sysroot: &Path, hasher: &mut blake3::Hasher) -> Option<()> {
-        for directory in &self.directories {
-            let modified = directory
-                .modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?;
-            hasher.update(b"\0sysroot-directory-identity\0");
-            hasher.update(
-                directory
-                    .path
-                    .strip_prefix(sysroot)
-                    .ok()?
-                    .to_string_lossy()
-                    .as_bytes(),
-            );
-            hasher.update(b"\0");
-            hasher.update(&modified.as_secs().to_le_bytes());
-            hasher.update(&modified.subsec_nanos().to_le_bytes());
-            #[cfg(unix)]
-            {
-                hasher.update(&directory.device.to_le_bytes());
-                hasher.update(&directory.inode.to_le_bytes());
-            }
-        }
-        for file in &self.files {
-            let modified = file.modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-            hasher.update(b"\0sysroot-file-identity\0");
-            hasher.update(
-                file.path
-                    .strip_prefix(sysroot)
-                    .ok()?
-                    .to_string_lossy()
-                    .as_bytes(),
-            );
-            hasher.update(b"\0");
-            hasher.update(&file.len.to_le_bytes());
-            hasher.update(&modified.as_secs().to_le_bytes());
-            hasher.update(&modified.subsec_nanos().to_le_bytes());
-            #[cfg(unix)]
-            {
-                hasher.update(&file.device.to_le_bytes());
-                hasher.update(&file.inode.to_le_bytes());
-            }
-        }
-        Some(())
+    pub(crate) fn contains_file(&self, path: &Path) -> bool {
+        self.files
+            .binary_search_by(|witness| witness.path.as_path().cmp(path))
+            .is_ok()
     }
 }
 
@@ -176,12 +184,7 @@ pub struct Rustc {
     pub host: InternedString,
     /// The rustc full commit hash, this comes from `verbose_version`.
     pub commit_hash: Option<String>,
-    /// The actual compiler binary whose contents identify restorable output.
-    ///
-    /// This is absent for explicitly configured compiler drivers and
-    /// unresolved rustup proxy invocations.
-    artifact_cache_identity_program: Option<PathBuf>,
-    artifact_cache_identity: OnceLock<Option<ArtifactCacheIdentity>>,
+    artifact_cache_identity_provider: ArtifactCacheIdentityProvider,
     cache: Mutex<Cache>,
 }
 
@@ -257,7 +260,7 @@ impl Rustc {
         });
         let artifact_cache_identity_program = artifact_cache_identity_is_modeled
             .then(|| {
-                let program = paths::resolve_executable(&path).ok()?;
+                let program = std::fs::canonicalize(paths::resolve_executable(&path).ok()?).ok()?;
                 let rustup_proxy = paths::resolve_executable(rustup_rustc).ok();
                 let is_rustup_proxy = rustup_proxy
                     .as_ref()
@@ -282,7 +285,7 @@ impl Rustc {
                     .join("bin")
                     .join("rustc")
                     .with_extension(env::consts::EXE_EXTENSION);
-                paths::resolve_executable(&actual_program).ok()
+                std::fs::canonicalize(paths::resolve_executable(&actual_program).ok()?).ok()
             })
             .flatten();
 
@@ -294,34 +297,16 @@ impl Rustc {
             version,
             host,
             commit_hash,
-            artifact_cache_identity_program,
-            artifact_cache_identity: OnceLock::new(),
+            artifact_cache_identity_provider: ArtifactCacheIdentityProvider {
+                program: artifact_cache_identity_program,
+                identity: Arc::new(OnceLock::new()),
+            },
             cache: Mutex::new(cache),
         })
     }
 
-    /// Gets the compiler-content identity used by Cargo's artifact cache.
-    ///
-    /// Explicitly configured compiler programs and unresolved rustup proxies
-    /// can delegate to side inputs Cargo cannot model, so they do not receive
-    /// an identity for restoration.
-    pub fn artifact_cache_identity(&self) -> Option<blake3::Hash> {
-        self.artifact_cache_identity_snapshot()
-            .map(|identity| identity.digest)
-    }
-
-    pub(crate) fn artifact_cache_identity_witness(&self) -> Option<ArtifactCacheIdentityWitness> {
-        self.artifact_cache_identity_snapshot()
-            .map(|identity| identity.witness.clone())
-    }
-
-    fn artifact_cache_identity_snapshot(&self) -> Option<&ArtifactCacheIdentity> {
-        self.artifact_cache_identity
-            .get_or_init(|| {
-                let path = self.artifact_cache_identity_program.as_ref()?;
-                artifact_cache_identity_for_program(path)
-            })
-            .as_ref()
+    pub(crate) fn artifact_cache_identity_provider(&self) -> ArtifactCacheIdentityProvider {
+        self.artifact_cache_identity_provider.clone()
     }
 
     /// Gets a process builder set up to use the found rustc version, with a wrapper if `Some`.
@@ -421,9 +406,41 @@ fn directory_runtime_library_files(path: &Path) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
-fn is_codegen_backend(path: &Path) -> bool {
-    path.components()
+fn is_codegen_backend(sysroot: &Path, path: &Path) -> bool {
+    path.strip_prefix(sysroot)
+        .ok()
+        .into_iter()
+        .flat_map(Path::components)
         .any(|component| component.as_os_str() == "codegen-backends")
+}
+
+fn update_reader_and_find_marker(
+    hasher: &mut blake3::Hasher,
+    reader: &mut impl std::io::Read,
+    marker: &[u8],
+) -> Option<bool> {
+    let mut buffer = [0; 64 * 1024];
+    let mut tail = Vec::with_capacity(marker.len().saturating_sub(1));
+    let mut found = marker.is_empty();
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(found);
+        }
+        let bytes = &buffer[..read];
+        hasher.update(bytes);
+        if !found {
+            let mut search = Vec::with_capacity(tail.len() + bytes.len());
+            search.extend_from_slice(&tail);
+            search.extend_from_slice(bytes);
+            found = search.windows(marker.len()).any(|window| window == marker);
+            if !found {
+                let keep = marker.len().saturating_sub(1).min(search.len());
+                tail.clear();
+                tail.extend_from_slice(&search[search.len() - keep..]);
+            }
+        }
+    }
 }
 
 fn has_nested_runtime_library(path: &Path, excluded_root_child: Option<&str>) -> Option<bool> {
@@ -501,6 +518,10 @@ fn artifact_cache_identity_witness_for_sysroot(
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
         });
         if recursive {
             for entry in std::fs::read_dir(path).ok()? {
@@ -540,19 +561,7 @@ fn artifact_cache_identity_witness_for_sysroot(
     })
 }
 
-fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdentity> {
-    let sysroot = path.parent()?.parent()?;
-    let witness_before = artifact_cache_identity_witness_for_sysroot(sysroot)?;
-    let rustc_metadata = std::fs::metadata(path).ok()?;
-    let mut file_witnesses = vec![ArtifactCacheFileWitness::from_metadata(
-        path,
-        &rustc_metadata,
-    )?];
-    let contents = std::fs::read(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(path.to_string_lossy().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&contents);
+fn artifact_cache_modeled_files(sysroot: &Path) -> Option<Vec<PathBuf>> {
     if cfg!(target_os = "linux")
         && has_nested_runtime_library(&sysroot.join("lib"), Some("rustlib"))?
     {
@@ -578,43 +587,70 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
     }
     modeled_files.sort();
     modeled_files.dedup();
-    for modeled_file in modeled_files {
-        // Normal sysroot installation publishes compiler and target libraries
-        // with new metadata. Named backends are content-hashed because SRS can
-        // select one directly while retaining ordinary cache startup cost.
-        let metadata = std::fs::metadata(&modeled_file).ok()?;
-        file_witnesses.push(ArtifactCacheFileWitness::from_metadata(
-            &modeled_file,
+    Some(modeled_files)
+}
+
+fn update_artifact_cache_file_digest(
+    hasher: &mut blake3::Hasher,
+    sysroot: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<ArtifactCacheFileWitness> {
+    let witness = ArtifactCacheFileWitness::from_metadata(path, metadata)?;
+    let mut file = std::fs::File::open(path).ok()?;
+    if ArtifactCacheFileWitness::from_metadata(path, &file.metadata().ok()?)? != witness {
+        return None;
+    }
+    let relative = path
+        .strip_prefix(sysroot)
+        .ok()?
+        .as_os_str()
+        .as_encoded_bytes();
+    hasher.update(b"\0sysroot-file-content\0");
+    hasher.update(&(relative.len() as u64).to_le_bytes());
+    hasher.update(relative);
+    hasher.update(&witness.len.to_le_bytes());
+    if is_codegen_backend(sysroot, path) {
+        if !update_reader_and_find_marker(
+            hasher,
+            &mut file,
+            ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER,
+        )? {
+            return None;
+        }
+    } else {
+        hasher.update_reader(&mut file).ok()?;
+    }
+    if ArtifactCacheFileWitness::from_metadata(path, &file.metadata().ok()?)? != witness {
+        return None;
+    }
+    Some(witness)
+}
+
+fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdentity> {
+    let sysroot = path.parent()?.parent()?;
+    let witness_before = artifact_cache_identity_witness_for_sysroot(sysroot)?;
+    let rustc_metadata = std::fs::metadata(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-compiler-identity-v2\0");
+    let mut file_witnesses = vec![update_artifact_cache_file_digest(
+        &mut hasher,
+        sysroot,
+        path,
+        &rustc_metadata,
+    )?];
+    let modeled_files = artifact_cache_modeled_files(sysroot)?;
+    for modeled_file in &modeled_files {
+        let metadata = std::fs::metadata(modeled_file).ok()?;
+        file_witnesses.push(update_artifact_cache_file_digest(
+            &mut hasher,
+            sysroot,
+            modeled_file,
             &metadata,
         )?);
-        let modified = metadata
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?;
-        hasher.update(b"\0sysroot-input\0");
-        hasher.update(
-            modeled_file
-                .strip_prefix(sysroot)
-                .ok()?
-                .to_string_lossy()
-                .as_bytes(),
-        );
-        hasher.update(b"\0");
-        hasher.update(&metadata.len().to_le_bytes());
-        hasher.update(&modified.as_secs().to_le_bytes());
-        hasher.update(&modified.subsec_nanos().to_le_bytes());
-        if is_codegen_backend(&modeled_file) {
-            let contents = std::fs::read(&modeled_file).ok()?;
-            if !contents
-                .windows(ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER.len())
-                .any(|window| window == ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER)
-            {
-                return None;
-            }
-            hasher.update(b"\0sysroot-codegen-backend-content\0");
-            hasher.update(&contents);
-        }
+    }
+    if artifact_cache_modeled_files(sysroot)? != modeled_files {
+        return None;
     }
     let mut witness = artifact_cache_identity_witness_for_sysroot(sysroot)?;
     if witness.directories != witness_before.directories {
@@ -625,7 +661,6 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
     if !witness.is_current() {
         return None;
     }
-    witness.update_digest(sysroot, &mut hasher)?;
     Some(ArtifactCacheIdentity {
         digest: hasher.finalize(),
         witness,
@@ -633,8 +668,138 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
 }
 
 #[cfg(test)]
+pub(crate) fn artifact_cache_identity_for_program_for_test(
+    path: &Path,
+) -> Option<(blake3::Hash, ArtifactCacheIdentityWitness)> {
+    let identity = artifact_cache_identity_for_program(path)?;
+    Some((identity.digest, identity.witness))
+}
+
+#[cfg(test)]
 mod artifact_cache_identity_tests {
     use super::*;
+
+    fn write_portable_test_sysroot(sysroot: &Path, rustc_contents: &[u8]) -> PathBuf {
+        let rustc = sysroot.join("bin").join("rustc");
+        let lib = sysroot.join("lib");
+        let rustlib = lib.join("rustlib");
+        let target = rustlib.join("test-target");
+        let target_lib = target.join("lib");
+        let driver = lib.join("librustc_driver.dylib");
+        let standard_library = target_lib.join("libcore.rlib");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&target_lib).unwrap();
+        std::fs::write(&rustc, rustc_contents).unwrap();
+        std::fs::write(&driver, b"driver").unwrap();
+        std::fs::write(&standard_library, b"standard library").unwrap();
+
+        let timestamp = FileTime::from_unix_time(1_700_000_000, 0);
+        for file in [&rustc, &driver, &standard_library] {
+            filetime::set_file_times(file, timestamp, timestamp).unwrap();
+        }
+        for directory in [
+            &target_lib,
+            &target,
+            &rustlib,
+            &lib,
+            rustc.parent().unwrap(),
+        ] {
+            filetime::set_file_times(directory, timestamp, timestamp).unwrap();
+        }
+        rustc
+    }
+
+    #[test]
+    fn compiler_identity_is_portable_across_sysroot_extractions() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_rustc =
+            write_portable_test_sysroot(&temp.path().join("first-toolchain"), b"rustc");
+        let second_rustc =
+            write_portable_test_sysroot(&temp.path().join("second-toolchain"), b"rustc");
+        let changed_timestamp = FileTime::from_unix_time(1_700_000_100, 0);
+        filetime::set_file_times(&second_rustc, changed_timestamp, changed_timestamp).unwrap();
+        filetime::set_file_times(
+            second_rustc.parent().unwrap(),
+            changed_timestamp,
+            changed_timestamp,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            assert_ne!(
+                std::fs::metadata(&first_rustc).unwrap().ino(),
+                std::fs::metadata(&second_rustc).unwrap().ino()
+            );
+            assert_ne!(
+                std::fs::metadata(first_rustc.parent().unwrap())
+                    .unwrap()
+                    .ino(),
+                std::fs::metadata(second_rustc.parent().unwrap())
+                    .unwrap()
+                    .ino()
+            );
+        }
+
+        let first = artifact_cache_identity_for_program(&first_rustc).unwrap();
+        let second = artifact_cache_identity_for_program(&second_rustc).unwrap();
+
+        assert!(first.witness.is_current());
+        assert!(second.witness.is_current());
+        assert_ne!(first.witness, second.witness);
+        assert_eq!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn compiler_identity_ignores_codegen_backend_parent_directory_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_rustc =
+            write_portable_test_sysroot(&temp.path().join("first-toolchain"), b"rustc");
+        let second_rustc = write_portable_test_sysroot(
+            &temp
+                .path()
+                .join("codegen-backends")
+                .join("second-toolchain"),
+            b"rustc",
+        );
+
+        let first = artifact_cache_identity_for_program(&first_rustc).unwrap();
+        let second = artifact_cache_identity_for_program(&second_rustc).unwrap();
+
+        assert_eq!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn portable_compiler_identity_hashes_rustc_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_rustc =
+            write_portable_test_sysroot(&temp.path().join("first-toolchain"), b"rustc A");
+        let second_rustc =
+            write_portable_test_sysroot(&temp.path().join("second-toolchain"), b"rustc B");
+
+        let first = artifact_cache_identity_for_program(&first_rustc).unwrap();
+        let second = artifact_cache_identity_for_program(&second_rustc).unwrap();
+
+        assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn portable_compiler_identity_hashes_library_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_sysroot = temp.path().join("first-toolchain");
+        let second_sysroot = temp.path().join("second-toolchain");
+        let first_rustc = write_portable_test_sysroot(&first_sysroot, b"rustc");
+        let second_rustc = write_portable_test_sysroot(&second_sysroot, b"rustc");
+        let second_driver = second_sysroot.join("lib").join("librustc_driver.dylib");
+        let timestamp =
+            FileTime::from_last_modification_time(&std::fs::metadata(&second_driver).unwrap());
+        std::fs::write(&second_driver, b"change").unwrap();
+        filetime::set_file_times(&second_driver, timestamp, timestamp).unwrap();
+
+        let first = artifact_cache_identity_for_program(&first_rustc).unwrap();
+        let second = artifact_cache_identity_for_program(&second_rustc).unwrap();
+
+        assert_ne!(first.digest, second.digest);
+    }
 
     #[test]
     fn sysroot_codegen_backend_contents_change_compiler_identity() {
@@ -811,12 +976,50 @@ mod artifact_cache_identity_tests {
         let first = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
         std::fs::write(&standard_library, b"other core").unwrap();
-        let changed_timestamp =
-            FileTime::from_unix_time(timestamp.unix_seconds() + 1, timestamp.nanoseconds());
-        filetime::set_file_times(&standard_library, changed_timestamp, changed_timestamp).unwrap();
+        filetime::set_file_times(&standard_library, timestamp, timestamp).unwrap();
         let second = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
         assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_sysroot_update_with_preserved_mtime_invalidates_identity_witness() {
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = write_portable_test_sysroot(&sysroot, b"rustc");
+        let driver = sysroot.join("lib").join("librustc_driver.dylib");
+        let timestamp = FileTime::from_last_modification_time(&std::fs::metadata(&driver).unwrap());
+        let before = std::fs::metadata(&driver).unwrap();
+        let identity = artifact_cache_identity_for_program(&rustc).unwrap();
+
+        std::fs::write(&driver, b"change").unwrap();
+        filetime::set_file_times(&driver, timestamp, timestamp).unwrap();
+        let after = std::fs::metadata(&driver).unwrap();
+
+        assert_eq!(before.ino(), after.ino());
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert!(!identity.witness.is_current());
+    }
+
+    #[test]
+    fn backend_marker_detection_spans_read_boundaries() {
+        let marker = ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER;
+        let prefix_len = 64 * 1024 - marker.len() / 2;
+        let mut contents = vec![b'x'; prefix_len];
+        contents.extend_from_slice(marker);
+        contents.extend_from_slice(b"tail");
+        let mut reader = std::io::Cursor::new(&contents);
+        let mut hasher = blake3::Hasher::new();
+
+        assert_eq!(
+            update_reader_and_find_marker(&mut hasher, &mut reader, marker),
+            Some(true)
+        );
+        assert_eq!(hasher.finalize(), blake3::hash(&contents));
     }
 
     #[cfg(unix)]

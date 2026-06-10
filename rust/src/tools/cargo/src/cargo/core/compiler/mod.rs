@@ -615,16 +615,27 @@ fn rustc(
                 && artifact_cache_host_is_supported()
                 && artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc)
         });
-    let artifact_cache_compiler_identity = artifact_cache
+    let artifact_cache_identity_provider = artifact_cache
         .as_ref()
-        .and_then(|_| build_runner.bcx.rustc().artifact_cache_identity());
-    let artifact_cache_identity_witness = artifact_cache
-        .as_ref()
-        .and_then(|_| build_runner.bcx.rustc().artifact_cache_identity_witness());
+        .map(|_| build_runner.bcx.rustc().artifact_cache_identity_provider());
     let artifact_cache_compiler_program = build_runner.bcx.rustc().path.clone();
+    let artifact_cache_identity_program = artifact_cache_identity_provider
+        .as_ref()
+        .and_then(|provider| provider.program())
+        .unwrap_or(&artifact_cache_compiler_program)
+        .to_path_buf();
     let artifact_cache_loader_input_paths = artifact_cache
         .as_ref()
-        .map(|_| compiler_loader_input_paths(build_runner.bcx.gctx, &rustc, &cwd))
+        .map(|_| {
+            compiler_loader_input_paths(
+                build_runner.bcx.gctx,
+                &rustc,
+                &artifact_cache_identity_program,
+                &build_dir,
+                &root,
+                &cwd,
+            )
+        })
         .unwrap_or_default();
     let artifact_cache = artifact_cache.filter(|_| {
         artifact_cache_loader_input_paths_are_modeled(&artifact_cache_loader_input_paths)
@@ -640,6 +651,42 @@ fn rustc(
             })
         })
         .transpose()?
+        .unwrap_or_default();
+    let artifact_cache_portable_remaps = artifact_cache
+        .as_ref()
+        .map(|_| {
+            let source_id = unit.pkg.package_id().source_id();
+            let package_replacement = if source_id.is_git() {
+                "/__cargo_artifact_cache_git_checkouts"
+            } else if source_id.is_registry() {
+                "/__cargo_artifact_cache_registry_sources"
+            } else if unit
+                .pkg
+                .root()
+                .strip_prefix(build_runner.bcx.ws.root())
+                .is_ok()
+            {
+                "/__cargo_artifact_cache_workspace"
+            } else {
+                "/__cargo_artifact_cache_package"
+            };
+            [
+                (package_remap(build_runner, unit), package_replacement),
+                (
+                    build_dir_remap(build_runner),
+                    "/__cargo_artifact_cache_build_dir",
+                ),
+                (
+                    sysroot_remap(build_runner, unit),
+                    "/__cargo_artifact_cache_compiler_sysroot/lib/rustlib/src/rust",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(argument, replacement)| {
+                artifact_cache_portable_remap(argument, replacement)
+            })
+            .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let cache_crate_name = unit.target.crate_name().to_string();
 
@@ -716,18 +763,22 @@ fn rustc(
         // Record the invocation before reading cache-discovered inputs so edits
         // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        let cache_entry = match artifact_cache
+        let artifact_cache = artifact_cache.as_ref().filter(|_| {
+            rlib_action_is_cacheable_with_search_paths(
+                &rustc,
+                &root,
+                &artifact_cache_compiler_program,
+                &rustc_host,
+                &artifact_cache_dependency_search_paths,
+            )
+        });
+        let artifact_cache_compiler_identity = artifact_cache
             .as_ref()
-            .zip(artifact_cache_compiler_identity.as_ref())
-            .filter(|_| {
-                rlib_action_is_cacheable_with_search_paths(
-                    &rustc,
-                    &root,
-                    &artifact_cache_compiler_program,
-                    &rustc_host,
-                    &artifact_cache_dependency_search_paths,
-                )
-            }) {
+            .and_then(|_| artifact_cache_identity_provider.as_ref()?.identity());
+        let artifact_cache_identity_witness = artifact_cache_compiler_identity
+            .as_ref()
+            .and_then(|_| artifact_cache_identity_provider.as_ref()?.witness());
+        let cache_entry = match artifact_cache.zip(artifact_cache_compiler_identity.as_ref()) {
             Some((cache, compiler_identity)) => match rlib_cache_entry(
                 &cache.dir,
                 &rustc,
@@ -735,8 +786,11 @@ fn rustc(
                 &root,
                 &rustc_verbose_version,
                 compiler_identity,
+                &artifact_cache_identity_program,
                 &artifact_cache_dependency_search_paths,
+                &artifact_cache_portable_remaps,
                 &artifact_cache_loader_input_paths,
+                artifact_cache_identity_witness.as_ref(),
                 &cwd,
             ) {
                 Ok(entry) => Some(entry),
@@ -749,7 +803,7 @@ fn rustc(
         };
         let cache_hit = match cache_entry
             .as_ref()
-            .zip(artifact_cache.as_ref())
+            .zip(artifact_cache)
             .zip(artifact_cache_identity_witness.as_ref())
         {
             Some((
@@ -965,7 +1019,7 @@ fn rustc(
 
         if !cache_hit
             && let Some(((entry, loader_inputs_digest, action_inputs_digest), cache)) =
-                cache_entry.as_ref().zip(artifact_cache.as_ref())
+                cache_entry.as_ref().zip(artifact_cache)
             && let Some(identity_witness) = artifact_cache_identity_witness.as_ref()
         {
             match store_rlib_cache(
@@ -1808,8 +1862,11 @@ fn rlib_cache_entry(
     output_root: &Path,
     rustc_verbose_version: &str,
     compiler_identity: &blake3::Hash,
+    compiler_program: &Path,
     modeled_dependency_search_paths: &[OsString],
-    loader_input_paths: &[(OsString, PathBuf)],
+    portable_remaps: &[(OsString, OsString)],
+    loader_input_paths: &[CompilerLoaderInput],
+    identity_witness: Option<&crate::util::rustc::ArtifactCacheIdentityWitness>,
     rustc_cwd: &Path,
 ) -> CargoResult<(PathBuf, blake3::Hash, blake3::Hash)> {
     #[expect(
@@ -1820,8 +1877,9 @@ fn rlib_cache_entry(
         return Err(internal("test-only artifact cache key failure".to_string()));
     }
     let target_profile_root = output_root.parent().unwrap_or(output_root);
+    let compiler_sysroot = compiler_program.parent().and_then(Path::parent);
     let normalize = |value: &str| {
-        value
+        let value = value
             .replace(
                 &target_profile_root.to_string_lossy().to_string(),
                 "/__cargo_artifact_cache_target_profile",
@@ -1829,26 +1887,56 @@ fn rlib_cache_entry(
             .replace(
                 &build_dir.to_string_lossy().to_string(),
                 "/__cargo_artifact_cache_build_dir",
+            );
+        compiler_sysroot.map_or(value.clone(), |sysroot| {
+            value.replace(
+                &sysroot.to_string_lossy().to_string(),
+                "/__cargo_artifact_cache_compiler_sysroot",
             )
+        })
     };
     let normalize_cargo_dylib_path = |value: &OsStr| -> CargoResult<OsString> {
         let mut search_path = env::split_paths(value).collect::<Vec<_>>();
-        if let Some(cargo_path) = search_path.first_mut() {
+        for cargo_path in &mut search_path {
+            if let Some(input) = loader_input_paths.iter().find(|input| {
+                input.source == OsStr::new(paths::dylib_path_envvar())
+                    && input.raw_path == *cargo_path
+            }) {
+                match &input.location {
+                    CompilerLoaderInputLocation::CompilerSysroot { relative, .. } => {
+                        *cargo_path = PathBuf::from("/__cargo_artifact_cache_compiler_sysroot")
+                            .join(relative);
+                        continue;
+                    }
+                    CompilerLoaderInputLocation::TargetProfile { relative, .. } => {
+                        *cargo_path =
+                            PathBuf::from("/__cargo_artifact_cache_target_profile").join(relative);
+                        continue;
+                    }
+                    CompilerLoaderInputLocation::BuildDir { relative, .. } => {
+                        *cargo_path =
+                            PathBuf::from("/__cargo_artifact_cache_build_dir").join(relative);
+                        continue;
+                    }
+                    CompilerLoaderInputLocation::RustcCwd { relative, .. } => {
+                        *cargo_path =
+                            PathBuf::from("/__cargo_artifact_cache_rustc_cwd_loader_root")
+                                .join(relative);
+                        continue;
+                    }
+                    CompilerLoaderInputLocation::Absolute => {}
+                }
+            }
             *cargo_path = PathBuf::from(normalize(&cargo_path.to_string_lossy()));
         }
         paths::join_paths(&search_path, paths::dylib_path_envvar())
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cargo-artifact-cache-v6\0");
+    hasher.update(b"cargo-artifact-cache-v7\0");
     hasher.update(b"rustc-verbose-version\0");
     hasher.update(rustc_verbose_version.as_bytes());
     hasher.update(b"\0");
-    let program = paths::resolve_executable(Path::new(rustc.get_program()))
-        .unwrap_or_else(|_| PathBuf::from(rustc.get_program()));
-    hasher.update(b"rustc-command-program\0");
-    hasher.update(program.to_string_lossy().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(b"rustc-command-program-content\0");
+    hasher.update(b"rustc-compiler-identity\0");
     hasher.update(compiler_identity.as_bytes());
     hasher.update(b"\0");
     let args = rustc.get_args().collect::<Vec<_>>();
@@ -1863,7 +1951,12 @@ fn rlib_cache_entry(
                             .iter()
                             .any(|path| path == OsStr::new(value.as_ref()))))
                 || (args[index - 1] == OsStr::new("-C") && value.starts_with("incremental=")));
-        if normalize_operand || value.starts_with("-Cincremental=") {
+        if let Some((_, remap)) = portable_remaps
+            .iter()
+            .find(|(original, _)| original == *arg)
+        {
+            hasher.update(remap.as_encoded_bytes());
+        } else if normalize_operand || value.starts_with("-Cincremental=") {
             hasher.update(normalize(&value).as_bytes());
         } else {
             hasher.update(value.as_bytes());
@@ -1888,13 +1981,15 @@ fn rlib_cache_entry(
                 hasher.update(b"/__cargo_artifact_cache_manifest_dir");
             } else if key == "CARGO_MANIFEST_PATH" {
                 hasher.update(b"/__cargo_artifact_cache_manifest_path");
+            } else if key == crate::CARGO_ENV {
+                hasher.update(b"/__cargo_artifact_cache_cargo");
             } else {
                 hasher.update(value.to_string_lossy().as_bytes());
             }
         }
         hasher.update(b"\0");
     }
-    let loader_inputs_digest = compiler_loader_inputs_digest(loader_input_paths)?;
+    let loader_inputs_digest = compiler_loader_inputs_digest(loader_input_paths, identity_witness)?;
     hasher.update(b"compiler-loader-inputs-content\0");
     hasher.update(loader_inputs_digest.as_bytes());
     hasher.update(b"\0");
@@ -1915,6 +2010,337 @@ fn rlib_cache_entry(
         loader_inputs_digest,
         action_inputs_digest,
     ))
+}
+
+fn artifact_cache_portable_remap(
+    argument: OsString,
+    replacement_source: &str,
+) -> Option<(OsString, OsString)> {
+    let value = argument.to_str()?.strip_prefix("--remap-path-prefix=")?;
+    let (_, destination) = value.rsplit_once('=')?;
+    let normalized = OsString::from(format!(
+        "--remap-path-prefix={replacement_source}={destination}"
+    ));
+    Some((argument, normalized))
+}
+
+#[cfg(test)]
+mod artifact_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn runner_locations_do_not_change_cache_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let compiler_identity = blake3::hash(b"portable compiler identity");
+        let cache_entry = |runner_root: &Path,
+                           alternate_layout: bool,
+                           include_path_cfg: bool,
+                           relative_loader: bool| {
+            let workspace = runner_root.join("workspace");
+            let build_dir = workspace.join(if alternate_layout {
+                "target-b"
+            } else {
+                "target-a"
+            });
+            let toolchain = if alternate_layout {
+                runner_root.join("toolchain")
+            } else {
+                build_dir.join("toolchain")
+            };
+            let package = workspace.join("package");
+            let git_checkouts = if alternate_layout {
+                runner_root.join("cargo").join("git").join("checkouts")
+            } else {
+                workspace.join(".cargo").join("git").join("checkouts")
+            };
+            let output_root = runner_root.join("target").join("debug").join("deps");
+            let target_profile_loader = output_root.parent().unwrap().join("host-loader");
+            let rustc_cwd = package.clone();
+            let cwd_loader = rustc_cwd.join("relative-loader");
+            for directory in [
+                &target_profile_loader,
+                &cwd_loader,
+                &build_dir,
+                &output_root,
+                &rustc_cwd,
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(target_profile_loader.join("libhost.so"), b"host").unwrap();
+            std::fs::write(cwd_loader.join("librelative.so"), b"relative").unwrap();
+
+            let program = toolchain.join("bin").join("rustc");
+            let loader_root = toolchain.join("lib");
+            std::fs::create_dir_all(&loader_root).unwrap();
+            std::fs::write(loader_root.join("librustc_driver.so"), b"driver").unwrap();
+            let (raw_host_loader, resolved_host_loader) = if relative_loader {
+                (PathBuf::from("relative-loader"), cwd_loader)
+            } else {
+                (target_profile_loader.clone(), target_profile_loader)
+            };
+            let loader_path = paths::join_paths(
+                &[raw_host_loader.clone(), loader_root.clone()],
+                paths::dylib_path_envvar(),
+            )
+            .unwrap();
+            let mut rustc = ProcessBuilder::new(toolchain.join("rustup-proxy"));
+            let remap_arguments = [
+                OsString::from(format!(
+                    "--remap-path-prefix={}=/workspace",
+                    workspace.display()
+                )),
+                OsString::from(format!(
+                    "--remap-path-prefix={}=/package",
+                    package.display()
+                )),
+                OsString::from(format!(
+                    "--remap-path-prefix={}=/cargo/build-dir",
+                    build_dir.display()
+                )),
+                OsString::from(format!(
+                    "--remap-path-prefix={}/lib/rustlib/src/rust=/rustc/test",
+                    toolchain.display()
+                )),
+                OsString::from(format!("--remap-path-prefix={}=", git_checkouts.display())),
+            ];
+            rustc.args(&remap_arguments);
+            if include_path_cfg {
+                rustc.arg(format!("--cfg=runner_path=\"{}\"", runner_root.display()));
+            }
+            rustc.env(paths::dylib_path_envvar(), loader_path);
+            rustc.env(crate::CARGO_ENV, toolchain.join("bin").join("cargo"));
+            let portable_remaps = [
+                artifact_cache_portable_remap(
+                    remap_arguments[0].clone(),
+                    "/__cargo_artifact_cache_workspace",
+                )
+                .unwrap(),
+                artifact_cache_portable_remap(
+                    remap_arguments[1].clone(),
+                    "/__cargo_artifact_cache_package",
+                )
+                .unwrap(),
+                artifact_cache_portable_remap(
+                    remap_arguments[2].clone(),
+                    "/__cargo_artifact_cache_build_dir",
+                )
+                .unwrap(),
+                artifact_cache_portable_remap(
+                    remap_arguments[3].clone(),
+                    "/__cargo_artifact_cache_compiler_sysroot/lib/rustlib/src/rust",
+                )
+                .unwrap(),
+                artifact_cache_portable_remap(
+                    remap_arguments[4].clone(),
+                    "/__cargo_artifact_cache_git_checkouts",
+                )
+                .unwrap(),
+            ];
+            rlib_cache_entry(
+                &cache_root,
+                &rustc,
+                &build_dir,
+                &output_root,
+                "rustc 1.0.0\nhost: test-host",
+                &compiler_identity,
+                &program,
+                &[],
+                &portable_remaps,
+                &[
+                    compiler_loader_input(
+                        paths::dylib_path_envvar(),
+                        raw_host_loader,
+                        resolved_host_loader,
+                        Some(&toolchain),
+                        output_root.parent().unwrap(),
+                        &build_dir,
+                        &rustc_cwd,
+                    ),
+                    compiler_loader_input(
+                        paths::dylib_path_envvar(),
+                        loader_root.clone(),
+                        loader_root,
+                        Some(&toolchain),
+                        output_root.parent().unwrap(),
+                        &build_dir,
+                        &rustc_cwd,
+                    ),
+                ],
+                None,
+                &rustc_cwd,
+            )
+            .unwrap()
+        };
+
+        let first_runner = temp.path().join("first=runner");
+        let second_runner = temp.path().join("second=runner");
+        assert_eq!(
+            cache_entry(&first_runner, false, false, false),
+            cache_entry(&second_runner, true, false, false)
+        );
+        assert_eq!(
+            cache_entry(&first_runner, false, false, true),
+            cache_entry(&second_runner, true, false, true)
+        );
+        assert_ne!(
+            cache_entry(&first_runner, false, true, false),
+            cache_entry(&second_runner, true, true, false)
+        );
+    }
+
+    #[test]
+    fn loader_digest_frames_fields() {
+        let mut split = blake3::Hasher::new();
+        update_framed_loader_digest(&mut split, b"a");
+        update_framed_loader_digest(&mut split, b"bc");
+
+        let mut joined = blake3::Hasher::new();
+        update_framed_loader_digest(&mut joined, b"ab");
+        update_framed_loader_digest(&mut joined, b"c");
+
+        assert_ne!(split.finalize(), joined.finalize());
+    }
+
+    #[test]
+    fn loader_path_escape_is_not_normalized() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target").join("debug");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escaped = root.join("..").join("..").join("outside");
+
+        let input = compiler_loader_input(
+            paths::dylib_path_envvar(),
+            escaped.clone(),
+            escaped,
+            None,
+            &root,
+            &temp.path().join("build"),
+            &temp.path().join("source"),
+        );
+
+        assert!(matches!(
+            input.location,
+            CompilerLoaderInputLocation::Absolute
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loader_symlink_escape_is_not_normalized() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target").join("debug");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escaped = root.join("loader");
+        symlink(&outside, &escaped).unwrap();
+
+        let input = compiler_loader_input(
+            paths::dylib_path_envvar(),
+            escaped.clone(),
+            escaped,
+            None,
+            &root,
+            &temp.path().join("build"),
+            &temp.path().join("source"),
+        );
+
+        assert!(matches!(
+            input.location,
+            CompilerLoaderInputLocation::Absolute
+        ));
+    }
+
+    #[test]
+    fn unmodeled_sysroot_loader_contents_change_cache_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let toolchain = temp.path().join("toolchain");
+        let rustc_program = toolchain.join("bin").join("rustc");
+        let rustlib = toolchain.join("lib").join("rustlib");
+        let custom_loader = toolchain.join("custom-loader");
+        let build_dir = temp.path().join("build");
+        let output_root = temp.path().join("target").join("debug").join("deps");
+        let rustc_cwd = temp.path().join("source");
+        for directory in [
+            rustc_program.parent().unwrap(),
+            &rustlib,
+            &custom_loader,
+            &build_dir,
+            &output_root,
+            &rustc_cwd,
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(&rustc_program, b"rustc").unwrap();
+        let custom_library = custom_loader.join("rustc_driver_dependency");
+        let dynamic_elf = |payload: &[u8]| {
+            let mut contents = vec![0; 20];
+            contents[..4].copy_from_slice(b"\x7fELF");
+            contents[5] = 1;
+            contents[16..18].copy_from_slice(&3u16.to_le_bytes());
+            contents.extend_from_slice(payload);
+            contents
+        };
+        std::fs::write(&custom_library, dynamic_elf(b"first")).unwrap();
+        let (compiler_identity, identity_witness) =
+            crate::util::rustc::artifact_cache_identity_for_program_for_test(&rustc_program)
+                .unwrap();
+        let rustc = ProcessBuilder::new(toolchain.join("rustup-proxy"));
+        let loader_input = compiler_loader_input(
+            paths::dylib_path_envvar(),
+            custom_loader.clone(),
+            custom_loader,
+            Some(&toolchain),
+            output_root.parent().unwrap(),
+            &build_dir,
+            &rustc_cwd,
+        );
+        let cache_entry = || {
+            rlib_cache_entry(
+                &cache_root,
+                &rustc,
+                &build_dir,
+                &output_root,
+                "rustc 1.0.0\nhost: test-host",
+                &compiler_identity,
+                &rustc_program,
+                &[],
+                &[],
+                std::slice::from_ref(&loader_input),
+                Some(&identity_witness),
+                &rustc_cwd,
+            )
+            .unwrap()
+            .0
+        };
+
+        let first = cache_entry();
+        std::fs::write(custom_library, dynamic_elf(b"other")).unwrap();
+        let second = cache_entry();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn loader_binary_magic_distinguishes_macho_objects_and_fat_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("extensionless-library");
+        std::fs::write(&library, b"\xca\xfe\xba\xbfcontents").unwrap();
+        let object = temp.path().join("extensionless-object");
+        let mut object_header = [0; 20];
+        object_header[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        object_header[12..16].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&object, object_header).unwrap();
+
+        assert!(is_potential_dynamic_library(&library).unwrap());
+        assert!(!is_potential_dynamic_library(&object).unwrap());
+    }
 }
 
 const APPLE_DEPLOYMENT_TARGET_ENVIRONMENT: [&str; 5] = [
@@ -1994,8 +2420,82 @@ fn artifact_cache_host_is_supported() -> bool {
     cfg!(target_os = "linux") || cfg!(target_os = "macos")
 }
 
-const CARGO_INJECTED_COMPILER_LOADER_ROOT: &str = "cargo-injected-compiler-loader-root";
-const CARGO_INJECTED_RUSTC_CWD_LOADER_ROOT: &str = "cargo-injected-rustc-cwd-loader-root";
+#[derive(Clone, Debug)]
+struct CompilerLoaderInput {
+    source: OsString,
+    raw_path: PathBuf,
+    path: PathBuf,
+    location: CompilerLoaderInputLocation,
+}
+
+#[derive(Clone, Debug)]
+enum CompilerLoaderInputLocation {
+    Absolute,
+    CompilerSysroot { root: PathBuf, relative: PathBuf },
+    TargetProfile { root: PathBuf, relative: PathBuf },
+    BuildDir { root: PathBuf, relative: PathBuf },
+    RustcCwd { root: PathBuf, relative: PathBuf },
+}
+
+fn canonical_relative(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let root = std::fs::canonicalize(root).ok()?;
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+fn compiler_loader_input(
+    source: &str,
+    raw_path: PathBuf,
+    path: PathBuf,
+    compiler_sysroot: Option<&Path>,
+    target_profile_root: &Path,
+    build_dir: &Path,
+    rustc_cwd: &Path,
+) -> CompilerLoaderInput {
+    let location = (!raw_path.is_absolute())
+        .then(|| {
+            canonical_relative(&path, rustc_cwd).map(|relative| {
+                CompilerLoaderInputLocation::RustcCwd {
+                    root: rustc_cwd.to_path_buf(),
+                    relative,
+                }
+            })
+        })
+        .flatten()
+        .or_else(|| {
+            compiler_sysroot.and_then(|root| {
+                canonical_relative(&path, root).map(|relative| {
+                    CompilerLoaderInputLocation::CompilerSysroot {
+                        root: root.to_path_buf(),
+                        relative,
+                    }
+                })
+            })
+        })
+        .or_else(|| {
+            canonical_relative(&path, target_profile_root).map(|relative| {
+                CompilerLoaderInputLocation::TargetProfile {
+                    root: target_profile_root.to_path_buf(),
+                    relative,
+                }
+            })
+        })
+        .or_else(|| {
+            canonical_relative(&path, build_dir).map(|relative| {
+                CompilerLoaderInputLocation::BuildDir {
+                    root: build_dir.to_path_buf(),
+                    relative,
+                }
+            })
+        })
+        .unwrap_or(CompilerLoaderInputLocation::Absolute);
+    CompilerLoaderInput {
+        source: OsString::from(source),
+        raw_path,
+        path,
+        location,
+    }
+}
 
 fn artifact_cache_loader_environment_is_modeled(
     gctx: &crate::util::GlobalContext,
@@ -2034,8 +2534,11 @@ fn artifact_cache_loader_environment_is_modeled(
 fn compiler_loader_input_paths(
     gctx: &crate::util::GlobalContext,
     rustc: &ProcessBuilder,
+    compiler_program: &Path,
+    build_dir: &Path,
+    output_root: &Path,
     rustc_cwd: &Path,
-) -> Vec<(OsString, PathBuf)> {
+) -> Vec<CompilerLoaderInput> {
     fn resolve_path(path: PathBuf, rustc_cwd: &Path) -> PathBuf {
         if path.as_os_str().is_empty() {
             rustc_cwd.to_path_buf()
@@ -2047,54 +2550,104 @@ fn compiler_loader_input_paths(
     }
 
     fn extend_paths(
-        inputs: &mut Vec<(OsString, PathBuf)>,
+        inputs: &mut Vec<CompilerLoaderInput>,
         key: &str,
         value: &OsStr,
+        compiler_sysroot: Option<&Path>,
+        target_profile_root: &Path,
+        build_dir: &Path,
         rustc_cwd: &Path,
     ) {
-        inputs.extend(
-            env::split_paths(value)
-                .map(|path| (OsString::from(key), resolve_path(path, rustc_cwd))),
-        );
+        inputs.extend(env::split_paths(value).map(|raw_path| {
+            let path = resolve_path(raw_path.clone(), rustc_cwd);
+            compiler_loader_input(
+                key,
+                raw_path,
+                path,
+                compiler_sysroot,
+                target_profile_root,
+                build_dir,
+                rustc_cwd,
+            )
+        }));
     }
 
     let mut inputs = Vec::new();
+    let compiler_sysroot = compiler_program.parent().and_then(Path::parent);
+    let target_profile_root = output_root.parent().unwrap_or(output_root);
     let primary = paths::dylib_path_envvar();
     if let Some(value) = rustc.get_env(primary).filter(|value| !value.is_empty()) {
-        let mut paths = env::split_paths(&value);
-        if let Some(path) = paths.next() {
-            inputs.push((
-                OsString::from(CARGO_INJECTED_COMPILER_LOADER_ROOT),
-                resolve_path(path, rustc_cwd),
-            ));
-        }
-        inputs.extend(paths.map(|path| (OsString::from(primary), resolve_path(path, rustc_cwd))));
+        extend_paths(
+            &mut inputs,
+            primary,
+            &value,
+            compiler_sysroot,
+            target_profile_root,
+            build_dir,
+            rustc_cwd,
+        );
     } else if cfg!(target_os = "macos") {
         if let Some(home) = gctx.get_env_os("HOME") {
-            inputs.push((
-                OsString::from(primary),
-                resolve_path(PathBuf::from(home).join("lib"), rustc_cwd),
+            let home_lib = PathBuf::from(home).join("lib");
+            inputs.push(compiler_loader_input(
+                primary,
+                home_lib.clone(),
+                resolve_path(home_lib, rustc_cwd),
+                compiler_sysroot,
+                target_profile_root,
+                build_dir,
+                rustc_cwd,
             ));
         }
-        inputs.push((OsString::from(primary), PathBuf::from("/usr/local/lib")));
-        inputs.push((OsString::from(primary), PathBuf::from("/usr/lib")));
+        inputs.push(compiler_loader_input(
+            primary,
+            PathBuf::from("/usr/local/lib"),
+            PathBuf::from("/usr/local/lib"),
+            compiler_sysroot,
+            target_profile_root,
+            build_dir,
+            rustc_cwd,
+        ));
+        inputs.push(compiler_loader_input(
+            primary,
+            PathBuf::from("/usr/lib"),
+            PathBuf::from("/usr/lib"),
+            compiler_sysroot,
+            target_profile_root,
+            build_dir,
+            rustc_cwd,
+        ));
     }
     if cfg!(target_os = "macos") {
         for key in ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
             if let Some(value) = rustc.get_env(key).filter(|value| !value.is_empty()) {
-                extend_paths(&mut inputs, key, &value, rustc_cwd);
+                extend_paths(
+                    &mut inputs,
+                    key,
+                    &value,
+                    compiler_sysroot,
+                    target_profile_root,
+                    build_dir,
+                    rustc_cwd,
+                );
             }
         }
-        inputs.push((
-            OsString::from(CARGO_INJECTED_RUSTC_CWD_LOADER_ROOT),
-            rustc_cwd.to_path_buf(),
-        ));
+        inputs.push(CompilerLoaderInput {
+            source: OsString::from(paths::dylib_path_envvar()),
+            raw_path: PathBuf::new(),
+            path: rustc_cwd.to_path_buf(),
+            location: CompilerLoaderInputLocation::RustcCwd {
+                root: rustc_cwd.to_path_buf(),
+                relative: PathBuf::new(),
+            },
+        });
     }
     inputs
 }
 
 fn compiler_loader_inputs_digest(
-    loader_input_paths: &[(OsString, PathBuf)],
+    loader_input_paths: &[CompilerLoaderInput],
+    identity_witness: Option<&crate::util::rustc::ArtifactCacheIdentityWitness>,
 ) -> CargoResult<blake3::Hash> {
     // Bind Linux nested-library admission to key creation and publication as
     // well as the early eligibility check, since loader trees can change.
@@ -2102,40 +2655,168 @@ fn compiler_loader_inputs_digest(
         anyhow::bail!("Linux compiler loader roots contain nested dynamic libraries");
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cargo-artifact-cache-compiler-loader-inputs-v1\0");
-    for (source, path) in loader_input_paths {
-        hasher.update(source.as_encoded_bytes());
-        hasher.update(b"\0");
-        if source == OsStr::new(CARGO_INJECTED_COMPILER_LOADER_ROOT) {
-            hasher.update(b"/__cargo_artifact_cache_compiler_loader_root");
-        } else if source == OsStr::new(CARGO_INJECTED_RUSTC_CWD_LOADER_ROOT) {
-            hasher.update(b"/__cargo_artifact_cache_rustc_cwd_loader_root");
-        } else {
-            hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update(b"cargo-artifact-cache-compiler-loader-inputs-v2\0");
+    for input in loader_input_paths {
+        update_framed_loader_digest(&mut hasher, input.source.as_encoded_bytes());
+        let mut hash_contents = true;
+        match &input.location {
+            CompilerLoaderInputLocation::CompilerSysroot { root, relative } => {
+                validate_portable_loader_location(input, root, relative)?;
+                update_framed_loader_digest(
+                    &mut hasher,
+                    b"/__cargo_artifact_cache_compiler_sysroot",
+                );
+                update_framed_loader_digest(&mut hasher, relative.as_os_str().as_encoded_bytes());
+                hash_contents = identity_witness.is_none_or(|witness| {
+                    !compiler_identity_covers_loader_input(witness, &input.path)
+                });
+            }
+            CompilerLoaderInputLocation::TargetProfile { root, relative } => {
+                validate_portable_loader_location(input, root, relative)?;
+                update_framed_loader_digest(&mut hasher, b"/__cargo_artifact_cache_target_profile");
+                update_framed_loader_digest(&mut hasher, relative.as_os_str().as_encoded_bytes());
+            }
+            CompilerLoaderInputLocation::BuildDir { root, relative } => {
+                validate_portable_loader_location(input, root, relative)?;
+                update_framed_loader_digest(&mut hasher, b"/__cargo_artifact_cache_build_dir");
+                update_framed_loader_digest(&mut hasher, relative.as_os_str().as_encoded_bytes());
+            }
+            CompilerLoaderInputLocation::RustcCwd { root, relative } => {
+                validate_portable_loader_location(input, root, relative)?;
+                update_framed_loader_digest(
+                    &mut hasher,
+                    b"/__cargo_artifact_cache_rustc_cwd_loader_root",
+                );
+                update_framed_loader_digest(&mut hasher, relative.as_os_str().as_encoded_bytes());
+            }
+            CompilerLoaderInputLocation::Absolute => {
+                update_framed_loader_digest(&mut hasher, input.path.as_os_str().as_encoded_bytes());
+            }
         }
-        hasher.update(b"\0");
-        hash_dynamic_library_inputs(
-            &mut hasher,
-            path,
-            source == OsStr::new(CARGO_INJECTED_COMPILER_LOADER_ROOT)
-                || source == OsStr::new(CARGO_INJECTED_RUSTC_CWD_LOADER_ROOT),
-        )?;
+        if hash_contents {
+            hash_dynamic_library_inputs(
+                &mut hasher,
+                &input.path,
+                !matches!(&input.location, CompilerLoaderInputLocation::Absolute),
+            )?;
+        }
     }
     Ok(hasher.finalize())
 }
 
+fn compiler_identity_covers_loader_input(
+    witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+    path: &Path,
+) -> bool {
+    fn visit(
+        witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+        path: &Path,
+        recurse: bool,
+    ) -> CargoResult<bool> {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Ok(false);
+            }
+            if recurse && file_type.is_dir() && !visit(witness, &path, true)? {
+                return Ok(false);
+            }
+            if file_type.is_file()
+                && is_potential_dynamic_library(&path)?
+                && !witness.contains_file(&path)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    visit(witness, path, cfg!(target_os = "linux")).unwrap_or(false)
+}
+
+fn validate_portable_loader_location(
+    input: &CompilerLoaderInput,
+    root: &Path,
+    expected_relative: &Path,
+) -> CargoResult<()> {
+    let current_relative = canonical_relative(&input.path, root).ok_or_else(|| {
+        internal(format!(
+            "compiler loader input escaped its modeled root: {}",
+            input.path.display()
+        ))
+    })?;
+    if current_relative != expected_relative {
+        anyhow::bail!(
+            "compiler loader input changed location: {}",
+            input.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn update_framed_loader_digest(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn dynamic_library_file_digest(path: &Path) -> CargoResult<blake3::Hash> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file)?;
+    Ok(hasher.finalize())
+}
+
+fn is_potential_dynamic_library(path: &Path) -> CargoResult<bool> {
+    if path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        name.ends_with(".dylib") || name.ends_with(".dll") || name.contains(".so")
+    }) {
+        return Ok(true);
+    }
+    let mut file = File::open(path)?;
+    let mut header = [0; 20];
+    let read = std::io::Read::read(&mut file, &mut header)?;
+    let header = &header[..read];
+    if header.starts_with(b"\x7fELF") {
+        let Some(kind) = header.get(16..18) else {
+            return Ok(true);
+        };
+        let kind = match header.get(5) {
+            Some(1) => u16::from_le_bytes(kind.try_into().unwrap()),
+            Some(2) => u16::from_be_bytes(kind.try_into().unwrap()),
+            _ => return Ok(true),
+        };
+        return Ok(kind == 3);
+    }
+    let macho_file_type = match header.get(..4) {
+        Some([0xfe, 0xed, 0xfa, 0xce] | [0xfe, 0xed, 0xfa, 0xcf]) => header
+            .get(12..16)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap())),
+        Some([0xce, 0xfa, 0xed, 0xfe] | [0xcf, 0xfa, 0xed, 0xfe]) => header
+            .get(12..16)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())),
+        Some(
+            [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbf, 0xba, 0xfe, 0xca],
+        ) => return Ok(true),
+        _ => None,
+    };
+    Ok(macho_file_type.is_some_and(|kind| kind == 6 || kind == 8) || header.starts_with(b"MZ"))
+}
+
 fn artifact_cache_loader_input_paths_are_modeled(
-    loader_input_paths: &[(OsString, PathBuf)],
+    loader_input_paths: &[CompilerLoaderInput],
 ) -> bool {
     if !cfg!(target_os = "linux") {
         return true;
-    }
-
-    fn is_dynamic_library(path: &Path) -> bool {
-        path.file_name().is_some_and(|name| {
-            let name = name.to_string_lossy();
-            name.ends_with(".dylib") || name.ends_with(".dll") || name.contains(".so")
-        })
     }
 
     fn has_nested_dynamic_library(
@@ -2161,15 +2842,15 @@ fn artifact_cache_loader_input_paths_are_modeled(
             if path.is_dir() && has_nested_dynamic_library(&path, true, visited)? {
                 return Ok(true);
             }
-            if nested && path.is_file() && is_dynamic_library(&path) {
+            if nested && path.is_file() && is_potential_dynamic_library(&path)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    loader_input_paths.iter().all(|(_, path)| {
-        !has_nested_dynamic_library(path, false, &mut HashSet::new()).unwrap_or(true)
+    loader_input_paths.iter().all(|input| {
+        !has_nested_dynamic_library(&input.path, false, &mut HashSet::new()).unwrap_or(true)
     })
 }
 
@@ -2191,26 +2872,26 @@ fn hash_dynamic_library_inputs(
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        hasher.update(b"compiler-loader-search-directory\0");
-        hasher.update(
+        update_framed_loader_digest(hasher, b"compiler-loader-search-directory");
+        update_framed_loader_digest(
+            hasher,
             path.strip_prefix(root)
                 .unwrap_or(path)
                 .as_os_str()
                 .as_encoded_bytes(),
         );
-        hasher.update(b"\0");
         if normalize_directory_locations {
-            hasher.update(b"/__cargo_artifact_cache_compiler_loader_root/");
-            hasher.update(
+            update_framed_loader_digest(hasher, b"/__cargo_artifact_cache_compiler_loader_root");
+            update_framed_loader_digest(
+                hasher,
                 path.strip_prefix(root)
                     .unwrap_or(path)
                     .as_os_str()
                     .as_encoded_bytes(),
             );
         } else {
-            hasher.update(canonical.as_os_str().as_encoded_bytes());
+            update_framed_loader_digest(hasher, canonical.as_os_str().as_encoded_bytes());
         }
-        hasher.update(b"\0");
         if recurse && !visited.insert(canonical) {
             return Ok(());
         }
@@ -2223,16 +2904,18 @@ fn hash_dynamic_library_inputs(
         for entry in entries {
             let path = entry.path();
             if entry.file_type()?.is_symlink() {
-                hasher.update(b"compiler-loader-search-symlink\0");
-                hasher.update(
+                update_framed_loader_digest(hasher, b"compiler-loader-search-symlink");
+                update_framed_loader_digest(
+                    hasher,
                     path.strip_prefix(root)
                         .unwrap_or(&path)
                         .as_os_str()
                         .as_encoded_bytes(),
                 );
-                hasher.update(b"\0");
-                hasher.update(fs::read_link(&path)?.as_os_str().as_encoded_bytes());
-                hasher.update(b"\0");
+                update_framed_loader_digest(
+                    hasher,
+                    fs::read_link(&path)?.as_os_str().as_encoded_bytes(),
+                );
             }
             if recurse && path.is_dir() {
                 hash_directory(
@@ -2245,24 +2928,18 @@ fn hash_dynamic_library_inputs(
                 )?;
                 continue;
             }
-            let name = path.file_name().map(|name| name.to_string_lossy());
-            if !path.is_file()
-                || !name.is_some_and(|name| {
-                    name.ends_with(".dylib") || name.ends_with(".dll") || name.contains(".so")
-                })
-            {
+            if !path.is_file() || !is_potential_dynamic_library(&path)? {
                 continue;
             }
-            hasher.update(b"compiler-loader-search-input\0");
-            hasher.update(
+            update_framed_loader_digest(hasher, b"compiler-loader-search-input");
+            update_framed_loader_digest(
+                hasher,
                 path.strip_prefix(root)
                     .unwrap_or(&path)
                     .as_os_str()
                     .as_encoded_bytes(),
             );
-            hasher.update(b"\0");
-            hasher.update(&fs::read(path)?);
-            hasher.update(b"\0");
+            hasher.update(dynamic_library_file_digest(&path)?.as_bytes());
         }
         Ok(())
     }
@@ -2369,7 +3046,7 @@ fn restore_rlib_cache(
     pkg_root: &Path,
     output_root: &Path,
     identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
-    loader_input_paths: &[(OsString, PathBuf)],
+    loader_input_paths: &[CompilerLoaderInput],
     loader_inputs_digest: &blake3::Hash,
     action_inputs_digest: &blake3::Hash,
     materialization: ArtifactCacheMaterialization,
@@ -2390,7 +3067,9 @@ fn restore_rlib_cache(
         debug!("not restoring artifact cache entry with compiler identity modified after lookup");
         return Ok(false);
     }
-    if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest {
+    if compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+        != *loader_inputs_digest
+    {
         debug!(
             "not restoring artifact cache entry with compiler loader inputs modified after lookup"
         );
@@ -2467,7 +3146,8 @@ fn restore_rlib_cache(
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
         if !restore_materialized_identity_witness_is_current(identity_witness)
-            || compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
+            || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+                != *loader_inputs_digest
             || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
         {
             debug!("not restoring artifact cache entry with inputs modified during restore");
@@ -2603,7 +3283,7 @@ fn store_rlib_cache(
     build_dir: &Path,
     output_root: &Path,
     identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
-    loader_input_paths: &[(OsString, PathBuf)],
+    loader_input_paths: &[CompilerLoaderInput],
     loader_inputs_digest: &blake3::Hash,
     action_inputs_digest: &blake3::Hash,
     rustc: &ProcessBuilder,
@@ -2620,7 +3300,9 @@ fn store_rlib_cache(
         );
         return Ok(false);
     }
-    if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest {
+    if compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+        != *loader_inputs_digest
+    {
         debug!(
             "not storing artifact cache entry with compiler loader inputs modified during compilation"
         );
@@ -2760,7 +3442,9 @@ fn store_rlib_cache(
             return Ok(false);
         }
         delay_rlib_cache_publish_for_tests()?;
-        if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
+        if !identity_witness.is_current()
+            || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+                != *loader_inputs_digest
             || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
             || rlib_cache_inputs_digest_matching_rustc_dep_info(
                 rustc_dep_info_loc,
