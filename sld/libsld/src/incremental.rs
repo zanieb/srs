@@ -2433,6 +2433,24 @@ fn update_macho_symbol_resolutions_for_input(
     let mut reusable_branch_targets = Vec::new();
     let mut retiring_names = Vec::new();
     let mut changed = false;
+    let mut requested_names_by_input = HashMap::<SharedText, Vec<SharedText>>::new();
+    for resolution in resolutions.iter() {
+        let Some(target) = resolution
+            .target
+            .as_ref()
+            .filter(|target| target.input_file == input.path)
+        else {
+            continue;
+        };
+        requested_names_by_input
+            .entry(target.input.clone())
+            .or_default()
+            .push(resolution.name.clone());
+    }
+    let resolver = (!requested_names_by_input.is_empty())
+        .then(|| PatchInputResolver::new(bytes, true))
+        .transpose()?;
+    let mut indexed_inputs = HashMap::<SharedText, IndexedMachOSymbolCatalogInput<'_>>::new();
     for resolution in resolutions {
         let Some(target) = resolution
             .target
@@ -2441,27 +2459,54 @@ fn update_macho_symbol_resolutions_for_input(
         else {
             continue;
         };
-        let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &target.input)?
-        else {
-            return Ok(Err(format!(
-                "could not resolve Mach-O symbol catalog input {} for {} in {}",
-                display_hex_text(&target.input),
-                display_hex_text(&resolution.name),
-                display_hex_path(&input.path),
-            )));
-        };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse changed Mach-O symbol catalog input")?;
-        let current_input =
-            resolved_patch_input_ref(input.path.as_str(), target.input.as_str(), input_bytes)?;
-        let current = match unique_symbol_position_by_name(
-            input_bytes.bytes,
-            input_bytes.file_offset,
-            &file,
-            resolution.name.as_str(),
-        )? {
-            Ok(Some(current)) => current,
-            Ok(None) => {
+        let previous_input = target.input.clone();
+        if !indexed_inputs.contains_key(&previous_input) {
+            let Some(input_bytes) = resolver
+                .as_ref()
+                .expect("requested Mach-O symbol names require an input resolver")
+                .resolve(
+                    input.path.as_str(),
+                    previous_input.as_str(),
+                    PatchInputLookup::MatchArchiveMember,
+                )?
+            else {
+                return Ok(Err(format!(
+                    "could not resolve Mach-O symbol catalog input {} for {} in {}",
+                    display_hex_text(&previous_input),
+                    display_hex_text(&resolution.name),
+                    display_hex_path(&input.path),
+                )));
+            };
+            let file = object::File::parse(input_bytes.bytes)
+                .context("Failed to parse changed Mach-O symbol catalog input")?;
+            let current_input = resolved_patch_input_ref(
+                input.path.as_str(),
+                previous_input.as_str(),
+                input_bytes,
+            )?;
+            let positions = indexed_unique_symbol_positions(
+                input_bytes.bytes,
+                input_bytes.file_offset,
+                &file,
+                requested_names_by_input
+                    .get(&previous_input)
+                    .expect("recorded input has requested Mach-O symbol names"),
+            )?;
+            indexed_inputs.insert(
+                previous_input.clone(),
+                IndexedMachOSymbolCatalogInput {
+                    file,
+                    current_input,
+                    positions,
+                },
+            );
+        }
+        let indexed_input = indexed_inputs
+            .get(&previous_input)
+            .expect("requested Mach-O symbol input was indexed");
+        let current = match indexed_input.positions.get(&resolution.name) {
+            Some(IndexedSymbolPosition::Unique(current)) => current.clone(),
+            None => {
                 if allow_added_archive_retirement
                     && resolution.direct_value.is_some()
                     && resolution.got_address.is_none()
@@ -2476,7 +2521,11 @@ fn update_macho_symbol_resolutions_for_input(
                     display_hex_path(&input.path)
                 )));
             }
-            Err(reason) => return Ok(Err(reason)),
+            Some(IndexedSymbolPosition::Ambiguous) => {
+                return Ok(Err(
+                    "ambiguous cross-input Mach-O relocation target symbol".to_owned()
+                ));
+            }
         };
         if let Some(value_range) = current.value_range {
             input_ranges.push(value_range);
@@ -2499,8 +2548,8 @@ fn update_macho_symbol_resolutions_for_input(
                     .as_ref()
                     .expect("output context requires parsed output"),
                 matched_sections,
-                &file,
-                current_input.as_str(),
+                &indexed_input.file,
+                indexed_input.current_input.as_str(),
                 current.section_index,
                 current.section_offset,
             );
@@ -2510,7 +2559,7 @@ fn update_macho_symbol_resolutions_for_input(
                 && normalized_archive_input_refs_match(
                     input.path.as_str(),
                     target.input.as_str(),
-                    current_input.as_str(),
+                    indexed_input.current_input.as_str(),
                 )?
             {
                 current_value = Some(previous_value);
@@ -2526,7 +2575,7 @@ fn update_macho_symbol_resolutions_for_input(
             }
             let Some(current_value) = current_value else {
                 let current_section_index =
-                    patch_section_record_index(&file, current.section_index)?;
+                    patch_section_record_index(&indexed_input.file, current.section_index)?;
                 let section_inputs = matched_sections
                     .iter()
                     .filter(|section| section.current.section_index == current_section_index)
@@ -2537,7 +2586,7 @@ fn update_macho_symbol_resolutions_for_input(
                     "Mach-O symbol catalog target `{}` has no current output address in {}: current input `{}`, section {}, offset {:#x}; matched section inputs: [{}]",
                     display_hex_text(resolution.name.as_str()),
                     display_hex_path(&input.path),
-                    display_hex_path(&current_input).replace('\0', "\\0"),
+                    display_hex_path(&indexed_input.current_input).replace('\0', "\\0"),
                     current_section_index,
                     current.section_offset,
                     section_inputs
@@ -2556,11 +2605,11 @@ fn update_macho_symbol_resolutions_for_input(
         };
         let position_changed = current.section_offset != target.section_offset;
         let value_changed = current_value != previous_value;
-        let input_changed = target.input != current_input
+        let input_changed = target.input != indexed_input.current_input
             && !normalized_archive_input_refs_match(
                 input.path.as_str(),
                 target.input.as_str(),
-                current_input.as_str(),
+                indexed_input.current_input.as_str(),
             )?;
         if !position_changed && !value_changed && !input_changed {
             continue;
@@ -2579,7 +2628,7 @@ fn update_macho_symbol_resolutions_for_input(
         }
         let previous_target = target.clone();
         let mut current_target = previous_target.clone();
-        current_target.input = current_input.into();
+        current_target.input = indexed_input.current_input.clone().into();
         current_target.section_offset = current.section_offset;
         if value_changed {
             output_symbols.push(RelocationTargetSymbolPatch {
@@ -3143,10 +3192,68 @@ fn add_encoded_delta_u64(value: u64, delta: i128) -> u64 {
     adjusted as u64
 }
 
+#[derive(Clone)]
 struct SymbolPosition {
     section_index: object::SectionIndex,
     section_offset: u64,
     value_range: Option<std::ops::Range<usize>>,
+}
+
+enum IndexedSymbolPosition {
+    Unique(SymbolPosition),
+    Ambiguous,
+}
+
+struct IndexedMachOSymbolCatalogInput<'data> {
+    file: object::File<'data>,
+    current_input: String,
+    positions: HashMap<SharedText, IndexedSymbolPosition>,
+}
+
+fn indexed_unique_symbol_positions(
+    bytes: &[u8],
+    file_offset: usize,
+    file: &object::File<'_>,
+    encoded_names: &[SharedText],
+) -> Result<HashMap<SharedText, IndexedSymbolPosition>> {
+    let mut requested = HashMap::with_capacity(encoded_names.len());
+    for encoded_name in encoded_names {
+        requested.insert(
+            hex::decode(encoded_name.as_str())
+                .context("Malformed incremental relocation target name")?,
+            encoded_name.clone(),
+        );
+    }
+    let mut positions = HashMap::with_capacity(requested.len());
+    for symbol in file.symbols() {
+        let name = symbol.name_bytes()?;
+        let Some(encoded_name) = requested.get(name) else {
+            continue;
+        };
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let section_address = file.section_by_index(section_index)?.address();
+        let section_offset = symbol
+            .address()
+            .checked_sub(section_address)
+            .context("Mach-O symbol address precedes its section")?;
+        let value_range = symbol_value_field_range(bytes, symbol.index())
+            .map(|range| file_offset + range.start..file_offset + range.end);
+        match positions.entry(encoded_name.clone()) {
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(IndexedSymbolPosition::Unique(SymbolPosition {
+                    section_index,
+                    section_offset,
+                    value_range,
+                }));
+            }
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(IndexedSymbolPosition::Ambiguous);
+            }
+        }
+    }
+    Ok(positions)
 }
 
 fn symbol_position_by_name(
@@ -51059,6 +51166,33 @@ mod tests {
             result,
             Err(reason) if reason == "ambiguous cross-input Mach-O relocation target symbol"
         ));
+        let data_name = SharedText::from(hex::encode(b"_data"));
+        let indexed =
+            indexed_unique_symbol_positions(&bytes, 0, &file, std::slice::from_ref(&data_name))
+                .unwrap();
+        assert!(matches!(
+            indexed.get(&data_name),
+            Some(IndexedSymbolPosition::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn indexed_macho_symbol_positions_omit_unrequested_names() {
+        let bytes = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let data_name = SharedText::from(hex::encode(b"_data"));
+        let text_name = SharedText::from(hex::encode(b"_text"));
+
+        let indexed =
+            indexed_unique_symbol_positions(&bytes, 0, &file, std::slice::from_ref(&data_name))
+                .unwrap();
+
+        assert_eq!(indexed.len(), 1);
+        assert!(matches!(
+            indexed.get(&data_name),
+            Some(IndexedSymbolPosition::Unique(_))
+        ));
+        assert!(!indexed.contains_key(&text_name));
     }
 
     #[test]
