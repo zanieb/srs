@@ -13363,9 +13363,15 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 display_hex_path(&input.path)
             ));
         }
+        let resolution_index =
+            macho_symbol_resolution_index_for_name(resolutions, target_name.as_str())?;
+        let catalog_has_owner = resolution_index
+            .and_then(|index| resolutions[index].target.as_ref())
+            .is_some();
         let mut targets = references.iter().filter_map(|(_, target)| target.as_ref());
         let current_target = targets.next().cloned();
-        if current_target.is_some()
+        if !catalog_has_owner
+            && current_target.is_some()
             && !targets.all(|target| Some(target) == current_target.as_ref())
         {
             return Err(format!(
@@ -13374,8 +13380,6 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
             ));
         }
 
-        let resolution_index =
-            macho_symbol_resolution_index_for_name(resolutions, target_name.as_str())?;
         let Some(current_target_value) = current_target_value else {
             let Some(resolution_index) = resolution_index else {
                 continue;
@@ -46158,6 +46162,82 @@ mod tests {
                 target: Some(target),
             }]
         );
+    }
+
+    #[test]
+    fn rematerialized_macho_symbol_resolution_preserves_catalog_owner() {
+        let input = state("args", b"output", &[("changed.o", b"input")])
+            .input_files
+            .remove(0);
+        let target_value = 0x1000_4020;
+        let catalog_target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("target.o")),
+            input: SharedText::from(hex::encode("target.o")),
+            section_index: 3,
+            section_offset: 32,
+        };
+        let relocation = |input_file: &str, target_input: &str| {
+            relocation_record(
+                input_file,
+                1,
+                4,
+                Some(0),
+                target_value,
+                Some("_target"),
+                Some((target_input, 3, 32)),
+                0,
+                0x350,
+                4,
+                encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                    r_address: 0,
+                    r_symbolnum: 0,
+                    r_pcrel: true,
+                    r_length: 2,
+                    r_extern: true,
+                    r_type: object::macho::ARM64_RELOC_PAGE21,
+                }),
+                0,
+            )
+        };
+        let relocations = [
+            relocation("first.o", "target.o"),
+            relocation("second.o", "duplicate.o"),
+        ];
+        let replay = rematerialized_macho_replay(
+            "changed.o",
+            "_target",
+            target_value,
+            catalog_target.clone(),
+        );
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(target_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(catalog_target.clone()),
+        }];
+
+        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &relocations,
+            &[replay],
+            &[(
+                SharedText::from(hex::encode("changed.o")),
+                hex::encode("changed.o"),
+                1,
+                hex::encode("changed.o"),
+                1,
+            )],
+            false,
+            &[],
+            &input,
+        )
+        .unwrap();
+
+        assert!(output_symbols.is_empty());
+        assert!(!changed);
+        assert_eq!(resolutions[0].target.as_ref(), Some(&catalog_target));
     }
 
     #[test]
