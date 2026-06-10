@@ -4621,6 +4621,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     };
                     match validate_macho_data_relocations_are_stable(
                         &mut previous.relocations[..stable_relocation_count],
+                        &previous.macho_symbol_resolutions,
                         input,
                         &matched_sections,
                         previous_resolver,
@@ -14235,6 +14236,7 @@ fn macho_text_relocation_replays_for_input(
 
 fn validate_macho_data_relocations_are_stable(
     relocations: &mut [RelocationRecord],
+    resolutions: &[MachOSymbolResolutionRecord],
     input: &FileState,
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
@@ -14431,21 +14433,42 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let Some(previous_target) =
-                    macho_data_relocation_target_position(&previous_file, previous_context.target)?
-                else {
+                let current_output_offset = patch_section
+                    .current
+                    .output_offset
+                    .checked_add(current_context.range.start as u64)
+                    .context("Mach-O data relocation output offset overflow")?;
+                if relocation.output_offset != current_output_offset {
                     return Ok(Err(format!(
-                        "unsupported previous Mach-O data relocation target in {}",
+                        "moved Mach-O data relocation field in {}",
                         display_hex_path(&input.path)
                     )));
-                };
-                let Some(current_target) =
-                    macho_data_relocation_target_position(&current_file, current_context.target)?
+                }
+                let previous_target =
+                    macho_data_relocation_target_position(&previous_file, previous_context.target)?;
+                let current_target =
+                    macho_data_relocation_target_position(&current_file, current_context.target)?;
+                let (Some(previous_target), Some(current_target)) =
+                    (previous_target, current_target)
                 else {
-                    return Ok(Err(format!(
-                        "unsupported current Mach-O data relocation target in {}",
-                        display_hex_path(&input.path)
-                    )));
+                    if !macho_external_data_relocation_target_is_stable(
+                        &previous_identity,
+                        &current_identity,
+                        relocation,
+                        resolutions,
+                    )? {
+                        return Ok(Err(format!(
+                            "unsupported external Mach-O data relocation target in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    }
+                    let previous_record = relocation.clone();
+                    if relocation.input != patch_section.current.input {
+                        relocation.input = patch_section.current.input.clone().into();
+                    }
+                    relocation.section_index = patch_section.current.section_index;
+                    changed |= *relocation != previous_record;
+                    continue;
                 };
                 let previous_target_patch_section_index =
                     patch_section_record_index(&previous_file, previous_target.section_index)?;
@@ -14525,18 +14548,6 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let current_output_offset = patch_section
-                    .current
-                    .output_offset
-                    .checked_add(current_context.range.start as u64)
-                    .context("Mach-O data relocation output offset overflow")?;
-                if relocation.output_offset != current_output_offset {
-                    return Ok(Err(format!(
-                        "moved Mach-O data relocation field in {}",
-                        display_hex_path(&input.path)
-                    )));
-                }
-
                 let previous_record = relocation.clone();
                 if relocation.input != patch_section.current.input {
                     relocation.input = patch_section.current.input.clone().into();
@@ -14569,6 +14580,32 @@ fn macho_data_relocation_semantics_are_stable(
         && previous_context.addend == relocation.addend
         && previous_identity.is_some()
         && previous_identity == current_identity
+}
+
+fn macho_external_data_relocation_target_is_stable(
+    previous_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+    current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+    relocation: &RelocationRecord,
+    resolutions: &[MachOSymbolResolutionRecord],
+) -> std::result::Result<bool, String> {
+    let (Some((previous_name, None)), Some((current_name, None))) =
+        (previous_identity, current_identity)
+    else {
+        return Ok(false);
+    };
+    if previous_name != current_name {
+        return Ok(false);
+    }
+    let encoded_name = hex::encode(previous_name);
+    let Some(resolution_index) =
+        macho_symbol_resolution_index_for_name(resolutions, &encoded_name)?
+    else {
+        return Ok(false);
+    };
+    let resolution = &resolutions[resolution_index];
+    Ok(resolution.direct_value == Some(relocation.target_value)
+        && resolution.target == relocation.target
+        && relocation.applied_target_value == Some(relocation.target_value))
 }
 
 fn macho_data_relocation_layout_is_stable(
@@ -39246,6 +39283,68 @@ mod tests {
             &identity,
             &changed_identity,
         ));
+    }
+
+    #[test]
+    fn external_macho_data_relocation_requires_catalog_value_and_owner() {
+        let target_value = 0x1000_4020;
+        let mut relocation = relocation_record(
+            "input.o",
+            1,
+            1,
+            Some(target_value),
+            target_value,
+            Some("_target"),
+            Some(("target.o", 3, 32)),
+            8,
+            0,
+            8,
+            0,
+            0,
+        );
+        relocation.applied_target_value = Some(target_value);
+        let identity = Some((b"_target".to_vec(), None));
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(target_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: relocation.target.clone(),
+        }];
+
+        assert!(
+            macho_external_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+            )
+            .unwrap()
+        );
+
+        resolutions[0].direct_value = Some(target_value + 8);
+        assert!(
+            !macho_external_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+            )
+            .unwrap()
+        );
+
+        resolutions[0].direct_value = Some(target_value);
+        resolutions[0].target = None;
+        assert!(
+            !macho_external_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
