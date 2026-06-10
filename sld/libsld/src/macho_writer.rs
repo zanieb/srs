@@ -717,6 +717,8 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::chained_fixup_page_count;
+    use super::chained_fixup_slot_is_file_backed;
     use super::compact_unwind_dwarf_offset_hint;
     use super::compact_unwind_section_addend;
     use super::path_matches_library;
@@ -793,6 +795,20 @@ mod tests {
             0x10e24
         );
         assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
+    }
+
+    #[test]
+    fn chained_fixup_pages_end_with_last_fixup() {
+        assert_eq!(chained_fixup_page_count(0x1000, 0x1000), 1);
+        assert_eq!(chained_fixup_page_count(0x1000, 0x4ff8), 1);
+        assert_eq!(chained_fixup_page_count(0x1000, 0x5000), 2);
+    }
+
+    #[test]
+    fn chained_fixup_slots_are_fully_file_backed() {
+        assert!(chained_fixup_slot_is_file_backed(0x7ff8, 0x8000));
+        assert!(!chained_fixup_slot_is_file_backed(0x7ff9, 0x8000));
+        assert!(!chained_fixup_slot_is_file_backed(u64::MAX, u64::MAX));
     }
 
     #[test]
@@ -3272,11 +3288,13 @@ fn write_chained_fixup_table(
         let data_segment = get_segment_sections(layout, SegmentType::DataSections)
             .ok_or_else(|| error!("Chained rebases require a __DATA segment"))?;
         let data_start = data_segment.segment_size.mem_offset;
-        let page_count = data_segment
-            .segment_size
-            .mem_size
-            .div_ceil(MACHO_PAGE_SIZE)
-            .max(1);
+        let last_slot = *chained_rebases.slots.last().unwrap();
+        ensure!(
+            last_slot >= data_start,
+            "Mach-O chained fixup slot {last_slot:#x} precedes __DATA"
+        );
+        let page_count = chained_fixup_page_count(data_start, last_slot);
+        let data_file_size = data_segment.segment_size.file_size as u64;
         let segment_info_size = (size_of::<u32>()
             + size_of::<u16>()
             + size_of::<u16>()
@@ -3332,8 +3350,8 @@ fn write_chained_fixup_table(
             );
             let offset_in_segment = slot - data_start;
             ensure!(
-                offset_in_segment < data_segment.segment_size.mem_size,
-                "Mach-O chained fixup slot {slot:#x} is outside __DATA"
+                chained_fixup_slot_is_file_backed(offset_in_segment, data_file_size),
+                "Mach-O chained fixup slot {slot:#x} is not fully within file-backed __DATA"
             );
             let page_index = (offset_in_segment / MACHO_PAGE_SIZE) as usize;
             let offset_in_page = (offset_in_segment % MACHO_PAGE_SIZE) as u16;
@@ -3384,6 +3402,16 @@ fn write_chained_fixup_table(
     }
 
     Ok(())
+}
+
+fn chained_fixup_page_count(data_start: u64, last_slot: u64) -> u64 {
+    (last_slot - data_start) / MACHO_PAGE_SIZE + 1
+}
+
+fn chained_fixup_slot_is_file_backed(offset_in_segment: u64, file_size: u64) -> bool {
+    offset_in_segment
+        .checked_add(size_of::<u64>() as u64)
+        .is_some_and(|end| end <= file_size)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
