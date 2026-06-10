@@ -1715,14 +1715,17 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         structurally_recordable_section && !section.flags.needs_got() && !section.flags.needs_plt();
     let can_reuse_section_bytes = reusable_section && relocations.num_relocations() == 0;
     let section_name = object_layout.object.section_name(section_header)?;
+    let is_macho_data_const =
+        section_name == b"__const" && section_header.segname.starts_with(b"__DATA\0");
     // Relocated data and text cannot reuse their input bytes directly. Recording their output
     // ranges lets the incremental patch validator admit changes that preserve every relocation;
     // text also needs records when its relocations require GOT or PLT entries.
     let record_for_incremental_state = can_reuse_section_bytes
         || (reusable_section && section_name == b"__data")
+        || (reusable_section && is_macho_data_const)
         || (structurally_recordable_section && section_name == b"__text");
-    let record_text_relocations = structurally_recordable_section
-        && section_name == b"__text"
+    let record_incremental_relocations = structurally_recordable_section
+        && (section_name == b"__text" || is_macho_data_const)
         && incremental.records_relocations();
     let can_reuse_existing_bytes = existing_output_bytes_available && can_reuse_section_bytes;
 
@@ -1837,7 +1840,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             layout,
             out,
             chained_rebases,
-            record_text_relocations.then_some(&mut incremental_relocations),
+            record_incremental_relocations.then_some(&mut incremental_relocations),
         )?;
         paired_addend = 0;
     }
@@ -2150,7 +2153,10 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         && let Some(local_symbol_id) = local_symbol_id
         && matches!(
             rel.r_type,
-            macho::ARM64_RELOC_BRANCH26 | macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_PAGEOFF12
+            macho::ARM64_RELOC_UNSIGNED
+                | macho::ARM64_RELOC_BRANCH26
+                | macho::ARM64_RELOC_PAGE21
+                | macho::ARM64_RELOC_PAGEOFF12
         )
     {
         let target_symbol = layout.symbol_db.definition(local_symbol_id);

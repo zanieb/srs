@@ -12,7 +12,7 @@
 //#TestIncrementalChangedInput:incremental-multi-grown-archive-first.a
 //#TestIncrementalChangedCompArgs:-DGROW_TEXT=1
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:6
+//#TestIncrementalChangedPatchedSectionCount:7
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedRestore:true
@@ -29,10 +29,24 @@
 extern int incremental_multi_grown_archive_first(void);
 extern int incremental_multi_grown_archive_second(void);
 
+struct incremental_multi_grown_archive_metadata {
+    const int *target;
+    int value;
+    int stable;
+};
+
+extern const struct incremental_multi_grown_archive_metadata
+    incremental_multi_grown_archive_metadata;
+
 void main(void) {
     int first = incremental_multi_grown_archive_first();
     int second = incremental_multi_grown_archive_second();
-    int initial = first == 20 && second == 22;
-    int grown = first == 24 && second == 26;
+    int metadata_is_valid =
+        *incremental_multi_grown_archive_metadata.target == 7 &&
+        incremental_multi_grown_archive_metadata.stable == 17;
+    int initial = first == 20 && second == 22 && metadata_is_valid &&
+                  incremental_multi_grown_archive_metadata.value == 20;
+    int grown = first == 24 && second == 26 && metadata_is_valid &&
+                incremental_multi_grown_archive_metadata.value == 24;
     exit_syscall(initial || grown ? 42 : 1);
 }
