@@ -12190,6 +12190,33 @@ struct MachODataRelocationTargetPosition {
     section_offset: u64,
 }
 
+fn unmatched_macho_data_relocation_target_is_stable(
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    previous_target: &MachODataRelocationTargetPosition,
+    current_target: &MachODataRelocationTargetPosition,
+) -> Result<bool> {
+    if previous_target.section_index != current_target.section_index
+        || previous_target.section_offset != current_target.section_offset
+    {
+        return Ok(false);
+    }
+    let previous_section = previous_file.section_by_index(previous_target.section_index)?;
+    let current_section = current_file.section_by_index(current_target.section_index)?;
+    if previous_section.name()? != current_section.name()?
+        || previous_section.segment_name()? != current_section.segment_name()?
+        || previous_section.kind() != current_section.kind()
+        || previous_section.flags() != current_section.flags()
+        || previous_section.align() != current_section.align()
+        || previous_section.size() != current_section.size()
+        || previous_section.relocations().next().is_some()
+        || current_section.relocations().next().is_some()
+    {
+        return Ok(false);
+    }
+    Ok(previous_section.data()? == current_section.data()?)
+}
+
 fn macho_data_relocation_target_position(
     file: &object::File<'_>,
     target: object::RelocationTarget,
@@ -13835,20 +13862,28 @@ fn validate_macho_data_relocations_are_stable(
                     patch_section_record_index(&previous_file, previous_target.section_index)?;
                 let current_target_patch_section_index =
                     patch_section_record_index(&current_file, current_target.section_index)?;
-                let Some(target_section) = matched_sections.iter().find(|section| {
+                let target_section = matched_sections.iter().find(|section| {
                     section.previous.input == patch_section.previous.input
                         && section.previous.section_index == previous_target_patch_section_index
                         && section.current.input == patch_section.current.input
                         && section.current.section_index == current_target_patch_section_index
-                }) else {
+                });
+                if target_section.is_none()
+                    && !unmatched_macho_data_relocation_target_is_stable(
+                        &previous_file,
+                        &current_file,
+                        &previous_target,
+                        &current_target,
+                    )?
+                {
                     return Ok(Err(format!(
                         "missing Mach-O data relocation target section in {}",
                         display_hex_path(&input.path)
                     )));
-                };
-                if previous_target.section_offset != current_target.section_offset
-                    || target_section.previous.output_offset != target_section.current.output_offset
-                {
+                }
+                if target_section.is_some_and(|target_section| {
+                    target_section.previous.output_offset != target_section.current.output_offset
+                }) {
                     return Ok(Err(format!(
                         "moved Mach-O data relocation target in {}",
                         display_hex_path(&input.path)
@@ -13875,18 +13910,23 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let Some(target_address) = macho_output_address_for_file_offset(
-                    &output_file,
-                    target_section
-                        .current
-                        .output_offset
-                        .checked_add(current_target.section_offset)
-                        .context("Mach-O data relocation target output offset overflow")?,
-                ) else {
-                    return Ok(Err(format!(
-                        "Mach-O data relocation target has no output address in {}",
-                        display_hex_path(&input.path)
-                    )));
+                let target_address = if let Some(target_section) = target_section {
+                    let Some(target_address) = macho_output_address_for_file_offset(
+                        &output_file,
+                        target_section
+                            .current
+                            .output_offset
+                            .checked_add(current_target.section_offset)
+                            .context("Mach-O data relocation target output offset overflow")?,
+                    ) else {
+                        return Ok(Err(format!(
+                            "Mach-O data relocation target has no output address in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
+                    target_address
+                } else {
+                    relocation.target_value
                 };
                 if target_address != relocation.target_value
                     || relocation.applied_target_value != Some(relocation.target_value)
@@ -38280,6 +38320,76 @@ mod tests {
         assert!(!macho_data_relocation_layout_is_stable(0, 1, 0, true));
         assert!(!macho_data_relocation_layout_is_stable(1, 1, 0, true));
         assert!(!macho_data_relocation_layout_is_stable(1, 1, 1, false));
+    }
+
+    #[test]
+    fn unmatched_macho_data_relocation_target_allows_only_stable_section_content() {
+        let previous = test_macho_object_with_data_section_name(
+            b"\x1f\x20\x03\xd5",
+            b"constant",
+            0,
+            b"__const",
+        );
+        let current = test_macho_object_with_data_section_name(
+            b"\x1f\x20\x03\xd5\x1f\x20\x03\xd5",
+            b"constant",
+            0,
+            b"__const",
+        );
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let previous_section = previous_file.section_by_name("__const").unwrap();
+        let current_section = current_file.section_by_name("__const").unwrap();
+        assert_ne!(previous_section.address(), current_section.address());
+        let previous_target = MachODataRelocationTargetPosition {
+            section_index: previous_section.index(),
+            section_offset: 0,
+        };
+        let current_target = MachODataRelocationTargetPosition {
+            section_index: current_section.index(),
+            section_offset: 0,
+        };
+
+        assert!(
+            unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &current_file,
+                &previous_target,
+                &current_target,
+            )
+            .unwrap()
+        );
+
+        let changed = test_macho_object_with_data_section_name(
+            b"\x1f\x20\x03\xd5\x1f\x20\x03\xd5",
+            b"changed!",
+            0,
+            b"__const",
+        );
+        let changed_file = object::File::parse(changed.as_slice()).unwrap();
+        assert!(
+            !unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &changed_file,
+                &previous_target,
+                &current_target,
+            )
+            .unwrap()
+        );
+
+        let moved_target = MachODataRelocationTargetPosition {
+            section_offset: 1,
+            ..current_target
+        };
+        assert!(
+            !unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &current_file,
+                &previous_target,
+                &moved_target,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
