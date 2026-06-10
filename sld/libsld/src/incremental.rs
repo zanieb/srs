@@ -14444,24 +14444,15 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let previous_target =
-                    macho_data_relocation_target_position(&previous_file, previous_context.target)?;
-                let current_target =
-                    macho_data_relocation_target_position(&current_file, current_context.target)?;
-                let (Some(previous_target), Some(current_target)) =
-                    (previous_target, current_target)
-                else {
-                    if !macho_external_data_relocation_target_is_stable(
+                if macho_relocation_target_is_global(&previous_file, previous_context.target)
+                    && macho_relocation_target_is_global(&current_file, current_context.target)
+                    && macho_catalog_data_relocation_target_is_stable(
                         &previous_identity,
                         &current_identity,
                         relocation,
                         resolutions,
-                    )? {
-                        return Ok(Err(format!(
-                            "unsupported external Mach-O data relocation target in {}",
-                            display_hex_path(&input.path)
-                        )));
-                    }
+                    )?
+                {
                     let previous_record = relocation.clone();
                     if relocation.input != patch_section.current.input {
                         relocation.input = patch_section.current.input.clone().into();
@@ -14469,6 +14460,18 @@ fn validate_macho_data_relocations_are_stable(
                     relocation.section_index = patch_section.current.section_index;
                     changed |= *relocation != previous_record;
                     continue;
+                }
+                let previous_target =
+                    macho_data_relocation_target_position(&previous_file, previous_context.target)?;
+                let current_target =
+                    macho_data_relocation_target_position(&current_file, current_context.target)?;
+                let (Some(previous_target), Some(current_target)) =
+                    (previous_target, current_target)
+                else {
+                    return Ok(Err(format!(
+                        "unsupported external Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
                 };
                 let previous_target_patch_section_index =
                     patch_section_record_index(&previous_file, previous_target.section_index)?;
@@ -14582,14 +14585,13 @@ fn macho_data_relocation_semantics_are_stable(
         && previous_identity == current_identity
 }
 
-fn macho_external_data_relocation_target_is_stable(
+fn macho_catalog_data_relocation_target_is_stable(
     previous_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
     current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
     relocation: &RelocationRecord,
     resolutions: &[MachOSymbolResolutionRecord],
 ) -> std::result::Result<bool, String> {
-    let (Some((previous_name, None)), Some((current_name, None))) =
-        (previous_identity, current_identity)
+    let (Some((previous_name, _)), Some((current_name, _))) = (previous_identity, current_identity)
     else {
         return Ok(false);
     };
@@ -39286,7 +39288,7 @@ mod tests {
     }
 
     #[test]
-    fn external_macho_data_relocation_requires_catalog_value_and_owner() {
+    fn catalog_macho_data_relocation_requires_value_and_owner() {
         let target_value = 0x1000_4020;
         let mut relocation = relocation_record(
             "input.o",
@@ -39314,7 +39316,7 @@ mod tests {
         }];
 
         assert!(
-            macho_external_data_relocation_target_is_stable(
+            macho_catalog_data_relocation_target_is_stable(
                 &identity,
                 &identity,
                 &relocation,
@@ -39323,9 +39325,20 @@ mod tests {
             .unwrap()
         );
 
+        let defined_identity = Some((b"_target".to_vec(), Some(object::SectionIndex(1))));
+        assert!(
+            macho_catalog_data_relocation_target_is_stable(
+                &defined_identity,
+                &defined_identity,
+                &relocation,
+                &resolutions,
+            )
+            .unwrap()
+        );
+
         resolutions[0].direct_value = Some(target_value + 8);
         assert!(
-            !macho_external_data_relocation_target_is_stable(
+            !macho_catalog_data_relocation_target_is_stable(
                 &identity,
                 &identity,
                 &relocation,
@@ -39337,7 +39350,7 @@ mod tests {
         resolutions[0].direct_value = Some(target_value);
         resolutions[0].target = None;
         assert!(
-            !macho_external_data_relocation_target_is_stable(
+            !macho_catalog_data_relocation_target_is_stable(
                 &identity,
                 &identity,
                 &relocation,
