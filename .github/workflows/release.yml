@@ -83,8 +83,13 @@ jobs:
         run: |
           ./build.sh \
             --ci false \
+            --set=rust.codegen-units=1 \
+            --set=rust.debug-assertions=false \
+            --set=rust.debug-logging=false \
             --set=rust.incremental=false \
             --set=rust.debuginfo-level=0 \
+            --set=rust.frame-pointers=false \
+            --set=rust.lto=thin \
             --set="build.description=srs-$RELEASE_TAG"
 
       - name: Package release
