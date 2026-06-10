@@ -12566,6 +12566,7 @@ fn unmatched_macho_data_relocation_target_is_stable(
     current_file: &object::File<'_>,
     previous_target: &MachODataRelocationTargetPosition,
     current_target: &MachODataRelocationTargetPosition,
+    input_objects_are_identical: bool,
 ) -> Result<bool> {
     if previous_target.section_index != current_target.section_index
         || previous_target.section_offset != current_target.section_offset
@@ -12574,14 +12575,24 @@ fn unmatched_macho_data_relocation_target_is_stable(
     }
     let previous_section = previous_file.section_by_index(previous_target.section_index)?;
     let current_section = current_file.section_by_index(current_target.section_index)?;
+    let previous_has_relocations = previous_section.relocations().next().is_some();
+    let current_has_relocations = current_section.relocations().next().is_some();
+    // An unchanged object keeps its existing emitted text and local symbol address even when the
+    // text section itself was not eligible for a direct-copy patch record.
+    let identical_relocated_text = input_objects_are_identical
+        && previous_file.architecture() == object::Architecture::Aarch64
+        && current_file.architecture() == object::Architecture::Aarch64
+        && previous_section.segment_name()? == Some("__TEXT")
+        && current_section.segment_name()? == Some("__TEXT")
+        && previous_section.name()? == "__text"
+        && current_section.name()? == "__text";
     if previous_section.name()? != current_section.name()?
         || previous_section.segment_name()? != current_section.segment_name()?
         || previous_section.kind() != current_section.kind()
         || previous_section.flags() != current_section.flags()
         || previous_section.align() != current_section.align()
         || previous_section.size() != current_section.size()
-        || previous_section.relocations().next().is_some()
-        || current_section.relocations().next().is_some()
+        || ((previous_has_relocations || current_has_relocations) && !identical_relocated_text)
     {
         return Ok(false);
     }
@@ -14483,12 +14494,15 @@ fn validate_macho_data_relocations_are_stable(
                         && section.current.input == patch_section.current.input
                         && section.current.section_index == current_target_patch_section_index
                 });
+                let input_objects_are_identical =
+                    previous_input_bytes.bytes == current_input_bytes.bytes;
                 if target_section.is_none()
                     && !unmatched_macho_data_relocation_target_is_stable(
                         &previous_file,
                         &current_file,
                         &previous_target,
                         &current_target,
+                        input_objects_are_identical,
                     )?
                 {
                     return Ok(Err(format!(
@@ -39403,6 +39417,7 @@ mod tests {
                 &current_file,
                 &previous_target,
                 &current_target,
+                false,
             )
             .unwrap()
         );
@@ -39420,6 +39435,7 @@ mod tests {
                 &changed_file,
                 &previous_target,
                 &current_target,
+                false,
             )
             .unwrap()
         );
@@ -39434,6 +39450,60 @@ mod tests {
                 &current_file,
                 &previous_target,
                 &moved_target,
+                false,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn unmatched_macho_data_target_allows_identical_relocated_text_object() {
+        let previous = test_macho_object_with_text_relocation(b"\x1f\x20\x03\xd5", b"constant");
+        let current = previous.clone();
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let previous_section = previous_file.section_by_name("__text").unwrap();
+        let current_section = current_file.section_by_name("__text").unwrap();
+        assert_eq!(previous_section.relocations().count(), 1);
+        let previous_target = MachODataRelocationTargetPosition {
+            section_index: previous_section.index(),
+            section_offset: 0,
+        };
+        let current_target = MachODataRelocationTargetPosition {
+            section_index: current_section.index(),
+            section_offset: 0,
+        };
+
+        assert!(
+            unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &current_file,
+                &previous_target,
+                &current_target,
+                true,
+            )
+            .unwrap()
+        );
+        assert!(
+            !unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &current_file,
+                &previous_target,
+                &current_target,
+                false,
+            )
+            .unwrap()
+        );
+
+        let changed = test_macho_object_with_text_relocation(b"\x00\x00\x00\x14", b"constant");
+        let changed_file = object::File::parse(changed.as_slice()).unwrap();
+        assert!(
+            !unmatched_macho_data_relocation_target_is_stable(
+                &previous_file,
+                &changed_file,
+                &previous_target,
+                &current_target,
+                true,
             )
             .unwrap()
         );
@@ -41687,6 +41757,28 @@ mod tests {
         data_symbol_offset: u64,
         data_section_name: &[u8],
     ) -> Vec<u8> {
+        test_macho_object_with_options(
+            text,
+            data,
+            debug,
+            data_symbol_offset,
+            data_section_name,
+            false,
+        )
+    }
+
+    fn test_macho_object_with_text_relocation(text: &[u8], data: &[u8]) -> Vec<u8> {
+        test_macho_object_with_options(text, data, None, 0, b"__data", true)
+    }
+
+    fn test_macho_object_with_options(
+        text: &[u8],
+        data: &[u8],
+        debug: Option<&[u8]>,
+        data_symbol_offset: u64,
+        data_section_name: &[u8],
+        text_relocation: bool,
+    ) -> Vec<u8> {
         const HEADER_SIZE: usize = 32;
         const SEGMENT_COMMAND_SIZE: usize = 72;
         const SECTION_SIZE: usize = 80;
@@ -41700,7 +41792,9 @@ mod tests {
         let data_offset = text_offset + text.len();
         let debug_offset = data_offset + data.len();
         let debug_len = debug.map_or(0, <[u8]>::len);
-        let symoff = (debug_offset + debug_len).next_multiple_of(8);
+        let text_relocation_offset = (debug_offset + debug_len).next_multiple_of(8);
+        let text_relocation_count = usize::from(text_relocation);
+        let symoff = (text_relocation_offset + text_relocation_count * 8).next_multiple_of(8);
         let stroff = symoff + 2 * NLIST_64_SIZE;
         let strings = b"\0_text\0_data\0";
         let mut bytes = Vec::new();
@@ -41729,13 +41823,15 @@ mod tests {
         push_u32(&mut bytes, section_count as u32);
         push_u32(&mut bytes, 0);
 
-        push_macho_section(
+        push_macho_section_with_relocations(
             &mut bytes,
             b"__text",
             b"__TEXT",
             0,
             text.len(),
             text_offset,
+            text_relocation_offset,
+            text_relocation_count,
             object::macho::S_REGULAR
                 | object::macho::S_ATTR_PURE_INSTRUCTIONS
                 | object::macho::S_ATTR_SOME_INSTRUCTIONS,
@@ -41773,6 +41869,20 @@ mod tests {
         bytes.extend_from_slice(data);
         if let Some(debug) = debug {
             bytes.extend_from_slice(debug);
+        }
+        bytes.resize(text_relocation_offset, 0);
+        if text_relocation {
+            push_test_macho_relocation(
+                &mut bytes,
+                TestMachORelocation {
+                    offset: 0,
+                    symbol: 1,
+                    pcrel: true,
+                    length: 2,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_PAGE21,
+                },
+            );
         }
         bytes.resize(symoff, 0);
         push_macho_symbol(&mut bytes, 1, 1, 0);
