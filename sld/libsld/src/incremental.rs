@@ -12696,11 +12696,24 @@ fn macho_text_relocation_target_candidates_for_resolution(
 
 fn recorded_macho_branch_target_candidate(
     relocation: &RelocationRecord,
+    target_name: Option<&SharedText>,
+    target_is_global: bool,
+    target: Option<&RelocationTargetRecord>,
+    target_value: u64,
+    addend: i64,
     previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Option<u64> {
     let raw_relocation = decode_macho_aarch64_relocation_kind(relocation.kind)?;
-    if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26 {
+    if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
+        || relocation.addend != addend
+        || relocation.target_value != target_value
+        || if target_is_global {
+            target_name.is_none() || relocation.target_name.as_ref() != target_name
+        } else {
+            target.is_none() || relocation.target.as_ref() != target
+        }
+    {
         return None;
     }
     let applied_target_value = relocation.applied_target_value?;
@@ -12737,72 +12750,32 @@ fn recorded_macho_branch_target_candidate(
     .then_some(applied_target_value)
 }
 
-struct RecordedMachOBranchTargetCandidates {
-    global: HashMap<SharedText, HashMap<(u64, i64), Vec<u64>>>,
-    local: HashMap<RelocationTargetRecord, HashMap<(u64, i64), Vec<u64>>>,
-    imports: HashMap<SharedText, HashMap<i64, Vec<u64>>>,
-    symbol_ids_by_name: HashMap<Option<SharedText>, u32>,
-    symbol_ids_by_name_and_target: HashMap<(Option<SharedText>, RelocationTargetRecord), u32>,
+struct RecordedMachOBranchTargetCandidates<'a> {
+    relocations: &'a [RelocationRecord],
+    branch_indices_by_name: HashMap<&'a str, Vec<usize>>,
 }
 
-impl RecordedMachOBranchTargetCandidates {
-    fn new(
-        relocations: &[RelocationRecord],
-        previous_output: &[u8],
-        output_file: &object::File<'_>,
-    ) -> Self {
-        let mut candidates = Self {
-            global: HashMap::new(),
-            local: HashMap::new(),
-            imports: HashMap::new(),
-            symbol_ids_by_name: HashMap::new(),
-            symbol_ids_by_name_and_target: HashMap::new(),
-        };
-        for relocation in relocations {
-            candidates
-                .symbol_ids_by_name
-                .entry(relocation.target_name.clone())
-                .or_insert(relocation.target_symbol_id);
-            if let Some(target) = relocation.target.as_ref() {
-                candidates
-                    .symbol_ids_by_name_and_target
-                    .entry((relocation.target_name.clone(), target.clone()))
-                    .or_insert(relocation.target_symbol_id);
-            }
-            let Some(candidate) =
-                recorded_macho_branch_target_candidate(relocation, previous_output, output_file)
-            else {
+impl<'a> RecordedMachOBranchTargetCandidates<'a> {
+    fn new(relocations: &'a [RelocationRecord]) -> Self {
+        let mut branch_indices_by_name = HashMap::<&str, Vec<usize>>::new();
+        for (index, relocation) in relocations.iter().enumerate() {
+            let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
                 continue;
             };
-            if let Some(target_name) = relocation.target_name.as_ref() {
-                candidates
-                    .global
-                    .entry(target_name.clone())
-                    .or_default()
-                    .entry((relocation.target_value, relocation.addend))
-                    .or_default()
-                    .push(candidate);
-                if candidate != 0 && relocation.target.is_none() && relocation.target_value == 0 {
-                    candidates
-                        .imports
-                        .entry(target_name.clone())
-                        .or_default()
-                        .entry(relocation.addend)
-                        .or_default()
-                        .push(candidate);
-                }
+            if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26 {
+                continue;
             }
-            if let Some(target) = relocation.target.as_ref() {
-                candidates
-                    .local
-                    .entry(target.clone())
+            if let Some(target_name) = relocation.target_name.as_deref() {
+                branch_indices_by_name
+                    .entry(target_name)
                     .or_default()
-                    .entry((relocation.target_value, relocation.addend))
-                    .or_default()
-                    .push(candidate);
+                    .push(index);
             }
         }
-        candidates
+        Self {
+            relocations,
+            branch_indices_by_name,
+        }
     }
 
     fn branch_targets(
@@ -12812,28 +12785,79 @@ impl RecordedMachOBranchTargetCandidates {
         target: Option<&RelocationTargetRecord>,
         target_value: u64,
         addend: i64,
-    ) -> &[u64] {
+        previous_output: &[u8],
+        output_file: &object::File<'_>,
+    ) -> Vec<u64> {
         if target_is_global {
-            target_name
-                .and_then(|name| self.global.get(name.as_str()))
-                .and_then(|values| values.get(&(target_value, addend)))
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+            let Some(indices) =
+                target_name.and_then(|name| self.branch_indices_by_name.get(name.as_str()))
+            else {
+                return Vec::new();
+            };
+            indices
+                .iter()
+                .filter_map(|index| {
+                    recorded_macho_branch_target_candidate(
+                        &self.relocations[*index],
+                        target_name,
+                        true,
+                        target,
+                        target_value,
+                        addend,
+                        previous_output,
+                        output_file,
+                    )
+                })
+                .collect()
         } else {
-            target
-                .and_then(|target| self.local.get(target))
-                .and_then(|values| values.get(&(target_value, addend)))
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+            self.relocations
+                .iter()
+                .filter_map(|relocation| {
+                    recorded_macho_branch_target_candidate(
+                        relocation,
+                        target_name,
+                        false,
+                        target,
+                        target_value,
+                        addend,
+                        previous_output,
+                        output_file,
+                    )
+                })
+                .collect()
         }
     }
 
-    fn import_stubs(&self, target_name: &SharedText, addend: i64) -> &[u64] {
-        self.imports
+    fn import_stubs(
+        &self,
+        target_name: &SharedText,
+        addend: i64,
+        previous_output: &[u8],
+        output_file: &object::File<'_>,
+    ) -> Vec<u64> {
+        self.branch_indices_by_name
             .get(target_name.as_str())
-            .and_then(|values| values.get(&addend))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter_map(|index| {
+                let relocation = &self.relocations[*index];
+                (relocation.target.is_none())
+                    .then(|| {
+                        recorded_macho_branch_target_candidate(
+                            relocation,
+                            Some(target_name),
+                            true,
+                            None,
+                            0,
+                            addend,
+                            previous_output,
+                            output_file,
+                        )
+                    })
+                    .flatten()
+            })
+            .filter(|candidate| *candidate != 0)
+            .collect()
     }
 
     fn target_symbol_id(
@@ -12841,17 +12865,27 @@ impl RecordedMachOBranchTargetCandidates {
         target_name: Option<&SharedText>,
         target: Option<&RelocationTargetRecord>,
     ) -> u32 {
-        if let Some(target) = target {
-            self.symbol_ids_by_name_and_target
-                .get(&(target_name.cloned(), target.clone()))
-                .copied()
-                .unwrap_or_default()
-        } else {
-            self.symbol_ids_by_name
-                .get(&target_name.cloned())
-                .copied()
-                .unwrap_or_default()
+        if let Some(indices) =
+            target_name.and_then(|name| self.branch_indices_by_name.get(name.as_str()))
+            && let Some(relocation) = indices
+                .iter()
+                .map(|index| &self.relocations[*index])
+                .find(|relocation| target.is_none() || relocation.target.as_ref() == target)
+        {
+            return relocation.target_symbol_id;
         }
+        self.relocations
+            .iter()
+            .find(|relocation| {
+                relocation.target_name.as_ref() == target_name
+                    && (target.is_none() || relocation.target.as_ref() == target)
+            })
+            .map_or(0, |relocation| relocation.target_symbol_id)
+    }
+
+    #[cfg(test)]
+    fn indexed_relocation_count(&self) -> usize {
+        self.branch_indices_by_name.values().map(Vec::len).sum()
     }
 }
 
@@ -12866,9 +12900,15 @@ fn recorded_macho_branch_target_candidates(
     previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Vec<u64> {
-    RecordedMachOBranchTargetCandidates::new(relocations, previous_output, output_file)
-        .branch_targets(target_name, target_is_global, target, target_value, addend)
-        .to_vec()
+    RecordedMachOBranchTargetCandidates::new(relocations).branch_targets(
+        target_name,
+        target_is_global,
+        target,
+        target_value,
+        addend,
+        previous_output,
+        output_file,
+    )
 }
 
 fn recorded_macho_import_stub_candidates(
@@ -12878,12 +12918,12 @@ fn recorded_macho_import_stub_candidates(
     previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Vec<u64> {
-    RecordedMachOBranchTargetCandidates::new(relocations, previous_output, output_file)
-        .import_stubs(target_name, addend)
-        .iter()
-        .copied()
-        .filter(|candidate| *candidate != 0)
-        .collect()
+    RecordedMachOBranchTargetCandidates::new(relocations).import_stubs(
+        target_name,
+        addend,
+        previous_output,
+        output_file,
+    )
 }
 
 fn macho_aarch64_applied_target_addend(
@@ -12903,12 +12943,13 @@ fn rematerialized_macho_text_relocation_replay(
     relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
     resolution_lookup: &MachOSymbolResolutionLookup<'_>,
-    recorded_branch_targets: &RecordedMachOBranchTargetCandidates,
+    recorded_branch_targets: &RecordedMachOBranchTargetCandidates<'_>,
     input: &FileState,
     patch_section: &MatchedPatchSection,
     current_file: &object::File<'_>,
     current_context: &MachOTextRelocationContext,
     matched_sections: &[MatchedPatchSection],
+    previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Result<std::result::Result<MachOTextRelocationReplay, String>> {
     if current_context.subtractor.is_some() {
@@ -12937,7 +12978,7 @@ fn rematerialized_macho_text_relocation_replay(
     let mut target_is_global = false;
     let target;
     let mut resolution = None;
-    let mut recorded_import_stub_candidates = &[][..];
+    let mut recorded_import_stub_candidates = Vec::new();
     let current_target_value = match current_context.target {
         object::RelocationTarget::Symbol(symbol_index) => {
             let symbol = current_file
@@ -13001,8 +13042,12 @@ fn rematerialized_macho_text_relocation_replay(
                         .and_then(|resolution| resolution.stub_address)
                         .is_none()
                     {
-                        recorded_import_stub_candidates = recorded_branch_targets
-                            .import_stubs(encoded_name, current_context.addend);
+                        recorded_import_stub_candidates = recorded_branch_targets.import_stubs(
+                            encoded_name,
+                            current_context.addend,
+                            previous_output,
+                            output_file,
+                        );
                         if recorded_import_stub_candidates.is_empty() {
                             return Ok(Err(format!(
                                 "missing Mach-O symbol resolution for {} in {}",
@@ -13068,6 +13113,8 @@ fn rematerialized_macho_text_relocation_replay(
             target.as_ref(),
             current_target_value,
             current_context.addend,
+            previous_output,
+            output_file,
         )
     } else {
         recorded_import_stub_candidates
@@ -13079,7 +13126,7 @@ fn rematerialized_macho_text_relocation_replay(
                 .and_then(|name| resolution_lookup.get_encoded(resolutions, name)),
             current_context.r_type,
             current_target_value,
-            recorded_target_candidates,
+            &recorded_target_candidates,
         );
 
     let target_symbol_id =
@@ -13663,13 +13710,8 @@ fn macho_text_relocation_replays_for_input(
                         consumed_target_moves.insert(*relocation_index);
                     }
                 }
-                let recorded_branch_targets = recorded_branch_targets.get_or_init(|| {
-                    RecordedMachOBranchTargetCandidates::new(
-                        relocations,
-                        previous_output,
-                        &output_file,
-                    )
-                });
+                let recorded_branch_targets = recorded_branch_targets
+                    .get_or_init(|| RecordedMachOBranchTargetCandidates::new(relocations));
                 for current_context in &current_contexts {
                     let replay = match rematerialized_macho_text_relocation_replay(
                         relocations,
@@ -13681,6 +13723,7 @@ fn macho_text_relocation_replays_for_input(
                         &current_file,
                         current_context,
                         matched_sections,
+                        previous_output,
                         &output_file,
                     )? {
                         Ok(replay) => replay,
@@ -44957,11 +45000,8 @@ mod tests {
             .remove(0);
         let resolutions = Vec::new();
         let resolution_lookup = MachOSymbolResolutionLookup::new(&resolutions);
-        let recorded_branch_targets = RecordedMachOBranchTargetCandidates::new(
-            std::slice::from_ref(&relocation),
-            &previous_output,
-            &output_file,
-        );
+        let recorded_branch_targets =
+            RecordedMachOBranchTargetCandidates::new(std::slice::from_ref(&relocation));
 
         let replay = rematerialized_macho_text_relocation_replay(
             std::slice::from_ref(&relocation),
@@ -44973,6 +45013,7 @@ mod tests {
             &current_file,
             &contexts[0],
             &matched,
+            &previous_output,
             &output_file,
         )
         .unwrap()
@@ -44993,7 +45034,7 @@ mod tests {
         let mut resolutions = Vec::new();
         let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
             &mut resolutions,
-            &[relocation],
+            std::slice::from_ref(&relocation),
             std::slice::from_ref(&replay),
             &[(
                 input.path.clone().into(),
@@ -45065,6 +45106,65 @@ mod tests {
 
         assert_eq!(recorded, vec![recorded_stub]);
         assert_eq!(candidates, vec![recorded_stub, target_value]);
+    }
+
+    #[test]
+    fn recorded_macho_branch_index_omits_unrelated_relocations() {
+        let page_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_PAGE21,
+        });
+        let branch_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        });
+        let mut relocations = (0..4096)
+            .map(|offset| {
+                relocation_record(
+                    "first.o",
+                    1,
+                    9,
+                    Some(0),
+                    0,
+                    Some("_page_target"),
+                    None,
+                    offset,
+                    offset,
+                    4,
+                    page_kind,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        relocations.push(relocation_record(
+            "first.o",
+            1,
+            7,
+            Some(0),
+            0,
+            Some("_branch_target"),
+            None,
+            4096,
+            4096,
+            4,
+            branch_kind,
+            0,
+        ));
+        let branch_target = SharedText::from(hex::encode("_branch_target"));
+        let page_target = SharedText::from(hex::encode("_page_target"));
+        let index = RecordedMachOBranchTargetCandidates::new(&relocations);
+
+        assert_eq!(index.indexed_relocation_count(), 1);
+        assert_eq!(index.target_symbol_id(Some(&branch_target), None), 7);
+        assert_eq!(index.target_symbol_id(Some(&page_target), None), 9);
     }
 
     #[test]
