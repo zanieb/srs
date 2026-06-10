@@ -12626,10 +12626,12 @@ fn macho_relocation_instruction_shape(
     Some(shape)
 }
 
+type MachOTextRelocationSignature = (u8, bool, i64, Option<(Vec<u8>, Option<usize>)>);
+
 fn macho_text_relocation_signature(
     file: &object::File<'_>,
     context: &MachOTextRelocationContext,
-) -> Result<(u8, bool, i64, Option<(Vec<u8>, Option<usize>)>)> {
+) -> Result<MachOTextRelocationSignature> {
     Ok((
         context.r_type,
         context.r_pcrel,
@@ -12637,6 +12639,29 @@ fn macho_text_relocation_signature(
         macho_relocation_target_identity(file, context.target)?
             .map(|(name, section)| (name, section.map(|section| section.0))),
     ))
+}
+
+fn missing_macho_replacement_resolution<'a>(
+    previous_signatures: &[MachOTextRelocationSignature],
+    current_signatures: &'a [MachOTextRelocationSignature],
+    resolutions: &[MachOSymbolResolutionRecord],
+    resolution_lookup: &MachOSymbolResolutionLookup<'_>,
+) -> Option<&'a [u8]> {
+    previous_signatures
+        .iter()
+        .zip(current_signatures)
+        .filter(|(previous, current)| previous != current)
+        .filter_map(|(_, current)| {
+            current
+                .3
+                .as_ref()
+                .map(|(current_name, _)| current_name.as_slice())
+        })
+        .find(|current_name| {
+            resolution_lookup
+                .get_name(resolutions, current_name)
+                .is_none()
+        })
 }
 
 fn macho_output_address_for_current_section_offset(
@@ -13822,14 +13847,12 @@ fn macho_text_relocation_replays_for_input(
                     },
                 );
             if replaces_external_target
-                && let Some((current_name, _)) = current_signatures
-                    .iter()
-                    .filter_map(|signature| signature.3.as_ref())
-                    .find(|(current_name, _)| {
-                        resolution_lookup
-                            .get_name(resolutions, current_name)
-                            .is_none()
-                    })
+                && let Some(current_name) = missing_macho_replacement_resolution(
+                    &previous_signatures,
+                    &current_signatures,
+                    resolutions,
+                    &resolution_lookup,
+                )
             {
                 return Ok(Err(format!(
                     "{MACHO_SYMBOL_RESOLUTIONS_REQUIRED} for {} in {}",
@@ -45003,6 +45026,51 @@ mod tests {
 
         assert_eq!(contexts.len(), 1);
         assert!(macho_relocation_target_is_global(&file, contexts[0].target));
+    }
+
+    #[test]
+    fn replacement_resolution_request_ignores_stable_unresolved_imports() {
+        let signature = |name: &[u8]| {
+            (
+                object::macho::ARM64_RELOC_BRANCH26,
+                true,
+                0,
+                Some((name.to_vec(), None)),
+            )
+        };
+        let previous = [signature(b"_old_target"), signature(b"__Unwind_Resume")];
+        let current = [signature(b"_new_target"), signature(b"__Unwind_Resume")];
+        let resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_new_target")),
+            direct_value: Some(0x2000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        }];
+        let resolution_lookup = MachOSymbolResolutionLookup::new(&resolutions);
+
+        assert_eq!(
+            missing_macho_replacement_resolution(
+                &previous,
+                &current,
+                &resolutions,
+                &resolution_lookup,
+            ),
+            None
+        );
+
+        let resolutions = Vec::new();
+        let resolution_lookup = MachOSymbolResolutionLookup::new(&resolutions);
+        assert_eq!(
+            missing_macho_replacement_resolution(
+                &previous,
+                &current,
+                &resolutions,
+                &resolution_lookup,
+            ),
+            Some(b"_new_target".as_slice())
+        );
     }
 
     #[test]
