@@ -2255,6 +2255,7 @@ fn finish_macho_cross_input_target_moves(
     relocations: &mut [RelocationRecord],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
+    reusable_branch_targets: &[MachOReusableBranchTarget],
     reuse_previous_target: bool,
     finish_unmatched: bool,
     input: &FileState,
@@ -2312,21 +2313,25 @@ fn finish_macho_cross_input_target_moves(
             }
         };
         if let Some(moved) = forwarding_move {
-            if reuse_previous_target {
-                if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26
-                    || previous_applied_target_value != previous_target_value
-                {
+            if reuse_previous_target
+                && reusable_branch_targets.iter().any(|reusable| {
+                    reusable.moved == *moved
+                        && reusable.applied_target_value == previous_applied_target_value
+                })
+            {
+                if raw_relocation.r_type != object::macho::ARM64_RELOC_BRANCH26 {
                     return Ok(Err(format!(
                         "unsupported moved Mach-O forwarding target in {}",
                         display_hex_path(&input.path)
                     )));
                 }
                 relocation.target_value = moved.current_value;
-                relocation.applied_target_value = Some(moved.previous_value);
+                relocation.applied_target_value = Some(previous_applied_target_value);
                 relocation.target = Some(moved.current_target.clone());
                 continue;
             }
-        } else if !finish_unmatched {
+        }
+        if !finish_unmatched {
             remaining_moves.push(target_move);
             continue;
         }
@@ -2418,6 +2423,8 @@ fn update_macho_symbol_resolutions_for_input(
     let mut input_ranges = Vec::new();
     let mut output_symbols = Vec::new();
     let mut moves = Vec::new();
+    let mut thunk_patches = Vec::new();
+    let mut reusable_branch_targets = Vec::new();
     let mut retiring_names = Vec::new();
     let mut changed = false;
     for resolution in resolutions {
@@ -2552,12 +2559,16 @@ fn update_macho_symbol_resolutions_for_input(
         if !position_changed && !value_changed && !input_changed {
             continue;
         }
-        if (position_changed || value_changed)
-            && (resolution.got_address.is_some() || !resolution.thunk_addresses.is_empty())
-        {
+        if value_changed && resolution.got_address.is_some() {
             return Ok(Err(format!(
-                "moved Mach-O GOT or thunk target in {}",
-                display_hex_path(&input.path)
+                "moved Mach-O GOT target `{}` in {}: previous value {previous_value:#x}, \
+                 current value {current_value:#x}, previous section offset {:#x}, current section \
+                 offset {:#x}, GOT address {:?}",
+                display_hex_text(resolution.name.as_str()),
+                display_hex_path(&input.path),
+                target.section_offset,
+                current.section_offset,
+                resolution.got_address,
             )));
         }
         let previous_target = target.clone();
@@ -2572,13 +2583,46 @@ fn update_macho_symbol_resolutions_for_input(
                 allow_missing: true,
                 source: "Mach-O symbol catalog refresh",
             });
-            moves.push(MachOSymbolResolutionMove {
+            let moved = MachOSymbolResolutionMove {
                 name: resolution.name.clone(),
                 previous_value,
                 current_value,
                 previous_target,
                 current_target: current_target.clone(),
-            });
+            };
+            if !resolution.thunk_addresses.is_empty() {
+                let Some(output_file) = output_file.as_ref() else {
+                    return Ok(Err(format!(
+                        "moved Mach-O thunk target `{}` has no previous output",
+                        display_hex_text(resolution.name.as_str())
+                    )));
+                };
+                let Some((_, previous_output)) = output_context else {
+                    unreachable!("parsed output requires output context");
+                };
+                let retargets = match recorded_macho_thunk_retargets(
+                    resolution.name.as_str(),
+                    &resolution.thunk_addresses,
+                    previous_value,
+                    current_value,
+                    output_file,
+                    previous_output,
+                ) {
+                    Ok(retargets) => retargets,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                resolution
+                    .thunk_addresses
+                    .retain(|address| !retargets.retired_addresses.contains(address));
+                thunk_patches.extend(retargets.patches);
+                reusable_branch_targets.extend(retargets.reusable_branch_targets.into_iter().map(
+                    |applied_target_value| MachOReusableBranchTarget {
+                        moved: moved.clone(),
+                        applied_target_value,
+                    },
+                ));
+            }
+            moves.push(moved);
         }
         resolution.direct_value = Some(current_value);
         *target = current_target;
@@ -2595,9 +2639,98 @@ fn update_macho_symbol_resolutions_for_input(
         input_ranges,
         output_symbols,
         moves,
+        thunk_patches,
+        reusable_branch_targets,
         retiring_names,
         changed,
     }))
+}
+
+fn recorded_macho_thunk_retargets(
+    name: &str,
+    thunk_addresses: &[u64],
+    previous_target: u64,
+    current_target: u64,
+    output_file: &object::File<'_>,
+    previous_output: &[u8],
+) -> std::result::Result<MachORecordedThunkRetargets, String> {
+    let config = <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config()
+        .ok_or_else(|| "Mach-O recorded thunks are unavailable for this architecture".to_owned())?;
+    let thunk_size = usize::try_from(config.thunk_size)
+        .map_err(|_| "Mach-O recorded thunk size does not fit usize".to_owned())?;
+    let mut addresses = thunk_addresses.to_vec();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let mut retargets = MachORecordedThunkRetargets::default();
+    for thunk_address in addresses {
+        if thunk_address % 4 != 0 {
+            return Err(format!(
+                "recorded Mach-O thunk for `{}` is not instruction-aligned",
+                display_hex_text(name)
+            ));
+        }
+        if !macho_aarch64_thunk_target_is_reachable(thunk_address, previous_target) {
+            return Err(format!(
+                "recorded Mach-O thunk for `{}` has an old target outside ADRP range",
+                display_hex_text(name)
+            ));
+        }
+        let Some(output_offset) =
+            macho_output_file_offset_for_address(output_file, thunk_address, config.thunk_size)?
+        else {
+            return Err(format!(
+                "recorded Mach-O thunk for `{}` has no output file range",
+                display_hex_text(name)
+            ));
+        };
+        let start = usize::try_from(output_offset)
+            .map_err(|_| "recorded Mach-O thunk output offset does not fit usize".to_owned())?;
+        let end = start
+            .checked_add(thunk_size)
+            .ok_or_else(|| "recorded Mach-O thunk output range overflowed".to_owned())?;
+        let previous_bytes = previous_output.get(start..end).ok_or_else(|| {
+            "recorded Mach-O thunk output range is outside the previous output".to_owned()
+        })?;
+        let mut expected_previous = vec![0; thunk_size];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            previous_target,
+            &mut expected_previous,
+        );
+        if previous_bytes != expected_previous {
+            return Err(format!(
+                "recorded Mach-O thunk encoding changed for `{}` at {thunk_address:#x}",
+                display_hex_text(name)
+            ));
+        }
+
+        retargets.reusable_branch_targets.push(thunk_address);
+        if thunk_address == current_target {
+            retargets.retired_addresses.push(thunk_address);
+            continue;
+        }
+        if !macho_aarch64_thunk_target_is_reachable(thunk_address, current_target) {
+            return Err(format!(
+                "recorded Mach-O thunk target for `{}` is outside ADRP range",
+                display_hex_text(name)
+            ));
+        }
+        let mut data = vec![0; thunk_size];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            current_target,
+            &mut data,
+        );
+        retargets.patches.push(SectionPatch {
+            output_offset,
+            size: config.thunk_size,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+    Ok(retargets)
 }
 
 fn macho_forwarding_thunk_patch(
@@ -3983,13 +4116,22 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 MachOForwardingThunkPatches::default()
             };
+            let mut reusable_macho_branch_targets =
+                macho_resolution_updates.reusable_branch_targets.clone();
+            reusable_macho_branch_targets.extend(macho_forwarding_thunk_patches.moves.iter().map(
+                |moved| MachOReusableBranchTarget {
+                    moved: moved.clone(),
+                    applied_target_value: moved.previous_value,
+                },
+            ));
             let had_macho_cross_input_target_moves = !relocation_target_patches
                 .macho_cross_input_target_moves
                 .is_empty();
             match finish_macho_cross_input_target_moves(
                 &mut previous.relocations,
                 &mut relocation_target_patches,
-                &macho_forwarding_thunk_patches.moves,
+                &macho_resolution_updates.moves,
+                &reusable_macho_branch_targets,
                 true,
                 false,
                 input,
@@ -4200,6 +4342,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &mut previous.relocations,
                 &mut relocation_target_patches,
                 &migrated_macho_resolution_moves,
+                &[],
                 false,
                 true,
                 input,
@@ -5262,6 +5405,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .map(|activation| std::mem::take(&mut activation.auxiliary_patches))
                 .unwrap_or_default();
             update_matched_patch_current_sections(&mut matched_sections, &current_sections);
+            patched_section_count += macho_resolution_updates.thunk_patches.len();
             patched_section_count += macho_reserved_thunk_patches.len();
             patched_section_count += changed_macho_definition_patches.len();
             patched_section_count += macho_text_auxiliary_patches.len();
@@ -5316,6 +5460,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     )
                     .chain(relocation_addend_patches.output_patches)
                     .chain(relocation_target_patches.output_patches)
+                    .chain(macho_resolution_updates.thunk_patches)
                     .chain(macho_forwarding_thunk_patches.patches)
                     .chain(macho_reserved_thunk_patches)
                     .chain(macho_text_auxiliary_patches)
@@ -6409,8 +6554,17 @@ struct MachOSymbolResolutionUpdates {
     input_ranges: Vec<std::ops::Range<usize>>,
     output_symbols: Vec<RelocationTargetSymbolPatch>,
     moves: Vec<MachOSymbolResolutionMove>,
+    thunk_patches: Vec<SectionPatch>,
+    reusable_branch_targets: Vec<MachOReusableBranchTarget>,
     retiring_names: Vec<SharedText>,
     changed: bool,
+}
+
+#[derive(Default)]
+struct MachORecordedThunkRetargets {
+    patches: Vec<SectionPatch>,
+    reusable_branch_targets: Vec<u64>,
+    retired_addresses: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -6426,6 +6580,12 @@ struct MachOSymbolResolutionMove {
     current_value: u64,
     previous_target: RelocationTargetRecord,
     current_target: RelocationTargetRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MachOReusableBranchTarget {
+    moved: MachOSymbolResolutionMove,
+    applied_target_value: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -14631,6 +14791,44 @@ fn macho_output_address_for_file_offset(file: &object::File<'_>, file_offset: u6
         }
     }
     None
+}
+
+fn macho_output_file_offset_for_address(
+    file: &object::File<'_>,
+    address: u64,
+    size: u64,
+) -> std::result::Result<Option<u64>, String> {
+    let end = address
+        .checked_add(size)
+        .ok_or_else(|| "Mach-O output address range overflowed".to_owned())?;
+    let mut output_offset = None;
+    for section in file.sections() {
+        let section_address = section.address();
+        let Some(section_end) = section_address.checked_add(section.size()) else {
+            return Err("Mach-O output section address range overflowed".to_owned());
+        };
+        if address < section_address || end > section_end {
+            continue;
+        }
+        let Some((section_file_offset, section_file_size)) = section.file_range() else {
+            continue;
+        };
+        let relative = address - section_address;
+        let Some(relative_end) = relative.checked_add(size) else {
+            return Err("Mach-O output section-relative range overflowed".to_owned());
+        };
+        if relative_end > section_file_size {
+            continue;
+        }
+        let Some(candidate) = section_file_offset.checked_add(relative) else {
+            return Err("Mach-O output file offset overflowed".to_owned());
+        };
+        if output_offset.is_some_and(|existing| existing != candidate) {
+            return Err("Mach-O output address maps to multiple file ranges".to_owned());
+        }
+        output_offset = Some(candidate);
+    }
+    Ok(output_offset)
 }
 
 fn section_size_allows_direct_patching(
@@ -37141,6 +37339,282 @@ mod tests {
     }
 
     #[test]
+    fn moved_macho_symbol_retargets_recorded_thunk() {
+        let object = test_macho_object(&[0; 32], &[0; 4], 0);
+        let file = object::File::parse(object.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let input_path = hex::encode("input.o");
+        let mut output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let previous_output_offset = output.text_offset + 0x100;
+        let current_output_offset = output.text_offset + 0x500;
+        let thunk_output_offset = output.text_offset + 0x700;
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, previous_output_offset).unwrap();
+        let current_value =
+            macho_output_address_for_file_offset(&output_file, current_output_offset).unwrap();
+        let thunk_address =
+            macho_output_address_for_file_offset(&output_file, thunk_output_offset).unwrap();
+        let config =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config().unwrap();
+        let mut previous_thunk = vec![0; config.thunk_size as usize];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            previous_value,
+            &mut previous_thunk,
+        );
+        let thunk_start = thunk_output_offset as usize;
+        output.bytes[thunk_start..thunk_start + previous_thunk.len()]
+            .copy_from_slice(&previous_thunk);
+        let section_index = patch_section_record_index(&file, text.index()).unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: previous_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: current_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&object),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_text")),
+            direct_value: Some(previous_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: vec![thunk_address],
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: text.index().0 as u32,
+                section_offset: 0,
+            }),
+        };
+        let mut resolutions = vec![resolution.clone()];
+        let updates = update_macho_symbol_resolutions_for_input(
+            &mut resolutions,
+            &input,
+            &object,
+            false,
+            Some((&matched, &output.bytes)),
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut expected = vec![0; config.thunk_size as usize];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            current_value,
+            &mut expected,
+        );
+        assert_eq!(updates.thunk_patches.len(), 1);
+        assert_eq!(updates.thunk_patches[0].output_offset, thunk_output_offset);
+        assert_eq!(updates.thunk_patches[0].data, expected);
+        assert_eq!(
+            updates.reusable_branch_targets,
+            vec![MachOReusableBranchTarget {
+                moved: updates.moves[0].clone(),
+                applied_target_value: thunk_address,
+            }]
+        );
+        assert_eq!(resolutions[0].thunk_addresses, vec![thunk_address]);
+
+        let mut corrupted_output = output.bytes.clone();
+        corrupted_output[thunk_start] ^= 1;
+        assert!(matches!(
+            update_macho_symbol_resolutions_for_input(
+                &mut [resolution],
+                &input,
+                &object,
+                false,
+                Some((&matched, &corrupted_output)),
+            )
+            .unwrap(),
+            Err(reason) if reason.contains("thunk encoding changed")
+        ));
+    }
+
+    #[test]
+    fn moved_macho_symbol_retires_reclaimed_thunk() {
+        let object = test_macho_object(&[0; 32], &[0; 4], 0);
+        let file = object::File::parse(object.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let input_path = hex::encode("input.o");
+        let mut output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let previous_output_offset = output.text_offset + 0x100;
+        let current_output_offset = output.text_offset + 0x500;
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, previous_output_offset).unwrap();
+        let current_value =
+            macho_output_address_for_file_offset(&output_file, current_output_offset).unwrap();
+        let config =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config().unwrap();
+        let mut previous_thunk = vec![0; config.thunk_size as usize];
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            current_value,
+            previous_value,
+            &mut previous_thunk,
+        );
+        let thunk_start = current_output_offset as usize;
+        output.bytes[thunk_start..thunk_start + previous_thunk.len()]
+            .copy_from_slice(&previous_thunk);
+        let section_index = patch_section_record_index(&file, text.index()).unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: previous_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: current_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&object),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_text")),
+            direct_value: Some(previous_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: vec![current_value],
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: text.index().0 as u32,
+                section_offset: 0,
+            }),
+        }];
+        let updates = update_macho_symbol_resolutions_for_input(
+            &mut resolutions,
+            &input,
+            &object,
+            false,
+            Some((&matched, &output.bytes)),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(updates.thunk_patches.is_empty());
+        assert!(resolutions[0].thunk_addresses.is_empty());
+        assert_eq!(
+            updates.reusable_branch_targets,
+            vec![MachOReusableBranchTarget {
+                moved: updates.moves[0].clone(),
+                applied_target_value: current_value,
+            }]
+        );
+    }
+
+    #[test]
+    fn moved_macho_got_target_remains_unsupported() {
+        let object = test_macho_object(&[0; 32], &[0; 4], 0);
+        let file = object::File::parse(object.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let input_path = hex::encode("input.o");
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let previous_output_offset = output.text_offset + 0x100;
+        let current_output_offset = output.text_offset + 0x500;
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, previous_output_offset).unwrap();
+        let section_index = patch_section_record_index(&file, text.index()).unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: previous_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: current_output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&object),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let mut resolutions = [MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_text")),
+            direct_value: Some(previous_value),
+            got_address: Some(0x2000),
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: text.index().0 as u32,
+                section_offset: 0,
+            }),
+        }];
+
+        assert!(matches!(
+            update_macho_symbol_resolutions_for_input(
+                &mut resolutions,
+                &input,
+                &object,
+                false,
+                Some((&matched, &output.bytes)),
+            )
+            .unwrap(),
+            Err(reason) if reason.contains("moved Mach-O GOT target")
+        ));
+    }
+
+    #[test]
     fn moved_macho_symbol_plans_validated_forwarding_thunk() {
         let object = test_macho_object(&[0; 32], &[0; 4], 0);
         let file = object::File::parse(object.as_slice()).unwrap();
@@ -49953,15 +50427,20 @@ mod tests {
         assert!(patches.output_patches.is_empty());
         assert_eq!(patches.macho_cross_input_target_moves.len(), 1);
         assert_eq!(relocations[0].target_value, previous_target_value);
+        let moved = MachOSymbolResolutionMove {
+            name: SharedText::from(hex::encode("_data")),
+            previous_value: previous_target_value,
+            current_value: current_target_value,
+            previous_target,
+            current_target: current_target.clone(),
+        };
         finish_macho_cross_input_target_moves(
             &mut relocations,
             &mut patches,
-            &[MachOSymbolResolutionMove {
-                name: SharedText::from(hex::encode("_data")),
-                previous_value: previous_target_value,
-                current_value: current_target_value,
-                previous_target,
-                current_target: current_target.clone(),
+            std::slice::from_ref(&moved),
+            &[MachOReusableBranchTarget {
+                moved: moved.clone(),
+                applied_target_value: previous_target_value,
             }],
             true,
             true,
@@ -49980,6 +50459,36 @@ mod tests {
         );
         assert_eq!(relocations[0].target.as_ref(), Some(&current_target));
 
+        let recorded_thunk = 0x3000;
+        let mut thunk_relocation = relocation.clone();
+        thunk_relocation.applied_target_value = Some(recorded_thunk);
+        let mut thunk_relocations = vec![thunk_relocation];
+        let mut thunk_patches =
+            relocation_target_patches_for_input(&mut thunk_relocations, &input, &current)
+                .unwrap()
+                .unwrap();
+        finish_macho_cross_input_target_moves(
+            &mut thunk_relocations,
+            &mut thunk_patches,
+            std::slice::from_ref(&moved),
+            &[MachOReusableBranchTarget {
+                moved: moved.clone(),
+                applied_target_value: recorded_thunk,
+            }],
+            true,
+            true,
+            &input,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(thunk_patches.output_patches.is_empty());
+        assert_eq!(thunk_relocations[0].target_value, current_target_value);
+        assert_eq!(
+            thunk_relocations[0].applied_target_value,
+            Some(recorded_thunk)
+        );
+        assert_eq!(thunk_relocations[0].target.as_ref(), Some(&current_target));
+
         let mut direct_relocations = vec![relocation];
         let mut direct_patches =
             relocation_target_patches_for_input(&mut direct_relocations, &input, &current)
@@ -49988,6 +50497,7 @@ mod tests {
         finish_macho_cross_input_target_moves(
             &mut direct_relocations,
             &mut direct_patches,
+            &[],
             &[],
             false,
             true,
