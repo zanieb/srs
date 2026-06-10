@@ -30,6 +30,8 @@ jobs:
     env:
       # Keep the workload builds from growing debug incremental caches on CI.
       CARGO_INCREMENTAL: 0
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: srs-self-build-v1
 
     steps:
       - uses: actions/checkout@v6
@@ -37,6 +39,11 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
           submodules: recursive
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.15.0
 
       - name: Verify immutable installer snapshot
         run: ./scripts/test-install-snapshot.sh
@@ -93,7 +100,18 @@ jobs:
 
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
-        run: ./build.sh --ci false --set=rust.incremental=false --set=rust.debuginfo-level=0
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          ./build.sh \
+            --ci false \
+            --set=build.ccache=sccache \
+            --set=rust.incremental=false \
+            --set=rust.debuginfo-level=0
+
+      - name: Show SRS build cache statistics
+        if: always()
+        run: '"$SCCACHE_PATH" --show-adv-stats'
 
       - name: Install SRS
         run: ./install.sh
