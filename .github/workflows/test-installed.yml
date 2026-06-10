@@ -1,9 +1,7 @@
-name: Installed toolchain tests
-
 on:
   workflow_call:
     inputs:
-      name:
+      platform:
         required: true
         type: string
       runner:
@@ -20,7 +18,7 @@ permissions: {}
 
 jobs:
   checksum-composition:
-    name: Checksum composition (${{ inputs.name }})
+    name: "checksum composition on ${{ inputs.platform }}"
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     env:
@@ -64,7 +62,7 @@ jobs:
             artifact_cache::same_mtime_input_changed_during_publication_is_not_published -- --exact
 
   smoke:
-    name: Installed smoke (${{ inputs.name }})
+    name: "smoke on ${{ inputs.platform }}"
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     env:

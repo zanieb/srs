@@ -24,59 +24,65 @@ jobs:
     uses: ./.github/workflows/test-sld.yml
 
   build-linux:
+    name: "build-toolchain"
     uses: ./.github/workflows/build-toolchain.yml
     with:
-      name: Linux x86_64
+      platform: linux
       runner: ubuntu-24.04
       target: x86_64-unknown-linux-gnu
       sha: ${{ github.sha }}
 
   build-macos:
+    name: "build-toolchain"
     uses: ./.github/workflows/build-toolchain.yml
     with:
-      name: macOS arm64
+      platform: macos
       runner: macos-15
       target: aarch64-apple-darwin
       sha: ${{ github.sha }}
 
-  installed-tests-linux:
+  test-installed-linux:
+    name: "test-installed"
     needs: build-linux
     uses: ./.github/workflows/test-installed.yml
     with:
-      name: Linux x86_64
+      platform: linux
       runner: ubuntu-24.04
       target: x86_64-unknown-linux-gnu
       sha: ${{ github.sha }}
 
-  installed-tests-macos:
+  test-installed-macos:
+    name: "test-installed"
     needs: build-macos
     uses: ./.github/workflows/test-installed.yml
     with:
-      name: macOS arm64
+      platform: macos
       runner: macos-15
       target: aarch64-apple-darwin
       sha: ${{ github.sha }}
 
-  workloads-linux:
+  test-workloads-linux:
+    name: "test-workloads"
     needs: build-linux
     uses: ./.github/workflows/test-workloads.yml
     with:
-      name: Linux x86_64
+      platform: linux
       runner: ubuntu-24.04
       target: x86_64-unknown-linux-gnu
       sha: ${{ github.sha }}
 
-  workloads-macos:
+  test-workloads-macos:
+    name: "test-workloads"
     needs: build-macos
     uses: ./.github/workflows/test-workloads.yml
     with:
-      name: macOS arm64
+      platform: macos
       runner: macos-15
       target: aarch64-apple-darwin
       sha: ${{ github.sha }}
 
   required-checks-passed:
-    name: Required checks passed
+    name: "all required jobs passed"
     if: always()
     needs:
       - test-scripts
@@ -84,14 +90,14 @@ jobs:
       - test-sld
       - build-linux
       - build-macos
-      - installed-tests-linux
-      - installed-tests-macos
-      - workloads-linux
-      - workloads-macos
+      - test-installed-linux
+      - test-installed-macos
+      - test-workloads-linux
+      - test-workloads-macos
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check required jobs
+      - name: "Check required jobs passed"
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |

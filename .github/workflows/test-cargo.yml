@@ -1,5 +1,3 @@
-name: Cargo tests
-
 on:
   workflow_call:
 
@@ -7,16 +5,16 @@ permissions: {}
 
 jobs:
   test:
-    name: Cargo (${{ matrix.name }})
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x86_64
+          - name: linux
             runner: ubuntu-24.04
-          - name: macOS arm64
+          - name: macos
             runner: macos-15
     env:
       CARGO_INCREMENTAL: 0

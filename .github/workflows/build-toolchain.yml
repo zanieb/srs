@@ -1,9 +1,7 @@
-name: Build toolchain
-
 on:
   workflow_call:
     inputs:
-      name:
+      platform:
         required: true
         type: string
       runner:
@@ -20,7 +18,7 @@ permissions: {}
 
 jobs:
   build:
-    name: Build toolchain (${{ inputs.name }})
+    name: ${{ inputs.platform }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
     env:

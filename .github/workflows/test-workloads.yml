@@ -1,9 +1,7 @@
-name: Workload tests
-
 on:
   workflow_call:
     inputs:
-      name:
+      platform:
         required: true
         type: string
       runner:
@@ -20,7 +18,7 @@ permissions: {}
 
 jobs:
   build:
-    name: ${{ matrix.name }} (${{ inputs.name }})
+    name: "${{ matrix.name }} on ${{ inputs.platform }}"
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
     strategy:
@@ -30,7 +28,7 @@ jobs:
           - name: uv
             repository: astral-sh/uv
             packages: -p uv
-          - name: Ruff and ty
+          - name: ruff and ty
             repository: astral-sh/ruff
             packages: -p ruff -p ty
     env:
