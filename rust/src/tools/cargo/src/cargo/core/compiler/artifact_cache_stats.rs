@@ -6,6 +6,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use crate::util::{CargoResult, GlobalContext};
 
 const INELIGIBLE_REASON_COUNT: usize = 11;
+const RESTORE_PHASE_COUNT: usize = 6;
 
 #[derive(Clone, Copy, Debug)]
 pub enum IneligibleReason {
@@ -27,6 +28,44 @@ pub enum MaterializationKind {
     Hardlink,
     Copy,
     CrossDeviceCopy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RestorePhase {
+    Lock,
+    ControlValidation,
+    SourceValidation,
+    EntryValidation,
+    FinalValidation,
+    StateWrite,
+}
+
+impl RestorePhase {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Lock => "lock_us",
+            Self::ControlValidation => "control_validation_us",
+            Self::SourceValidation => "source_validation_us",
+            Self::EntryValidation => "entry_validation_us",
+            Self::FinalValidation => "final_validation_us",
+            Self::StateWrite => "state_write_us",
+        }
+    }
+
+    fn all() -> [Self; RESTORE_PHASE_COUNT] {
+        [
+            Self::Lock,
+            Self::ControlValidation,
+            Self::SourceValidation,
+            Self::EntryValidation,
+            Self::FinalValidation,
+            Self::StateWrite,
+        ]
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +144,7 @@ pub struct ArtifactCacheStats {
     restore_elapsed_us: AtomicU64,
     restore_hit_elapsed_us: AtomicU64,
     restore_miss_elapsed_us: AtomicU64,
+    restore_phase_elapsed_us: [AtomicU64; RESTORE_PHASE_COUNT],
     restored_files: AtomicU64,
     restored_bytes: AtomicU64,
     hardlinked_files: AtomicU64,
@@ -156,6 +196,7 @@ impl Default for ArtifactCacheStats {
             restore_elapsed_us: AtomicU64::new(0),
             restore_hit_elapsed_us: AtomicU64::new(0),
             restore_miss_elapsed_us: AtomicU64::new(0),
+            restore_phase_elapsed_us: std::array::from_fn(|_| AtomicU64::new(0)),
             restored_files: AtomicU64::new(0),
             restored_bytes: AtomicU64::new(0),
             hardlinked_files: AtomicU64::new(0),
@@ -255,6 +296,13 @@ impl ArtifactCacheStats {
         );
     }
 
+    pub fn restore_phase(&self, phase: RestorePhase, elapsed: Duration) {
+        Self::add(
+            &self.restore_phase_elapsed_us[phase.index()],
+            Self::micros(elapsed),
+        );
+    }
+
     pub fn materialization_finished(&self, elapsed: Duration) {
         Self::add(&self.materialization_elapsed_us, Self::micros(elapsed));
     }
@@ -343,6 +391,13 @@ impl ArtifactCacheStats {
             ineligible += count;
             reasons.insert(reason.name().to_string(), count.into());
         }
+        let mut restore_phases = serde_json::Map::new();
+        for phase in RestorePhase::all() {
+            restore_phases.insert(
+                phase.name().to_string(),
+                load(&self.restore_phase_elapsed_us[phase.index()]).into(),
+            );
+        }
         let summary = serde_json::json!({
             "version": 1,
             "configured": self.cache_configured.load(Ordering::Relaxed),
@@ -359,6 +414,7 @@ impl ArtifactCacheStats {
                 "elapsed_us": load(&self.restore_elapsed_us),
                 "hit_elapsed_us": load(&self.restore_hit_elapsed_us),
                 "miss_elapsed_us": load(&self.restore_miss_elapsed_us),
+                "phase_elapsed_us": restore_phases,
             },
             "restore": {
                 "files": load(&self.restored_files),

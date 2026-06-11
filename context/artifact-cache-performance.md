@@ -88,6 +88,38 @@ policy through Cargo's unstable configuration fixed the normal SRS wrapper
 path; a real wrapped cold/warm Clippy pair then reported four eligible misses
 followed by four hits, with the warm command taking 4.42s.
 
+### Metadata-only Check actions
+
+The next local iteration admitted non-test `--emit=dep-info,metadata` library
+actions. Restored Check outputs are copied even when the cache is configured for
+hardlinks because Cargo advances their mtimes after a successful check. This
+keeps the shared entry immutable while allowing the restored target to become
+Cargo-fresh on its next invocation.
+
+All rows below used the same optimized patched Cargo and `uv-normalize` graph.
+The Clippy control disabled the artifact cache on the exact current code. Each
+warm row used an empty target and entries produced by the corresponding cold
+row; the three Clippy warm samples were 7.43s, 5.46s, and 4.87s.
+
+| Command and state | Wall | Eligible | Hits | Hit rate | Ineligible | rustc executions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Clippy, cache disabled | 6.81s | 0 | 0 | n/a | 0 | 70 |
+| Clippy, cold Check variants | 8.37s | 25 | 0 | 0% | 45 | 70 |
+| Clippy, warm Check variants, median | 5.46s | 25 | 25 | 100% | 45 | 45 |
+| Plain Check, cold cache | 7.31s | 27 | 0 | 0% | 43 | 70 |
+| Plain Check, warm cache | 4.81s | 27 | 25 | 92.6% | 43 | 45 |
+
+The warm Clippy runs restored 21 Check rmeta files / 11.6 MB by copy and eight
+Build outputs / 18.2 MB by hardlink. Physical materialization took only 5-9ms.
+Restore-phase counters instead found that a redundant pre-materialization
+compiler/action-input validation duplicated the correctness-authoritative
+post-materialization validation. Removing the first pass retained the mutation
+regressions and reduced the Clippy warm median below the disabled control by
+1.35s. The remaining final validation cost was 2.9-3.5s of cumulative worker
+time for Clippy, compared with 138ms for plain Check, and is the next replay
+overhead to remove or share. The cold population tax remains visible, so a
+designated writer should populate shared entries rather than every reader.
+
 ### Full uv root build
 
 The representative command was:
@@ -194,12 +226,12 @@ prunable.
 
 ### Uncached units poison downstream content keys
 
-The cache rejects proc macros, build scripts, test binaries, Check actions,
-Clippy wrapper actions, and every package that has a custom build script. A
-consumer's action key hashes raw dependency artifacts. When an uncached
-dependency embeds an absolute `OUT_DIR` or target path, its bytes differ on the
-next runner and every downstream consumer misses even if its own source and
-arguments are unchanged.
+The cache rejects proc macros, build scripts, test binaries, test-mode Check
+actions, Clippy wrapper actions, and every package that has a custom build
+script. A consumer's action key hashes raw dependency artifacts. When an
+uncached dependency embeds an absolute `OUT_DIR` or target path, its bytes
+differ on the next runner and every downstream consumer misses even if its own
+source and arguments are unchanged.
 
 For example, serde's rmeta differed by only 50 bytes between two controlled
 targets; those bytes included its generated `OUT_DIR/private.rs` path. That was
@@ -269,15 +301,15 @@ fingerprint commit can only leave the unit dirty. Restored hardlinks remain
 immutable and are detached before any compiler, linker, or external tool can
 mutate them.
 
-This protocol should first cover only the existing pure Build-library
-eligibility. Metadata-only Check actions are the next distinct artifact class.
-Clippy requires a separate composite action identity covering wrapper order and
-arguments, `clippy-driver`, rustc/sysroot, dynamic loader inputs, lint levels,
-relevant environment, and `.clippy.toml`/configuration inputs, with diagnostic
-replay. Packages with build scripts remain outside the portable closure until
-a capsule can bind the build-script executable, observed environment, parsed
-stdout directives, watched inputs, native search inputs, and the complete
-portable `OUT_DIR` tree.
+This protocol should first cover the existing pure Build-library and non-test
+metadata-only Check eligibility. Clippy-wrapped actions require a separate
+composite action identity covering wrapper order and arguments,
+`clippy-driver`, rustc/sysroot, dynamic loader inputs, lint levels, relevant
+environment, and `.clippy.toml`/configuration inputs, with diagnostic replay.
+Packages with build scripts remain outside the portable closure until a capsule
+can bind the build-script executable, observed environment, parsed stdout
+directives, watched inputs, native search inputs, and the complete portable
+`OUT_DIR` tree.
 
 A thin snapshot should then be compared with the full profile snapshot. It
 should omit `.rlib`/`.rmeta` bytes supplied by the portable layers and contain
@@ -333,8 +365,8 @@ Implement in measured order:
 3. Add opt-in structured counters and cumulative phase timing so hit rates,
    skipped publications, hashed bytes, and replay cost are visible without
    parsing debug logs.
-4. Cache metadata-only rustc Check actions. Use copy materialization or avoid
-   changing the mtime of a restored hardlinked rmeta.
+4. Keep non-test metadata-only rustc Check actions copy-materialized and
+   covered by cache-immutability, source-mutation, and next-run freshness tests.
 5. Add a composite identity for Clippy that covers the ordered wrapper chain,
    `clippy-driver`, rustc, and the sysroot.
 6. Admit ordinary library actions from packages with build scripts only after
@@ -365,6 +397,8 @@ build queue. It remains disabled by default and reports:
 - compiler identity files/bytes, one-time wall/CPU time, and reuse count;
 - action-input hash calls, failures, and time;
 - total hit and miss lookup time, materialization time, and publication time;
+- restore lock, control validation, source validation, entry validation, final
+  validation, and target-state write time;
 - rustc executions; and
 - link-producing primary-package rustc executions and full action time.
 

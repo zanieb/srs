@@ -526,8 +526,9 @@ that are uplifted into the target or artifact directories.
 
 ## artifact-cache
 
-The `artifact-cache` feature reuses verified ordinary-library outputs across
-build directories through a shared content cache. Artifact restoration is
+The `artifact-cache` feature reuses verified ordinary-library Build outputs and
+non-test metadata-only Check outputs across build directories through a shared
+content cache. Artifact restoration is
 currently supported only on macOS and Linux hosts. It is intentionally limited
 to non-proc-macro library builds without build scripts, compiler wrappers,
 explicitly configured compiler drivers, SBOM side outputs, profiling side
@@ -599,6 +600,8 @@ On macOS and Linux, hardlink materialization avoids duplicate filesystem
 allocation. Cargo detaches a restored hardlink before rebuilding that output,
 including after the cache feature is disabled, and automatically falls back to
 copying when the cache and build directory are on different filesystems.
+Metadata-only Check outputs are always restored by copy because Cargo advances
+their mtimes after a successful check.
 In `hardlink` mode, restored `.rlib` and `.rmeta` files share storage with the
 central cache. Tools outside Cargo must not mutate those restored files in
 place; use `copy` materialization for workflows that modify build artifacts
@@ -629,10 +632,10 @@ stderr after the build queue and begins with
 `srs-artifact-cache-stats=` followed by versioned JSON. It reports admission
 reasons, hits and misses, restored and published files and logical bytes,
 hardlinks, configured copies and cross-device copies, compiler identity and
-action-input hashing, materialization, publication, rustc execution, and
-link-producing primary-package rustc actions. The latter includes frontend and
-code generation and is not linker-only time. The feature is disabled by
-default.
+action-input hashing, per-phase restore validation, materialization,
+publication, rustc execution, and link-producing primary-package rustc actions.
+The latter includes frontend and code generation and is not linker-only time.
+The feature is disabled by default.
 
 Elapsed values are cumulative worker microseconds and can exceed command wall
 time under parallel execution. Cargo-fresh units are scheduling decisions;

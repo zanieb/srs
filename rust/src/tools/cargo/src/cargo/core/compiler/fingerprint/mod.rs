@@ -407,7 +407,6 @@ use crate::{CARGO_ENV, GlobalContext};
 
 use super::BuildContext;
 use super::BuildRunner;
-use super::CompileMode;
 use super::FileFlavor;
 use super::Job;
 use super::Unit;
@@ -1621,12 +1620,13 @@ fn calculate_normal(
     if build_runner.bcx.build_config.artifact_cache.is_some()
         && unit.target.is_lib()
         && !unit.target.proc_macro()
-        && matches!(unit.mode, CompileMode::Build)
+        && super::artifact_cache_compile_mode_is_supported(unit.mode)
         && !unit.pkg.has_custom_build()
         && build_runner.sbom_output_files(unit)?.is_empty()
     {
-        // Cached hardlinks stay immutable; this target-local completion stamp
-        // records a successful cache-eligible build, including fallback builds.
+        // This target-local completion stamp records a successful
+        // cache-eligible action, including fallback execution, independently
+        // from the restored output's materialization mode and mtime.
         outputs.push(
             build_runner
                 .files()

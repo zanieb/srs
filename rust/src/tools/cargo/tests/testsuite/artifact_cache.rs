@@ -229,6 +229,21 @@ fn build_in_target_with_stats(project: &Project, target_dir: &Path) -> RawOutput
         .run()
 }
 
+fn check_in_target_with_stats(project: &Project, target_dir: &Path) -> RawOutput {
+    project
+        .cargo("-Zartifact-cache check --lib")
+        .arg("--target-dir")
+        .arg(target_dir)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .run()
+}
+
 fn artifact_cache_stats(output: &RawOutput) -> serde_json::Value {
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     let reports = stderr
@@ -354,6 +369,21 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(misses, 0);
     assert_eq!(artifact_cache_stat(&warm, &["publication", "attempts"]), 0);
     assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
+    let restore_phases = &warm["lookup"]["phase_elapsed_us"];
+    for phase in [
+        "lock_us",
+        "control_validation_us",
+        "source_validation_us",
+        "entry_validation_us",
+        "final_validation_us",
+        "state_write_us",
+    ] {
+        assert!(
+            restore_phases[phase].is_u64(),
+            "missing restore phase {phase}: {restore_phases}"
+        );
+    }
+    assert!(restore_phases["final_validation_us"].as_u64().unwrap() > 0);
     let restored = artifact_cache_stat(&warm, &["restore", "files"]);
     assert!(restored > 0);
     assert!(artifact_cache_stat(&warm, &["restore", "logical_bytes"]) > 0);
@@ -375,6 +405,74 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(artifact_cache_stat(&fresh, &["lookup", "hits"]), 0);
     assert_eq!(artifact_cache_stat(&fresh, &["lookup", "misses"]), 0);
     assert_eq!(artifact_cache_stat(&fresh, &["rustc", "executions"]), 0);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn metadata_only_check_restores_by_copy_and_becomes_cargo_fresh() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    let cold = artifact_cache_stats(&check_in_target_with_stats(&project, &producer_target));
+    assert_eq!(artifact_cache_stat(&cold, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["rustc", "executions"]), 1);
+
+    let cached = cached_rmeta(&cache);
+    let cached_contents = fs::read(&cached).unwrap();
+    let cached_mtime = fs::metadata(&cached).unwrap().modified().unwrap();
+    let warm = artifact_cache_stats(&check_in_target_with_stats(&project, &consumer_target));
+    assert_eq!(artifact_cache_stat(&warm, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "misses"]), 0);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
+    let restored_files = artifact_cache_stat(&warm, &["restore", "files"]);
+    assert_eq!(restored_files, 1);
+    assert_eq!(
+        artifact_cache_stat(&warm, &["materialization", "copied_files"]),
+        restored_files
+    );
+    assert_eq!(
+        artifact_cache_stat(&warm, &["materialization", "hardlinked_files"]),
+        0
+    );
+    assert_ne!(
+        fs::metadata(&cached).unwrap().ino(),
+        fs::metadata(cached_rmeta(&consumer_target.join("debug").join("deps")))
+            .unwrap()
+            .ino()
+    );
+    assert_eq!(fs::read(&cached).unwrap(), cached_contents);
+    assert_eq!(
+        fs::metadata(&cached).unwrap().modified().unwrap(),
+        cached_mtime
+    );
+
+    let fresh = artifact_cache_stats(&check_in_target_with_stats(&project, &consumer_target));
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "cargo_fresh"]), 1);
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "eligible"]), 0);
+    assert_eq!(artifact_cache_stat(&fresh, &["rustc", "executions"]), 0);
+
+    let restored = cached_rmeta(&consumer_target.join("debug").join("deps"));
+    let restored_contents = fs::read(&restored).unwrap();
+    project.change_file("src/lib.rs", "pub fn value() -> u64 { 43 }\n");
+    let rebuilt = artifact_cache_stats(&check_in_target_with_stats(&project, &consumer_target));
+    assert_eq!(artifact_cache_stat(&rebuilt, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&rebuilt, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&rebuilt, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&rebuilt, &["rustc", "executions"]), 1);
+    assert_ne!(fs::read(restored).unwrap(), restored_contents);
+    assert_eq!(fs::read(&cached).unwrap(), cached_contents);
+    assert_eq!(
+        fs::metadata(&cached).unwrap().modified().unwrap(),
+        cached_mtime
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -2385,7 +2483,9 @@ fn changed_loader_input_after_materialization_forces_compile() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can begin the restore.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3433,7 +3533,9 @@ fn changed_relative_extern_during_restore_forces_compile() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can begin the restore.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }

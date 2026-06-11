@@ -76,7 +76,7 @@ use regex::Regex;
 use tracing::{debug, instrument, trace};
 
 use self::artifact_cache_stats::{
-    IneligibleReason, MaterializationKind, MaterializationTotals, thread_cpu_time,
+    IneligibleReason, MaterializationKind, MaterializationTotals, RestorePhase, thread_cpu_time,
 };
 pub use self::build_config::UserIntent;
 pub use self::build_config::{
@@ -383,6 +383,13 @@ struct ArtifactCachePublicationLock {
     _filesystem_lock: crate::util::FileLock,
 }
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
+
+pub(super) fn artifact_cache_compile_mode_is_supported(mode: CompileMode) -> bool {
+    matches!(
+        mode,
+        CompileMode::Build | CompileMode::Check { test: false }
+    )
+}
 pub(super) const SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP: &str =
     "sld-native-incremental-complete.timestamp";
 static ARTIFACT_CACHE_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -633,7 +640,7 @@ fn rustc(
     let artifact_cache_freshness_stamp = build_runner.bcx.build_config.artifact_cache.is_some()
         && unit.target.is_lib()
         && !unit.target.proc_macro()
-        && matches!(unit.mode, CompileMode::Build)
+        && artifact_cache_compile_mode_is_supported(unit.mode)
         && !unit.pkg.has_custom_build()
         && sbom_files.is_empty();
     let configured_artifact_cache = build_runner.bcx.build_config.artifact_cache.clone();
@@ -645,8 +652,11 @@ fn rustc(
             ))
         } else if unit.target.proc_macro() {
             Some((IneligibleReason::ProcMacro, "target is a proc macro"))
-        } else if !matches!(unit.mode, CompileMode::Build) {
-            Some((IneligibleReason::CompileMode, "compile mode is not build"))
+        } else if !artifact_cache_compile_mode_is_supported(unit.mode) {
+            Some((
+                IneligibleReason::CompileMode,
+                "compile mode is not supported",
+            ))
         } else if unit.pkg.has_custom_build() {
             Some((
                 IneligibleReason::CustomBuildScript,
@@ -951,7 +961,11 @@ fn rustc(
                     &artifact_cache_loader_input_paths,
                     loader_inputs_digest,
                     action_inputs_digest,
-                    cache.materialization,
+                    if mode.is_check() {
+                        ArtifactCacheMaterialization::Copy
+                    } else {
+                        cache.materialization
+                    },
                     cache.max_size,
                     artifact_cache_stats.as_deref(),
                 ) {
@@ -1413,7 +1427,12 @@ fn rlib_action_is_cacheable_with_search_paths(
         && args
             .iter()
             .filter_map(|arg| arg.strip_prefix("--emit="))
-            .all(|emit| matches!(emit, "dep-info,link" | "dep-info,metadata,link"))
+            .all(|emit| {
+                matches!(
+                    emit,
+                    "dep-info,metadata" | "dep-info,link" | "dep-info,metadata,link"
+                )
+            })
         && args.iter().filter(|arg| arg.starts_with("--emit=")).count() == 1
         && !args.windows(2).any(|pair| pair[0] == "--emit")
         && args
@@ -1501,15 +1520,40 @@ fn rlib_action_is_cacheable_with_search_paths(
 mod artifact_cache_admission_tests {
     use super::*;
 
-    fn ordinary_rlib_command() -> ProcessBuilder {
+    fn ordinary_library_command(emit: &str) -> ProcessBuilder {
         let mut rustc = ProcessBuilder::new("rustc");
         rustc
             .arg("--crate-type")
             .arg("lib")
-            .arg("--emit=dep-info,metadata,link")
+            .arg(format!("--emit={emit}"))
             .arg("--out-dir")
             .arg("target/debug/deps");
         rustc
+    }
+
+    fn ordinary_rlib_command() -> ProcessBuilder {
+        ordinary_library_command("dep-info,metadata,link")
+    }
+
+    #[test]
+    fn metadata_only_library_actions_are_cacheable() {
+        assert!(rlib_action_is_cacheable(
+            &ordinary_library_command("dep-info,metadata"),
+            Path::new("target/debug/deps"),
+            Path::new("rustc"),
+            "aarch64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn metadata_only_test_actions_remain_ineligible() {
+        assert!(artifact_cache_compile_mode_is_supported(CompileMode::Build));
+        assert!(artifact_cache_compile_mode_is_supported(
+            CompileMode::Check { test: false }
+        ));
+        assert!(!artifact_cache_compile_mode_is_supported(
+            CompileMode::Check { test: true }
+        ));
     }
 
     #[test]
@@ -3250,29 +3294,20 @@ fn restore_rlib_cache(
         return Ok(false);
     }
     let cache_root = entry_root.parent().unwrap_or(entry_root);
-    let Some(lock) = try_read_lock_rlib_cache_within_limit(cache_root, max_size)? else {
+    let phase_started = stats.map(|_| Instant::now());
+    let lock_result = try_read_lock_rlib_cache_within_limit(cache_root, max_size);
+    if let Some(started) = phase_started
+        && let Some(stats) = stats
+    {
+        stats.restore_phase(RestorePhase::Lock, started.elapsed());
+    }
+    let Some(lock) = lock_result? else {
         return Ok(false);
     };
     if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
     }
     delay_rlib_cache_restore_for_tests()?;
-    if !identity_witness.is_current() {
-        debug!("not restoring artifact cache entry with compiler identity modified after lookup");
-        return Ok(false);
-    }
-    if compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
-        != *loader_inputs_digest
-    {
-        debug!(
-            "not restoring artifact cache entry with compiler loader inputs modified after lookup"
-        );
-        return Ok(false);
-    }
-    if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
-        debug!("not restoring artifact cache entry with action inputs modified after lookup");
-        return Ok(false);
-    }
     let mut entries = fs::read_dir(entry_root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
     let mut corrupt_entries = Vec::new();
@@ -3286,7 +3321,14 @@ fn restore_rlib_cache(
         {
             continue;
         }
-        match verify_rlib_cache_control_files(&entry) {
+        let phase_started = stats.map(|_| Instant::now());
+        let control_result = verify_rlib_cache_control_files(&entry);
+        if let Some(started) = phase_started
+            && let Some(stats) = stats
+        {
+            stats.restore_phase(RestorePhase::ControlValidation, started.elapsed());
+        }
+        match control_result {
             Ok(true) => {}
             Ok(false) => {
                 debug!("rejecting corrupt artifact cache entry {}", entry.display());
@@ -3302,7 +3344,14 @@ fn restore_rlib_cache(
                 continue;
             }
         }
-        match verify_rlib_cache_inputs(&entry, rustc, rustc_cwd) {
+        let phase_started = stats.map(|_| Instant::now());
+        let inputs_result = verify_rlib_cache_inputs(&entry, rustc, rustc_cwd);
+        if let Some(started) = phase_started
+            && let Some(stats) = stats
+        {
+            stats.restore_phase(RestorePhase::SourceValidation, started.elapsed());
+        }
+        match inputs_result {
             Ok(true) => {}
             Ok(false) => continue,
             Err(error) => {
@@ -3313,7 +3362,14 @@ fn restore_rlib_cache(
                 continue;
             }
         }
-        match verify_rlib_cache_entry(&entry, outputs) {
+        let phase_started = stats.map(|_| Instant::now());
+        let entry_result = verify_rlib_cache_entry(&entry, outputs);
+        if let Some(started) = phase_started
+            && let Some(stats) = stats
+        {
+            stats.restore_phase(RestorePhase::EntryValidation, started.elapsed());
+        }
+        match entry_result {
             Ok(true) => {}
             Ok(false) => {
                 debug!("rejecting corrupt artifact cache entry {}", entry.display());
@@ -3358,12 +3414,22 @@ fn restore_rlib_cache(
             restored_bytes += bytes;
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
-        if !restore_materialized_identity_witness_is_current(identity_witness)
-            || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
-                != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
-                != *action_inputs_digest
+        let phase_started = stats.map(|_| Instant::now());
+        let inputs_are_current: CargoResult<bool> = (|| {
+            Ok(
+                restore_materialized_identity_witness_is_current(identity_witness)
+                    && compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+                        == *loader_inputs_digest
+                    && artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
+                        == *action_inputs_digest,
+            )
+        })();
+        if let Some(started) = phase_started
+            && let Some(stats) = stats
         {
+            stats.restore_phase(RestorePhase::FinalValidation, started.elapsed());
+        }
+        if !inputs_are_current? {
             debug!("not restoring artifact cache entry with inputs modified during restore");
             for output in outputs {
                 if fs::symlink_metadata(&output.path).is_ok() {
@@ -3372,21 +3438,31 @@ fn restore_rlib_cache(
             }
             return Ok(false);
         }
-        paths::copy(&entry.join("compiler-messages"), message_cache_path)?;
-        let stored_dep_info = entry.join("rustc-dep-info");
-        if path_is_regular_file(&stored_dep_info) {
-            let origin_pkg_root = paths::read(&entry.join("origin-pkg-root"))?;
-            let origin_target_profile_root =
-                paths::read(&entry.join("origin-target-profile-root"))?;
-            let target_profile_root = output_root.parent().unwrap_or(output_root);
-            let translated = paths::read(&stored_dep_info)?
-                .replace(origin_pkg_root.trim_end(), &pkg_root.to_string_lossy())
-                .replace(
-                    origin_target_profile_root.trim_end(),
-                    &target_profile_root.to_string_lossy(),
-                );
-            paths::write(rustc_dep_info_loc, translated.as_bytes())?;
+        let phase_started = stats.map(|_| Instant::now());
+        let state_write_result: CargoResult<()> = (|| {
+            paths::copy(&entry.join("compiler-messages"), message_cache_path)?;
+            let stored_dep_info = entry.join("rustc-dep-info");
+            if path_is_regular_file(&stored_dep_info) {
+                let origin_pkg_root = paths::read(&entry.join("origin-pkg-root"))?;
+                let origin_target_profile_root =
+                    paths::read(&entry.join("origin-target-profile-root"))?;
+                let target_profile_root = output_root.parent().unwrap_or(output_root);
+                let translated = paths::read(&stored_dep_info)?
+                    .replace(origin_pkg_root.trim_end(), &pkg_root.to_string_lossy())
+                    .replace(
+                        origin_target_profile_root.trim_end(),
+                        &target_profile_root.to_string_lossy(),
+                    );
+                paths::write(rustc_dep_info_loc, translated.as_bytes())?;
+            }
+            Ok(())
+        })();
+        if let Some(started) = phase_started
+            && let Some(stats) = stats
+        {
+            stats.restore_phase(RestorePhase::StateWrite, started.elapsed());
         }
+        state_write_result?;
         if let Some(stats) = stats {
             stats.restored(restored_files, restored_bytes, &materialization_totals);
         }

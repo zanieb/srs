@@ -7,7 +7,7 @@ keep its own writable target directory, but independently compiling and storing
 the same dependencies wastes both build time and disk space.
 
 The installed SRS Cargo wrapper enables Cargo's verified ordinary-library
-artifact cache at:
+Build and metadata-only Check artifact cache at:
 
 ```text
 ${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2
@@ -23,6 +23,9 @@ On macOS and Linux, cached artifacts are restored by hardlink by default.
 Hardlink materialization avoids allocating a second copy of identical `.rlib`
 and `.rmeta` files. Restoration automatically falls back to copying when the
 cache and build directory are on different filesystems.
+Metadata-only Check artifacts are always restored by copy because Cargo moves
+their mtimes after a successful check; touching a restored hardlink would also
+mutate the shared cache entry.
 
 Cargo detaches restored hardlinks before rebuilding them, including when the
 cache feature is later disabled. Tools outside Cargo must not overwrite
@@ -35,7 +38,8 @@ external tool to mutate artifacts previously restored by hardlink.
 
 ## Cache Admission
 
-The cache is deliberately limited to verified ordinary-library artifacts.
+The cache is deliberately limited to verified ordinary-library Build outputs
+and non-test metadata-only Check outputs.
 Builds that use unmodeled inputs execute normally without artifact restoration.
 
 Restoration is skipped for inputs including:
@@ -155,8 +159,10 @@ stderr after Cargo's build queue finishes. The record begins with
 `srs-artifact-cache-stats=` and reports Cargo-fresh units, cache admission by
 reason, hits and misses, restored and published bytes, materialization mode,
 compiler-identity and action-input hashing, publication, rustc execution, and
-link-producing primary-package rustc actions. No record is produced and no
-phase clocks or extra file-size reads are performed by default.
+link-producing primary-package rustc actions. `lookup.phase_elapsed_us`
+separates lock wait, control/source/entry/final validation, and target-state
+writes. No record is produced and no phase clocks or extra file-size reads are
+performed by default.
 
 The timing fields are cumulative worker time in microseconds. They can exceed
 command wall time when jobs overlap. `units.cargo_fresh` describes Cargo's
