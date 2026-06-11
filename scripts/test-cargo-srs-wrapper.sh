@@ -74,6 +74,8 @@ unset SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE
 unset CARGO_BUILD_ARTIFACT_CACHE_DIR
 unset CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION
 unset CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE
+unset CARGO_UNSTABLE_ARTIFACT_CACHE
+unset CARGO_UNSTABLE_CHECKSUM_FRESHNESS
 
 SRS_TEST_UNAME_S=Darwin SRS_TEST_UNAME_M=arm64 run_wrapper darwin-default build
 assert_args darwin-default \
@@ -93,6 +95,8 @@ assert_env_contains darwin-default "SRS_TARGET_CODEGEN_BACKEND=llvm"
 assert_env_contains darwin-default "SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS=1"
 assert_env_contains darwin-default $'SRS_ENCODED_TARGET_RUSTFLAGS=-Zcodegen-backend=llvm\x1f-Zpreserve-duplicate-constants=yes'
 assert_env_contains darwin-default "CARGO_BUILD_ARTIFACT_CACHE_DIR=$scratch/cargo-home/srs-artifact-cache-v2"
+assert_env_contains darwin-default "CARGO_UNSTABLE_ARTIFACT_CACHE=true"
+assert_env_contains darwin-default "CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true"
 assert_env_does_not_contain darwin-default "CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION"
 assert_env_does_not_contain darwin-default "CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE"
 assert_env_does_not_contain darwin-default "RUSTFLAGS"
@@ -183,6 +187,8 @@ assert_args cache-disabled \
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_DIR"
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION"
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE"
+assert_env_contains cache-disabled "CARGO_UNSTABLE_ARTIFACT_CACHE=false"
+assert_env_contains cache-disabled "CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true"
 
 SRS_CARGO_CHECKSUM_FRESHNESS=0 \
 SRS_TEST_UNAME_S=Linux \
@@ -195,6 +201,8 @@ assert_args checksum-disabled \
     --config 'target-applies-to-host=false' \
     --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
     build
+assert_env_contains checksum-disabled "CARGO_UNSTABLE_ARTIFACT_CACHE=true"
+assert_env_contains checksum-disabled "CARGO_UNSTABLE_CHECKSUM_FRESHNESS=false"
 
 SRS_CARGO_ARTIFACT_CACHE_DIR="$scratch/srs-cache" \
 SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy \

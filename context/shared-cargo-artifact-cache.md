@@ -126,6 +126,11 @@ ordinary compilation rather than participating in shared restoration.
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration and
 publication.
 
+The SRS wrapper also exports the matching Cargo unstable configuration for the
+artifact cache and checksum freshness. External Cargo subcommands such as
+Clippy invoke Cargo again through `CARGO`; the exported configuration keeps the
+same enabled or disabled policy in that nested process.
+
 Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root.
 The wrapper exports its per-user default directory, so this alias or the
 lower-level environment setting should be used to override that default for

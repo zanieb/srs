@@ -82,6 +82,12 @@ seven of eight eligible units in 90ms cumulative and spent 171ms in its one
 link-producing primary rustc action. These counters establish internal hit
 rates without claiming that Cargo currently measures linker-only time.
 
+An outer `-Zartifact-cache` did not survive the external `cargo-clippy` hop by
+itself: the inner Cargo summary reported `configured:false`. Exporting the same
+policy through Cargo's unstable configuration fixed the normal SRS wrapper
+path; a real wrapped cold/warm Clippy pair then reported four eligible misses
+followed by four hits, with the warm command taking 4.42s.
+
 ### Full uv root build
 
 The representative command was:

@@ -13,8 +13,10 @@ fi
 # and content edits are detected even when their mtimes are preserved.
 if [[ "${SRS_CARGO_CHECKSUM_FRESHNESS:-1}" != "0" ]]; then
     checksum_freshness_args=(-Z checksum-freshness)
+    export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true
 else
     checksum_freshness_args=()
+    export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=false
 fi
 
 # Target artifacts link through sld by default. Preserve an explicit override
@@ -31,6 +33,10 @@ append_target_rustflag() {
 # detaches links before rebuilding. Set SRS_CARGO_ARTIFACT_CACHE=0 to disable
 # this while investigating a build.
 if [[ "${SRS_CARGO_ARTIFACT_CACHE:-1}" != "0" ]]; then
+    # Cargo subcommands such as Clippy invoke the Cargo path from `CARGO`
+    # directly rather than re-entering this wrapper. Propagate the feature as
+    # config so those nested Cargo processes keep the same cache policy.
+    export CARGO_UNSTABLE_ARTIFACT_CACHE=true
     export CARGO_BUILD_ARTIFACT_CACHE_DIR="${CARGO_BUILD_ARTIFACT_CACHE_DIR:-${SRS_CARGO_ARTIFACT_CACHE_DIR:-${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2}}"
     if [[ -n "${SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION:-}" ]]; then
         export CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION="${CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION:-$SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION}"
@@ -40,6 +46,7 @@ if [[ "${SRS_CARGO_ARTIFACT_CACHE:-1}" != "0" ]]; then
     fi
     artifact_cache_args=(-Z artifact-cache)
 else
+    export CARGO_UNSTABLE_ARTIFACT_CACHE=false
     artifact_cache_args=(-Z artifact-cache --config build.artifact-cache=false)
 fi
 
