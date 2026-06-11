@@ -64,3 +64,9 @@ jobs:
         run: |
           read -ra cargo_packages <<< "$CARGO_PACKAGES"
           cargo +srs build --locked "${cargo_packages[@]}"
+
+      - name: Test ${{ matrix.name }}
+        working-directory: workload
+        run: |
+          read -ra cargo_packages <<< "$CARGO_PACKAGES"
+          cargo +srs test --locked "${cargo_packages[@]}" --lib
