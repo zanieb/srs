@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::core::PackageId;
+use crate::core::compiler::artifact_cache_stats::ArtifactCacheStats;
 use crate::core::compiler::compilation::{self, UnitOutput};
 use crate::core::compiler::locking::LockManager;
 use crate::core::compiler::{self, Unit, UserIntent, artifact};
@@ -16,6 +17,7 @@ use cargo_util_terminal::report::{Level, Message};
 use filetime::FileTime;
 use itertools::Itertools;
 use jobserver::Client;
+use tracing::debug;
 
 use super::RustdocFingerprint;
 use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
@@ -91,6 +93,8 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+    /// Optional per-invocation artifact cache instrumentation.
+    pub artifact_cache_stats: Option<Arc<ArtifactCacheStats>>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -112,6 +116,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 client
             }
         };
+        let artifact_cache_stats = (bcx.gctx.get_env_os("SRS_CARGO_ARTIFACT_CACHE_STATS")
+            == Some(std::ffi::OsStr::new("1")))
+        .then(|| {
+            let stats = Arc::new(ArtifactCacheStats::default());
+            if bcx.build_config.artifact_cache.is_some() {
+                stats.configured();
+            }
+            stats
+        });
 
         Ok(Self {
             bcx,
@@ -131,6 +144,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             metadata_for_doc_units: HashMap::new(),
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),
             lock_manager: Arc::new(LockManager::new()),
+            artifact_cache_stats,
         })
     }
 
@@ -200,7 +214,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self)?;
+        let execute_result = queue.execute(&mut self);
+        if let Some(stats) = &self.artifact_cache_stats
+            && let Err(error) = stats.report(self.bcx.gctx)
+        {
+            debug!("failed to report artifact cache statistics: {error:#}");
+        }
+        execute_result?;
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self

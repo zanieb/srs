@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+mod artifact_cache_stats;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
@@ -74,6 +75,9 @@ use portable_atomic::{AtomicU64, Ordering};
 use regex::Regex;
 use tracing::{debug, instrument, trace};
 
+use self::artifact_cache_stats::{
+    IneligibleReason, MaterializationKind, MaterializationTotals, thread_cpu_time,
+};
 pub use self::build_config::UserIntent;
 pub use self::build_config::{
     ArtifactCacheMaterialization, BuildConfig, CompileMode, MessageFormat, PrimaryUnitRustc,
@@ -483,6 +487,9 @@ fn compile<'gctx>(
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
+                if let Some(stats) = &build_runner.artifact_cache_stats {
+                    stats.cargo_fresh();
+                }
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
                 let work = replay_output_cache(
@@ -555,6 +562,7 @@ fn rustc(
     exec: &Arc<dyn Executor>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
+    let artifact_cache_stats = build_runner.artifact_cache_stats.clone();
 
     let name = unit.pkg.name();
 
@@ -610,6 +618,15 @@ fn rustc(
     let show_cached_diagnostics = unit.show_warnings(build_runner.bcx.gctx);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
+    let is_primary_link_rustc = artifact_cache_stats.is_some()
+        && build_runner.is_primary_package(unit)
+        && (matches!(unit.mode, CompileMode::Test)
+            || (matches!(unit.mode, CompileMode::Build)
+                && (unit.target.is_executable()
+                    || unit.target.is_dylib()
+                    || unit.target.is_cdylib()
+                    || unit.target.is_staticlib()
+                    || unit.target.proc_macro())));
     let artifact = unit.artifact;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = build_sbom(build_runner, unit)?;
@@ -622,26 +639,38 @@ fn rustc(
     let configured_artifact_cache = build_runner.bcx.build_config.artifact_cache.clone();
     let artifact_cache_rejection = configured_artifact_cache.as_ref().and_then(|_| {
         if !unit.target.is_lib() {
-            Some("target is not a library")
+            Some((
+                IneligibleReason::TargetNotLibrary,
+                "target is not a library",
+            ))
         } else if unit.target.proc_macro() {
-            Some("target is a proc macro")
+            Some((IneligibleReason::ProcMacro, "target is a proc macro"))
         } else if !matches!(unit.mode, CompileMode::Build) {
-            Some("compile mode is not build")
+            Some((IneligibleReason::CompileMode, "compile mode is not build"))
         } else if unit.pkg.has_custom_build() {
-            Some("package has a custom build script")
+            Some((
+                IneligibleReason::CustomBuildScript,
+                "package has a custom build script",
+            ))
         } else if !sbom_files.is_empty() {
-            Some("SBOM output is enabled")
+            Some((IneligibleReason::Sbom, "SBOM output is enabled"))
         } else if !artifact_cache_host_is_supported() {
-            Some("host platform is unsupported")
+            Some((
+                IneligibleReason::UnsupportedHost,
+                "host platform is unsupported",
+            ))
         } else if !artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc) {
-            Some("compiler loader environment is not safely modeled")
+            Some((
+                IneligibleReason::UnmodeledLoaderEnvironment,
+                "compiler loader environment is not safely modeled",
+            ))
         } else {
             None
         }
     });
-    if let Some(reason) = artifact_cache_rejection {
+    if let Some((_, description)) = artifact_cache_rejection {
         debug!(
-            "artifact cache admission rejected for {}: {reason}",
+            "artifact cache admission rejected for {}: {description}",
             unit.target.crate_name()
         );
     }
@@ -752,6 +781,13 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
+        if let Some(stats) = &artifact_cache_stats {
+            if let Some((reason, _)) = artifact_cache_rejection {
+                stats.ineligible(reason);
+            } else if !loader_inputs_are_modeled {
+                stats.ineligible(IneligibleReason::UnmodeledLoaderInputs);
+            }
+        }
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
@@ -811,6 +847,9 @@ fn rustc(
             )
         });
         if !action_is_cacheable {
+            if let Some(stats) = &artifact_cache_stats {
+                stats.ineligible(IneligibleReason::UnmodeledRustcAction);
+            }
             debug!(
                 "artifact cache admission rejected for {cache_crate_name}: rustc action is not safely modeled"
             );
@@ -821,13 +860,34 @@ fn rustc(
                 input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != root
             });
         }
-        let artifact_cache_compiler_identity = artifact_cache
+        let identity_started = (artifact_cache.is_some() && artifact_cache_stats.is_some())
+            .then(|| (Instant::now(), thread_cpu_time()));
+        let (identity_snapshot, identity_computed) = artifact_cache
             .as_ref()
-            .and_then(|_| artifact_cache_identity_provider.as_ref()?.identity());
-        let artifact_cache_identity_witness = artifact_cache_compiler_identity
-            .as_ref()
-            .and_then(|_| artifact_cache_identity_provider.as_ref()?.witness());
+            .and_then(|_| artifact_cache_identity_provider.as_ref())
+            .map_or((None, false), |provider| provider.identity_snapshot());
+        if let Some((started, cpu_started)) = identity_started
+            && let Some(stats) = &artifact_cache_stats
+        {
+            let (files, bytes) = identity_snapshot
+                .as_ref()
+                .map_or((0, 0), |(_, _, files, bytes)| (*files, *bytes));
+            stats.compiler_identity(
+                identity_computed,
+                files,
+                bytes,
+                started.elapsed(),
+                thread_cpu_time().saturating_sub(cpu_started),
+            );
+        }
+        let (artifact_cache_compiler_identity, artifact_cache_identity_witness) = identity_snapshot
+            .map_or((None, None), |(identity, witness, _, _)| {
+                (Some(identity), Some(witness))
+            });
         if artifact_cache.is_some() && artifact_cache_compiler_identity.is_none() {
+            if let Some(stats) = &artifact_cache_stats {
+                stats.ineligible(IneligibleReason::CompilerIdentityUnavailable);
+            }
             debug!(
                 "artifact cache admission rejected for {cache_crate_name}: portable compiler identity is unavailable"
             );
@@ -846,15 +906,29 @@ fn rustc(
                 &artifact_cache_loader_input_paths,
                 artifact_cache_identity_witness.as_ref(),
                 &cwd,
+                artifact_cache_stats.as_deref(),
             ) {
                 Ok(entry) => Some(entry),
                 Err(error) => {
+                    if let Some(stats) = &artifact_cache_stats {
+                        stats.ineligible(IneligibleReason::KeyGenerationFailure);
+                    }
                     debug!("ignoring artifact cache key failure for {cache_crate_name}: {error:#}");
                     None
                 }
             },
             None => None,
         };
+        if cache_entry.is_some()
+            && let Some(stats) = &artifact_cache_stats
+        {
+            stats.eligible();
+        }
+        let restore_started = cache_entry
+            .is_some()
+            .then(|| artifact_cache_stats.as_ref().map(|_| Instant::now()))
+            .flatten();
+        let mut restore_failed = false;
         let cache_hit = match cache_entry
             .as_ref()
             .zip(artifact_cache)
@@ -879,9 +953,11 @@ fn rustc(
                     action_inputs_digest,
                     cache.materialization,
                     cache.max_size,
+                    artifact_cache_stats.as_deref(),
                 ) {
                     Ok(cache_hit) => cache_hit,
                     Err(error) => {
+                        restore_failed = true;
                         debug!(
                             "ignoring artifact cache restore failure for {cache_crate_name}: {error:#}"
                         );
@@ -891,6 +967,11 @@ fn rustc(
             }
             None => false,
         };
+        if let Some(started) = restore_started
+            && let Some(stats) = &artifact_cache_stats
+        {
+            stats.restore_finished(cache_hit, restore_failed, started.elapsed());
+        }
 
         if cache_hit {
             debug!("artifact cache hit for {cache_crate_name}");
@@ -959,6 +1040,7 @@ fn rustc(
                 serde_json::to_writer(outfile, &sbom)?;
             }
 
+            let rustc_started = artifact_cache_stats.as_ref().map(|_| Instant::now());
             let result = exec
                 .exec(
                     &rustc,
@@ -1003,6 +1085,12 @@ fn rustc(
                     let name = descriptive_pkg_name(&name, &target, &mode);
                     format!("could not compile {name}{errors}{warnings}")
                 });
+
+            if let Some(started) = rustc_started
+                && let Some(stats) = &artifact_cache_stats
+            {
+                stats.rustc_finished(started.elapsed(), result.is_err(), is_primary_link_rustc);
+            }
 
             if let Err(e) = result {
                 if let Some(diagnostic) = failed_scrape_diagnostic {
@@ -1076,7 +1164,11 @@ fn rustc(
                 cache_entry.as_ref().zip(artifact_cache)
             && let Some(identity_witness) = artifact_cache_identity_witness.as_ref()
         {
-            match store_rlib_cache(
+            if let Some(stats) = &artifact_cache_stats {
+                stats.publication_attempt();
+            }
+            let publication_started = artifact_cache_stats.as_ref().map(|_| Instant::now());
+            let store_result = store_rlib_cache(
                 entry,
                 outputs.as_slice(),
                 &rustc_dep_info_loc,
@@ -1092,7 +1184,17 @@ fn rustc(
                 action_inputs_digest,
                 &rustc,
                 cache.max_size,
-            ) {
+                artifact_cache_stats.as_deref(),
+            );
+            if let Some(started) = publication_started
+                && let Some(stats) = &artifact_cache_stats
+            {
+                stats.publication_finished(
+                    store_result.as_ref().map(|stored| *stored).map_err(|_| ()),
+                    started.elapsed(),
+                );
+            }
+            match store_result {
                 Ok(true) => debug!("stored artifact cache entry for {cache_crate_name}"),
                 Ok(false) => {}
                 Err(error) => {
@@ -1922,6 +2024,7 @@ fn rlib_cache_entry(
     loader_input_paths: &[CompilerLoaderInput],
     identity_witness: Option<&crate::util::rustc::ArtifactCacheIdentityWitness>,
     rustc_cwd: &Path,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
 ) -> CargoResult<(PathBuf, blake3::Hash, blake3::Hash)> {
     #[expect(
         clippy::disallowed_methods,
@@ -2047,7 +2150,7 @@ fn rlib_cache_entry(
     hasher.update(b"compiler-loader-inputs-content\0");
     hasher.update(loader_inputs_digest.as_bytes());
     hasher.update(b"\0");
-    let action_inputs_digest = artifact_cache_action_inputs_digest(rustc, rustc_cwd)?;
+    let action_inputs_digest = artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?;
     hasher.update(b"action-inputs-content\0");
     hasher.update(action_inputs_digest.as_bytes());
     hasher.update(b"\0");
@@ -2223,6 +2326,7 @@ mod artifact_cache_key_tests {
                 ],
                 None,
                 &rustc_cwd,
+                None,
             )
             .unwrap()
         };
@@ -2369,6 +2473,7 @@ mod artifact_cache_key_tests {
                 std::slice::from_ref(&loader_input),
                 Some(&identity_witness),
                 &rustc_cwd,
+                None,
             )
             .unwrap()
             .0
@@ -2416,58 +2521,68 @@ fn resolve_rustc_input_path(path: &Path, rustc_cwd: &Path) -> PathBuf {
 fn artifact_cache_action_inputs_digest(
     rustc: &ProcessBuilder,
     rustc_cwd: &Path,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
 ) -> CargoResult<blake3::Hash> {
-    let args = rustc.get_args().collect::<Vec<_>>();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cargo-artifact-cache-action-inputs-v1\0");
-    for pair in args.windows(2) {
-        if pair[0] != OsStr::new("--extern") {
-            continue;
+    let started = stats.map(|_| Instant::now());
+    let result = (|| {
+        let args = rustc.get_args().collect::<Vec<_>>();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"cargo-artifact-cache-action-inputs-v1\0");
+        for pair in args.windows(2) {
+            if pair[0] != OsStr::new("--extern") {
+                continue;
+            }
+            let value = pair[1].to_string_lossy();
+            let Some((_, path)) = value.split_once('=') else {
+                continue;
+            };
+            let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
+            if path.is_file() {
+                hasher.update(b"extern-content\0");
+                hasher.update(&fs::read(path)?);
+                hasher.update(b"\0");
+            }
         }
-        let value = pair[1].to_string_lossy();
-        let Some((_, path)) = value.split_once('=') else {
-            continue;
-        };
-        let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
-        if path.is_file() {
-            hasher.update(b"extern-content\0");
-            hasher.update(&fs::read(path)?);
-            hasher.update(b"\0");
+        for (key, value) in rustc.get_envs() {
+            if key != "OUT_DIR" && !key.ends_with("_OUT_DIR") {
+                continue;
+            }
+            let Some(value) = value else {
+                continue;
+            };
+            let path = resolve_rustc_input_path(Path::new(value), rustc_cwd);
+            if path.is_dir() {
+                hasher.update(b"generated-input-tree\0");
+                hasher.update(key.as_bytes());
+                hasher.update(b"\0");
+                hash_path_tree(&mut hasher, &path, &path, None, false)?;
+            }
         }
+        for pair in args.windows(2) {
+            if pair[0] != OsStr::new("-L") {
+                continue;
+            }
+            let value = pair[1].to_string_lossy();
+            if value.starts_with("dependency=") || value.starts_with("crate=") {
+                continue;
+            }
+            let path = value
+                .split_once('=')
+                .map_or(value.as_ref(), |(_, path)| path);
+            let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
+            if path.is_dir() {
+                hasher.update(b"link-search-input-tree\0");
+                hash_path_tree(&mut hasher, &path, &path, None, true)?;
+            }
+        }
+        Ok(hasher.finalize())
+    })();
+    if let Some(started) = started
+        && let Some(stats) = stats
+    {
+        stats.action_hash(started.elapsed(), result.is_err());
     }
-    for (key, value) in rustc.get_envs() {
-        if key != "OUT_DIR" && !key.ends_with("_OUT_DIR") {
-            continue;
-        }
-        let Some(value) = value else {
-            continue;
-        };
-        let path = resolve_rustc_input_path(Path::new(value), rustc_cwd);
-        if path.is_dir() {
-            hasher.update(b"generated-input-tree\0");
-            hasher.update(key.as_bytes());
-            hasher.update(b"\0");
-            hash_path_tree(&mut hasher, &path, &path, None, false)?;
-        }
-    }
-    for pair in args.windows(2) {
-        if pair[0] != OsStr::new("-L") {
-            continue;
-        }
-        let value = pair[1].to_string_lossy();
-        if value.starts_with("dependency=") || value.starts_with("crate=") {
-            continue;
-        }
-        let path = value
-            .split_once('=')
-            .map_or(value.as_ref(), |(_, path)| path);
-        let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
-        if path.is_dir() {
-            hasher.update(b"link-search-input-tree\0");
-            hash_path_tree(&mut hasher, &path, &path, None, true)?;
-        }
-    }
-    Ok(hasher.finalize())
+    result
 }
 
 fn artifact_cache_host_is_supported() -> bool {
@@ -3129,6 +3244,7 @@ fn restore_rlib_cache(
     action_inputs_digest: &blake3::Hash,
     materialization: ArtifactCacheMaterialization,
     max_size: Option<u64>,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
 ) -> CargoResult<bool> {
     if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
@@ -3153,7 +3269,7 @@ fn restore_rlib_cache(
         );
         return Ok(false);
     }
-    if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+    if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
         debug!("not restoring artifact cache entry with action inputs modified after lookup");
         return Ok(false);
     }
@@ -3213,20 +3329,40 @@ fn restore_rlib_cache(
                 continue;
             }
         }
-        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+        if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
             debug!("not restoring artifact cache entry with action inputs modified during lookup");
             return Ok(false);
         }
         let stored_files = entry.join("files");
+        let mut restored_files = 0;
+        let mut restored_bytes = 0;
+        let mut materialization_totals = MaterializationTotals::default();
         for output in outputs {
             let stored = stored_files.join(output.path.file_name().unwrap());
-            materialize_rlib_cache_file(&stored, &output.path, materialization)?;
+            let bytes = if stats.is_some() {
+                fs::metadata(&stored)?.len()
+            } else {
+                0
+            };
+            let started = stats.map(|_| Instant::now());
+            let materialization_result =
+                materialize_rlib_cache_file(&stored, &output.path, materialization);
+            if let Some(started) = started
+                && let Some(stats) = stats
+            {
+                stats.materialization_finished(started.elapsed());
+            }
+            let materialization_kind = materialization_result?;
+            materialization_totals.record(materialization_kind, bytes);
+            restored_files += 1;
+            restored_bytes += bytes;
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
         if !restore_materialized_identity_witness_is_current(identity_witness)
             || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
                 != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
+                != *action_inputs_digest
         {
             debug!("not restoring artifact cache entry with inputs modified during restore");
             for output in outputs {
@@ -3251,6 +3387,9 @@ fn restore_rlib_cache(
                 );
             paths::write(rustc_dep_info_loc, translated.as_bytes())?;
         }
+        if let Some(stats) = stats {
+            stats.restored(restored_files, restored_bytes, &materialization_totals);
+        }
         drop(lock);
         cleanup_corrupt_rlib_cache_entries(cache_root, &corrupt_entries, outputs, max_size);
         return Ok(true);
@@ -3264,7 +3403,7 @@ fn materialize_rlib_cache_file(
     stored: &Path,
     output: &Path,
     materialization: ArtifactCacheMaterialization,
-) -> CargoResult<()> {
+) -> CargoResult<MaterializationKind> {
     match materialization {
         ArtifactCacheMaterialization::Hardlink => {
             #[cfg(unix)]
@@ -3291,6 +3430,7 @@ fn materialize_rlib_cache_file(
                             stored.display(),
                             output.display()
                         );
+                        return Ok(MaterializationKind::Hardlink);
                     }
                     Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
                         paths::copy(stored, output)?;
@@ -3299,6 +3439,7 @@ fn materialize_rlib_cache_file(
                             stored.display(),
                             output.display()
                         );
+                        return Ok(MaterializationKind::CrossDeviceCopy);
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -3311,6 +3452,7 @@ fn materialize_rlib_cache_file(
                     stored.display(),
                     output.display()
                 );
+                return Ok(MaterializationKind::Copy);
             }
         }
         ArtifactCacheMaterialization::Copy => {
@@ -3323,9 +3465,9 @@ fn materialize_rlib_cache_file(
                 stored.display(),
                 output.display()
             );
+            return Ok(MaterializationKind::Copy);
         }
     }
-    Ok(())
 }
 
 fn prepare_materialized_rlib_output_for_write(output: &Path) -> CargoResult<()> {
@@ -3366,6 +3508,7 @@ fn store_rlib_cache(
     action_inputs_digest: &blake3::Hash,
     rustc: &ProcessBuilder,
     max_size: Option<u64>,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
 ) -> CargoResult<bool> {
     if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
         debug!("not storing artifact cache entry with generated build-directory inputs");
@@ -3386,7 +3529,7 @@ fn store_rlib_cache(
         );
         return Ok(false);
     }
-    if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+    if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
         debug!("not storing artifact cache entry with action inputs modified during compilation");
         return Ok(false);
     }
@@ -3427,6 +3570,7 @@ fn store_rlib_cache(
             ));
         }
         let mut manifest = String::new();
+        let mut entry_files = 0;
         for output in outputs {
             if output.path.exists() {
                 let name = output.path.file_name().ok_or_else(|| {
@@ -3438,12 +3582,14 @@ fn store_rlib_cache(
                 let stored = files.join(name);
                 paths::copy(&output.path, &stored)?;
                 append_rlib_cache_manifest(&mut manifest, &staging, &stored)?;
+                entry_files += 1;
             }
         }
         if rustc_dep_info_loc.exists() {
             let stored = staging.join("rustc-dep-info");
             paths::copy(rustc_dep_info_loc, &stored)?;
             append_rlib_cache_manifest(&mut manifest, &staging, &stored)?;
+            entry_files += 1;
         }
         let stored_messages = staging.join("compiler-messages");
         if message_cache_path.exists() {
@@ -3452,16 +3598,19 @@ fn store_rlib_cache(
             paths::write(&stored_messages, b"")?;
         }
         append_rlib_cache_manifest(&mut manifest, &staging, &stored_messages)?;
+        entry_files += 1;
         paths::write(
             staging.join("inputs.blake3"),
             format!("{inputs_digest}\n").as_bytes(),
         )?;
         append_rlib_cache_manifest(&mut manifest, &staging, &staging.join("inputs.blake3"))?;
+        entry_files += 1;
         paths::write(
             staging.join("origin-pkg-root"),
             pkg_root.to_string_lossy().as_bytes(),
         )?;
         append_rlib_cache_manifest(&mut manifest, &staging, &staging.join("origin-pkg-root"))?;
+        entry_files += 1;
         paths::write(
             staging.join("origin-target-profile-root"),
             output_root
@@ -3475,13 +3624,16 @@ fn store_rlib_cache(
             &staging,
             &staging.join("origin-target-profile-root"),
         )?;
+        entry_files += 1;
         let manifest_path = staging.join("manifest.blake3");
         paths::write(&manifest_path, manifest.as_bytes())?;
+        entry_files += 1;
         let manifest_digest = rlib_cache_digest(&manifest_path)?;
         paths::write(
             staging.join("complete"),
             format!("{manifest_digest}\n").as_bytes(),
         )?;
+        entry_files += 1;
         let entry_size = artifact_cache_entry_size(&staging)?;
         if let Some(max_size) = max_size
             && entry_size > max_size
@@ -3497,7 +3649,8 @@ fn store_rlib_cache(
         if !identity_witness.is_current()
             || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
                 != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
+                != *action_inputs_digest
             || rlib_cache_inputs_digest_matching_rustc_dep_info(
                 rustc_dep_info_loc,
                 rustc_cwd,
@@ -3523,7 +3676,8 @@ fn store_rlib_cache(
         if !identity_witness.is_current()
             || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
                 != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
+                != *action_inputs_digest
             || rlib_cache_inputs_digest_matching_rustc_dep_info(
                 rustc_dep_info_loc,
                 rustc_cwd,
@@ -3564,6 +3718,9 @@ fn store_rlib_cache(
             reconcile_rlib_cache_size(cache_root, max_size, Some(&entry))?;
         } else {
             write_rlib_cache_size(cache_root, cache_size)?;
+        }
+        if let Some(stats) = stats {
+            stats.published(entry_files, entry_size);
         }
         Ok(true)
     })();

@@ -51,6 +51,37 @@ uncached generated or proc-macro inputs whose bytes still vary by target path.
 The patched debug Cargo took 8.71s cold and 7.09s warm, so those wall times
 should not be compared directly with the installed release-Cargo rows above.
 
+The opt-in counters were then measured with an optimized build of the patched
+Cargo. Every row used an empty target except the explicitly Cargo-fresh row;
+Clippy's cold row reused the central build cache but had no matching
+all-features variants.
+
+| Command and state | Wall | Eligible | Hits | Hit rate | Ineligible | rustc executions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Build, cache disabled | 4.37s | 0 | 0 | n/a | 0 | 26 |
+| Build, cold cache | 5.44s | 9 | 0 | 0% | 17 | 26 |
+| Build, warm cache | 3.85s | 9 | 7 | 77.8% | 17 | 19 |
+| Build, same warm target | 0.13s | 0 | 0 | n/a | 0 | 0 |
+| Clippy all-targets/all-features, cold variants | 6.39s | 4 | 0 | 0% | 66 | 70 |
+| Clippy all-targets/all-features, warm variants | 4.51s | 4 | 4 | 100% | 66 | 66 |
+| Test/no-run, warm build cache | 2.55s | 8 | 7 | 87.5% | 18 | 19 |
+
+The warm build restored 31.7 MB of outputs. Its seven hit lookups took 83ms of
+cumulative worker time, of which hardlink materialization took 3ms. Action
+input hashing took 27ms, and the one compiler identity computation hashed 56
+files / 332.1 MB in 196ms wall and 180ms thread CPU. The two misses published
+0.76 MB in 46ms. This is materially cheaper than the seven avoided rustc
+actions; the remaining 3.85s is dominated by 17 ineligible actions and the two
+target-path-contaminated misses.
+
+Warm Clippy restored all four eligible variants, but 66 of 70 rustc actions
+remained ineligible: 44 Check-mode actions, 11 proc macros, nine non-library
+targets, and two packages with build scripts. The four hit lookups took 937ms
+cumulative while physical materialization took 2ms. Warm test/no-run restored
+seven of eight eligible units in 90ms cumulative and spent 171ms in its one
+link-producing primary rustc action. These counters establish internal hit
+rates without claiming that Cargo currently measures linker-only time.
+
 ### Full uv root build
 
 The representative command was:
@@ -189,6 +220,82 @@ authority.
 
 ## Recommended Layering
 
+### Selected composition and safety protocol
+
+The best current design is not a larger monolithic archive. It is a stack in
+which each layer owns a different portability boundary:
+
+| Layer | Authority | Intended contents | Fallback |
+| --- | --- | --- | --- |
+| Portable artifact cache | Content-verified rustc action | Ordinary library outputs, dep-info, messages | Execute rustc |
+| Portable freshness capsule | Current Cargo process | Restored outputs plus a newly calculated current fingerprint | Normal dirty scheduling |
+| Thin workload snapshot | Workload/path domain | Build scripts, proc macros, final binaries, `OUT_DIR`, messages and target-local state not covered above | Full workload build |
+| Full target snapshot | Exact target-path domain | Complete profile directory; control and emergency fast path | Full workload build |
+| SLD state | Exact linked action and root output | Private linker state paired with the root binary | Full relink |
+| Release compiler identity | Verified SRS installer | Preverified relative content digest plus extraction witness | Hash the installed toolchain |
+
+Portable freshness must run as a graph-wide preflight before the first normal
+fingerprint calculation. Restoring a unit after Cargo has recursively memoized
+dependent fingerprints is too late. The implementation therefore needs to
+factor a side-effect-free cache action description out of `rustc()`, walk the
+unit graph in dependency order, and admit a unit only when every fingerprint
+dependency is already Cargo-fresh or has been successfully restored in the
+same preflight closure.
+
+For each admitted unit the preflight must:
+
+1. Verify the current compiler, action, source, generated input, cache-control,
+   and stored-output digests.
+2. Stage the outputs, translated rustc dep-info, compiler messages, and
+   completion stamp under the target lock.
+3. Give the closure a dependency-safe current preflight timestamp rather than
+   trusting producer mtimes.
+4. Calculate the fingerprint from the current `Unit`, dependency
+   fingerprints, flags, environment, and verified filesystem state.
+5. Commit the current fingerprint last as the freshness marker.
+
+The portable record is a versioned restoration capsule: it references the
+verified artifact action, output manifest and digests, rustc dep-info and its
+origin roots, compiler messages, and completion-stamp kind. A producer's Cargo
+fingerprint is never cache authority and is not copied into place. A crash,
+lock timeout, malformed record, partial closure, or mutation before the final
+fingerprint commit can only leave the unit dirty. Restored hardlinks remain
+immutable and are detached before any compiler, linker, or external tool can
+mutate them.
+
+This protocol should first cover only the existing pure Build-library
+eligibility. Metadata-only Check actions are the next distinct artifact class.
+Clippy requires a separate composite action identity covering wrapper order and
+arguments, `clippy-driver`, rustc/sysroot, dynamic loader inputs, lint levels,
+relevant environment, and `.clippy.toml`/configuration inputs, with diagnostic
+replay. Packages with build scripts remain outside the portable closure until
+a capsule can bind the build-script executable, observed environment, parsed
+stdout directives, watched inputs, native search inputs, and the complete
+portable `OUT_DIR` tree.
+
+A thin snapshot should then be compared with the full profile snapshot. It
+should omit `.rlib`/`.rmeta` bytes supplied by the portable layers and contain
+only nonportable outputs and their target-local state: build-script output and
+`OUT_DIR`, proc macros and build-script executables, final test/root binaries,
+their dep-info/messages/fingerprints, and optional SLD state. Snapshot keys
+must isolate OS, architecture, SRS release and schema, backend, linker, command
+shape, profile, Cargo configuration, source revision, runner/path domain, and
+SLD schema. Only one trusted writer publishes each domain.
+
+SLD remains orthogonal to fresh-target acceleration. Its capsule must
+atomically bind the private root executable and linker state to the linker
+identity, full arguments, ordered object/archive/dylib/rlib provenance, and SLD
+environment. Any mismatch forces a full relink. Measure it on an incremental
+source edit after restoring the target layer; do not credit it for a fresh
+target unless the root binary and Cargo freshness state were restored too.
+
+A precomputed compiler digest is safe only when an SRS release manifest binds
+relative paths and contents under the already verified archive checksum or a
+signature, and installation creates an extraction-specific metadata/directory
+witness. Cargo must validate that witness and fall back to content hashing on
+any mismatch. At roughly 0.2s in optimized Cargo this is a later optimization,
+not the primary performance fix.
+
 ### Immediate workload layer
 
 Use selective target snapshots for workloads whose expensive outputs are not
@@ -240,21 +347,30 @@ hermetic output contract.
 
 ### Instrumentation contract
 
-An opt-in summary should report at least:
+`SRS_CARGO_ARTIFACT_CACHE_STATS=1` now emits one versioned JSON line after the
+build queue. It remains disabled by default and reports:
 
 - Cargo-fresh units;
 - eligible dirty units, hits, misses, and key failures;
 - ineligible units by reason;
-- publication success, rejection, failure, and lock contention;
+- publication success, rejection, and failure;
 - restored and published files/logical bytes;
-- hardlink, copy, and cross-device fallback counts;
+- accepted hardlink, configured-copy, and cross-device fallback counts;
 - compiler identity files/bytes, one-time wall/CPU time, and reuse count;
-- action-input hash calls/files/bytes/time;
-- cache verification, materialization, and publication cumulative worker time;
-- rustc executions and final link executions.
+- action-input hash calls, failures, and time;
+- total hit and miss lookup time, materialization time, and publication time;
+- rustc executions; and
+- link-producing primary-package rustc executions and full action time.
 
 Phase totals are cumulative worker time and may exceed wall time when jobs run
-in parallel. The summary must remain off by default.
+in parallel. Cargo-fresh scheduling counters and dirty artifact-admission
+counters deliberately remain separate populations. Materialization file
+counters include only accepted restores, while materialization time also
+captures work discarded by a later validation failure. Cache-lock wait time
+and action-input files/bytes remain useful future schema additions if the v1
+measurements show that those aggregates cannot explain replay cost.
+`primary_link_rustc` includes frontend and code generation, so linker-only time
+still requires rustc or SLD timing data.
 
 ## Integration Gate
 
@@ -270,3 +386,37 @@ prove locally that:
 After those gates, uv PR 19754 can combine the repaired artifact layer with
 job-specific target snapshots and compare equivalent runner classes. The
 aggregate CI acceptance target still requires that final integration rerun.
+
+### uv PR 19754 integration path
+
+The pinned PR revision currently installs SRS `2026.06.09`, combines registry,
+git, and artifact-cache data in one `actions/cache` object, and restores target
+state only for selected macOS no-debug and test paths. Linux nextest, Linux
+Clippy, generated-file tools, and the profiling benchmark do not receive
+workload target snapshots. The integration should change only after the local
+layer gates above pass:
+
+1. Update `setup-srs/install.sh` to the immutable SRS release containing the
+   loader, publication/restore-lock, statistics, and subcommand-propagation
+   fixes, with new archive checksums.
+2. Give `setup-srs` explicit `cache-domain`, `command-schema`, `target-path`,
+   backend, linker, runner/path-domain, and writer inputs. Include those values
+   plus the SRS/cache schema in keys; do not use the broad target restore prefix
+   across incompatible command or toolchain domains.
+3. Separate the portable artifact archive from registry/git download caches so
+   its hit, byte, and writer semantics are observable. Keep one trusted writer
+   for each cache domain rather than letting parallel jobs race publication.
+4. Set `SRS_CARGO_ARTIFACT_CACHE_STATS=1` for the measured jobs and retain the
+   single JSON line as a small job artifact. Report internal admission/hit
+   rates alongside target-cache hit state and command wall time.
+5. Add isolated target domains for the Linux/macOS no-debug root builds,
+   Linux/macOS nextest profiles, Linux Clippy, generated-file tools, and
+   profiling benchmarks. Restore to the same absolute workspace-relative path
+   and preserve the current commands and validation. Compare full target and
+   thin nonportable-state snapshots before choosing the smaller transfer.
+6. Force LLVM target codegen for CodSpeed simulation while keeping linker and
+   profile selection constant inside each comparison. Attach SLD state only to
+   the matching root-output snapshot and evaluate it on incremental edits.
+7. Rerun equivalent runner classes and aggregate active runner time only after
+   the local build, Clippy, test, snapshot, and correctness gates pass. That is
+   the acceptance experiment, not the next diagnostic loop.

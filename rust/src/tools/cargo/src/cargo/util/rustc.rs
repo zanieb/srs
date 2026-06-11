@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashSet, hash_map::HashMap};
 use std::env;
 use std::hash::{Hash, Hasher};
@@ -23,6 +24,8 @@ const ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER: &[u8] =
 struct ArtifactCacheIdentity {
     digest: blake3::Hash,
     witness: ArtifactCacheIdentityWitness,
+    files: u64,
+    bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -36,21 +39,30 @@ impl ArtifactCacheIdentityProvider {
         self.program.as_deref()
     }
 
-    pub(crate) fn identity(&self) -> Option<blake3::Hash> {
-        self.snapshot().map(|identity| identity.digest)
-    }
-
-    pub(crate) fn witness(&self) -> Option<ArtifactCacheIdentityWitness> {
-        self.snapshot().map(|identity| identity.witness.clone())
-    }
-
-    fn snapshot(&self) -> Option<&ArtifactCacheIdentity> {
-        self.identity
+    pub(crate) fn identity_snapshot(
+        &self,
+    ) -> (
+        Option<(blake3::Hash, ArtifactCacheIdentityWitness, u64, u64)>,
+        bool,
+    ) {
+        let initialized = Cell::new(false);
+        let identity = self
+            .identity
             .get_or_init(|| {
+                initialized.set(true);
                 let path = self.program.as_ref()?;
                 artifact_cache_identity_for_program(path)
             })
             .as_ref()
+            .map(|identity| {
+                (
+                    identity.digest,
+                    identity.witness.clone(),
+                    identity.files,
+                    identity.bytes,
+                )
+            });
+        (identity, initialized.get())
     }
 }
 
@@ -661,9 +673,13 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
     if !witness.is_current() {
         return None;
     }
+    let files = witness.files.len() as u64;
+    let bytes = witness.files.iter().map(|file| file.len).sum();
     Some(ArtifactCacheIdentity {
         digest: hasher.finalize(),
         witness,
+        files,
+        bytes,
     })
 }
 

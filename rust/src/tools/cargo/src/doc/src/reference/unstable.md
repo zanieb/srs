@@ -623,6 +623,24 @@ with a short exclusive cache lock. Cargo waits up to five seconds for cache-lock
 contention before falling back to ordinary compilation without restoring or
 publishing the affected artifact.
 
+SRS builds of Cargo can emit one concise, machine-readable cache summary by
+setting `SRS_CARGO_ARTIFACT_CACHE_STATS=1`. The opt-in record is written to
+stderr after the build queue and begins with
+`srs-artifact-cache-stats=` followed by versioned JSON. It reports admission
+reasons, hits and misses, restored and published files and logical bytes,
+hardlinks, configured copies and cross-device copies, compiler identity and
+action-input hashing, materialization, publication, rustc execution, and
+link-producing primary-package rustc actions. The latter includes frontend and
+code generation and is not linker-only time. The feature is disabled by
+default.
+
+Elapsed values are cumulative worker microseconds and can exceed command wall
+time under parallel execution. Cargo-fresh units are scheduling decisions;
+eligible and ineligible units are dirty rustc actions that reached cache
+admission, so the three counters are not a partition. Materialization file
+counters describe accepted restores, while materialization time can include a
+restore later rejected by final validation.
+
 ## update-breaking
 
 * Tracking Issue: [#12425](https://github.com/rust-lang/cargo/issues/12425)

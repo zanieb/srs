@@ -8,8 +8,10 @@ use std::process::Stdio;
 use crate::prelude::*;
 use crate::utils::tools;
 use cargo_test_support::{
-    Project, basic_manifest, paths, prelude::*, project_in, rustc_host, sleep_ms,
+    Project, RawOutput, basic_manifest, paths, prelude::*, project_in, rustc_host, sleep_ms,
 };
+
+const ARTIFACT_CACHE_STATS_PREFIX: &str = "srs-artifact-cache-stats=";
 
 fn project_with_cache(name: &str, cache: &Path, materialization: &str, value: u32) -> Project {
     let cache = cache.to_string_lossy().replace('\\', "\\\\");
@@ -210,6 +212,169 @@ fn build_in_target_with_env(project: &Project, target_dir: &Path, key: &str, val
         .env("CARGO_INCREMENTAL", "1")
         .env(key, value)
         .run();
+}
+
+fn build_in_target_with_stats(project: &Project, target_dir: &Path) -> RawOutput {
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(target_dir)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .run()
+}
+
+fn artifact_cache_stats(output: &RawOutput) -> serde_json::Value {
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    let reports = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(ARTIFACT_CACHE_STATS_PREFIX))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reports.len(),
+        1,
+        "expected exactly one artifact cache statistics report:\n{stderr}"
+    );
+    serde_json::from_str(reports[0]).unwrap()
+}
+
+fn artifact_cache_stat(stats: &serde_json::Value, path: &[&str]) -> u64 {
+    let mut value = stats;
+    for key in path {
+        value = &value[*key];
+    }
+    value
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected integer statistic at {}", path.join(".")))
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn artifact_cache_stats_are_disabled_by_default() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("target-dir");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env_remove("SRS_CARGO_ARTIFACT_CACHE_STATS")
+        .with_stderr_does_not_contain(ARTIFACT_CACHE_STATS_PREFIX)
+        .run();
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "project"
+            version = "0.0.1"
+            edition = "2024"
+
+            [dependencies]
+            dependency = { path = "dependency" }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn value() -> u32 { dependency::value() }\n",
+        )
+        .file(
+            "dependency/Cargo.toml",
+            r#"
+            [package]
+            name = "dependency"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file("dependency/src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .build();
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    let cold = artifact_cache_stats(&build_in_target_with_stats(&project, &producer_target));
+    assert_eq!(cold["version"].as_u64(), Some(1));
+    assert_eq!(cold["configured"].as_bool(), Some(true));
+    assert_eq!(artifact_cache_stat(&cold, &["units", "eligible"]), 2);
+    assert_eq!(artifact_cache_stat(&cold, &["units", "ineligible"]), 0);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 2);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "attempts"]), 2);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 2);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "skipped"]), 0);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "failures"]), 0);
+    assert_eq!(artifact_cache_stat(&cold, &["rustc", "executions"]), 2);
+    assert_eq!(
+        artifact_cache_stat(&cold, &["hashing", "compiler_identity", "computations"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&cold, &["hashing", "compiler_identity", "reuses"]),
+        1
+    );
+    assert!(artifact_cache_stat(&cold, &["hashing", "compiler_identity", "files"]) > 0);
+    assert!(artifact_cache_stat(&cold, &["hashing", "compiler_identity", "bytes"]) > 0);
+    assert!(artifact_cache_stat(&cold, &["publication", "files"]) > 0);
+    assert!(artifact_cache_stat(&cold, &["publication", "logical_bytes"]) > 0);
+
+    let warm = artifact_cache_stats(&build_in_target_with_stats(&project, &consumer_target));
+    let eligible = artifact_cache_stat(&warm, &["units", "eligible"]);
+    let hits = artifact_cache_stat(&warm, &["lookup", "hits"]);
+    let misses = artifact_cache_stat(&warm, &["lookup", "misses"]);
+    assert_eq!(eligible, 2);
+    assert_eq!(eligible, hits + misses);
+    assert_eq!(hits, 2);
+    assert_eq!(misses, 0);
+    assert_eq!(artifact_cache_stat(&warm, &["publication", "attempts"]), 0);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
+    let restored = artifact_cache_stat(&warm, &["restore", "files"]);
+    assert!(restored > 0);
+    assert!(artifact_cache_stat(&warm, &["restore", "logical_bytes"]) > 0);
+    if cfg!(unix) {
+        assert_eq!(
+            artifact_cache_stat(&warm, &["materialization", "hardlinked_files"]),
+            restored
+        );
+        assert_eq!(
+            artifact_cache_stat(&warm, &["materialization", "copied_files"]),
+            0
+        );
+    }
+
+    let fresh = artifact_cache_stats(&build_in_target_with_stats(&project, &consumer_target));
+    assert_eq!(fresh["configured"].as_bool(), Some(true));
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "eligible"]), 0);
+    assert_eq!(artifact_cache_stat(&fresh, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&fresh, &["lookup", "misses"]), 0);
+    assert_eq!(artifact_cache_stat(&fresh, &["rustc", "executions"]), 0);
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -871,7 +1036,22 @@ fn copy_restore_does_not_share_inodes() {
     let consumer_target = project.root().join("consumer-target");
 
     build_in_target(&project, &producer_target);
-    build_in_target(&project, &consumer_target);
+    let output = build_in_target_with_stats(&project, &consumer_target);
+    let stats = artifact_cache_stats(&output);
+    let restored_files = artifact_cache_stat(&stats, &["restore", "files"]);
+    assert!(restored_files > 0);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "copied_files"]),
+        restored_files
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "hardlinked_files"]),
+        0
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "cross_device_copied_files"]),
+        0
+    );
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
@@ -903,7 +1083,7 @@ fn cross_device_hardlink_failure_falls_back_to_copy() {
     let consumer_target = project.root().join("consumer-target");
 
     build_in_target(&project, &producer_target);
-    project
+    let output = project
         .cargo("-Zartifact-cache build --lib")
         .arg("--target-dir")
         .arg(&consumer_target)
@@ -917,7 +1097,24 @@ fn cross_device_hardlink_failure_falls_back_to_copy() {
             "__CARGO_TEST_ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE",
             "1",
         )
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
         .run();
+
+    let stats = artifact_cache_stats(&output);
+    let restored_files = artifact_cache_stat(&stats, &["restore", "files"]);
+    assert!(restored_files > 0);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "cross_device_copied_files"]),
+        restored_files
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "hardlinked_files"]),
+        0
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["materialization", "copied_files"]),
+        0
+    );
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
@@ -2875,12 +3072,12 @@ fn oversized_entry_is_not_published() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
-fn cache_key_failure_does_not_fail_build() {
+fn cache_key_failure_is_reported_and_does_not_fail_build() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);
     let target = project.root().join("target-dir");
 
-    project
+    let output = project
         .cargo("-Zartifact-cache build --lib")
         .arg("--target-dir")
         .arg(&target)
@@ -2890,7 +3087,24 @@ fn cache_key_failure_does_not_fail_build() {
             isolated_loader_path(),
         )
         .env("__CARGO_TEST_ARTIFACT_CACHE_KEY_FAILURE", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
         .run();
+
+    let stats = artifact_cache_stats(&output);
+    assert_eq!(stats["configured"].as_bool(), Some(true));
+    assert_eq!(artifact_cache_stat(&stats, &["units", "eligible"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["units", "ineligible"]), 1);
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["units", "ineligible_by_reason", "key_generation_failure"]
+        ),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "misses"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "attempts"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 1);
 
     assert!(cached_rlibs(&cache).is_empty());
     assert!(cached_rlib(&target.join("debug").join("deps")).exists());

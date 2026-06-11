@@ -145,6 +145,26 @@ The lower-level `CARGO_BUILD_ARTIFACT_CACHE_DIR`,
 `CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE` settings take precedence over their
 `SRS_` aliases.
 
+Set `SRS_CARGO_ARTIFACT_CACHE_STATS=1` to emit one versioned JSON record to
+stderr after Cargo's build queue finishes. The record begins with
+`srs-artifact-cache-stats=` and reports Cargo-fresh units, cache admission by
+reason, hits and misses, restored and published bytes, materialization mode,
+compiler-identity and action-input hashing, publication, rustc execution, and
+link-producing primary-package rustc actions. No record is produced and no
+phase clocks or extra file-size reads are performed by default.
+
+The timing fields are cumulative worker time in microseconds. They can exceed
+command wall time when jobs overlap. `units.cargo_fresh` describes Cargo's
+scheduling decision, while `units.eligible` and `units.ineligible` describe
+dirty rustc actions that reached artifact-cache admission; those fields are
+not one partition. For completed cache lookups, `units.eligible` equals
+`lookup.hits + lookup.misses`. Materialization file counters include only
+accepted restores, while `materialization.elapsed_us` also includes work from
+a restore that was later rejected or failed. `primary_link_rustc` counts the
+complete rustc action, including frontend and code generation, for link-
+producing Test actions and Build actions for primary package executables and
+dynamic, static, or proc-macro libraries. It is not linker-only time.
+
 Choose a cache root writable only by trusted build processes. Entry hashes
 reject accidental corruption but do not authenticate artifacts supplied by
 another writer with access to that directory.
