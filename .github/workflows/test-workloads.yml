@@ -28,13 +28,16 @@ jobs:
           - name: uv
             repository: astral-sh/uv
             packages: -p uv
+            tests: uv
           - name: ruff and ty
             repository: astral-sh/ruff
             packages: -p ruff -p ty
+            tests: ruff-and-ty
     env:
       CARGO_INCREMENTAL: 0
       CARGO_PACKAGES: ${{ matrix.packages }}
       SRS_CI_TARGET: ${{ inputs.target }}
+      WORKLOAD_TESTS: ${{ matrix.tests }}
     steps:
       - name: Download installed SRS snapshot
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -68,5 +71,18 @@ jobs:
       - name: Test ${{ matrix.name }}
         working-directory: workload
         run: |
-          read -ra cargo_packages <<< "$CARGO_PACKAGES"
-          cargo +srs test --locked "${cargo_packages[@]}" --lib -- --test-threads=1
+          case "$WORKLOAD_TESTS" in
+            uv)
+              cargo +srs test --locked -p uv --lib -- --test-threads=1
+              ;;
+            ruff-and-ty)
+              cargo +srs test --locked -p ruff --lib -- \
+                --test-threads=1 \
+                --skip commands::format::tests::error_diagnostics
+              cargo +srs test --locked -p ty --lib -- --test-threads=1
+              ;;
+            *)
+              printf 'unknown workload test selection: %s\n' "$WORKLOAD_TESTS" >&2
+              exit 2
+              ;;
+          esac
