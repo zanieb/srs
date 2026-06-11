@@ -42,6 +42,15 @@ took 2.17s, compared with 3.73s for per-unit artifact replay. The fingerprint
 directories themselves were only 20 KB and Cargo dep-info was 182 KB, which is
 why a smaller portable freshness layer remains attractive.
 
+After moving publication staging outside the global cache lock and making
+short cache-lock contention wait with in-process coordination, the same graph
+published all 9 eligible units instead of publishing 7 and losing 2 to lock
+contention. A fresh target then hit 7 of those 9 units instead of 5. The two
+remaining misses were `uv-small-str` and `uv-normalize`; both are downstream of
+uncached generated or proc-macro inputs whose bytes still vary by target path.
+The patched debug Cargo took 8.71s cold and 7.09s warm, so those wall times
+should not be compared directly with the installed release-Cargo rows above.
+
 ### Full uv root build
 
 The representative command was:
@@ -70,6 +79,34 @@ transfer. Restoring the same snapshot at a different absolute target path took
 `rerun-if-changed` directive, and that path change propagated through its
 dependents. Workload snapshots therefore need a stable target path or explicit
 build-script path relocation.
+
+### Publication and restore locking fix
+
+A clean paired rerun with the patched debug Cargo used the same uv revision,
+LLVM settings, command, and empty target directories:
+
+| State | Wall time | Artifact hits | Stored entries | rustc execution spans |
+| --- | ---: | ---: | ---: | ---: |
+| Empty target, cold repaired cache | 85.71s | 0 | 370 | 478 |
+| Empty target, warm repaired cache | 83.81s | 286 | 93 new variants | 192 |
+
+The cold writer had no publication lock timeout and no input-race rejection.
+This is the direct comparison with the original cold writer's 103 stores, 175
+lock-contention skips, and 95 loader-input race rejections. The warm reader also
+had no cache-lock timeout. Before restore locking was repaired, an intermediate
+run published 369 entries but abandoned 220 restores when those publications
+briefly held the global write lock; it produced only 75 hits. Bounded shared
+lock waits raised that to 286 hits.
+
+The approximate eligible-unit hit rate in the final warm run was
+286 / (286 + 93), or 75.5%, pending the structured counters needed to classify
+every miss exactly. Avoiding 286 rustc executions reduced user CPU time from
+423.88s to 368.55s and system CPU time from 92.91s to 83.93s, but reduced wall
+time by only 1.90s. This separates cache availability from cache usefulness:
+the repaired artifact layer now reuses most portable eligible actions, while
+per-unit input hashing, verification, replay, and the uncached build-script,
+proc-macro, and final-link critical path consume nearly all of the saved
+parallel rustc work.
 
 ### Compiler identity
 
@@ -101,18 +138,22 @@ path from that action's actual loader environment is both narrower and cheaper
 than hashing unrelated proc macros. The focused fix in this worktree does that
 only after runtime admission has accepted the action.
 
-### Publication is opportunistic under one global lock
+### Publication and restore used opportunistic global locking
 
-Publication performs a nonblocking global cache-lock attempt. Parallel rustc
-completion therefore discards many useful cold-run publications. A designated
-single CI writer cannot warm a useful cache if most completed entries are
-skipped inside that process.
+The original publication path performed a nonblocking global cache-lock attempt
+before copying and hashing outputs. Parallel rustc completion discarded many
+useful cold-run publications. Once staging moved outside that lock, publication
+succeeded, but nonblocking restore attempts then lost 220 available hits to the
+short commit sections.
 
-Publication should stage and hash per-entry data without the global lock, use a
-per-entry commit lock, and reserve the global lock for short size-accounting
-and eviction updates. A bounded publication queue or short publication-only
-wait is preferable to making compilation wait behind the current large
-critical section.
+The repaired path uses bounded striped action leases, stages and hashes outputs
+outside the global lock, serializes commit sections within one Cargo process,
+and reserves the global lock for final validation, atomic rename, size
+accounting, cleanup, and eviction. Restores use coordinated shared locks and
+bounded waits rather than falling back to rustc during those short commits.
+Active staging directories no longer dirty completed-entry size state, and the
+bounded stripe files live at the cache root so empty action directories remain
+prunable.
 
 ### Uncached units poison downstream content keys
 
@@ -174,8 +215,8 @@ have also been restored.
 Implement in measured order:
 
 1. Keep compiler loader inputs stable for admitted ordinary libraries.
-2. Make cold publication complete under parallel builds without serializing
-   rustc execution.
+2. Keep the repaired cold publication and restore-lock behavior covered by
+   concurrency, killed-publisher, size-accounting, and mutation regressions.
 3. Add opt-in structured counters and cumulative phase timing so hit rates,
    skipped publications, hashed bytes, and replay cost are visible without
    parsing debug logs.

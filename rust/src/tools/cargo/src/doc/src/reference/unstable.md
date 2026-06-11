@@ -616,10 +616,12 @@ or a guarantee that eviction immediately reclaims storage while target
 directory hardlinks remain. `cargo clean` removes target-directory links but
 leaves the shared cache intact. To reclaim shared-cache storage manually, remove
 the cache directory only while no Cargo process is using it. Cargo allows
-concurrent restorations under shared cache locks and protects publication, size
-accounting, cleanup of aborted publications, and eviction with an exclusive
-cache lock. Conflicting cache locks fall back to an opportunistic ordinary
-compilation rather than delaying the build.
+concurrent restorations under shared cache locks. Publishers stage and hash
+outputs under bounded striped action locks, then protect final validation,
+atomic commit, size accounting, cleanup of aborted publications, and eviction
+with a short exclusive cache lock. Cargo waits up to five seconds for cache-lock
+contention before falling back to ordinary compilation without restoring or
+publishing the affected artifact.
 
 ## update-breaking
 

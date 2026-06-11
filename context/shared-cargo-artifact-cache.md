@@ -108,11 +108,14 @@ eviction immediately reclaims storage while target-directory hardlinks remain.
 intact. To reclaim central-cache storage manually, remove the cache root only
 while no Cargo process is using it.
 
-Concurrent restores use shared cache locks. Publication, cleanup, and eviction
-use an exclusive cache lock. When the filesystem does not provide reliable
-locking, Cargo executes normally without restoring or publishing shared
-artifacts. Conflicting cache locks also fall back to an opportunistic ordinary
-compilation rather than delaying the build.
+Concurrent restores use shared cache locks. Publishers hold a bounded striped
+action lease while staging and hashing outputs, then use a short exclusive
+cache-lock section for final validation, atomic commit, cleanup, size
+accounting, and eviction. Cargo coordinates these sections within one process
+and waits up to five seconds for short cross-process cache-lock contention.
+When the filesystem does not provide reliable locking, or contention outlives
+that bound, Cargo executes normally without restoring or publishing the
+affected shared artifact.
 
 Cache descendants and modeled generated-input trees are traversed without
 following symlinks. A symlinked or otherwise unsupported tree falls back to an

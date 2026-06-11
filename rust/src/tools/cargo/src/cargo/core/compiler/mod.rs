@@ -63,8 +63,8 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
@@ -327,6 +327,10 @@ const ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE";
 const ARTIFACT_CACHE_PUBLISH_RELEASE_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE";
+const ARTIFACT_CACHE_PUBLISH_LOCKED_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_LOCKED_READY_FILE";
+const ARTIFACT_CACHE_PUBLISH_LOCKED_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_LOCKED_RELEASE_FILE";
 const ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS";
 const ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS: &str =
@@ -360,6 +364,20 @@ const ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE";
 const ARTIFACT_CACHE_SIZE_STATE: &str = ".cargo-artifact-cache-size";
 const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v2";
+const ARTIFACT_CACHE_ACTION_PUBLICATION_LOCK_PREFIX: &str = ".cargo-artifact-cache-publish-lock";
+const ARTIFACT_CACHE_ACTION_LOCK_SHARD_HEX_LEN: usize = 6;
+const ARTIFACT_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+static ARTIFACT_CACHE_ACCESS_LOCK: RwLock<()> = RwLock::new(());
+
+struct ArtifactCacheRestoreLock {
+    _process_lock: RwLockReadGuard<'static, ()>,
+    _filesystem_lock: crate::util::FileLock,
+}
+
+struct ArtifactCachePublicationLock {
+    _process_lock: RwLockWriteGuard<'static, ()>,
+    _filesystem_lock: crate::util::FileLock,
+}
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
 pub(super) const SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP: &str =
     "sld-native-incremental-complete.timestamp";
@@ -601,20 +619,33 @@ fn rustc(
         && matches!(unit.mode, CompileMode::Build)
         && !unit.pkg.has_custom_build()
         && sbom_files.is_empty();
-    let artifact_cache = build_runner
-        .bcx
-        .build_config
-        .artifact_cache
-        .clone()
-        .filter(|_| {
-            unit.target.is_lib()
-                && !unit.target.proc_macro()
-                && matches!(unit.mode, CompileMode::Build)
-                && !unit.pkg.has_custom_build()
-                && sbom_files.is_empty()
-                && artifact_cache_host_is_supported()
-                && artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc)
-        });
+    let configured_artifact_cache = build_runner.bcx.build_config.artifact_cache.clone();
+    let artifact_cache_rejection = configured_artifact_cache.as_ref().and_then(|_| {
+        if !unit.target.is_lib() {
+            Some("target is not a library")
+        } else if unit.target.proc_macro() {
+            Some("target is a proc macro")
+        } else if !matches!(unit.mode, CompileMode::Build) {
+            Some("compile mode is not build")
+        } else if unit.pkg.has_custom_build() {
+            Some("package has a custom build script")
+        } else if !sbom_files.is_empty() {
+            Some("SBOM output is enabled")
+        } else if !artifact_cache_host_is_supported() {
+            Some("host platform is unsupported")
+        } else if !artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc) {
+            Some("compiler loader environment is not safely modeled")
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = artifact_cache_rejection {
+        debug!(
+            "artifact cache admission rejected for {}: {reason}",
+            unit.target.crate_name()
+        );
+    }
+    let artifact_cache = configured_artifact_cache.filter(|_| artifact_cache_rejection.is_none());
     let artifact_cache_identity_provider = artifact_cache
         .as_ref()
         .map(|_| build_runner.bcx.rustc().artifact_cache_identity_provider());
@@ -637,9 +668,16 @@ fn rustc(
             )
         })
         .unwrap_or_default();
-    let artifact_cache = artifact_cache.filter(|_| {
+    let loader_inputs_are_modeled = artifact_cache.as_ref().is_none_or(|_| {
         artifact_cache_loader_input_paths_are_modeled(&artifact_cache_loader_input_paths)
     });
+    if !loader_inputs_are_modeled {
+        debug!(
+            "artifact cache admission rejected for {}: compiler loader inputs are not safely modeled",
+            unit.target.crate_name()
+        );
+    }
+    let artifact_cache = artifact_cache.filter(|_| loader_inputs_are_modeled);
     let artifact_cache_dependency_search_paths = artifact_cache
         .as_ref()
         .map(|_| {
@@ -763,7 +801,7 @@ fn rustc(
         // Record the invocation before reading cache-discovered inputs so edits
         // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        let artifact_cache = artifact_cache.as_ref().filter(|_| {
+        let action_is_cacheable = artifact_cache.as_ref().is_none_or(|_| {
             rlib_action_is_cacheable_with_search_paths(
                 &rustc,
                 &root,
@@ -772,6 +810,12 @@ fn rustc(
                 &artifact_cache_dependency_search_paths,
             )
         });
+        if !action_is_cacheable {
+            debug!(
+                "artifact cache admission rejected for {cache_crate_name}: rustc action is not safely modeled"
+            );
+        }
+        let artifact_cache = artifact_cache.as_ref().filter(|_| action_is_cacheable);
         if artifact_cache.is_some() && remove_cargo_injected_loader_path(&mut rustc, &root)? {
             artifact_cache_loader_input_paths.retain(|input| {
                 input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != root
@@ -783,6 +827,11 @@ fn rustc(
         let artifact_cache_identity_witness = artifact_cache_compiler_identity
             .as_ref()
             .and_then(|_| artifact_cache_identity_provider.as_ref()?.witness());
+        if artifact_cache.is_some() && artifact_cache_compiler_identity.is_none() {
+            debug!(
+                "artifact cache admission rejected for {cache_crate_name}: portable compiler identity is unavailable"
+            );
+        }
         let cache_entry = match artifact_cache.zip(artifact_cache_compiler_identity.as_ref()) {
             Some((cache, compiler_identity)) => match rlib_cache_entry(
                 &cache.dir,
@@ -1937,7 +1986,7 @@ fn rlib_cache_entry(
         paths::join_paths(&search_path, paths::dylib_path_envvar())
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cargo-artifact-cache-v7\0");
+    hasher.update(b"cargo-artifact-cache-v8\0");
     hasher.update(b"rustc-verbose-version\0");
     hasher.update(rustc_verbose_version.as_bytes());
     hasher.update(b"\0");
@@ -3351,17 +3400,10 @@ fn store_rlib_cache(
         return Ok(false);
     };
     let cache_root = entry_root.parent().unwrap_or(entry_root);
-    let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
+    paths::create_dir_all(cache_root)?;
+    let Some(_action_lock) = try_write_lock_rlib_cache_action(entry_root)? else {
         return Ok(false);
     };
-    let mut cache_size = match recorded_rlib_cache_size(cache_root) {
-        Some(size) if rlib_cache_size_within_limit(size, max_size) => size,
-        Some(_) | None => reconcile_rlib_cache_size(cache_root, max_size, None)?,
-    };
-    if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
-        debug!("not storing artifact cache entry with action inputs modified before publication");
-        return Ok(false);
-    }
     if !create_rlib_cache_directory_no_follow(entry_root)? {
         debug!(
             "not storing artifact cache entry under unsupported action root {}",
@@ -3369,27 +3411,9 @@ fn store_rlib_cache(
         );
         return Ok(false);
     }
+    cleanup_abandoned_rlib_cache_action_transients(entry_root);
     let entry = entry_root.join(&inputs_digest);
-    if entry.exists() {
-        if entry.join("complete").exists()
-            && verify_rlib_cache_entry(&entry, outputs).unwrap_or(false)
-            && artifact_cache_entry_size(&entry)
-                .is_ok_and(|size| rlib_cache_size_within_limit(size, max_size))
-        {
-            return Ok(false);
-        }
-        mark_rlib_cache_size_dirty(cache_root)?;
-        quarantine_rlib_cache_entry(&entry)?;
-        cache_size = reconcile_rlib_cache_size(cache_root, max_size, None)?;
-    }
-    mark_rlib_cache_size_dirty(cache_root)?;
-    let staging = match staging_rlib_cache_entry(&entry) {
-        Ok(staging) => staging,
-        Err(error) => {
-            write_rlib_cache_size(cache_root, cache_size)?;
-            return Err(error);
-        }
-    };
+    let staging = staging_rlib_cache_entry(&entry)?;
     let result = (|| -> CargoResult<bool> {
         let files = staging.join("files");
         paths::create_dir_all(&files)?;
@@ -3463,7 +3487,6 @@ fn store_rlib_cache(
             && entry_size > max_size
         {
             paths::remove_dir_all(&staging)?;
-            write_rlib_cache_size(cache_root, cache_size)?;
             debug!(
                 "not storing artifact cache entry larger than configured maximum: {} > {}",
                 entry_size, max_size
@@ -3485,9 +3508,48 @@ fn store_rlib_cache(
         {
             debug!("not storing artifact cache entry with inputs modified during staging");
             paths::remove_dir_all(&staging)?;
-            write_rlib_cache_size(cache_root, cache_size)?;
             return Ok(false);
         }
+        let Some(_lock) = lock_rlib_cache_exclusive(cache_root, "publishing artifact cache entry")?
+        else {
+            paths::remove_dir_all(&staging)?;
+            return Ok(false);
+        };
+        delay_rlib_cache_publish_locked_for_tests()?;
+        let mut cache_size = match recorded_rlib_cache_size(cache_root) {
+            Some(size) if rlib_cache_size_within_limit(size, max_size) => size,
+            Some(_) | None => reconcile_rlib_cache_size(cache_root, max_size, None)?,
+        };
+        if !identity_witness.is_current()
+            || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
+                != *loader_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+            || rlib_cache_inputs_digest_matching_rustc_dep_info(
+                rustc_dep_info_loc,
+                rustc_cwd,
+                invocation_time,
+            )?
+            .as_deref()
+                != Some(&inputs_digest)
+        {
+            debug!("not storing artifact cache entry with inputs modified before publication");
+            paths::remove_dir_all(&staging)?;
+            return Ok(false);
+        }
+        if entry.exists() {
+            if entry.join("complete").exists()
+                && verify_rlib_cache_entry(&entry, outputs).unwrap_or(false)
+                && artifact_cache_entry_size(&entry)
+                    .is_ok_and(|size| rlib_cache_size_within_limit(size, max_size))
+            {
+                paths::remove_dir_all(&staging)?;
+                return Ok(false);
+            }
+            mark_rlib_cache_size_dirty(cache_root)?;
+            quarantine_rlib_cache_entry(&entry)?;
+            cache_size = reconcile_rlib_cache_size(cache_root, max_size, None)?;
+        }
+        mark_rlib_cache_size_dirty(cache_root)?;
         match fs::rename(&staging, &entry) {
             Ok(()) => {}
             Err(_error) if entry.join("complete").exists() => {
@@ -3509,11 +3571,6 @@ fn store_rlib_cache(
         if let Err(error) = paths::remove_dir_all(&staging) {
             debug!(
                 "failed to remove abandoned artifact cache publication {}: {error:#}",
-                staging.display()
-            );
-        } else if let Err(error) = write_rlib_cache_size(cache_root, cache_size) {
-            debug!(
-                "failed to restore artifact cache size state after removing {}: {error:#}",
                 staging.display()
             );
         }
@@ -3859,6 +3916,25 @@ fn delay_rlib_cache_publish_for_tests() -> CargoResult<()> {
     Ok(())
 }
 
+fn delay_rlib_cache_publish_locked_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_PUBLISH_LOCKED_RELEASE_FILE_FOR_TESTS);
+    if release.is_none() {
+        return Ok(());
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_PUBLISH_LOCKED_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    wait_for_rlib_cache_test_release(release)
+}
+
 fn delay_rlib_cache_restore_materialized_for_tests() -> CargoResult<()> {
     #[expect(
         clippy::disallowed_methods,
@@ -3963,7 +4039,7 @@ fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
     let key = entry.file_name().unwrap_or_default().to_string_lossy();
     let sequence = ARTIFACT_CACHE_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let staging = entry.with_file_name(format!(
-        ".{key}.publishing-{}-{sequence}",
+        ".{key}.staging-v8-{}-{sequence}",
         std::process::id()
     ));
     fs::create_dir(&staging)?;
@@ -3984,7 +4060,41 @@ fn create_rlib_cache_directory_no_follow(path: &Path) -> CargoResult<bool> {
     }
 }
 
-fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
+fn read_lock_artifact_cache_process_until(
+    deadline: Instant,
+) -> Option<RwLockReadGuard<'static, ()>> {
+    let mut retry_delay = Duration::from_millis(1);
+    loop {
+        match ARTIFACT_CACHE_ACCESS_LOCK.try_read() {
+            Ok(lock) => return Some(lock),
+            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(32));
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+fn write_lock_artifact_cache_process_until(
+    deadline: Instant,
+) -> Option<RwLockWriteGuard<'static, ()>> {
+    let mut retry_delay = Duration::from_millis(1);
+    loop {
+        match ARTIFACT_CACHE_ACCESS_LOCK.try_write() {
+            Ok(lock) => return Some(lock),
+            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(32));
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+fn lock_rlib_cache_for_restore(cache_root: &Path) -> CargoResult<Option<ArtifactCacheRestoreLock>> {
     paths::create_dir_all(cache_root)?;
     if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -3992,21 +4102,41 @@ fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util
         debug!("not restoring artifact cache entries because the lock path is a symlink");
         return Ok(None);
     }
-    Ok(
-        match Filesystem::new(cache_root.to_path_buf())
-            .try_open_ro_shared_create_strict(".cargo-artifact-cache-lock")?
-        {
-            TryLockResult::Acquired(lock) => Some(lock),
+    let deadline = Instant::now() + ARTIFACT_CACHE_LOCK_TIMEOUT;
+    let Some(process_lock) = read_lock_artifact_cache_process_until(deadline) else {
+        debug!(
+            "not restoring artifact cache entry after waiting {:?} for in-process cache access",
+            ARTIFACT_CACHE_LOCK_TIMEOUT
+        );
+        return Ok(None);
+    };
+    let filesystem = Filesystem::new(cache_root.to_path_buf());
+    let mut retry_delay = Duration::from_millis(1);
+    loop {
+        match filesystem.try_open_ro_shared_create_strict(".cargo-artifact-cache-lock")? {
+            TryLockResult::Acquired(filesystem_lock) => {
+                return Ok(Some(ArtifactCacheRestoreLock {
+                    _process_lock: process_lock,
+                    _filesystem_lock: filesystem_lock,
+                }));
+            }
+            TryLockResult::WouldBlock if Instant::now() < deadline => {
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(32));
+            }
             TryLockResult::WouldBlock => {
-                debug!("not restoring artifact cache entries because the cache lock is contended");
-                None
+                debug!(
+                    "not restoring artifact cache entry after waiting {:?} for the cache lock",
+                    ARTIFACT_CACHE_LOCK_TIMEOUT
+                );
+                return Ok(None);
             }
             TryLockResult::LockingUnsupported => {
                 debug!("not restoring artifact cache entries because locking is unsupported");
-                None
+                return Ok(None);
             }
-        },
-    )
+        }
+    }
 }
 
 fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
@@ -4034,13 +4164,94 @@ fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::uti
     )
 }
 
+fn lock_rlib_cache_exclusive(
+    cache_root: &Path,
+    operation: &str,
+) -> CargoResult<Option<ArtifactCachePublicationLock>> {
+    paths::create_dir_all(cache_root)?;
+    if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        debug!("not publishing artifact cache entries because the lock path is a symlink");
+        return Ok(None);
+    }
+    let deadline = Instant::now() + ARTIFACT_CACHE_LOCK_TIMEOUT;
+    let Some(process_lock) = write_lock_artifact_cache_process_until(deadline) else {
+        debug!(
+            "not {operation} after waiting {:?} for in-process cache access",
+            ARTIFACT_CACHE_LOCK_TIMEOUT
+        );
+        return Ok(None);
+    };
+    let filesystem = Filesystem::new(cache_root.to_path_buf());
+    let mut retry_delay = Duration::from_millis(1);
+    loop {
+        match filesystem.try_open_rw_exclusive_create_strict(".cargo-artifact-cache-lock")? {
+            TryLockResult::Acquired(filesystem_lock) => {
+                return Ok(Some(ArtifactCachePublicationLock {
+                    _process_lock: process_lock,
+                    _filesystem_lock: filesystem_lock,
+                }));
+            }
+            TryLockResult::WouldBlock if Instant::now() < deadline => {
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(32));
+            }
+            TryLockResult::WouldBlock => {
+                debug!(
+                    "not {operation} after waiting {:?} for the cache lock",
+                    ARTIFACT_CACHE_LOCK_TIMEOUT
+                );
+                return Ok(None);
+            }
+            TryLockResult::LockingUnsupported => {
+                debug!("not publishing artifact cache entries because locking is unsupported");
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn try_write_lock_rlib_cache_action(
+    entry_root: &Path,
+) -> CargoResult<Option<crate::util::FileLock>> {
+    let cache_root = entry_root.parent().unwrap_or(entry_root);
+    let lock_name = rlib_cache_action_lock_name(entry_root);
+    let lock_path = cache_root.join(&lock_name);
+    if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        debug!(
+            "not publishing artifact cache entry because the action lock path is a symlink: {}",
+            lock_path.display()
+        );
+        return Ok(None);
+    }
+    Ok(
+        match Filesystem::new(cache_root.to_path_buf())
+            .try_open_rw_exclusive_create_strict(&lock_name)?
+        {
+            TryLockResult::Acquired(lock) => Some(lock),
+            TryLockResult::WouldBlock => {
+                debug!("not publishing duplicate artifact cache action concurrently");
+                None
+            }
+            TryLockResult::LockingUnsupported => {
+                debug!("not publishing artifact cache entry because locking is unsupported");
+                None
+            }
+        },
+    )
+}
+
+fn rlib_cache_action_lock_name(entry_root: &Path) -> String {
+    let action_name = entry_root.file_name().unwrap_or(entry_root.as_os_str());
+    let action_digest = blake3::hash(action_name.as_encoded_bytes()).to_hex();
+    format!(
+        "{ARTIFACT_CACHE_ACTION_PUBLICATION_LOCK_PREFIX}-{}",
+        &action_digest.as_str()[..ARTIFACT_CACHE_ACTION_LOCK_SHARD_HEX_LEN]
+    )
+}
+
 fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test-only hook is intentionally outside user configuration"
-    )]
-    let retain_transients_for_tests =
-        std::env::var_os(ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS).is_some();
     let Ok(entry_roots) = fs::read_dir(cache_root) else {
         return;
     };
@@ -4051,34 +4262,50 @@ fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
         {
             continue;
         }
-        let Ok(entries) = fs::read_dir(entry_root.path()) else {
+        let entry_root = entry_root.path();
+        let Ok(Some(_action_lock)) = try_write_lock_rlib_cache_action(&entry_root) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.file_name().is_some_and(|name| {
-                let name = name.to_string_lossy();
-                name.starts_with('.')
-                    && (name.contains(".publishing-") || name.contains(".rejected-"))
-            }) {
-                continue;
-            }
-            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                continue;
-            }
-            if retain_transients_for_tests {
-                debug!(
-                    "retaining abandoned artifact cache transient for test {}",
-                    path.display()
-                );
-                continue;
-            }
-            if let Err(error) = paths::remove_dir_all(&path) {
-                debug!(
-                    "failed to remove abandoned artifact cache transient {}: {error:#}",
-                    path.display()
-                );
-            }
+        cleanup_abandoned_rlib_cache_action_transients(&entry_root);
+    }
+}
+
+fn cleanup_abandoned_rlib_cache_action_transients(entry_root: &Path) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let retain_transients_for_tests =
+        std::env::var_os(ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS).is_some();
+    let Ok(entries) = fs::read_dir(entry_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with('.')
+                && (name.contains(".publishing-")
+                    || name.contains(".staging-v8-")
+                    || name.contains(".rejected-"))
+        }) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        if retain_transients_for_tests {
+            debug!(
+                "retaining abandoned artifact cache transient for test {}",
+                path.display()
+            );
+            continue;
+        }
+        if let Err(error) = paths::remove_dir_all(&path) {
+            debug!(
+                "failed to remove abandoned artifact cache transient {}: {error:#}",
+                path.display()
+            );
         }
     }
 }
@@ -4123,8 +4350,7 @@ fn rlib_cache_has_transients(cache_root: &Path) -> bool {
             };
             if entry.path().file_name().is_some_and(|name| {
                 let name = name.to_string_lossy();
-                name.starts_with('.')
-                    && (name.contains(".publishing-") || name.contains(".rejected-"))
+                name.starts_with('.') && name.contains(".rejected-")
             }) {
                 return true;
             }
@@ -4163,8 +4389,8 @@ fn reconcile_rlib_cache_size(
 fn try_read_lock_rlib_cache_within_limit(
     cache_root: &Path,
     max_size: Option<u64>,
-) -> CargoResult<Option<crate::util::FileLock>> {
-    let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
+) -> CargoResult<Option<ArtifactCacheRestoreLock>> {
+    let Some(lock) = lock_rlib_cache_for_restore(cache_root)? else {
         return Ok(None);
     };
     if max_size.is_none()
@@ -4175,7 +4401,9 @@ fn try_read_lock_rlib_cache_within_limit(
         return Ok(Some(lock));
     }
     drop(lock);
-    let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
+    let Some(_lock) =
+        lock_rlib_cache_exclusive(cache_root, "maintaining cache size before restore")?
+    else {
         return Ok(None);
     };
     if !recorded_rlib_cache_size(cache_root)
@@ -4184,7 +4412,7 @@ fn try_read_lock_rlib_cache_within_limit(
         reconcile_rlib_cache_size(cache_root, max_size, None)?;
     }
     drop(_lock);
-    let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
+    let Some(lock) = lock_rlib_cache_for_restore(cache_root)? else {
         return Ok(None);
     };
     if !recorded_rlib_cache_size(cache_root)
@@ -4272,7 +4500,9 @@ fn prune_rlib_cache_entries_with(
         }
         if remove_entry(&path).is_ok() {
             total_size = total_size.saturating_sub(size);
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = path.parent()
+                && let Ok(Some(_action_lock)) = try_write_lock_rlib_cache_action(parent)
+            {
                 let _ = fs::remove_dir(parent);
             }
         }
@@ -4290,8 +4520,12 @@ fn rlib_cache_size_within_limit(size: u64, max_size: Option<u64>) -> bool {
 #[cfg(test)]
 mod artifact_cache_size_tests {
     use super::{
-        artifact_cache_entry_size, hash_path_tree, prune_rlib_cache_entries_with,
-        rlib_cache_size_within_limit,
+        ARTIFACT_CACHE_ACCESS_LOCK, ARTIFACT_CACHE_ACTION_PUBLICATION_LOCK_PREFIX,
+        artifact_cache_entry_size, hash_path_tree, prune_rlib_cache_entries,
+        prune_rlib_cache_entries_with, read_lock_artifact_cache_process_until,
+        recorded_rlib_cache_size, rlib_cache_action_lock_name, rlib_cache_size_within_limit,
+        staging_rlib_cache_entry, try_write_lock_rlib_cache_action,
+        write_lock_artifact_cache_process_until, write_rlib_cache_size,
     };
 
     #[test]
@@ -4299,6 +4533,79 @@ mod artifact_cache_size_tests {
         assert!(rlib_cache_size_within_limit(u64::MAX, None));
         assert!(rlib_cache_size_within_limit(10, Some(10)));
         assert!(!rlib_cache_size_within_limit(11, Some(10)));
+    }
+
+    #[test]
+    fn live_publication_does_not_dirty_committed_size_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("action").join(".entry.staging-v8-active");
+        std::fs::create_dir_all(staging).unwrap();
+
+        write_rlib_cache_size(temp.path(), 42).unwrap();
+
+        assert_eq!(recorded_rlib_cache_size(temp.path()), Some(42));
+    }
+
+    #[test]
+    fn staging_names_are_invisible_to_legacy_publication_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let action = temp.path().join("action");
+        std::fs::create_dir(&action).unwrap();
+
+        let staging = staging_rlib_cache_entry(&action.join("entry")).unwrap();
+        let name = staging.file_name().unwrap().to_string_lossy();
+
+        assert!(name.contains(".staging-v8-"));
+        assert!(!name.contains(".publishing-"));
+    }
+
+    #[test]
+    fn action_lock_shards_distinguish_one_byte_hash_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut by_first_byte = std::collections::HashMap::new();
+        for index in 0..10_000 {
+            let action = temp.path().join(format!("action-{index}"));
+            let lock_name = rlib_cache_action_lock_name(&action);
+            let shard = lock_name
+                .strip_prefix(ARTIFACT_CACHE_ACTION_PUBLICATION_LOCK_PREFIX)
+                .unwrap()
+                .strip_prefix('-')
+                .unwrap();
+            assert_eq!(shard.len(), 6);
+            let first_byte = &shard[..2];
+            if let Some(previous) = by_first_byte.insert(first_byte.to_string(), lock_name.clone())
+                && previous != lock_name
+            {
+                return;
+            }
+        }
+        panic!("failed to construct a one-byte action-lock hash collision");
+    }
+
+    #[test]
+    fn process_cache_lock_attempts_respect_expired_deadlines() {
+        let write = ARTIFACT_CACHE_ACCESS_LOCK.write().unwrap();
+        assert!(read_lock_artifact_cache_process_until(std::time::Instant::now()).is_none());
+        drop(write);
+
+        let _read = ARTIFACT_CACHE_ACCESS_LOCK.read().unwrap();
+        assert!(write_lock_artifact_cache_process_until(std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn pruning_does_not_remove_an_action_root_held_by_a_publisher() {
+        let temp = tempfile::tempdir().unwrap();
+        let action = temp.path().join("action");
+        let entry = action.join("entry");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("complete"), b"complete").unwrap();
+        let _action_lock = try_write_lock_rlib_cache_action(&action).unwrap().unwrap();
+
+        assert_eq!(
+            prune_rlib_cache_entries(temp.path(), Some(0), None).unwrap(),
+            0
+        );
+        assert!(action.is_dir());
     }
 
     #[test]

@@ -1198,6 +1198,235 @@ fn concurrent_publishers_converge_on_single_entry() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn distinct_publishers_commit_while_another_action_is_staging() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    project.change_file(
+        ".cargo/config.toml",
+        &format!(
+            r#"
+            [build]
+            artifact-cache-dir = "{}"
+            artifact-cache-materialization = "hardlink"
+            artifact-cache-max-size = "1GB"
+            "#,
+            cache.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
+    let delayed_target = project.root().join("delayed-target");
+    let concurrent_target = project.root().join("concurrent-target");
+    let restored_target = project.root().join("restored-target");
+    let ready = project.root().join("publish-ready");
+    let release = project.root().join("publish-release");
+
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&delayed_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&concurrent_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("RUSTFLAGS", "--cfg concurrent_artifact_cache_variant")
+        .run();
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+    assert!(recorded_cache_size(&cache) > 0);
+    let concurrently_stored = cached_rlib(&cache);
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&restored_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("RUSTFLAGS", "--cfg concurrent_artifact_cache_variant")
+        .run();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let restored = cached_rlib(&restored_target.join("debug").join("deps"));
+        assert_eq!(
+            fs::metadata(concurrently_stored).unwrap().ino(),
+            fs::metadata(restored).unwrap().ino()
+        );
+    }
+
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "delayed publisher failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 2);
+    let completed_size = cached_rlibs(&cache)
+        .iter()
+        .map(|rlib| directory_size(rlib.parent().unwrap().parent().unwrap()))
+        .sum::<u64>();
+    assert_eq!(recorded_cache_size(&cache), completed_size);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn abandoned_staging_is_cleaned_before_same_action_republishes() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let abandoned_target = project.root().join("abandoned-target");
+    let republished_target = project.root().join("republished-target");
+    let ready = project.root().join("publish-ready");
+    let release = project.root().join("publish-release");
+
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&abandoned_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(contains_cache_entry_with_marker(&cache, ".staging-v8-"));
+
+    build_in_target(&project, &republished_target);
+
+    assert!(!contains_cache_entry_with_marker(&cache, ".staging-v8-"));
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn restore_waits_for_short_publication_commit() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let publisher_target = project.root().join("publisher-target");
+    let restored_target = project.root().join("restored-target");
+    let ready = project.root().join("publish-locked-ready");
+    let release = project.root().join("publish-locked-release");
+
+    build_in_target(&project, &producer_target);
+    let stored = cached_rlib(&cache);
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+
+    let mut publisher_command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&publisher_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_LOCKED_READY_FILE",
+            &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_LOCKED_RELEASE_FILE",
+            &release,
+        )
+        .build_command();
+    publisher_command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let publisher = publisher_command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(
+        ready.exists(),
+        "cargo did not acquire the publication commit lock"
+    );
+
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 42 }\n");
+    let mut restore_command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&restored_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .build_command();
+    restore_command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let restore = restore_command.spawn().unwrap();
+    sleep_ms(200);
+    fs::write(&release, b"release").unwrap();
+
+    let publisher_output = publisher.wait_with_output().unwrap();
+    assert!(
+        publisher_output.status.success(),
+        "publisher failed:\n{}",
+        String::from_utf8_lossy(&publisher_output.stderr)
+    );
+    let restore_output = restore.wait_with_output().unwrap();
+    assert!(
+        restore_output.status.success(),
+        "restore failed:\n{}",
+        String::from_utf8_lossy(&restore_output.stderr)
+    );
+    let restored = cached_rlib(&restored_target.join("debug").join("deps"));
+    assert_eq!(
+        fs::metadata(stored).unwrap().ino(),
+        fs::metadata(restored).unwrap().ino()
+    );
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
 fn environment_configuration_restores_by_hardlink() {
     use std::os::unix::fs::MetadataExt;
@@ -2149,7 +2378,7 @@ fn cache_store_failure_after_staging_is_cleaned_up() {
         )
         .run();
 
-    assert!(!contains_cache_entry_with_marker(&cache, ".publishing-"));
+    assert!(!contains_cache_entry_with_marker(&cache, ".staging-v8-"));
     assert!(cached_rlib(&target.join("debug").join("deps")).exists());
 }
 
