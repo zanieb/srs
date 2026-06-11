@@ -624,7 +624,7 @@ fn rustc(
         .and_then(|provider| provider.program())
         .unwrap_or(&artifact_cache_compiler_program)
         .to_path_buf();
-    let artifact_cache_loader_input_paths = artifact_cache
+    let mut artifact_cache_loader_input_paths = artifact_cache
         .as_ref()
         .map(|_| {
             compiler_loader_input_paths(
@@ -772,6 +772,11 @@ fn rustc(
                 &artifact_cache_dependency_search_paths,
             )
         });
+        if artifact_cache.is_some() && remove_cargo_injected_loader_path(&mut rustc, &root)? {
+            artifact_cache_loader_input_paths.retain(|input| {
+                input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != root
+            });
+        }
         let artifact_cache_compiler_identity = artifact_cache
             .as_ref()
             .and_then(|_| artifact_cache_identity_provider.as_ref()?.identity());
@@ -2643,6 +2648,30 @@ fn compiler_loader_input_paths(
         });
     }
     inputs
+}
+
+fn remove_cargo_injected_loader_path(
+    rustc: &mut ProcessBuilder,
+    output_root: &Path,
+) -> CargoResult<bool> {
+    let variable = paths::dylib_path_envvar();
+    let Some(value) = rustc.get_env(variable) else {
+        return Ok(false);
+    };
+    let mut search_paths = env::split_paths(&value).collect::<Vec<_>>();
+    let original_len = search_paths.len();
+    search_paths.retain(|path| path != output_root);
+    if search_paths.len() == original_len {
+        return Ok(false);
+    }
+
+    // `rlib_action_is_cacheable_with_search_paths` rejects proc macros and
+    // every other target-local dynamic-library input before this is called.
+    // An ordinary `--crate-type lib` action neither loads target artifacts nor
+    // invokes the linker, so retaining Cargo's target-local loader path only
+    // lets unrelated proc-macro dylibs perturb the key while the build runs.
+    rustc.env(variable, paths::join_paths(&search_paths, variable)?);
+    Ok(true)
 }
 
 fn compiler_loader_inputs_digest(

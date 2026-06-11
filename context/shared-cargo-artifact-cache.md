@@ -78,6 +78,12 @@ locations and extraction-assigned device and inode numbers are excluded from the
 persistent identity so an otherwise identical toolchain snapshot can reuse
 entries after restoration on another runner.
 
+For an ordinary library action that passes cache admission, Cargo removes its
+injected target `deps` directory from the action's actual dynamic loader search
+path. Admitted actions have no target-local dynamic extern and do not invoke the
+linker, so unrelated proc-macro dylibs cannot affect that rustc process. Other
+configured and inherited loader roots remain modeled in the cache key.
+
 Linux runs with nonempty `GLIBC_TUNABLES` or nested shared objects in compiler
 loader roots execute normally without restoration. This includes glibc
 hardware-capability candidates in configured or installed compiler loader

@@ -1325,7 +1325,9 @@ fn changed_relative_dynamic_library_inputs_use_rustc_cwd() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn changed_cargo_injected_dynamic_library_inputs_keep_distinct_variants() {
+fn unrelated_cargo_injected_dynamic_library_inputs_do_not_change_variant() {
+    use std::os::unix::fs::MetadataExt;
+
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);
     let producer_target = project.root().join("producer-target");
@@ -1345,7 +1347,13 @@ fn changed_cargo_injected_dynamic_library_inputs_keep_distinct_variants() {
     build_in_target(&project, &producer_target);
     build_in_target(&project, &consumer_target);
 
-    assert_eq!(cached_rlibs(&cache).len(), 2);
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+    assert_eq!(
+        fs::metadata(cached_rlib(&cache)).unwrap().ino(),
+        fs::metadata(cached_rlib(&consumer_target.join("debug/deps")))
+            .unwrap()
+            .ino()
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
