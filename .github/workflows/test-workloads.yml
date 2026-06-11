@@ -74,6 +74,15 @@ jobs:
           case "$WORKLOAD_TESTS" in
             uv)
               cargo +srs test --locked -p uv --lib -- --test-threads=1
+              for test in \
+                auth::login_token_stdin \
+                upgrade::upgrade_requires_production_dependency \
+                upgrade::upgrade_rejects_workspace_root_non_registry_source
+              do
+                cargo +srs test --locked -p uv --test it "$test" -- \
+                  --exact \
+                  --test-threads=1
+              done
               ;;
             ruff-and-ty)
               cargo +srs test --locked -p ruff --lib -- \
