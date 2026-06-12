@@ -860,11 +860,15 @@ prove locally that:
 - target-path and generated-input portability tests stay green; and
 - replay time is materially below the avoided rustc time.
 
-The pure Build-library closure now demonstrates the local scheduling gate, but
-Check replay, fine-grained locking, and the nonportable build-script closure
-remain open. After those gates, uv PR 19754 can combine the repaired artifact
-layer with job-specific target snapshots and compare equivalent runner classes.
-The aggregate CI acceptance target still requires that final integration rerun.
+The local product gates now pass for the selected composition. Metadata-only
+Check preflight was measured and not retained because it was neutral; per-job
+target isolation avoids requiring fine-grained shared-target locking; and the
+nonportable build-script, proc-macro, and final-link closure belongs to the
+implemented exact-path snapshot layer. uv PR 19754 can therefore combine the
+repaired artifact layer with job-specific target snapshots and compare
+equivalent runner classes. The aggregate CI acceptance target still requires a
+final integration rerun, but that is a consumer validation step rather than the
+diagnostic or product-development harness for this investigation.
 
 ### uv PR 19754 integration path
 
