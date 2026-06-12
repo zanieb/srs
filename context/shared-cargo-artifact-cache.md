@@ -39,7 +39,8 @@ external tool to mutate artifacts previously restored by hardlink.
 ## Cache Admission
 
 The cache is deliberately limited to verified ordinary-library Build outputs
-and non-test metadata-only Check outputs.
+and metadata-only library Check outputs, including test-mode library variants.
+Linked test binaries remain ineligible.
 Builds that use unmodeled inputs execute normally without artifact restoration.
 
 A package's custom build script is always executed or made fresh through
@@ -288,8 +289,9 @@ units plus elapsed time. `lookup.phase_elapsed_us` separates lock wait,
 control/source/entry validation, final compiler-identity/loader/action-input
 validation, and target-state writes. No record is produced and no phase clocks
 or extra file-size reads are performed by default.
-The `hashing.action_inputs` object also reports process-local witness checks,
-fast paths, fallbacks to full hashing, and cumulative witness time.
+The `hashing.action_inputs` object also reports files/logical bytes hashed,
+process-local witness checks, fast paths, fallbacks to full hashing, and
+cumulative witness time.
 When thin snapshot collection or reconstruction is requested, the `snapshot`
 object separately reports manifest-owned files/logical bytes, copy-on-write
 cloned files, byte-copied files, already-present files/logical bytes, failures,

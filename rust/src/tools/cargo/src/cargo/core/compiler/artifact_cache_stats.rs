@@ -257,6 +257,8 @@ pub struct ArtifactCacheStats {
     identity_reuse_cpu_us: AtomicU64,
     action_hash_calls: AtomicU64,
     action_hash_failures: AtomicU64,
+    action_hash_files: AtomicU64,
+    action_hash_bytes: AtomicU64,
     action_hash_wall_us: AtomicU64,
     action_witness_checks: AtomicU64,
     action_witness_fast_paths: AtomicU64,
@@ -335,6 +337,8 @@ impl Default for ArtifactCacheStats {
             identity_reuse_cpu_us: AtomicU64::new(0),
             action_hash_calls: AtomicU64::new(0),
             action_hash_failures: AtomicU64::new(0),
+            action_hash_files: AtomicU64::new(0),
+            action_hash_bytes: AtomicU64::new(0),
             action_hash_wall_us: AtomicU64::new(0),
             action_witness_checks: AtomicU64::new(0),
             action_witness_fast_paths: AtomicU64::new(0),
@@ -497,12 +501,24 @@ impl ArtifactCacheStats {
         Self::add(&self.identity_cpu_us, Self::micros(cpu));
     }
 
-    pub fn action_hash(&self, elapsed: Duration, failed: bool) {
+    pub fn action_hash(&self, files: u64, bytes: u64, elapsed: Duration, failed: bool) {
         Self::add(&self.action_hash_calls, 1);
         if failed {
             Self::add(&self.action_hash_failures, 1);
         }
+        Self::add(&self.action_hash_files, files);
+        Self::add(&self.action_hash_bytes, bytes);
         Self::add(&self.action_hash_wall_us, Self::micros(elapsed));
+    }
+
+    #[cfg(test)]
+    pub fn action_hash_test_totals(&self) -> (u64, u64, u64, u64) {
+        (
+            self.action_hash_calls.load(Ordering::Relaxed),
+            self.action_hash_failures.load(Ordering::Relaxed),
+            self.action_hash_files.load(Ordering::Relaxed),
+            self.action_hash_bytes.load(Ordering::Relaxed),
+        )
     }
 
     fn action_witness(&self, elapsed: Duration, counter: &AtomicU64) {
@@ -680,6 +696,8 @@ impl ArtifactCacheStats {
                 "action_inputs": {
                     "calls": load(&self.action_hash_calls),
                     "failures": load(&self.action_hash_failures),
+                    "files": load(&self.action_hash_files),
+                    "bytes": load(&self.action_hash_bytes),
                     "wall_us": load(&self.action_hash_wall_us),
                     "witness_checks": load(&self.action_witness_checks),
                     "witness_fast_paths": load(&self.action_witness_fast_paths),

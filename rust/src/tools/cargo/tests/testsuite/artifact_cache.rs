@@ -1339,6 +1339,8 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     // later boundary either validates a reliable metadata witness or records
     // one additional full-content fallback.
     let action_hash_calls = artifact_cache_stat(&warm, &["hashing", "action_inputs", "calls"]);
+    assert!(artifact_cache_stat(&warm, &["hashing", "action_inputs", "files"]) > 0);
+    assert!(artifact_cache_stat(&warm, &["hashing", "action_inputs", "bytes"]) > 0);
     let witness_checks =
         artifact_cache_stat(&warm, &["hashing", "action_inputs", "witness_checks"]);
     let witness_fast_paths =
@@ -2033,6 +2035,11 @@ fn test_mode_restores_and_uses_ordinary_dependencies() {
 
             [dependencies]
             dependency = { path = "dependency" }
+
+            [[test]]
+            name = "harnessless"
+            path = "tests/harnessless.rs"
+            harness = false
             "#,
         )
         .file(
@@ -2043,6 +2050,15 @@ fn test_mode_restores_and_uses_ordinary_dependencies() {
             #[test]
             fn restored_dependency_is_usable() { assert_eq!(value(), 42); }
             "#,
+        )
+        .file("src/main.rs", "fn main() { let _ = root::value(); }\n")
+        .file(
+            "tests/integration.rs",
+            "#[test]\nfn restored_root_is_usable() { assert_eq!(root::value(), 42); }\n",
+        )
+        .file(
+            "tests/harnessless.rs",
+            "fn main() { assert_eq!(root::value(), 42); }\n",
         )
         .file(
             "dependency/Cargo.toml",
@@ -2089,6 +2105,83 @@ fn test_mode_restores_and_uses_ordinary_dependencies() {
     assert_eq!(
         artifact_cache_stat(&warm, &["units", "ineligible_by_reason", "compile_mode"]),
         1
+    );
+
+    let check_tests = |target: &Path| {
+        artifact_cache_stats(
+            &project
+                .cargo("-Zartifact-cache check --all-targets")
+                .arg("--target-dir")
+                .arg(target)
+                .masquerade_as_nightly_cargo(&["artifact-cache"])
+                .env(
+                    cargo_util::paths::dylib_path_envvar(),
+                    isolated_loader_path(),
+                )
+                .env("CARGO_INCREMENTAL", "1")
+                .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+                .run(),
+        )
+    };
+    let check_cold = check_tests(&project.root().join("check-cold-target"));
+    assert_eq!(artifact_cache_stat(&check_cold, &["units", "eligible"]), 3);
+    assert_eq!(artifact_cache_stat(&check_cold, &["lookup", "misses"]), 3);
+    assert_eq!(
+        artifact_cache_stat(&check_cold, &["rustc", "executions"]),
+        7
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &check_cold,
+            &["units", "ineligible_by_reason", "target_not_library"]
+        ),
+        4
+    );
+
+    let check_warm = check_tests(&project.root().join("check-warm-target"));
+    assert_eq!(artifact_cache_stat(&check_warm, &["units", "eligible"]), 3);
+    assert_eq!(artifact_cache_stat(&check_warm, &["lookup", "hits"]), 3);
+    assert_eq!(
+        artifact_cache_stat(&check_warm, &["rustc", "executions"]),
+        4
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &check_warm,
+            &["units", "ineligible_by_reason", "target_not_library"]
+        ),
+        4
+    );
+
+    project.change_file(
+        "src/lib.rs",
+        r#"
+        pub fn value() -> u32 { dependency::value() }
+
+        #[test]
+        fn restored_dependency_is_usable() { assert_eq!(value(), dependency::value()); }
+        "#,
+    );
+    let check_changed = check_tests(&project.root().join("check-changed-target"));
+    assert_eq!(
+        artifact_cache_stat(&check_changed, &["units", "eligible"]),
+        3
+    );
+    assert_eq!(artifact_cache_stat(&check_changed, &["lookup", "hits"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&check_changed, &["lookup", "misses"]),
+        2
+    );
+    assert_eq!(
+        artifact_cache_stat(&check_changed, &["rustc", "executions"]),
+        6
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &check_changed,
+            &["units", "ineligible_by_reason", "target_not_library"]
+        ),
+        4
     );
 }
 

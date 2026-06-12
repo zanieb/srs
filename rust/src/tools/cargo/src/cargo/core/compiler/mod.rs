@@ -443,6 +443,8 @@ struct PreparedArtifactCacheKey {
 struct ArtifactCacheActionInputSnapshot {
     digest: blake3::Hash,
     witness: ArtifactCacheActionInputWitness,
+    files: u64,
+    bytes: u64,
 }
 
 #[derive(Debug)]
@@ -480,16 +482,14 @@ enum ArtifactCacheActionBuilder {
         cwd: PathBuf,
         rustc_verbose_version: String,
         rustc_host: String,
+        compile_mode: CompileMode,
     },
 }
 
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
 
 pub(super) fn artifact_cache_compile_mode_is_supported(mode: CompileMode) -> bool {
-    matches!(
-        mode,
-        CompileMode::Build | CompileMode::Check { test: false }
-    )
+    matches!(mode, CompileMode::Build | CompileMode::Check { .. })
 }
 pub(super) const SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP: &str =
     "sld-native-incremental-complete.timestamp";
@@ -1091,6 +1091,7 @@ impl ArtifactCacheActionBuilder {
             cwd: cwd.to_path_buf(),
             rustc_verbose_version: build_runner.bcx.rustc().verbose_version.clone(),
             rustc_host: build_runner.bcx.rustc().host.to_string(),
+            compile_mode: unit.mode,
         })
     }
 
@@ -1113,6 +1114,7 @@ impl ArtifactCacheActionBuilder {
             cwd,
             rustc_verbose_version,
             rustc_host,
+            compile_mode,
         } = self
         else {
             return Ok(None);
@@ -1124,6 +1126,7 @@ impl ArtifactCacheActionBuilder {
             &compiler_program,
             &rustc_host,
             &dependency_search_paths,
+            compile_mode,
         ) {
             let reason = unmodeled_rustc_action_reason(rustc);
             if let Some(stats) = stats {
@@ -1971,6 +1974,7 @@ fn rlib_action_is_cacheable(
         compiler_program,
         host_triple,
         &[],
+        CompileMode::Build,
     )
 }
 
@@ -1980,6 +1984,7 @@ fn rlib_action_is_cacheable_with_search_paths(
     compiler_program: &Path,
     host_triple: &str,
     modeled_dependency_search_paths: &[OsString],
+    compile_mode: CompileMode,
 ) -> bool {
     let args = rustc
         .get_args()
@@ -1998,6 +2003,19 @@ fn rlib_action_is_cacheable_with_search_paths(
                 .find_map(|pair| (pair[0] == "--target").then_some(pair[1].as_ref()))
         })
         .unwrap_or(host_triple);
+    let metadata_only = args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--emit="))
+        .eq(["dep-info,metadata"]);
+    let ordinary_library_crate_type = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--crate-type")
+        .map(|pair| pair[1].as_ref())
+        .eq(["lib"]);
+    let metadata_only_test_check = matches!(compile_mode, CompileMode::Check { test: true })
+        && metadata_only
+        && !args.iter().any(|arg| arg == "--crate-type")
+        && !args.iter().any(|arg| arg.starts_with("--crate-type="));
     let unmodeled_environment = [
         "RUSTC_BOOTSTRAP",
         "RUSTC_FORCE_RUSTC_VERSION",
@@ -2034,11 +2052,7 @@ fn rlib_action_is_cacheable_with_search_paths(
         // Windows GNU raw-dylib rlibs may embed output from a PATH-selected
         // or explicitly configured dlltool, which is outside this cache key.
         && !windows_gnu_target(action_target)
-        && args
-            .windows(2)
-            .filter(|pair| pair[0] == "--crate-type")
-            .map(|pair| pair[1].as_ref())
-            .eq(["lib"])
+        && (ordinary_library_crate_type || metadata_only_test_check)
         && args
             .iter()
             .filter_map(|arg| arg.strip_prefix("--emit="))
@@ -2083,7 +2097,7 @@ fn rlib_action_is_cacheable_with_search_paths(
                     && (pair[1].starts_with("save-temps")
                         || unmodeled_codegen_behavior_flag(&pair[1])))
         })
-        && !args.iter().any(|arg| arg == "--test")
+        && (!args.iter().any(|arg| arg == "--test") || metadata_only_test_check)
         && !args.iter().any(|arg| arg.starts_with('@'))
         && !args.iter().any(|arg| arg.starts_with("-l"))
         && !args.iter().any(|arg| arg != "-L" && arg.starts_with("-L"))
@@ -2221,12 +2235,62 @@ mod artifact_cache_admission_tests {
     }
 
     #[test]
-    fn metadata_only_test_actions_remain_ineligible() {
+    fn metadata_only_test_checks_are_cacheable_without_admitting_linked_tests() {
         assert!(artifact_cache_compile_mode_is_supported(CompileMode::Build));
         assert!(artifact_cache_compile_mode_is_supported(
             CompileMode::Check { test: false }
         ));
-        assert!(!artifact_cache_compile_mode_is_supported(
+        assert!(artifact_cache_compile_mode_is_supported(
+            CompileMode::Check { test: true }
+        ));
+        assert!(!artifact_cache_compile_mode_is_supported(CompileMode::Test));
+
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        let mut metadata_test_check = ProcessBuilder::new("rustc");
+        metadata_test_check
+            .arg("--emit=dep-info,metadata")
+            .arg("--out-dir")
+            .arg(output_root)
+            .arg("--test");
+        assert!(rlib_action_is_cacheable_with_search_paths(
+            &metadata_test_check,
+            output_root,
+            compiler,
+            host,
+            &[],
+            CompileMode::Check { test: true }
+        ));
+
+        let mut harnessless_check = ProcessBuilder::new("rustc");
+        harnessless_check
+            .arg("--emit=dep-info,metadata")
+            .arg("--out-dir")
+            .arg(output_root)
+            .arg("--cfg")
+            .arg("test");
+        assert!(rlib_action_is_cacheable_with_search_paths(
+            &harnessless_check,
+            output_root,
+            compiler,
+            host,
+            &[],
+            CompileMode::Check { test: true }
+        ));
+
+        let mut linked_test = ProcessBuilder::new("rustc");
+        linked_test
+            .arg("--emit=dep-info,metadata,link")
+            .arg("--out-dir")
+            .arg(output_root)
+            .arg("--test");
+        assert!(!rlib_action_is_cacheable_with_search_paths(
+            &linked_test,
+            output_root,
+            compiler,
+            host,
+            &[],
             CompileMode::Check { test: true }
         ));
     }
@@ -2673,7 +2737,8 @@ mod artifact_cache_admission_tests {
             output_root,
             compiler,
             host,
-            &[OsString::from("dependency=target/debug/deps")]
+            &[OsString::from("dependency=target/debug/deps")],
+            CompileMode::Build
         ));
     }
 
@@ -3385,6 +3450,58 @@ mod artifact_cache_key_tests {
     }
 
     #[test]
+    fn action_input_snapshot_reports_hashed_files_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dependency = temp.path().join("dependency.rlib");
+        let empty_dependency = temp.path().join("empty.rmeta");
+        let out_dir = temp.path().join("out");
+        std::fs::write(&dependency, b"library").unwrap();
+        std::fs::write(&empty_dependency, b"").unwrap();
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::write(out_dir.join("generated.rs"), b"generated").unwrap();
+        std::fs::write(out_dir.join("empty.rs"), b"").unwrap();
+
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--extern")
+            .arg(format!("dependency={}", dependency.display()))
+            .arg("--extern")
+            .arg(format!("empty={}", empty_dependency.display()))
+            .env("OUT_DIR", &out_dir);
+        let snapshot = artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).unwrap();
+        assert_eq!(snapshot.files, 4);
+        assert_eq!(snapshot.bytes, 16);
+
+        let mut missing = ProcessBuilder::new("rustc");
+        missing.arg("--extern").arg(format!(
+            "missing={}",
+            temp.path().join("missing.rlib").display()
+        ));
+        let snapshot = artifact_cache_action_inputs_snapshot(&missing, temp.path(), None).unwrap();
+        assert_eq!(snapshot.files, 0);
+        assert_eq!(snapshot.bytes, 0);
+    }
+
+    #[test]
+    fn failed_action_input_snapshot_reports_completed_hashing_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let dependency = temp.path().join("dependency.rlib");
+        let invalid_dependency = temp.path().join("not-a-file");
+        std::fs::write(&dependency, b"library").unwrap();
+        std::fs::create_dir(&invalid_dependency).unwrap();
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--extern")
+            .arg(format!("dependency={}", dependency.display()))
+            .arg("--extern")
+            .arg(format!("invalid={}", invalid_dependency.display()));
+        let stats = artifact_cache_stats::ArtifactCacheStats::default();
+
+        assert!(artifact_cache_action_inputs_snapshot(&rustc, temp.path(), Some(&stats)).is_err());
+        assert_eq!(stats.action_hash_test_totals(), (1, 1, 1, 7));
+    }
+
+    #[test]
     fn action_input_witness_detects_newly_created_tree() {
         let temp = tempfile::tempdir().unwrap();
         let out_dir = temp.path().join("out");
@@ -3651,10 +3768,10 @@ fn artifact_cache_action_inputs_snapshot(
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
 ) -> CargoResult<ArtifactCacheActionInputSnapshot> {
     let started = stats.map(|_| Instant::now());
+    let mut witnesses = Vec::new();
     let result = (|| {
         let args = rustc.get_args().collect::<Vec<_>>();
         let mut hasher = blake3::Hasher::new();
-        let mut witnesses = Vec::new();
         let mut supports_fast_path = true;
         hasher.update(b"cargo-artifact-cache-action-inputs-v1\0");
         for pair in args.windows(2) {
@@ -3737,17 +3854,45 @@ fn artifact_cache_action_inputs_snapshot(
                 witnesses.push(directory);
             }
         }
+        let (files, bytes) = artifact_cache_action_input_volume(&witnesses);
         Ok(ArtifactCacheActionInputSnapshot {
             digest: hasher.finalize(),
-            witness: ArtifactCacheActionInputWitness::new(witnesses, supports_fast_path),
+            witness: ArtifactCacheActionInputWitness::new(
+                std::mem::take(&mut witnesses),
+                supports_fast_path,
+            ),
+            files,
+            bytes,
         })
     })();
     if let Some(started) = started
         && let Some(stats) = stats
     {
-        stats.action_hash(started.elapsed(), result.is_err());
+        let (files, bytes) = result.as_ref().map_or_else(
+            |_| artifact_cache_action_input_volume(&witnesses),
+            |snapshot| (snapshot.files, snapshot.bytes),
+        );
+        stats.action_hash(files, bytes, started.elapsed(), result.is_err());
     }
     result
+}
+
+fn artifact_cache_action_input_volume(
+    witnesses: &[ArtifactCacheActionInputPathWitness],
+) -> (u64, u64) {
+    let files = witnesses
+        .iter()
+        .filter(|witness| {
+            witness.kind == ArtifactCacheActionInputPathKind::File && witness.metadata.is_some()
+        })
+        .count() as u64;
+    let bytes = witnesses
+        .iter()
+        .filter(|witness| witness.kind == ArtifactCacheActionInputPathKind::File)
+        .filter_map(|witness| witness.metadata.as_ref())
+        .map(|metadata| metadata.len)
+        .sum();
+    (files, bytes)
 }
 
 fn artifact_cache_action_inputs_are_current(

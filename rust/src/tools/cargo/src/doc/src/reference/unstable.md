@@ -527,8 +527,9 @@ that are uplifted into the target or artifact directories.
 ## artifact-cache
 
 The `artifact-cache` feature reuses verified ordinary-library Build outputs and
-non-test metadata-only Check outputs across build directories through a shared
-content cache. Artifact restoration is
+metadata-only library Check outputs, including test-mode library variants,
+across build directories through a shared content cache. Linked test binaries
+remain ineligible. Artifact restoration is
 currently supported only on macOS and Linux hosts. It is intentionally limited
 to non-proc-macro library actions whose finalized inputs are modeled. Compiler
 wrappers, custom Cargo executors that do not explicitly opt in to cache
