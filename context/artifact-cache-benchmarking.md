@@ -40,7 +40,7 @@ contains command arrays rather than shell fragments. The retained commands are:
 
 ```text
 cargo build --profile no-debug --bin uv --bin uvx --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked
 cargo nextest run --cargo-profile fast-build --features test-python-patch,native-auth,secret-service --workspace --profile ci-linux
 ```
 

@@ -270,9 +270,6 @@ class BenchmarkArtifactCacheTest(unittest.TestCase):
                 "--all-targets",
                 "--all-features",
                 "--locked",
-                "--",
-                "-D",
-                "warnings",
             ],
         )
         self.assertEqual(
