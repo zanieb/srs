@@ -245,7 +245,11 @@ fn check_in_target_with_stats(project: &Project, target_dir: &Path) -> RawOutput
 }
 
 fn artifact_cache_stats(output: &RawOutput) -> serde_json::Value {
-    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    artifact_cache_stats_from_stderr(&output.stderr)
+}
+
+fn artifact_cache_stats_from_stderr(stderr: &[u8]) -> serde_json::Value {
+    let stderr = std::str::from_utf8(stderr).unwrap();
     let reports = stderr
         .lines()
         .filter_map(|line| line.strip_prefix(ARTIFACT_CACHE_STATS_PREFIX))
@@ -640,7 +644,8 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     let producer_target = project.root().join("producer-target");
     let consumer_target = project.root().join("consumer-target");
 
-    let cold = artifact_cache_stats(&build_in_target_with_stats(&project, &producer_target));
+    let cold_output = build_in_target_with_stats(&project, &producer_target);
+    let cold = artifact_cache_stats(&cold_output);
     assert_eq!(cold["version"].as_u64(), Some(1));
     assert_eq!(cold["configured"].as_bool(), Some(true));
     assert_eq!(artifact_cache_stat(&cold, &["units", "eligible"]), 2);
@@ -648,7 +653,11 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(artifact_cache_stat(&cold, &["lookup", "hits"]), 0);
     assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 2);
     assert_eq!(artifact_cache_stat(&cold, &["publication", "attempts"]), 2);
-    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 2);
+    assert_eq!(
+        artifact_cache_stat(&cold, &["publication", "stored"]),
+        2,
+        "{cold:#}"
+    );
     assert_eq!(artifact_cache_stat(&cold, &["publication", "skipped"]), 0);
     assert_eq!(artifact_cache_stat(&cold, &["publication", "failures"]), 0);
     assert_eq!(artifact_cache_stat(&cold, &["rustc", "executions"]), 2);
@@ -684,13 +693,19 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(artifact_cache_stat(&warm, &["preflight", "finalized"]), 2);
     assert_eq!(artifact_cache_stat(&warm, &["publication", "attempts"]), 0);
     assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
-    // Each warm action hashes its inputs once while constructing the key and
-    // once after materialization. A separate pre-materialization pass would
-    // not strengthen the final comparison against the original key digest.
-    assert_eq!(
-        artifact_cache_stat(&warm, &["hashing", "action_inputs", "calls"]),
-        eligible * 2
-    );
+    // Each warm action hashes its inputs once while constructing the key. A
+    // later boundary either validates a reliable metadata witness or records
+    // one additional full-content fallback.
+    let action_hash_calls = artifact_cache_stat(&warm, &["hashing", "action_inputs", "calls"]);
+    let witness_checks =
+        artifact_cache_stat(&warm, &["hashing", "action_inputs", "witness_checks"]);
+    let witness_fast_paths =
+        artifact_cache_stat(&warm, &["hashing", "action_inputs", "witness_fast_paths"]);
+    let witness_fallbacks =
+        artifact_cache_stat(&warm, &["hashing", "action_inputs", "witness_fallbacks"]);
+    assert_eq!(action_hash_calls, eligible + witness_fallbacks, "{warm:#}");
+    assert_eq!(witness_checks, hits);
+    assert_eq!(witness_fast_paths + witness_fallbacks, witness_checks);
     let restore_phases = &warm["lookup"]["phase_elapsed_us"];
     for phase in [
         "lock_us",
@@ -4153,6 +4168,7 @@ fn changed_relative_extern_during_restore_forces_compile() {
             "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE",
             &release,
         )
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -4175,6 +4191,19 @@ fn changed_relative_extern_during_restore_forces_compile() {
         output.status.success(),
         "consumer build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = artifact_cache_stats_from_stderr(&output.stderr);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["hashing", "action_inputs", "calls"]),
+        3
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["hashing", "action_inputs", "witness_checks"]),
+        2
+    );
+    assert_eq!(
+        artifact_cache_stat(&stats, &["hashing", "action_inputs", "witness_fallbacks"]),
+        2
     );
 
     let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
@@ -4214,7 +4243,9 @@ fn changed_relative_extern_during_publication_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can begin publication.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }

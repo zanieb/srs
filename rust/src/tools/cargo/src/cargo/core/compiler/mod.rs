@@ -62,7 +62,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
@@ -394,11 +394,56 @@ struct ArtifactCacheKey {
     action_inputs_digest: blake3::Hash,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactCacheActionInputWitness {
+    paths: Vec<ArtifactCacheActionInputPathWitness>,
+    supports_fast_path: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactCacheActionInputPathKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactCacheActionInputPathWitness {
+    path: PathBuf,
+    kind: ArtifactCacheActionInputPathKind,
+    metadata: Option<ArtifactCacheActionInputMetadataWitness>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactCacheActionInputMetadataWitness {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct PreparedArtifactCacheKey {
+    key: ArtifactCacheKey,
+    action_inputs_witness: ArtifactCacheActionInputWitness,
+}
+
+struct ArtifactCacheActionInputSnapshot {
+    digest: blake3::Hash,
+    witness: ArtifactCacheActionInputWitness,
+}
+
 #[derive(Debug)]
 pub(super) struct PreparedArtifactCacheAction {
     crate_name: String,
     config: build_config::ArtifactCacheConfig,
     key: ArtifactCacheKey,
+    action_inputs_witness: ArtifactCacheActionInputWitness,
     identity_witness: crate::util::rustc::ArtifactCacheIdentityWitness,
     loader_input_paths: Vec<CompilerLoaderInput>,
     command_digest: blake3::Hash,
@@ -1088,7 +1133,7 @@ impl ArtifactCacheActionBuilder {
             return Ok(None);
         };
 
-        let key = match rlib_cache_entry(
+        let prepared_key = match rlib_cache_entry(
             &config.dir,
             rustc,
             &build_dir,
@@ -1119,7 +1164,8 @@ impl ArtifactCacheActionBuilder {
         Ok(Some(PreparedArtifactCacheAction {
             crate_name,
             config,
-            key,
+            key: prepared_key.key,
+            action_inputs_witness: prepared_key.action_inputs_witness,
             identity_witness,
             loader_input_paths,
             command_digest,
@@ -1156,6 +1202,7 @@ fn restore_artifact_cache_action(
             &action.loader_input_paths,
             &action.key.loader_inputs_digest,
             &action.key.action_inputs_digest,
+            &action.action_inputs_witness,
             if mode.is_check() {
                 ArtifactCacheMaterialization::Copy
             } else {
@@ -1676,6 +1723,7 @@ fn rustc(
                 &action.loader_input_paths,
                 &action.key.loader_inputs_digest,
                 &action.key.action_inputs_digest,
+                &action.action_inputs_witness,
                 &rustc,
                 action.config.max_size,
                 artifact_cache_stats.as_deref(),
@@ -2619,7 +2667,7 @@ fn rlib_cache_entry(
     identity_witness: Option<&crate::util::rustc::ArtifactCacheIdentityWitness>,
     rustc_cwd: &Path,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
-) -> CargoResult<ArtifactCacheKey> {
+) -> CargoResult<PreparedArtifactCacheKey> {
     #[expect(
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
@@ -2744,9 +2792,9 @@ fn rlib_cache_entry(
     hasher.update(b"compiler-loader-inputs-content\0");
     hasher.update(loader_inputs_digest.as_bytes());
     hasher.update(b"\0");
-    let action_inputs_digest = artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?;
+    let action_inputs = artifact_cache_action_inputs_snapshot(rustc, rustc_cwd, stats)?;
     hasher.update(b"action-inputs-content\0");
-    hasher.update(action_inputs_digest.as_bytes());
+    hasher.update(action_inputs.digest.as_bytes());
     hasher.update(b"\0");
     for key in APPLE_DEPLOYMENT_TARGET_ENVIRONMENT {
         hasher.update(key.as_bytes());
@@ -2756,10 +2804,13 @@ fn rlib_cache_entry(
         }
         hasher.update(b"\0");
     }
-    Ok(ArtifactCacheKey {
-        entry_root: cache_root.join(hasher.finalize().to_hex().as_str()),
-        loader_inputs_digest,
-        action_inputs_digest,
+    Ok(PreparedArtifactCacheKey {
+        key: ArtifactCacheKey {
+            entry_root: cache_root.join(hasher.finalize().to_hex().as_str()),
+            loader_inputs_digest,
+            action_inputs_digest: action_inputs.digest,
+        },
+        action_inputs_witness: action_inputs.witness,
     })
 }
 
@@ -2923,6 +2974,7 @@ mod artifact_cache_key_tests {
                 None,
             )
             .unwrap()
+            .key
         };
 
         let first_runner = temp.path().join("first=runner");
@@ -3136,6 +3188,7 @@ mod artifact_cache_key_tests {
                 None,
             )
             .unwrap()
+            .key
             .entry_root
         };
 
@@ -3159,6 +3212,143 @@ mod artifact_cache_key_tests {
 
         assert!(is_potential_dynamic_library(&library).unwrap());
         assert!(!is_potential_dynamic_library(&object).unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_input_witness_falls_back_after_same_mtime_content_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dependency.rlib");
+        std::fs::write(&input, b"before").unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&input).unwrap());
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--extern")
+            .arg(format!("dependency={}", input.display()));
+        let snapshot = artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).unwrap();
+        let mut witness = snapshot.witness;
+        assert!(witness.is_current());
+
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&input, b"after!").unwrap();
+        filetime::set_file_mtime(&input, mtime).unwrap();
+
+        assert!(!witness.is_current());
+        assert!(
+            !artifact_cache_action_inputs_are_current(
+                &rustc,
+                temp.path(),
+                &snapshot.digest,
+                &mut witness,
+                None,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_input_witness_refreshes_after_unchanged_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dependency.rlib");
+        std::fs::write(&input, b"contents").unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&input).unwrap());
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--extern")
+            .arg(format!("dependency={}", input.display()));
+        let snapshot = artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).unwrap();
+        let mut witness = snapshot.witness;
+
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&input, b"contents").unwrap();
+        filetime::set_file_mtime(&input, mtime).unwrap();
+
+        assert!(!witness.is_current());
+        assert!(
+            artifact_cache_action_inputs_are_current(
+                &rustc,
+                temp.path(),
+                &snapshot.digest,
+                &mut witness,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(witness.is_current());
+    }
+
+    #[test]
+    fn action_input_tree_witness_detects_added_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_dir = temp.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::write(out_dir.join("generated.rs"), b"before").unwrap();
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc.env("OUT_DIR", &out_dir);
+        let snapshot = artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).unwrap();
+        let mut witness = snapshot.witness;
+        assert!(witness.is_current());
+
+        std::fs::write(out_dir.join("additional.rs"), b"after").unwrap();
+
+        assert!(!witness.is_current());
+        assert!(
+            !artifact_cache_action_inputs_are_current(
+                &rustc,
+                temp.path(),
+                &snapshot.digest,
+                &mut witness,
+                None,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn action_input_witness_detects_newly_created_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_dir = temp.path().join("out");
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc.env("OUT_DIR", &out_dir);
+        let snapshot = artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).unwrap();
+        let mut witness = snapshot.witness;
+        assert!(witness.is_current());
+
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::write(out_dir.join("generated.rs"), b"contents").unwrap();
+
+        assert!(!witness.is_current());
+        assert!(
+            !artifact_cache_action_inputs_are_current(
+                &rustc,
+                temp.path(),
+                &snapshot.digest,
+                &mut witness,
+                None,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_input_witness_rejects_symlinked_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dependency.rlib");
+        let alias = temp.path().join("dependency-alias.rlib");
+        std::fs::write(&input, b"contents").unwrap();
+        symlink(&input, &alias).unwrap();
+        let mut rustc = ProcessBuilder::new("rustc");
+        rustc
+            .arg("--extern")
+            .arg(format!("dependency={}", alias.display()));
+
+        assert!(artifact_cache_action_inputs_snapshot(&rustc, temp.path(), None).is_err());
     }
 }
 
@@ -3228,15 +3418,167 @@ fn artifact_cache_command_digest(rustc: &ProcessBuilder) -> blake3::Hash {
     hasher.finalize()
 }
 
-fn artifact_cache_action_inputs_digest(
+impl ArtifactCacheActionInputPathWitness {
+    fn from_metadata(
+        path: &Path,
+        kind: ArtifactCacheActionInputPathKind,
+        metadata: &fs::Metadata,
+    ) -> CargoResult<Self> {
+        if !(matches!(kind, ArtifactCacheActionInputPathKind::File)
+            && metadata.file_type().is_file()
+            || matches!(kind, ArtifactCacheActionInputPathKind::Directory)
+                && metadata.file_type().is_dir())
+        {
+            anyhow::bail!(
+                "artifact cache action input has an unsupported file type {}",
+                path.display()
+            );
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            kind,
+            metadata: Some(ArtifactCacheActionInputMetadataWitness {
+                len: metadata.len(),
+                modified: metadata.modified()?,
+                #[cfg(unix)]
+                device: std::os::unix::fs::MetadataExt::dev(metadata),
+                #[cfg(unix)]
+                inode: std::os::unix::fs::MetadataExt::ino(metadata),
+                #[cfg(unix)]
+                changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
+                #[cfg(unix)]
+                changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
+            }),
+        })
+    }
+
+    fn capture(path: &Path, kind: ArtifactCacheActionInputPathKind) -> CargoResult<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Self::from_metadata(path, kind, &metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
+                path: path.to_path_buf(),
+                kind,
+                metadata: None,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        Self::capture(&self.path, self.kind).is_ok_and(|current| current == *self)
+    }
+}
+
+impl ArtifactCacheActionInputWitness {
+    fn new(mut paths: Vec<ArtifactCacheActionInputPathWitness>, supports_fast_path: bool) -> Self {
+        paths.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
+        });
+        paths.dedup();
+        Self {
+            paths,
+            supports_fast_path,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        self.paths
+            .iter()
+            .all(ArtifactCacheActionInputPathWitness::is_current)
+    }
+}
+
+fn hash_artifact_cache_action_input_file(
+    path: &Path,
+    witnesses: &mut Vec<ArtifactCacheActionInputPathWitness>,
+) -> CargoResult<(Option<Vec<u8>>, bool)> {
+    let before =
+        ArtifactCacheActionInputPathWitness::capture(path, ArtifactCacheActionInputPathKind::File)?;
+    let Some(_) = before.metadata else {
+        witnesses.push(before);
+        return Ok((None, false));
+    };
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let supports_fast_path = artifact_cache_action_input_witness_is_reliable(&file);
+    let handle_before = ArtifactCacheActionInputPathWitness::from_metadata(
+        path,
+        ArtifactCacheActionInputPathKind::File,
+        &file.metadata()?,
+    )?;
+    if before != handle_before {
+        anyhow::bail!(
+            "artifact cache action input changed while opening {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(
+        before
+            .metadata
+            .as_ref()
+            .and_then(|metadata| usize::try_from(metadata.len).ok())
+            .unwrap_or(0),
+    );
+    file.read_to_end(&mut bytes)?;
+    let handle_after = ArtifactCacheActionInputPathWitness::from_metadata(
+        path,
+        ArtifactCacheActionInputPathKind::File,
+        &file.metadata()?,
+    )?;
+    let after =
+        ArtifactCacheActionInputPathWitness::capture(path, ArtifactCacheActionInputPathKind::File)?;
+    if before != handle_after || before != after {
+        anyhow::bail!(
+            "artifact cache action input changed while hashing {}",
+            path.display()
+        );
+    }
+    witnesses.push(after);
+    Ok((Some(bytes), supports_fast_path))
+}
+
+#[cfg(target_vendor = "apple")]
+fn artifact_cache_action_input_witness_is_reliable(file: &File) -> bool {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd as _;
+
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `filesystem` points to writable storage for one `statfs` and is
+    // only assumed initialized after `fstatfs` reports success.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstatfs` initialized the structure.
+    let filesystem = unsafe { filesystem.assume_init() };
+    // SAFETY: Darwin guarantees that `f_fstypename` is NUL-terminated.
+    let name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
+    name.to_bytes() == b"apfs"
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn artifact_cache_action_input_witness_is_reliable(_file: &File) -> bool {
+    false
+}
+
+fn artifact_cache_action_inputs_snapshot(
     rustc: &ProcessBuilder,
     rustc_cwd: &Path,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
-) -> CargoResult<blake3::Hash> {
+) -> CargoResult<ArtifactCacheActionInputSnapshot> {
     let started = stats.map(|_| Instant::now());
     let result = (|| {
         let args = rustc.get_args().collect::<Vec<_>>();
         let mut hasher = blake3::Hasher::new();
+        let mut witnesses = Vec::new();
+        let mut supports_fast_path = true;
         hasher.update(b"cargo-artifact-cache-action-inputs-v1\0");
         for pair in args.windows(2) {
             if pair[0] != OsStr::new("--extern") {
@@ -3247,9 +3589,12 @@ fn artifact_cache_action_inputs_digest(
                 continue;
             };
             let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
-            if path.is_file() {
+            let (bytes, reliable_witness) =
+                hash_artifact_cache_action_input_file(&path, &mut witnesses)?;
+            supports_fast_path &= reliable_witness;
+            if let Some(bytes) = bytes {
                 hasher.update(b"extern-content\0");
-                hasher.update(&fs::read(path)?);
+                hasher.update(&bytes);
                 hasher.update(b"\0");
             }
         }
@@ -3261,11 +3606,26 @@ fn artifact_cache_action_inputs_digest(
                 continue;
             };
             let path = resolve_rustc_input_path(Path::new(value), rustc_cwd);
-            if path.is_dir() {
+            let directory = ArtifactCacheActionInputPathWitness::capture(
+                &path,
+                ArtifactCacheActionInputPathKind::Directory,
+            )?;
+            if directory.metadata.is_some() {
+                supports_fast_path = false;
                 hasher.update(b"generated-input-tree\0");
                 hasher.update(key.as_bytes());
                 hasher.update(b"\0");
-                hash_path_tree(&mut hasher, &path, &path, None, false)?;
+                hash_path_tree(
+                    &mut hasher,
+                    &path,
+                    &path,
+                    None,
+                    false,
+                    Some(directory),
+                    &mut witnesses,
+                )?;
+            } else {
+                witnesses.push(directory);
             }
         }
         for pair in args.windows(2) {
@@ -3280,12 +3640,30 @@ fn artifact_cache_action_inputs_digest(
                 .split_once('=')
                 .map_or(value.as_ref(), |(_, path)| path);
             let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
-            if path.is_dir() {
+            let directory = ArtifactCacheActionInputPathWitness::capture(
+                &path,
+                ArtifactCacheActionInputPathKind::Directory,
+            )?;
+            if directory.metadata.is_some() {
+                supports_fast_path = false;
                 hasher.update(b"link-search-input-tree\0");
-                hash_path_tree(&mut hasher, &path, &path, None, true)?;
+                hash_path_tree(
+                    &mut hasher,
+                    &path,
+                    &path,
+                    None,
+                    true,
+                    Some(directory),
+                    &mut witnesses,
+                )?;
+            } else {
+                witnesses.push(directory);
             }
         }
-        Ok(hasher.finalize())
+        Ok(ArtifactCacheActionInputSnapshot {
+            digest: hasher.finalize(),
+            witness: ArtifactCacheActionInputWitness::new(witnesses, supports_fast_path),
+        })
     })();
     if let Some(started) = started
         && let Some(stats) = stats
@@ -3293,6 +3671,36 @@ fn artifact_cache_action_inputs_digest(
         stats.action_hash(started.elapsed(), result.is_err());
     }
     result
+}
+
+fn artifact_cache_action_inputs_are_current(
+    rustc: &ProcessBuilder,
+    rustc_cwd: &Path,
+    expected_digest: &blake3::Hash,
+    witness: &mut ArtifactCacheActionInputWitness,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+) -> CargoResult<bool> {
+    let started = stats.map(|_| Instant::now());
+    let witness_is_current = witness.supports_fast_path && witness.is_current();
+    if witness_is_current {
+        if let Some(started) = started
+            && let Some(stats) = stats
+        {
+            stats.action_witness_fast_path(started.elapsed());
+        }
+        return Ok(true);
+    }
+    if let Some(started) = started
+        && let Some(stats) = stats
+    {
+        stats.action_witness_fallback(started.elapsed());
+    }
+    let current = artifact_cache_action_inputs_snapshot(rustc, rustc_cwd, stats)?;
+    if current.digest != *expected_digest {
+        return Ok(false);
+    }
+    *witness = current.witness;
+    Ok(true)
 }
 
 fn artifact_cache_host_is_supported() -> bool {
@@ -3899,7 +4307,22 @@ fn hash_path_tree(
     path: &Path,
     excluded_path: Option<&Path>,
     link_search_input: bool,
+    directory_before: Option<ArtifactCacheActionInputPathWitness>,
+    witnesses: &mut Vec<ArtifactCacheActionInputPathWitness>,
 ) -> CargoResult<()> {
+    let directory_before = match directory_before {
+        Some(directory_before) => directory_before,
+        None => ArtifactCacheActionInputPathWitness::capture(
+            path,
+            ArtifactCacheActionInputPathKind::Directory,
+        )?,
+    };
+    if directory_before.metadata.is_none() {
+        anyhow::bail!(
+            "artifact cache action input tree is not a directory {}",
+            path.display()
+        );
+    }
     let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
@@ -3917,7 +4340,15 @@ fn hash_path_tree(
                 path.display()
             );
         } else if file_type.is_dir() {
-            hash_path_tree(hasher, root, &path, excluded_path, link_search_input)?;
+            hash_path_tree(
+                hasher,
+                root,
+                &path,
+                excluded_path,
+                link_search_input,
+                None,
+                witnesses,
+            )?;
         } else if file_type.is_file() {
             hasher.update(
                 path.strip_prefix(root)
@@ -3926,7 +4357,13 @@ fn hash_path_tree(
                     .as_encoded_bytes(),
             );
             hasher.update(b"\0");
-            let bytes = fs::read(&path)?;
+            let (bytes, _) = hash_artifact_cache_action_input_file(&path, witnesses)?;
+            let Some(bytes) = bytes else {
+                anyhow::bail!(
+                    "artifact cache action input disappeared while hashing {}",
+                    path.display()
+                );
+            };
             if link_search_input && path.extension() == Some(OsStr::new("a")) {
                 hasher.update(&normalize_ar_timestamps(&bytes));
             } else {
@@ -3940,6 +4377,17 @@ fn hash_path_tree(
             );
         }
     }
+    let directory_after = ArtifactCacheActionInputPathWitness::capture(
+        path,
+        ArtifactCacheActionInputPathKind::Directory,
+    )?;
+    if directory_before != directory_after {
+        anyhow::bail!(
+            "artifact cache action input directory changed while hashing {}",
+            path.display()
+        );
+    }
+    witnesses.push(directory_after);
     Ok(())
 }
 
@@ -3988,11 +4436,13 @@ fn restore_rlib_cache(
     loader_input_paths: &[CompilerLoaderInput],
     loader_inputs_digest: &blake3::Hash,
     action_inputs_digest: &blake3::Hash,
+    action_inputs_witness: &ArtifactCacheActionInputWitness,
     materialization: ArtifactCacheMaterialization,
     max_size: Option<u64>,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
     snapshot: Option<&artifact_cache_snapshot::Recorder>,
 ) -> CargoResult<bool> {
+    let mut action_inputs_witness = action_inputs_witness.clone();
     if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
     }
@@ -4137,13 +4587,19 @@ fn restore_rlib_cache(
                 Ok(false)
             } else {
                 let action_started = stats.map(|_| Instant::now());
-                let action_result = artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats);
+                let action_result = artifact_cache_action_inputs_are_current(
+                    rustc,
+                    rustc_cwd,
+                    action_inputs_digest,
+                    &mut action_inputs_witness,
+                    stats,
+                );
                 if let Some(started) = action_started
                     && let Some(stats) = stats
                 {
                     stats.restore_phase(RestorePhase::FinalActionValidation, started.elapsed());
                 }
-                Ok(action_result? == *action_inputs_digest)
+                action_result
             }
         };
         if let Some(started) = phase_started
@@ -4307,11 +4763,13 @@ fn store_rlib_cache(
     loader_input_paths: &[CompilerLoaderInput],
     loader_inputs_digest: &blake3::Hash,
     action_inputs_digest: &blake3::Hash,
+    action_inputs_witness: &ArtifactCacheActionInputWitness,
     rustc: &ProcessBuilder,
     max_size: Option<u64>,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
     snapshot: Option<&artifact_cache_snapshot::Recorder>,
 ) -> CargoResult<bool> {
+    let mut action_inputs_witness = action_inputs_witness.clone();
     if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
         debug!("not storing artifact cache entry with generated build-directory inputs");
         return Ok(false);
@@ -4331,7 +4789,13 @@ fn store_rlib_cache(
         );
         return Ok(false);
     }
-    if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
+    if !artifact_cache_action_inputs_are_current(
+        rustc,
+        rustc_cwd,
+        action_inputs_digest,
+        &mut action_inputs_witness,
+        stats,
+    )? {
         debug!("not storing artifact cache entry with action inputs modified during compilation");
         return Ok(false);
     }
@@ -4451,8 +4915,13 @@ fn store_rlib_cache(
         if !identity_witness.is_current()
             || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
                 != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
-                != *action_inputs_digest
+            || !artifact_cache_action_inputs_are_current(
+                rustc,
+                rustc_cwd,
+                action_inputs_digest,
+                &mut action_inputs_witness,
+                stats,
+            )?
             || rlib_cache_inputs_digest_matching_rustc_dep_info(
                 rustc_dep_info_loc,
                 rustc_cwd,
@@ -4478,8 +4947,13 @@ fn store_rlib_cache(
         if !identity_witness.is_current()
             || compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
                 != *loader_inputs_digest
-            || artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
-                != *action_inputs_digest
+            || !artifact_cache_action_inputs_are_current(
+                rustc,
+                rustc_cwd,
+                action_inputs_digest,
+                &mut action_inputs_witness,
+                stats,
+            )?
             || rlib_cache_inputs_digest_matching_rustc_dep_info(
                 rustc_dep_info_loc,
                 rustc_cwd,
@@ -5618,6 +6092,8 @@ mod artifact_cache_size_tests {
                 temp.path(),
                 None,
                 false,
+                None,
+                &mut Vec::new(),
             )
             .is_err()
         );

@@ -189,6 +189,10 @@ pub struct ArtifactCacheStats {
     action_hash_calls: AtomicU64,
     action_hash_failures: AtomicU64,
     action_hash_wall_us: AtomicU64,
+    action_witness_checks: AtomicU64,
+    action_witness_fast_paths: AtomicU64,
+    action_witness_fallbacks: AtomicU64,
+    action_witness_wall_us: AtomicU64,
     publication_attempts: AtomicU64,
     publication_stored: AtomicU64,
     publication_skipped: AtomicU64,
@@ -262,6 +266,10 @@ impl Default for ArtifactCacheStats {
             action_hash_calls: AtomicU64::new(0),
             action_hash_failures: AtomicU64::new(0),
             action_hash_wall_us: AtomicU64::new(0),
+            action_witness_checks: AtomicU64::new(0),
+            action_witness_fast_paths: AtomicU64::new(0),
+            action_witness_fallbacks: AtomicU64::new(0),
+            action_witness_wall_us: AtomicU64::new(0),
             publication_attempts: AtomicU64::new(0),
             publication_stored: AtomicU64::new(0),
             publication_skipped: AtomicU64::new(0),
@@ -426,6 +434,20 @@ impl ArtifactCacheStats {
         Self::add(&self.action_hash_wall_us, Self::micros(elapsed));
     }
 
+    fn action_witness(&self, elapsed: Duration, counter: &AtomicU64) {
+        Self::add(&self.action_witness_checks, 1);
+        Self::add(counter, 1);
+        Self::add(&self.action_witness_wall_us, Self::micros(elapsed));
+    }
+
+    pub fn action_witness_fast_path(&self, elapsed: Duration) {
+        self.action_witness(elapsed, &self.action_witness_fast_paths);
+    }
+
+    pub fn action_witness_fallback(&self, elapsed: Duration) {
+        self.action_witness(elapsed, &self.action_witness_fallbacks);
+    }
+
     pub fn publication_attempt(&self) {
         Self::add(&self.publication_attempts, 1);
     }
@@ -581,6 +603,10 @@ impl ArtifactCacheStats {
                     "calls": load(&self.action_hash_calls),
                     "failures": load(&self.action_hash_failures),
                     "wall_us": load(&self.action_hash_wall_us),
+                    "witness_checks": load(&self.action_witness_checks),
+                    "witness_fast_paths": load(&self.action_witness_fast_paths),
+                    "witness_fallbacks": load(&self.action_witness_fallbacks),
+                    "witness_wall_us": load(&self.action_witness_wall_us),
                 },
             },
             "publication": {
