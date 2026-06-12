@@ -53893,6 +53893,34 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn macho_preloading_restores_deleted_output_from_retained_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("input.o");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        state.write(&state_dir).unwrap();
+        install_output_snapshot(&state_dir, &output).unwrap();
+        std::fs::remove_file(&output).unwrap();
+
+        assert!(maybe_reuse_output_before_loading(&args).unwrap());
+        assert_eq!(std::fs::read(&output).unwrap(), b"output");
+        assert!(
+            std::fs::read_to_string(state_dir.join(LOG_FILE))
+                .unwrap()
+                .contains("restored missing output from retained snapshot")
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn preloading_does_not_restore_deleted_output_before_changed_input_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");

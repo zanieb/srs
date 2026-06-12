@@ -277,6 +277,10 @@ impl platform::Args for MachOArgs {
         self.has_private_persistent_output_contract
     }
 
+    fn should_retain_output_snapshot(&self) -> bool {
+        !self.has_private_persistent_output_contract
+    }
+
     fn should_validate_macho_cstring_patches(&self) -> bool {
         true
     }
@@ -1396,7 +1400,7 @@ mod tests {
         assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(args.should_hash_directly_patched_output());
         assert!(!args.should_trust_persistent_output_data_identity());
-        assert!(!args.should_retain_output_snapshot());
+        assert!(args.should_retain_output_snapshot());
         assert!(args.should_validate_macho_cstring_patches());
         assert!(args.should_activate_macho_archive_members());
         assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
@@ -1409,7 +1413,7 @@ mod tests {
         assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(args.should_hash_directly_patched_output());
         assert!(!args.should_trust_persistent_output_data_identity());
-        assert!(!args.should_retain_output_snapshot());
+        assert!(args.should_retain_output_snapshot());
         assert!(args.should_validate_macho_cstring_patches());
         assert!(args.should_activate_macho_archive_members());
         assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
