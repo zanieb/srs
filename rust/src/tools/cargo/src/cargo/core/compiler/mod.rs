@@ -466,7 +466,6 @@ enum ArtifactCacheActionBuilder {
         identity_provider: crate::util::rustc::ArtifactCacheIdentityProvider,
         compiler_program: PathBuf,
         identity_program: PathBuf,
-        loader_input_paths: Vec<CompilerLoaderInput>,
         dependency_search_paths: Vec<OsString>,
         portable_remaps: Vec<(OsString, OsString)>,
         build_dir: PathBuf,
@@ -954,11 +953,6 @@ impl ArtifactCacheActionBuilder {
                 IneligibleReason::CompileMode,
                 "compile mode is not supported",
             ))
-        } else if unit.pkg.has_custom_build() {
-            Some((
-                IneligibleReason::CustomBuildScript,
-                "package has a custom build script",
-            ))
         } else if !sbom_files.is_empty() {
             Some((IneligibleReason::Sbom, "SBOM output is enabled"))
         } else if !artifact_cache_host_is_supported() {
@@ -985,8 +979,9 @@ impl ArtifactCacheActionBuilder {
             .program()
             .unwrap_or(&compiler_program)
             .to_path_buf();
+        let loader_home = rustc.get_env("HOME");
         let loader_input_paths = compiler_loader_input_paths(
-            build_runner.bcx.gctx,
+            loader_home.as_deref(),
             rustc,
             &identity_program,
             build_dir,
@@ -1041,7 +1036,6 @@ impl ArtifactCacheActionBuilder {
             identity_provider,
             compiler_program,
             identity_program,
-            loader_input_paths,
             dependency_search_paths,
             portable_remaps,
             build_dir: build_dir.to_path_buf(),
@@ -1064,7 +1058,6 @@ impl ArtifactCacheActionBuilder {
             identity_provider,
             compiler_program,
             identity_program,
-            mut loader_input_paths,
             dependency_search_paths,
             portable_remaps,
             build_dir,
@@ -1101,10 +1094,33 @@ impl ArtifactCacheActionBuilder {
             );
             return Ok(None);
         }
-        if remove_cargo_injected_loader_path(rustc, &output_root)? {
-            loader_input_paths.retain(|input| {
-                input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != output_root
-            });
+        if !artifact_cache_rustc_loader_environment_is_modeled(rustc) {
+            if let Some(stats) = stats {
+                stats.ineligible(IneligibleReason::UnmodeledLoaderEnvironment);
+            }
+            debug!(
+                "artifact cache admission rejected for {crate_name}: finalized compiler loader environment is not safely modeled"
+            );
+            return Ok(None);
+        }
+        remove_cargo_injected_loader_path(rustc, &output_root)?;
+        let loader_home = rustc.get_env("HOME");
+        let loader_input_paths = compiler_loader_input_paths(
+            loader_home.as_deref(),
+            rustc,
+            &identity_program,
+            &build_dir,
+            &output_root,
+            &cwd,
+        );
+        if !artifact_cache_loader_input_paths_are_modeled(&loader_input_paths) {
+            if let Some(stats) = stats {
+                stats.ineligible(IneligibleReason::UnmodeledLoaderInputs);
+            }
+            debug!(
+                "artifact cache admission rejected for {crate_name}: finalized compiler loader inputs are not safely modeled"
+            );
+            return Ok(None);
         }
 
         let identity_started = stats.map(|_| (Instant::now(), thread_cpu_time()));
@@ -1403,7 +1419,6 @@ fn rustc(
         && unit.target.is_lib()
         && !unit.target.proc_macro()
         && artifact_cache_compile_mode_is_supported(unit.mode)
-        && !unit.pkg.has_custom_build()
         && sbom_files.is_empty();
     let preflight_artifact_cache_state = if force_rebuild {
         build_runner.preflight_artifact_cache_states.remove(unit);
@@ -3788,44 +3803,48 @@ fn artifact_cache_loader_environment_is_modeled(
     gctx: &crate::util::GlobalContext,
     rustc: &ProcessBuilder,
 ) -> bool {
-    fn variable_is_modeled(key: &str, value: &OsStr) -> bool {
-        let bytes = value.as_encoded_bytes();
-        let has_loader_expansion = (cfg!(target_os = "linux") && bytes.contains(&b'$'))
-            || (cfg!(target_os = "macos") && (bytes.contains(&b'@') || bytes.contains(&b'$')));
-        if value.is_empty()
-            || (key == paths::dylib_path_envvar() && !has_loader_expansion)
-            || (cfg!(target_os = "macos")
-                && (key == "DYLD_LIBRARY_PATH" || key == "LD_LIBRARY_PATH")
-                && !has_loader_expansion)
-        {
-            return true;
-        }
-        !(cfg!(unix) && key.starts_with("LD_"))
-            && !(cfg!(target_os = "linux") && key == "GLIBC_TUNABLES")
-            && !(cfg!(target_os = "macos") && key.starts_with("DYLD_"))
-    }
-
     #[expect(
         clippy::disallowed_methods,
         reason = "loader admission must preserve non-UTF-8 inherited values filtered from GlobalContext::env"
     )]
     let inherited_is_modeled = std::env::vars_os().all(|(key, value)| {
         key.to_str()
-            .is_some_and(|key| variable_is_modeled(key, &value))
+            .is_some_and(|key| artifact_cache_loader_variable_is_modeled(key, &value))
     });
     inherited_is_modeled
         && gctx
             .env()
-            .all(|(key, value)| variable_is_modeled(key, OsStr::new(value)))
-        && rustc.get_envs().iter().all(|(key, value)| {
-            value
-                .as_deref()
-                .is_none_or(|value| variable_is_modeled(key, value))
-        })
+            .all(|(key, value)| artifact_cache_loader_variable_is_modeled(key, OsStr::new(value)))
+        && artifact_cache_rustc_loader_environment_is_modeled(rustc)
+}
+
+fn artifact_cache_loader_variable_is_modeled(key: &str, value: &OsStr) -> bool {
+    let bytes = value.as_encoded_bytes();
+    let has_loader_expansion = (cfg!(target_os = "linux") && bytes.contains(&b'$'))
+        || (cfg!(target_os = "macos") && (bytes.contains(&b'@') || bytes.contains(&b'$')));
+    if value.is_empty()
+        || (key == paths::dylib_path_envvar() && !has_loader_expansion)
+        || (cfg!(target_os = "macos")
+            && (key == "DYLD_LIBRARY_PATH" || key == "LD_LIBRARY_PATH")
+            && !has_loader_expansion)
+    {
+        return true;
+    }
+    !(cfg!(unix) && key.starts_with("LD_"))
+        && !(cfg!(target_os = "linux") && key == "GLIBC_TUNABLES")
+        && !(cfg!(target_os = "macos") && key.starts_with("DYLD_"))
+}
+
+fn artifact_cache_rustc_loader_environment_is_modeled(rustc: &ProcessBuilder) -> bool {
+    rustc.get_envs().iter().all(|(key, value)| {
+        value
+            .as_deref()
+            .is_none_or(|value| artifact_cache_loader_variable_is_modeled(key, value))
+    })
 }
 
 fn compiler_loader_input_paths(
-    gctx: &crate::util::GlobalContext,
+    home: Option<&OsStr>,
     rustc: &ProcessBuilder,
     compiler_program: &Path,
     build_dir: &Path,
@@ -3880,7 +3899,7 @@ fn compiler_loader_input_paths(
             rustc_cwd,
         );
     } else if cfg!(target_os = "macos") {
-        if let Some(home) = gctx.get_env_os("HOME") {
+        if let Some(home) = home {
             let home_lib = PathBuf::from(home).join("lib");
             inputs.push(compiler_loader_input(
                 primary,

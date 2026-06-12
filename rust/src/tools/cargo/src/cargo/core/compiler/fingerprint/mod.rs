@@ -1625,7 +1625,6 @@ fn calculate_normal(
         && unit.target.is_lib()
         && !unit.target.proc_macro()
         && super::artifact_cache_compile_mode_is_supported(unit.mode)
-        && !unit.pkg.has_custom_build()
         && build_runner.sbom_output_files(unit)?.is_empty()
     {
         // This target-local completion stamp records a successful

@@ -786,6 +786,378 @@ fn artifact_cache_stats_report_build_script_processes() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn custom_build_library_actions_restore_after_the_script_runs() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn value() -> &'static str { env!(\"PROBE_RUSTC_ENV\") }\n",
+        )
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+                let tree = std::env::var("PROBE_TREE").unwrap();
+                let rustc_env = std::env::var("PROBE_ENV").unwrap();
+                std::fs::write(out_dir.join("unused-input"), tree).unwrap();
+                println!("cargo::rerun-if-env-changed=PROBE_TREE");
+                println!("cargo::rerun-if-env-changed=PROBE_ENV");
+                println!("cargo::rustc-check-cfg=cfg(probe_build)");
+                println!("cargo::rustc-cfg=probe_build");
+                println!("cargo::rustc-env=PROBE_RUSTC_ENV={rustc_env}");
+            }
+            "#,
+        )
+        .build();
+    let build = |target: &Path, tree: &str, rustc_env: &str| {
+        artifact_cache_stats(
+            &project
+                .cargo("-Zartifact-cache build --lib")
+                .arg("--target-dir")
+                .arg(target)
+                .masquerade_as_nightly_cargo(&["artifact-cache"])
+                .env(
+                    cargo_util::paths::dylib_path_envvar(),
+                    isolated_loader_path(),
+                )
+                .env("CARGO_INCREMENTAL", "1")
+                .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+                .env("PROBE_TREE", tree)
+                .env("PROBE_ENV", rustc_env)
+                .run(),
+        )
+    };
+
+    let cold = build(&project.root().join("target-cold"), "stable", "stable");
+    assert_eq!(artifact_cache_stat(&cold, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["rustc", "executions"]), 2);
+    assert_eq!(
+        artifact_cache_stat(&cold, &["build_script", "executions"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &cold,
+            &["units", "ineligible_by_reason", "custom_build_script"]
+        ),
+        0
+    );
+
+    let warm = build(&project.root().join("target-warm"), "stable", "stable");
+    assert_eq!(artifact_cache_stat(&warm, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "misses"]), 0);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&warm, &["build_script", "executions"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&warm, &["preflight", "attempted"]), 0);
+
+    let changed_tree = build(
+        &project.root().join("target-changed-tree"),
+        "changed",
+        "stable",
+    );
+    assert_eq!(artifact_cache_stat(&changed_tree, &["lookup", "misses"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&changed_tree, &["publication", "stored"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&changed_tree, &["rustc", "executions"]),
+        2
+    );
+
+    let changed_env = build(
+        &project.root().join("target-changed-env"),
+        "changed",
+        "changed",
+    );
+    assert_eq!(artifact_cache_stat(&changed_env, &["lookup", "misses"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&changed_env, &["publication", "stored"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&changed_env, &["rustc", "executions"]),
+        2
+    );
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn custom_build_generated_source_remains_unpublished() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file(
+            "src/lib.rs",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        )
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+                std::fs::write(
+                    out_dir.join("generated.rs"),
+                    "pub fn value() -> u32 { 42 }\n",
+                )
+                .unwrap();
+            }
+            "#,
+        )
+        .build();
+
+    for target in ["target-first", "target-second"] {
+        let stats = artifact_cache_stats(&build_in_target_with_stats(
+            &project,
+            &project.root().join(target),
+        ));
+        assert_eq!(artifact_cache_stat(&stats, &["units", "eligible"]), 1);
+        assert_eq!(artifact_cache_stat(&stats, &["lookup", "misses"]), 1);
+        assert_eq!(artifact_cache_stat(&stats, &["publication", "stored"]), 0);
+        assert_eq!(artifact_cache_stat(&stats, &["publication", "skipped"]), 1);
+        assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 2);
+    }
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn custom_build_native_link_actions_remain_ineligible() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                println!("cargo::rustc-link-lib=dylib=c");
+            }
+            "#,
+        )
+        .build();
+    let stats = artifact_cache_stats(&build_in_target_with_stats(
+        &project,
+        &project.root().join("target-dir"),
+    ));
+
+    assert_eq!(artifact_cache_stat(&stats, &["units", "eligible"]), 0);
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["units", "ineligible_by_reason", "unmodeled_rustc_action"]
+        ),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["units", "ineligible_by_reason", "custom_build_script"]
+        ),
+        0
+    );
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn custom_build_final_loader_inputs_are_content_sensitive() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let loader_variable = cargo_util::paths::dylib_path_envvar();
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .file("loader/libprobe.so", "first loader contents")
+        .file(
+            "build.rs",
+            &format!(
+                r#"
+                fn main() {{
+                    let loader = std::path::PathBuf::from(
+                        std::env::var_os("CARGO_MANIFEST_DIR").unwrap(),
+                    )
+                    .join("loader");
+                    println!("cargo::rustc-env={loader_variable}={{}}", loader.display());
+                }}
+                "#,
+            ),
+        )
+        .build();
+    let loader_dir = project.root().join("loader");
+    let build = |target: &str| {
+        artifact_cache_stats(&build_in_target_with_stats(
+            &project,
+            &project.root().join(target),
+        ))
+    };
+
+    let cold = build("target-cold");
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 1);
+
+    let warm = build("target-warm");
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 1);
+
+    fs::write(loader_dir.join("libprobe.so"), b"changed loader contents").unwrap();
+    let changed = build("target-changed");
+    assert_eq!(artifact_cache_stat(&changed, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["publication", "stored"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["rustc", "executions"]), 2);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(target_os = "macos")]
+fn custom_build_final_home_controls_dyld_fallback_inputs() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .file("fallback-home/lib/libprobe.dylib", "first loader contents")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let home = std::path::PathBuf::from(
+                    std::env::var_os("CARGO_MANIFEST_DIR").unwrap(),
+                )
+                .join("fallback-home");
+                println!("cargo::rustc-env=HOME={}", home.display());
+                println!("cargo::rustc-env=DYLD_FALLBACK_LIBRARY_PATH=");
+            }
+            "#,
+        )
+        .build();
+    let loader = project.root().join("fallback-home/lib/libprobe.dylib");
+    let build = |target: &str| {
+        artifact_cache_stats(&build_in_target_with_stats(
+            &project,
+            &project.root().join(target),
+        ))
+    };
+
+    let cold = build("target-cold");
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["publication", "stored"]), 1);
+
+    let warm = build("target-warm");
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 1);
+
+    fs::write(loader, b"changed loader contents").unwrap();
+    let changed = build("target-changed");
+    assert_eq!(artifact_cache_stat(&changed, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["publication", "stored"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["rustc", "executions"]), 2);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn custom_build_final_loader_environment_is_revalidated() {
+    let (variable, value) = if cfg!(target_os = "linux") {
+        ("GLIBC_TUNABLES", "glibc.cpu.hwcaps=-AVX2")
+    } else if cfg!(target_os = "macos") {
+        ("DYLD_LIBRARY_PATH", "$ORIGIN")
+    } else {
+        return;
+    };
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .file(
+            "build.rs",
+            &format!(
+                r#"
+                fn main() {{
+                    println!("cargo::rustc-env={variable}={value}");
+                }}
+                "#,
+            ),
+        )
+        .build();
+    let stats = artifact_cache_stats(&build_in_target_with_stats(
+        &project,
+        &project.root().join("target-dir"),
+    ));
+
+    assert_eq!(artifact_cache_stat(&stats, &["units", "eligible"]), 0);
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &[
+                "units",
+                "ineligible_by_reason",
+                "unmodeled_loader_environment"
+            ]
+        ),
+        1
+    );
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     let cache = paths::root().join("shared-cache");
     let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
@@ -2188,7 +2560,6 @@ fn target_paths_inside_semantic_rustflags_keep_distinct_variants() {
             cache.to_string_lossy().replace('\\', "\\\\")
         )
     };
-
     project.change_file(".cargo/config.toml", &config(&producer_value));
     build_in_target(&project, &producer_target);
     let producer_bytes =
