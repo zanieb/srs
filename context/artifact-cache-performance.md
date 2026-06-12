@@ -314,6 +314,61 @@ pairs, final executable copies, `build/` state, and proc-macro dylibs. Cargo
 must emit the omission manifest; external matching by extension, basename,
 inode, size, or mtime is not a safe product protocol.
 
+A bounded four-worker prototype then staged and verified reconstructed files in
+parallel using available Cargo jobserver tokens, with a barrier before the
+first target installation. It improved failure atomicity but not speed: the
+three restore samples were 1.52s, 1.17s, and 1.68s (1.52s median), versus the
+retained serial samples of 1.50s, 1.29s, and 1.33s (1.33s median). Whole Cargo
+time regressed from a 1.89s serial median to 3.04s. APFS metadata and read
+contention outweighed file-level hash parallelism, so the prototype was not
+retained. Grouping the two files per cache entry can still remove duplicate
+small control-file reads, but cannot avoid either 597 MB data digest and is not
+a priority without contrary measurements on the Linux cache filesystem.
+
+### Generated-file and profiling controls
+
+Two additional commands were measured locally with empty target directories.
+The generated-file command was the unchanged
+`cargo dev generate-all --mode dry-run`; a scratch `npx` shim invoked an
+already installed Prettier package because the machine-global npm cache was not
+writable. The profiling control used
+`cargo build --profile profiling -p uv-bench --benches --locked`. It exercises
+the benchmark Rust graph and profile but does not claim to reproduce
+`cargo codspeed build` or benchmark runtime.
+
+| Workload and state | Wall | Hits / eligible | Cargo-fresh | rustc | Build scripts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Generate, cache disabled | 94.14s | 0 / 0 | 0 | 562 | 55 |
+| Generate, cold cache | 101.04s | 0 / 385 | 0 | 562 | 55 |
+| Generate, warm cross-target cache | 83.40s | 304 / 385 | 186 | 258 | 55 |
+| Profiling, cache disabled | 136.21s | 0 / 0 | 0 | 531 | 53 |
+| Profiling, cold cache | 142.04s | 0 / 357 | 0 | 531 | 53 |
+| Profiling, warm cross-target cache | 122.63s | 279 / 357 | 168 | 252 | 53 |
+
+These are single sequential disabled/cold/warm samples, so the wall-time deltas
+are directional rather than stable medians. The warm rows were 10.74s (11.4%)
+and 13.58s (10.0%) below their disabled controls; the cold rows were 6.90s and
+5.83s above them. Filesystem-cache state, run order, and machine noise are not
+isolated. Both warm runs nevertheless restored about 78-79% of eligible
+actions, while every build script and the primary link-producing action still
+ran. The generated-file warm run recorded 258 rustc executions exactly
+matching its 81 eligible misses plus 177 ineligible actions. The profiling warm
+run similarly recorded 252 executions, matching 78 misses plus 174 ineligible
+actions. This accounts for the ordinary compiler queue rather than leaving an
+unexplained cache gap.
+
+Warm generation spent 18.53s of cumulative worker time in lookup and 11.03s
+hashing action inputs while its remaining rustc and build-script processes used
+237.50s and 182.82s cumulatively. Warm profiling spent 10.32s in lookup and
+12.91s hashing action inputs; remaining rustc and build scripts used 519.79s
+and 140.20s cumulatively, and the primary compile/link action used 28.16s.
+These totals overlap concurrently and structurally: action-input hashing is
+inside lookup/publication work, materialization is inside lookup, and the
+primary link counter is a subset of rustc. They must not be summed. Compiler
+identity remained only 0.23-0.30s wall per Cargo process. The measurements
+support a workload snapshot for these graphs and do not support weakening
+linked-action identity merely to raise the per-unit hit count.
+
 ### Full uv root build
 
 The representative command was:
