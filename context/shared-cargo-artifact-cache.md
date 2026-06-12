@@ -132,6 +132,14 @@ whole-second timestamp rounding invalidates retained downstream fingerprints.
 Keep the artifact-cache policy enabled during restore because its completion
 stamp participates in the target fingerprint contract.
 
+Set the restore-manifest variable only for the first Cargo invocation after
+extracting the matching snapshot. Reconstruction verifies already-present
+manifest paths as well as omitted paths. If a later build replaces one of
+those outputs, reusing the old manifest is rejected before scheduling rather
+than overwriting the newer target state. Unset
+`SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` after a successful
+reconstruction command.
+
 ## Compiler Identity
 
 Each cache key includes the BLAKE3 contents and relative paths of the sysroot

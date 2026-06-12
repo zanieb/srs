@@ -609,6 +609,43 @@ environment. Any mismatch forces a full relink. Measure it on an incremental
 source edit after restoring the target layer; do not credit it for a fresh
 target unless the root binary and Cargo freshness state were restored too.
 
+### Snapshot and SLD composition probe
+
+A focused Apple-silicon probe used the installed SRS toolchain, current Cargo,
+LLVM target codegen, native SLD incrementality, one library, and one binary.
+The population build emitted a two-record thin manifest while retaining the
+private root binary and its `.incr` directory. After moving only the manifest-
+owned `.rlib` and `.rmeta` aside, explicit reconstruction copy-on-write cloned
+both files (8,081 logical bytes) in 2.4ms. The unchanged build finished in
+0.04s with two Cargo-fresh units, zero cache lookups, zero rustc executions,
+and an unchanged SLD log. This proves that the portable artifact layer can
+reconstruct its exact-path subset without disturbing retained root link state.
+
+The edit result exposes the current boundary. Changing the library rebuilt the
+library and root in 0.40s. SLD consumed the preserved state, reused seven
+isolated rustc work-product inputs and 31 unchanged input sections, and produced
+the correct binary, but logged that the replacement `.rlib` had no saved patch
+metadata and performed a full relink. A second edit repeated that fallback.
+These are tiny directional correctness samples, not representative timings,
+but the linker log is decisive: target snapshots plus current SLD state do not
+yet provide the changed-input patch fast path when Cargo replaces an
+artifact-cached Rust archive.
+
+The current best fresh-CI combination is therefore portable artifacts plus the
+thin exact-path snapshot, with SLD state retained only as correct root state,
+not credited as an incremental-edit speed layer. A real snapshot-plus-SLD edit
+win needs a producer-side contract that supplies immutable prior inputs or a
+compiler-provided section diff, or persists equivalent verified patch metadata
+for artifact-cache outputs. This is a linker/cache ownership problem, not a
+reason to restore a larger archive.
+
+Snapshot reconstruction is intentionally one-shot. Leaving the restore
+manifest configured after a later build changes a manifest-owned output causes
+the next Cargo invocation to reject the stale target before scheduling. CI
+readers naturally invoke it once after extraction; an interactive workflow
+must unset `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` after the
+successful reconstruction command.
+
 A precomputed compiler digest is safe only when an SRS release manifest binds
 relative paths and contents under the already verified archive checksum or a
 signature, and installation creates an extraction-specific metadata/directory
@@ -648,11 +685,14 @@ For uv PR 19754, integrate the layers without changing any workload command:
    manifest-owned paths.
 3. Let readers restore both layers, extract the thin archive at the same target
    path, and set `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` for the
-   unchanged Cargo command. A failed explicit reconstruction discards that
-   target and falls back to the full snapshot or ordinary build.
+   first unchanged Cargo command only. Unset it after successful reconstruction.
+   A failed explicit reconstruction discards that target and falls back to the
+   full snapshot or ordinary build.
 4. Retain separate keys and single-writer lanes for root build, Clippy,
    nextest, generated files, and profiling. Pair the root/profiling snapshot
-   with SLD state only when measuring incremental edits.
+   with SLD state only when measuring incremental edits, and require the SLD
+   log to prove a patch rather than a full-relink fallback before crediting any
+   link-state speedup.
 5. Upload the structured JSON line with job timing. Gate rollout on zero
    restore failures, zero unexpected rustc/build-script executions after a
    snapshot hit, and an end-to-end median win including archive transfer.

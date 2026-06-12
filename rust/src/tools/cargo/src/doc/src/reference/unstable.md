@@ -702,6 +702,12 @@ invalidates retained dependents. Restore with the same artifact-cache policy as
 the writer because its completion stamp participates in the fingerprint output
 contract.
 
+Set the restore-manifest variable only for the first Cargo invocation after
+extracting the matching snapshot, then unset it. Cargo also verifies listed
+outputs that are already present. Reusing an old manifest after a later build
+changes one of those outputs is rejected before scheduling rather than
+overwriting newer target state.
+
 Elapsed values are cumulative worker microseconds and can exceed command wall
 time under parallel execution. Cargo-fresh units are scheduling decisions;
 eligible and ineligible units are dirty rustc actions that reached cache
