@@ -2122,6 +2122,7 @@ fn relocation_target_patches_for_input(
     input: &FileState,
     bytes: &[u8],
 ) -> Result<std::result::Result<RelocationTargetPatches, String>> {
+    let macho_archive_symbol_inputs = MachOArchiveSymbolInputLookup::new(bytes)?;
     let mut input_ranges = Vec::new();
     let mut output_patches = Vec::new();
     let mut output_symbols = Vec::new();
@@ -2138,12 +2139,49 @@ fn relocation_target_patches_for_input(
         let Some(target_name) = relocation.target_name.as_deref() else {
             continue;
         };
-        let Some(input_bytes) = patch_input_bytes(bytes, input.path.as_str(), &target.input)?
-        else {
+        let input_bytes = if let Some(lookup) = macho_archive_symbol_inputs.as_ref() {
+            if let Some(input_bytes) = lookup.get(target_name) {
+                Some(input_bytes)
+            } else if !lookup.contains(target_name)
+                && relocation.input_file == input.path
+                && stable_rust_mangled_name(target_name)
+                && !archive_member_reference_contains_symbol(
+                    bytes,
+                    input.path.as_str(),
+                    relocation.input.as_str(),
+                    target_name,
+                )?
+            {
+                // The source CGU and its local target were both retired. Current section replay
+                // will rediscover any replacement relocation from the repartitioned archive.
+                changed_relocation_indices.push(relocation_index);
+                continue;
+            } else {
+                patch_input_bytes(bytes, input.path.as_str(), &target.input)?
+            }
+        } else {
+            patch_input_bytes(bytes, input.path.as_str(), &target.input)?
+        };
+        let Some(input_bytes) = input_bytes else {
             continue;
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse changed relocation target input")?;
+        let current_target_input =
+            resolved_patch_input_ref(input.path.as_str(), target.input.as_str(), input_bytes)?;
+        let target_input_changed = target.input != current_target_input;
+        let file = match object::File::parse(input_bytes.bytes) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(Err(format!(
+                    "Failed to parse changed relocation target input `{}` for symbol `{}` from `{}` at {:#x} ({} bytes, magic {:02x?}): {error}",
+                    display_hex_text(&target.input),
+                    display_hex_text(target_name),
+                    display_hex_text(&relocation.input),
+                    input_bytes.file_offset,
+                    input_bytes.bytes.len(),
+                    &input_bytes.bytes[..input_bytes.bytes.len().min(8)],
+                )));
+            }
+        };
         let cross_input_macho_relocation = relocation.input_file != input.path
             && file.format() == object::BinaryFormat::MachO
             && file.architecture() == object::Architecture::Aarch64
@@ -2185,6 +2223,10 @@ fn relocation_target_patches_for_input(
         if current.section_index.0 as u32 == target.section_index
             && current.section_offset == target.section_offset
         {
+            if target_input_changed {
+                target.input = current_target_input.into();
+                changed_relocation_indices.push(relocation_index);
+            }
             continue;
         }
         if current.section_index.0 as u32 != target.section_index {
@@ -2234,6 +2276,8 @@ fn relocation_target_patches_for_input(
                     relocation_index,
                     current_section_offset: current.section_offset,
                     current_target_value: target_value,
+                    current_input: target_input_changed
+                        .then(|| current_target_input.clone().into()),
                 });
                 continue;
             }
@@ -2241,6 +2285,7 @@ fn relocation_target_patches_for_input(
                 relocation_index,
                 current_section_offset: current.section_offset,
                 current_target_value: target_value,
+                current_input: target_input_changed.then(|| current_target_input.clone().into()),
             });
             // A grown section may be rematerialized elsewhere. Defer the symbol patch until
             // text replay can reconcile this provisional offset with the final output mapping.
@@ -2297,6 +2342,9 @@ fn relocation_target_patches_for_input(
         });
         relocation.written_value = Some(written_value);
         relocation.target_value = target_value;
+        if target_input_changed {
+            target.input = current_target_input.into();
+        }
         target.section_offset = current.section_offset;
         output_symbols.push(RelocationTargetSymbolPatch {
             target_name: target_name.to_owned(),
@@ -2346,10 +2394,13 @@ fn resolved_macho_relocation_target(
     if let Some(moved) = resolution_move {
         return (moved.current_value, Some(moved.current_target.clone()));
     }
-    if let Some(target_move) = target_move
+    if let Some(target_move) = target_move.as_ref()
         && let Some(target) = target.as_mut()
     {
         target.section_offset = target_move.current_section_offset;
+        if let Some(current_input) = target_move.current_input.as_ref() {
+            target.input = current_input.clone();
+        }
     }
     (
         target_move.map_or(previous_target_value, |target_move| {
@@ -2502,6 +2553,9 @@ fn finish_macho_cross_input_target_moves(
             relocation.target = Some(moved.current_target.clone());
         } else if let Some(target) = relocation.target.as_mut() {
             target.section_offset = target_move.current_section_offset;
+            if let Some(current_input) = target_move.current_input {
+                target.input = current_input;
+            }
         }
         target_patches
             .output_symbols
@@ -4609,6 +4663,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .collect::<Vec<_>>();
             macho_text_relocation_retiring_names.sort_unstable();
             macho_text_relocation_retiring_names.dedup();
+            if let Err(reason) = restore_deferred_macho_symbol_resolutions(
+                &mut previous.macho_symbol_resolutions,
+                retired_macho_archive_activations
+                    .iter()
+                    .flat_map(|state| &state.symbol_resolutions),
+            ) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
             if !records_complete && !macho_text_relocation_retiring_names.is_empty() {
                 return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                     "retiring Mach-O symbols needs complete relocation records".to_owned(),
@@ -5124,15 +5186,72 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 } else {
                     false
                 };
+            let activated_archive_base_diff_is_member_addition = if let Some(activation) =
+                added_macho_archive_text_activation.as_ref()
+                && !activated_archive_base_fingerprint_matches
+            {
+                let previous_bytes = {
+                    timing_phase!("Read previous incremental input snapshot");
+                    previous_snapshot_bytes.get()?
+                };
+                if let Some(previous_bytes) = previous_bytes {
+                    let previous_unwind_input_ranges = activation
+                        .previous_unwind_input_ranges
+                        .iter()
+                        .cloned()
+                        .chain(
+                            changed_macho_archive_unwind_activation
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|activation| {
+                                    activation.previous_input_ranges.iter().cloned()
+                                }),
+                        )
+                        .collect::<Vec<_>>();
+                    let current_unwind_input_ranges = activation
+                        .current_unwind_input_ranges
+                        .iter()
+                        .cloned()
+                        .chain(
+                            changed_macho_archive_unwind_activation
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|activation| {
+                                    activation.current_input_ranges.iter().cloned()
+                                }),
+                        )
+                        .collect::<Vec<_>>();
+                    archive_diff_allows_owned_macho_member_addition(
+                        previous_bytes,
+                        &bytes,
+                        input.path.as_str(),
+                        &matched_sections,
+                        &ignored_archive_identifiers,
+                        &previous_unwind_input_ranges,
+                        &current_unwind_input_ranges,
+                    )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             if (added_macho_archive_text_activation.is_some()
                 || changed_macho_definition_activation.is_some()
                 || !replaced_archive_identifiers.is_empty())
                 && !activated_archive_base_fingerprint_matches
                 && !activated_archive_base_diff_is_changed_definitions
+                && !activated_archive_base_diff_is_member_addition
             {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "changed archive members outside activated Mach-O text members in `{}`",
-                    path.display()
+                    "changed archive members outside activated Mach-O text members in `{}`: base={:?}, previous={}, added={}, changed-definitions={}, replaced={}, ignored={}",
+                    path.display(),
+                    activated_archive_base_fingerprint,
+                    previous_patch.fingerprint,
+                    added_macho_archive_text_activation.is_some(),
+                    changed_macho_definition_activation.is_some(),
+                    replaced_archive_identifiers.len(),
+                    ignored_archive_identifiers.len(),
                 )));
             }
             if fingerprint != previous_patch.fingerprint {
@@ -5744,7 +5863,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.patches))
                 .unwrap_or_default();
-            let retired_macho_archive_rollback_patches = retired_macho_archive_activations
+            let mut retired_macho_archive_rollback_patches = retired_macho_archive_activations
                 .iter()
                 .flat_map(|state| state.rollback_patches.iter())
                 .map(|patch| SectionPatch {
@@ -5756,6 +5875,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     adjustments: Vec::new(),
                 })
                 .collect::<Vec<_>>();
+            remove_plain_patches_shadowed_by_exact_current_ranges(
+                &mut retired_macho_archive_rollback_patches,
+                &changed_macho_archive_unwind_patches,
+            );
             let macho_text_auxiliary_patches = macho_text_section_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.auxiliary_patches))
@@ -6222,6 +6345,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
+    deduplicate_identical_plain_section_patches(&mut patches);
     if let Some(reason) = patch_output_range_rejection_reason(&patches) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -6957,11 +7081,12 @@ struct MachOReusableBranchTarget {
     applied_target_value: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MachORelocationTargetMove {
     relocation_index: usize,
     current_section_offset: u64,
     current_target_value: u64,
+    current_input: Option<SharedText>,
 }
 
 #[derive(Clone)]
@@ -7082,25 +7207,72 @@ impl ExpectedInputContent {
 
 fn patch_output_range_rejection_reason(patches: &[SectionPatch]) -> Option<String> {
     let mut ranges = Vec::with_capacity(patches.len());
-    for patch in patches {
+    for (index, patch) in patches.iter().enumerate() {
         let Ok(start) = usize::try_from(patch.output_offset) else {
             return Some("changed patch output range is out of bounds".to_owned());
         };
         let Some(end) = start.checked_add(patch.size as usize) else {
             return Some("changed patch output range overflow".to_owned());
         };
-        ranges.push(start..end);
+        ranges.push((start..end, index));
     }
-    ranges.sort_by_key(|range| range.start);
+    ranges.sort_by_key(|(range, _)| range.start);
 
-    let mut previous_end = 0;
-    for range in ranges {
-        if !range.is_empty() && range.start < previous_end {
-            return Some("changed patch output ranges overlap".to_owned());
+    let mut previous = (0..0, 0);
+    for (range, index) in ranges {
+        if !range.is_empty() && range.start < previous.0.end {
+            return Some(format!(
+                "changed patch output ranges overlap: patch {} at {:#x}..{:#x} and patch {} at {:#x}..{:#x}",
+                previous.1, previous.0.start, previous.0.end, index, range.start, range.end,
+            ));
         }
-        previous_end = previous_end.max(range.end);
+        if range.end > previous.0.end {
+            previous = (range, index);
+        }
     }
     None
+}
+
+fn deduplicate_identical_plain_section_patches(patches: &mut Vec<SectionPatch>) {
+    let mut unique = Vec::<SectionPatch>::with_capacity(patches.len());
+    let mut plain_by_range = HashMap::<(u64, u64), usize>::new();
+    for patch in patches.drain(..) {
+        let is_plain = patch.deferred_relocation.is_none()
+            && patch.preserve_ranges.is_empty()
+            && patch.adjustments.is_empty();
+        let key = (patch.output_offset, patch.size);
+        if is_plain
+            && plain_by_range
+                .get(&key)
+                .is_some_and(|index| unique[*index].data == patch.data)
+        {
+            continue;
+        }
+        if is_plain {
+            plain_by_range.entry(key).or_insert(unique.len());
+        }
+        unique.push(patch);
+    }
+    *patches = unique;
+}
+
+fn remove_plain_patches_shadowed_by_exact_current_ranges(
+    patches: &mut Vec<SectionPatch>,
+    current: &[SectionPatch],
+) {
+    patches.retain(|patch| {
+        let is_plain = patch.deferred_relocation.is_none()
+            && patch.preserve_ranges.is_empty()
+            && patch.adjustments.is_empty();
+        !is_plain
+            || !current.iter().any(|current| {
+                current.deferred_relocation.is_none()
+                    && current.preserve_ranges.is_empty()
+                    && current.adjustments.is_empty()
+                    && current.output_offset == patch.output_offset
+                    && current.size == patch.size
+            })
+    });
 }
 
 fn apply_addend_delta(data: &mut [u8], addend_delta: i64) -> std::result::Result<(), String> {
@@ -7868,6 +8040,94 @@ struct PatchInputResolver<'data> {
     bytes: &'data [u8],
     archive_members: Option<HashMap<Vec<u8>, ArchiveMemberMatch<'data>>>,
     normalize_rust_archive_patch_inputs: bool,
+}
+
+struct MachOArchiveSymbolInputLookup<'data> {
+    inputs_by_name: HashMap<String, Option<PatchInputBytes<'data>>>,
+}
+
+impl<'data> MachOArchiveSymbolInputLookup<'data> {
+    fn new(bytes: &'data [u8]) -> Result<Option<Self>> {
+        let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+            return Ok(None);
+        };
+        let mut inputs_by_name = HashMap::new();
+        for entry in archive {
+            let ArchiveEntry::Regular(content) = entry? else {
+                continue;
+            };
+            let Ok(file) = object::File::parse(content.entry_data) else {
+                continue;
+            };
+            if !is_supported_incremental_macho_object(&file) {
+                continue;
+            }
+            let input = PatchInputBytes {
+                bytes: content.entry_data,
+                file_offset: content.data_offset,
+                archive_identifier: Some(content.ident.as_slice()),
+            };
+            for symbol in file.symbols() {
+                let name = symbol.name_bytes()?;
+                let is_stable_rust_local = name.starts_with(b"__R") || name.starts_with(b"__ZN");
+                if symbol.is_undefined() || (!symbol.is_global() && !is_stable_rust_local) {
+                    continue;
+                }
+                let name = hex::encode(name);
+                match inputs_by_name.entry(name) {
+                    hashbrown::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(input));
+                    }
+                    hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                        if entry
+                            .get()
+                            .is_none_or(|existing| existing.file_offset != input.file_offset)
+                        {
+                            *entry.get_mut() = None;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(Self { inputs_by_name }))
+    }
+
+    fn get(&self, encoded_name: &str) -> Option<PatchInputBytes<'data>> {
+        self.inputs_by_name.get(encoded_name).copied().flatten()
+    }
+
+    fn contains(&self, encoded_name: &str) -> bool {
+        self.inputs_by_name.contains_key(encoded_name)
+    }
+}
+
+fn stable_rust_mangled_name(encoded_name: &str) -> bool {
+    encoded_name.starts_with("5f5f52") || encoded_name.starts_with("5f5f5a4e")
+}
+
+fn archive_member_reference_contains_symbol(
+    bytes: &[u8],
+    input_file_path: &str,
+    input_ref: &str,
+    encoded_name: &str,
+) -> Result<bool> {
+    let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)? else {
+        return Ok(true);
+    };
+    let input = match patch_archive_member_bytes(bytes, &parsed.identifier)? {
+        ArchiveMemberMatch::Unique(input) => input,
+        ArchiveMemberMatch::Ambiguous => return Ok(true),
+        ArchiveMemberMatch::Unavailable => return Ok(false),
+    };
+    let Ok(file) = object::File::parse(input.bytes) else {
+        return Ok(true);
+    };
+    for symbol in file.symbols() {
+        if hex::encode(symbol.name_bytes()?) == encoded_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl<'data> PatchInputResolver<'data> {
@@ -14224,7 +14484,10 @@ fn retire_missing_macho_symbol_resolutions(
         let Some(resolution_index) =
             macho_symbol_resolution_index_for_name(resolutions, name.as_str())?
         else {
-            return Err("missing deferred Mach-O symbol resolution catalog entry".to_owned());
+            return Err(format!(
+                "missing deferred Mach-O symbol resolution catalog entry for `{}` during retirement",
+                display_hex_text(name.as_str())
+            ));
         };
         let resolution = &resolutions[resolution_index];
         if resolution.direct_value.is_none()
@@ -14316,7 +14579,7 @@ fn macho_text_relocation_replays_for_input(
     let target_moves = target_patches
         .macho_target_moves
         .iter()
-        .map(|target_move| (target_move.relocation_index, *target_move))
+        .map(|target_move| (target_move.relocation_index, target_move.clone()))
         .collect::<HashMap<_, _>>();
     let mut target_resolution_moves = HashMap::new();
     for target_move in &target_patches.macho_target_moves {
@@ -14783,12 +15046,13 @@ fn macho_text_relocation_replays_for_input(
                         relocation_index,
                         current_section_offset: current_position.section_offset,
                         current_target_value,
+                        current_input: None,
                     };
                     if current_target_value != relocation.target_value
                         || current_position.section_offset != target.section_offset
                     {
                         section_has_moved_target = true;
-                        same_object_target_moves.push(target_move);
+                        same_object_target_moves.push(target_move.clone());
                         target_output_symbols.push(RelocationTargetSymbolPatch {
                             target_name: relocation
                                 .target_name
@@ -14844,12 +15108,12 @@ fn macho_text_relocation_replays_for_input(
                 if recorded_target_move.is_some() {
                     consumed_target_moves.insert(relocation_index);
                 }
-                let target_move = recorded_target_move.copied().or(same_object_target_move);
+                let target_move = recorded_target_move.cloned().or(same_object_target_move);
                 let resolution_move = target_resolution_moves.get(&relocation_index);
                 let (current_target_value, current_target) = resolved_macho_relocation_target(
                     relocation.target_value,
                     replay_target,
-                    target_move,
+                    target_move.clone(),
                     resolution_move,
                 );
                 replay_target = current_target;
@@ -14951,6 +15215,7 @@ fn macho_text_relocation_replays_for_input(
     dedup_ranges(&mut target_patches.input_ranges);
     target_patches.output_symbols.extend(target_output_symbols);
     drop(resolution_lookup);
+    let retained_output_resolution_start = resolutions.len();
     resolutions.extend(retained_output_resolutions.iter().cloned());
     let reconciled = {
         timing_phase!("Reconcile rematerialized Mach-O symbol resolutions");
@@ -14964,12 +15229,11 @@ fn macho_text_relocation_replays_for_input(
             input,
         )
     };
-    let retained_output_resolution_names = retained_output_resolutions
-        .iter()
-        .map(|resolution| resolution.name.as_str())
-        .collect::<HashSet<_>>();
-    resolutions
-        .retain(|resolution| !retained_output_resolution_names.contains(resolution.name.as_str()));
+    remove_temporary_macho_symbol_resolutions(
+        resolutions,
+        retained_output_resolution_start,
+        retained_output_resolutions.len(),
+    );
     let (resolution_output_symbols, symbol_resolutions_changed) = match reconciled {
         Ok(updates) => updates,
         Err(reason) => return Ok(Err(reason)),
@@ -14983,6 +15247,27 @@ fn macho_text_relocation_replays_for_input(
         normalize_rust_archive_patch_inputs,
         symbol_resolutions_changed,
     }))
+}
+
+fn remove_temporary_macho_symbol_resolutions(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    start: usize,
+    count: usize,
+) {
+    resolutions.drain(start..start + count);
+}
+
+fn restore_deferred_macho_symbol_resolutions<'a>(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    deferred: impl IntoIterator<Item = &'a MachOSymbolResolutionRecord>,
+) -> std::result::Result<(), String> {
+    for resolution in deferred {
+        match macho_symbol_resolution_index_for_name(resolutions, resolution.name.as_str())? {
+            Some(_) => {}
+            None => resolutions.push(resolution.clone()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_macho_data_relocations_are_stable(
@@ -18521,6 +18806,36 @@ fn archive_diff_allows_owned_macho_member_removal(
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
 
+fn archive_diff_allows_owned_macho_member_addition(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    added_identifiers: &[Vec<u8>],
+    previous_extra_ranges: &[std::ops::Range<usize>],
+    current_extra_ranges: &[std::ops::Range<usize>],
+) -> Result<bool> {
+    let reverse_current_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let reverse_matched_sections = matched_sections
+        .iter()
+        .map(|section| MatchedPatchSection {
+            previous: section.current.clone(),
+            current: section.previous.clone(),
+        })
+        .collect::<Vec<_>>();
+    archive_diff_allows_owned_macho_member_removal(
+        current_bytes,
+        previous_bytes,
+        input_file_path,
+        &reverse_matched_sections,
+        &reverse_current_resolver,
+        added_identifiers,
+        &[],
+        current_extra_ranges,
+        previous_extra_ranges,
+    )
+}
+
 fn macho_object_patch_fingerprint(
     bytes: &[u8],
     file_offset: usize,
@@ -21036,9 +21351,10 @@ fn recycled_macho_symbol_table_patches(
         let Some(previous_resolution_index) =
             macho_symbol_resolution_index_for_name(previous_resolutions, retiring_name.as_str())?
         else {
-            return Ok(Err(
-                "missing deferred Mach-O symbol resolution catalog entry".to_owned(),
-            ));
+            return Ok(Err(format!(
+                "missing deferred Mach-O symbol resolution catalog entry for `{}` during archive activation",
+                display_hex_text(retiring_name.as_str())
+            )));
         };
         let previous_resolution = &previous_resolutions[previous_resolution_index];
         let Some(previous_value) = previous_resolution.direct_value else {
@@ -40432,6 +40748,23 @@ mod tests {
             )
             .unwrap()
         );
+
+        let reverse_matched = [MatchedPatchSection {
+            previous: matched[0].current.clone(),
+            current: matched[0].previous.clone(),
+        }];
+        assert!(
+            archive_diff_allows_owned_macho_member_addition(
+                &current,
+                &previous,
+                &input_file,
+                &reverse_matched,
+                &[archive_member_patch_identifier(removed_identifier)],
+                &[],
+                &[],
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -40543,6 +40876,22 @@ mod tests {
                 &[],
                 &previous_unwind,
                 &current_unwind,
+            )
+            .unwrap()
+        );
+        let reverse_matched = [MatchedPatchSection {
+            previous: matched[0].current.clone(),
+            current: matched[0].previous.clone(),
+        }];
+        assert!(
+            archive_diff_allows_owned_macho_member_addition(
+                &current,
+                &previous,
+                &input_file,
+                &reverse_matched,
+                &removed,
+                &current_unwind,
+                &previous_unwind,
             )
             .unwrap()
         );
@@ -46948,6 +47297,53 @@ mod tests {
                 .get_encoded(&resolutions, target_name.as_str())
                 .is_none()
         );
+        assert_eq!(
+            lookup
+                .unique_index_encoded(target_name.as_str())
+                .unwrap_err(),
+            "ambiguous Mach-O symbol resolution catalog entry"
+        );
+    }
+
+    #[test]
+    fn temporary_macho_symbol_resolution_cleanup_preserves_catalog_names() {
+        let resolution = |name: &str, direct_value| MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode(name)),
+            direct_value: Some(direct_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
+        let persistent = resolution("_shared", 0x1000);
+        let temporary = resolution("_shared", 0x2000);
+        let appended = resolution("_new", 0x3000);
+        let mut resolutions = vec![persistent.clone(), temporary, appended.clone()];
+
+        remove_temporary_macho_symbol_resolutions(&mut resolutions, 1, 1);
+
+        assert_eq!(resolutions, vec![persistent, appended]);
+    }
+
+    #[test]
+    fn deferred_macho_symbol_resolution_restore_only_fills_missing_names() {
+        let resolution = |name: &str, direct_value| MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode(name)),
+            direct_value: Some(direct_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
+        let live = resolution("_live", 0x1000);
+        let stale_live = resolution("_live", 0x2000);
+        let deferred = resolution("_deferred", 0x3000);
+        let mut resolutions = vec![live.clone()];
+
+        restore_deferred_macho_symbol_resolutions(&mut resolutions, [&stale_live, &deferred])
+            .unwrap();
+
+        assert_eq!(resolutions, vec![live, deferred]);
     }
 
     #[test]
@@ -53634,6 +54030,114 @@ mod tests {
     }
 
     #[test]
+    fn macho_relocation_target_refreshes_repartitioned_archive_member() {
+        let mut object = test_macho_object(&[0; 4], &[0; 8], 0);
+        let data_name = object
+            .windows(b"_data\0".len())
+            .rposition(|window| window == b"_data\0")
+            .unwrap();
+        object[data_name..data_name + b"__Rxx".len()].copy_from_slice(b"__Rxx");
+        let data_symbol = macho_symbol_value_field_range(&object, object::SymbolIndex(1))
+            .unwrap()
+            .start
+            - 8;
+        object[data_symbol + 4] = object::macho::N_SECT;
+        object[data_symbol + 6..data_symbol + 8]
+            .copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        let current_identifier = b"crate-hash.current-cgu.current-invocation.rcgu.o";
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(current_identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let current = builder.into_inner().unwrap();
+        let mut state = state("args", b"output", &[("libcrate.rlib", &current)]);
+        let input = state.input_files.remove(0);
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let mut relocation = relocation_record(
+            "caller.o",
+            1,
+            42,
+            Some(0),
+            0x2000,
+            Some("__Rxx"),
+            Some(("libcrate.rlib", 2, 0)),
+            0,
+            300,
+            4,
+            encode_macho_aarch64_relocation_kind(raw_relocation),
+            0,
+        );
+        relocation.target.as_mut().unwrap().input =
+            hex::encode(b"libcrate.rlib\0crate-hash.retired-cgu.old-invocation.rcgu.o\08:16")
+                .into();
+        let mut relocations = [relocation];
+
+        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        let target_input = display_hex_text(&relocations[0].target.as_ref().unwrap().input);
+        assert!(target_input.contains(String::from_utf8_lossy(current_identifier).as_ref()));
+        assert_eq!(patches.changed_relocation_indices, vec![0]);
+        assert!(patches.macho_cross_input_target_moves.is_empty());
+    }
+
+    #[test]
+    fn macho_relocation_target_retires_when_source_drops_reference() {
+        let object = test_macho_object(&[0; 4], &[0; 8], 0);
+        let current_identifier = b"crate-hash.source-cgu.current-invocation.rcgu.o";
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(current_identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let current = builder.into_inner().unwrap();
+        let mut state = state("args", b"output", &[("libcrate.rlib", &current)]);
+        let input = state.input_files.remove(0);
+        let mut relocation = relocation_record(
+            "libcrate.rlib",
+            1,
+            42,
+            Some(0),
+            0x2000,
+            Some("__Rretired"),
+            Some(("libcrate.rlib", 2, 0)),
+            0,
+            300,
+            4,
+            0,
+            0,
+        );
+        relocation.input =
+            hex::encode(b"libcrate.rlib\0crate-hash.source-cgu.old-invocation.rcgu.o\08:16").into();
+        relocation.target.as_mut().unwrap().input =
+            hex::encode(b"libcrate.rlib\0crate-hash.retired-target.old-invocation.rcgu.o\016:24")
+                .into();
+        let mut relocations = [relocation];
+
+        let patches = relocation_target_patches_for_input(&mut relocations, &input, &current)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patches.changed_relocation_indices, vec![0]);
+        assert!(patches.output_patches.is_empty());
+        assert!(patches.macho_target_moves.is_empty());
+        assert!(patches.macho_cross_input_target_moves.is_empty());
+    }
+
+    #[test]
     fn macho_target_move_prefers_layout_aware_symbol_resolution() {
         let previous = test_macho_object(&[0; 4], &[0; 8], 0);
         let current = test_macho_object(&[0; 4], &[0; 8], 124);
@@ -53710,11 +54214,12 @@ mod tests {
             relocation_index: 0,
             current_section_offset: 124,
             current_target_value: provisional_value,
+            current_input: None,
         };
         let (resolved_value, resolved_target) = resolved_macho_relocation_target(
             previous_value,
             Some(previous_target.clone()),
-            Some(target_move),
+            Some(target_move.clone()),
             Some(moved),
         );
         assert_eq!(resolved_value, moved_value);
@@ -54566,11 +55071,54 @@ mod tests {
         assert!(patch_output_range_rejection_reason(&[patch(24, 8), patch(16, 8)]).is_none());
         assert_eq!(
             patch_output_range_rejection_reason(&[patch(16, 8), patch(23, 8)]).as_deref(),
-            Some("changed patch output ranges overlap")
+            Some(
+                "changed patch output ranges overlap: patch 0 at 0x10..0x18 and patch 1 at 0x17..0x1f"
+            )
         );
         assert_eq!(
             patch_output_range_rejection_reason(&[patch(usize::MAX as u64, 8)]).as_deref(),
             Some("changed patch output range overflow")
         );
+    }
+
+    #[test]
+    fn identical_plain_section_patches_are_deduplicated() {
+        let patch = |data| SectionPatch {
+            output_offset: 16,
+            size: 4,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut patches = vec![patch(vec![1, 2, 3, 4]), patch(vec![1, 2, 3, 4])];
+
+        deduplicate_identical_plain_section_patches(&mut patches);
+
+        assert_eq!(patches.len(), 1);
+
+        patches.push(patch(vec![4, 3, 2, 1]));
+        deduplicate_identical_plain_section_patches(&mut patches);
+        assert_eq!(patches.len(), 2);
+        assert!(patch_output_range_rejection_reason(&patches).is_some());
+    }
+
+    #[test]
+    fn exact_current_patch_range_shadows_plain_archive_rollback() {
+        let patch = |output_offset, size, data| SectionPatch {
+            output_offset,
+            size,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut rollback = vec![patch(16, 4, vec![1, 2, 3, 4]), patch(32, 8, vec![0; 8])];
+        let current = [patch(16, 4, vec![4, 3, 2, 1]), patch(36, 4, vec![1; 4])];
+
+        remove_plain_patches_shadowed_by_exact_current_ranges(&mut rollback, &current);
+
+        assert_eq!(rollback.len(), 1);
+        assert_eq!(rollback[0].output_offset, 32);
     }
 }
