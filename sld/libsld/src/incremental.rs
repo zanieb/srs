@@ -1132,14 +1132,9 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
     }
 
     if !changed_inputs.is_empty() {
-        if retained_output_to_restore.is_some() {
-            append_log(
-                &state_dir,
-                "changed-input patch unavailable before loading inputs: missing retained output requires full relink",
-            )?;
-            return Ok(false);
-        }
-        if !args.should_patch_changed_inputs_before_loading() {
+        if retained_output_to_restore.is_none()
+            && !args.should_patch_changed_inputs_before_loading()
+        {
             append_log(
                 &state_dir,
                 "changed-input patch unavailable before loading inputs: signed Mach-O output requires full relink",
@@ -6731,6 +6726,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 ),
             )?;
         }
+        if !args.output().try_exists().unwrap_or(false)
+            && retained_output_snapshot_matches_previous(
+                state_dir,
+                &previous.output,
+                args.output(),
+            )?
+            && !restore_missing_output_snapshot(state_dir, &previous.output, args.output())?
+        {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "missing retained output could not be restored".to_owned(),
+            ));
+        }
         append_log(state_dir, "reused existing output before loading inputs")?;
         return Ok(ChangedInputPatchResult::Patched);
     }
@@ -6748,10 +6755,19 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
+    let retained_output_snapshot = if args.should_retain_output_snapshot()
+        && !args.output().try_exists().unwrap_or(false)
+        && retained_output_snapshot_matches_previous(state_dir, &previous.output, args.output())?
+    {
+        Some(output_snapshot_path(state_dir))
+    } else {
+        None
+    };
     let Some(mut directly_patched_output) = DirectlyPatchedOutput::new(
         args.output(),
         state_dir,
         args.should_replace_directly_patched_output(),
+        retained_output_snapshot.as_deref(),
     ) else {
         return Ok(ChangedInputPatchResult::Unsupported(
             "could not clone directly patched output generation".to_owned(),
@@ -7747,16 +7763,41 @@ struct DirectlyPatchedOutput {
     published_path: Option<PathBuf>,
     published_identity: Option<FileIdentity>,
     standby_state_path: Option<PathBuf>,
+    install_if_missing: bool,
 }
 
 impl DirectlyPatchedOutput {
-    fn new(output: &Path, state_dir: &Path, should_replace: bool) -> Option<Self> {
+    fn new(
+        output: &Path,
+        state_dir: &Path,
+        should_replace: bool,
+        retained_output_snapshot: Option<&Path>,
+    ) -> Option<Self> {
+        if !output.try_exists().unwrap_or(false) {
+            let snapshot = retained_output_snapshot?;
+            let generation = directly_patched_output_standby_path(state_dir);
+            let _ = std::fs::remove_file(&generation);
+            let _ = std::fs::remove_file(directly_patched_output_standby_state_path(state_dir));
+            if !clone_snapshot_bytes(snapshot, &generation)
+                && std::fs::copy(snapshot, &generation).is_err()
+            {
+                return None;
+            }
+            return Some(Self {
+                path: generation,
+                published_path: Some(output.to_path_buf()),
+                published_identity: None,
+                standby_state_path: None,
+                install_if_missing: true,
+            });
+        }
         if !should_replace {
             return Some(Self {
                 path: output.to_path_buf(),
                 published_path: None,
                 published_identity: None,
                 standby_state_path: None,
+                install_if_missing: false,
             });
         }
 
@@ -7796,6 +7837,7 @@ impl DirectlyPatchedOutput {
             published_path: Some(output.to_path_buf()),
             published_identity: Some(published_identity),
             standby_state_path: Some(standby_state_path),
+            install_if_missing: false,
         })
     }
 
@@ -7815,6 +7857,22 @@ impl DirectlyPatchedOutput {
         let Some(published_path) = self.published_path.as_ref() else {
             return Ok(());
         };
+        if self.install_if_missing {
+            std::fs::hard_link(&self.path, published_path).with_context(|| {
+                format!(
+                    "Failed to install directly patched missing output `{}` without replacing an existing file",
+                    published_path.display()
+                )
+            })?;
+            std::fs::remove_file(&self.path).with_context(|| {
+                format!(
+                    "Failed to remove directly patched output generation `{}`",
+                    self.path.display()
+                )
+            })?;
+            self.published_path = None;
+            return Ok(());
+        }
         verbose_timing_phase!("Install directly patched output generation");
         install_directly_patched_output_generation(&self.path, published_path)?;
         let standby_is_predecessor = self
@@ -34713,13 +34771,13 @@ mod tests {
         std::fs::write(&output, b"original").unwrap();
         let original_identity = FileIdentity::from_path(&output).unwrap().unwrap();
 
-        let in_place = DirectlyPatchedOutput::new(&output, &state_dir, false).unwrap();
+        let in_place = DirectlyPatchedOutput::new(&output, &state_dir, false, None).unwrap();
         assert_eq!(in_place.path(), output);
         assert!(!in_place.is_generation());
         assert!(in_place.should_invalidate_code_signature_cache());
         drop(in_place);
 
-        let aborted = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let aborted = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         let aborted_path = aborted.path().to_path_buf();
         assert_ne!(aborted.path(), output);
         assert!(aborted.is_generation());
@@ -34729,7 +34787,7 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
         assert!(!aborted_path.exists());
 
-        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         let installed_path = installed.path().to_path_buf();
         std::fs::write(installed.path(), b"changed!").unwrap();
         let installed_identity = FileIdentity::from_path(&installed_path).unwrap().unwrap();
@@ -34754,7 +34812,7 @@ mod tests {
                 vec![0..8],
             );
 
-            let mut reused = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+            let mut reused = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
             assert_eq!(reused.path(), installed_path);
             assert_eq!(std::fs::read(reused.path()).unwrap(), b"changed!");
             std::fs::write(reused.path(), b"second!!").unwrap();
@@ -34773,6 +34831,52 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn directly_patched_missing_output_installs_from_retained_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        let snapshot = state_dir.join(OUTPUT_SNAPSHOT_FILE);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&snapshot, b"original").unwrap();
+
+        let mut patched =
+            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot)).unwrap();
+        assert!(patched.is_generation());
+        assert!(!patched.should_invalidate_code_signature_cache());
+        std::fs::write(patched.path(), b"changed!").unwrap();
+        let generation = patched.path().to_path_buf();
+        patched.install(&[0..8]).unwrap();
+        drop(patched);
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"changed!");
+        assert!(!generation.exists());
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directly_patched_missing_output_does_not_replace_appeared_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        let snapshot = state_dir.join(OUTPUT_SNAPSHOT_FILE);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&snapshot, b"original").unwrap();
+
+        let mut patched =
+            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot)).unwrap();
+        std::fs::write(patched.path(), b"changed!").unwrap();
+        let generation = patched.path().to_path_buf();
+        std::fs::write(&output, b"appeared").unwrap();
+
+        assert!(patched.install(&[0..8]).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"appeared");
+        drop(patched);
+        assert!(!generation.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn directly_patched_output_generation_discards_replaced_predecessor() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("app");
@@ -34780,12 +34884,12 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         std::fs::write(&output, b"abcdefgh").unwrap();
 
-        let mut first = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let mut first = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         std::fs::write(first.path(), b"Abcdefgh").unwrap();
         first.install(&[0..1]).unwrap();
         drop(first);
 
-        let mut raced = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let mut raced = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         assert_eq!(std::fs::read(raced.path()).unwrap(), b"Abcdefgh");
         std::fs::write(raced.path(), b"ABcdefgh").unwrap();
         let replacement = dir.path().join("replacement");
@@ -34796,7 +34900,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&output).unwrap(), b"ABcdefgh");
         assert!(!directly_patched_output_standby_state_path(&state_dir).exists());
-        let recloned = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let recloned = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         assert_eq!(std::fs::read(recloned.path()).unwrap(), b"ABcdefgh");
     }
 
@@ -34809,7 +34913,7 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         std::fs::write(&output, b"original").unwrap();
 
-        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         std::fs::write(installed.path(), b"changed!").unwrap();
         installed.install(&[0..8]).unwrap();
         drop(installed);
@@ -34823,7 +34927,7 @@ mod tests {
             .join("\n");
         std::fs::write(&state_path, format!("{truncated}\n")).unwrap();
 
-        let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
         assert_eq!(std::fs::read(fallback.path()).unwrap(), b"changed!");
     }
 
@@ -53952,7 +54056,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(state_dir.join(LOG_FILE))
                 .unwrap()
-                .contains("missing retained output requires full relink")
+                .contains("changed-input patch unavailable before loading inputs")
         );
     }
 

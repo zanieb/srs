@@ -254,7 +254,7 @@ impl platform::Args for MachOArgs {
         flush_ranges: &mut Vec<std::ops::Range<usize>>,
         should_invalidate_code_signature_cache: bool,
     ) -> Result {
-        if self.should_emit_code_signature && self.has_private_persistent_output_contract {
+        if self.should_emit_code_signature {
             let code_signature_ranges = crate::macho_writer::refresh_code_signature(
                 output,
                 flush_ranges,
@@ -266,7 +266,7 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_snapshot_changed_inputs_while_finalizing_direct_patches(&self) -> bool {
-        self.should_emit_code_signature && self.has_private_persistent_output_contract
+        self.should_emit_code_signature
     }
 
     fn should_hash_directly_patched_output(&self) -> bool {
@@ -1397,7 +1397,7 @@ mod tests {
         let mut args = MachOArgs::default();
         assert!(!args.should_patch_changed_inputs_before_loading());
         assert!(!args.should_replace_directly_patched_output());
-        assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(args.should_hash_directly_patched_output());
         assert!(!args.should_trust_persistent_output_data_identity());
         assert!(args.should_retain_output_snapshot());
