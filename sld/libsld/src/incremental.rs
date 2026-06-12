@@ -5276,6 +5276,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             input.path.as_str(),
                             added_identifiers,
                             &matched_sections,
+                            &previous.sections,
                             &current_sections,
                             &current_resolver,
                             &[],
@@ -5476,6 +5477,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &bytes,
                     input.path.as_str(),
                     &matched_sections,
+                    &previous.sections,
                     &current_sections,
                     &current_resolver,
                     previous_output.get()?,
@@ -20865,11 +20867,82 @@ fn macho_unwind_function_identities(
     Ok(identities)
 }
 
+fn supplement_macho_unwind_section_mappings(
+    input_file_path: &str,
+    input: &str,
+    unwind: &AddedMachOArchiveUnwind,
+    file: &object::File<'_>,
+    records: &[SectionRecord],
+    sections: &mut Vec<PatchSection>,
+) -> Result<std::result::Result<(), String>> {
+    let mut section_indices = unwind
+        .compact_unwind
+        .iter()
+        .flat_map(|compact| {
+            compact
+                .entries
+                .iter()
+                .map(|entry| entry.function.section_index)
+        })
+        .chain(
+            unwind
+                .eh_frame
+                .iter()
+                .flat_map(|eh_frame| eh_frame.fdes.iter().map(|fde| fde.function.section_index)),
+        )
+        .collect::<Vec<_>>();
+    section_indices.sort_unstable();
+    section_indices.dedup();
+
+    for section_index in section_indices {
+        if sections
+            .iter()
+            .any(|section| section.input == input && section.section_index == section_index)
+        {
+            continue;
+        }
+        let mut matching_records = records.iter().filter(|record| {
+            record.input_file == input_file_path
+                && record.input == input
+                && record.section_index == section_index
+        });
+        let Some(record) = matching_records.next() else {
+            continue;
+        };
+        if matching_records.next().is_some() {
+            return Ok(Err(
+                "changed Mach-O unwind function section has ambiguous previous output mappings"
+                    .to_owned(),
+            ));
+        }
+        let object_section_index = patch_section_object_index(file, section_index)?;
+        let section = file.section_by_index(object_section_index)?;
+        if section.size() > record.size {
+            return Ok(Err(
+                "changed Mach-O unwind function section exceeds its previous output mapping"
+                    .to_owned(),
+            ));
+        }
+        sections.push(PatchSection {
+            input: input.to_owned(),
+            section_index,
+            section_name: patch_section_name_for_matching(&section),
+            input_size: section.size(),
+            output_offset: record.output_offset,
+            output_size: record.size,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        });
+    }
+    Ok(Ok(()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn changed_macho_archive_unwind_members(
     previous_bytes: &[u8],
     input_file_path: &str,
     matched_sections: &[MatchedPatchSection],
+    section_records: &[SectionRecord],
     current_resolver: &PatchInputResolver<'_>,
     output_file: &object::File<'_>,
     excluded_identifiers: &[Vec<u8>],
@@ -20886,11 +20959,10 @@ fn changed_macho_archive_unwind_members(
         .collect::<Vec<_>>();
     input_pairs.sort_unstable();
     input_pairs.dedup();
-    let previous_sections = matched_sections
+    let mut previous_sections = matched_sections
         .iter()
         .map(|matched| matched.previous.clone())
         .collect::<Vec<_>>();
-
     let mut members = Vec::new();
     let mut retired_entries = Vec::new();
     let mut previous_input_ranges = Vec::new();
@@ -20953,6 +21025,17 @@ fn changed_macho_archive_unwind_members(
                 "changed Mach-O member added or removed all unwind metadata".to_owned(),
             ));
         };
+        match supplement_macho_unwind_section_mappings(
+            input_file_path,
+            previous_input_ref.as_str(),
+            &previous_unwind,
+            &previous_file,
+            section_records,
+            &mut previous_sections,
+        )? {
+            Ok(()) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
 
         let previous_ranges = match macho_archive_unwind_input_ranges(
             previous_input,
@@ -21110,6 +21193,7 @@ fn changed_macho_archive_unwind_activation(
     current_bytes: &[u8],
     input_file_path: &str,
     matched_sections: &[MatchedPatchSection],
+    section_records: &[SectionRecord],
     current_sections: &[PatchSection],
     current_resolver: &PatchInputResolver<'_>,
     previous_output: &[u8],
@@ -21127,6 +21211,7 @@ fn changed_macho_archive_unwind_activation(
         previous_bytes,
         input_file_path,
         matched_sections,
+        section_records,
         current_resolver,
         &output_file,
         ignored_previous_identifiers,
@@ -21209,6 +21294,7 @@ fn added_macho_archive_text_activations(
     input_file_path: &str,
     added_identifiers: &[Vec<u8>],
     matched_sections: &[MatchedPatchSection],
+    section_records: &[SectionRecord],
     existing_current_sections: &[PatchSection],
     current_resolver: &PatchInputResolver<'_>,
     excluded_unwind_identifiers: &[Vec<u8>],
@@ -21503,6 +21589,7 @@ fn added_macho_archive_text_activations(
         previous_bytes,
         input_file_path,
         matched_sections,
+        section_records,
         current_resolver,
         &output_file,
         excluded_unwind_identifiers,
@@ -44011,6 +44098,7 @@ mod tests {
             &previous_archive,
             &input_file_path,
             &matched,
+            &[],
             &current_resolver,
             &output_file,
             &[],
@@ -44031,6 +44119,7 @@ mod tests {
             &previous_archive,
             &input_file_path,
             &matched,
+            &[],
             &current_resolver,
             &output_file,
             &[archive_member_patch_identifier(current_identifier)],
@@ -44041,6 +44130,46 @@ mod tests {
         assert!(excluded.retired_entries.is_empty());
         assert!(excluded.previous_input_ranges.is_empty());
         assert!(excluded.current_input_ranges.is_empty());
+    }
+
+    #[test]
+    fn changed_macho_unwind_uses_persisted_section_mapping() {
+        let object = test_observed_049_macho_unwind_object(false);
+        let file = object::File::parse(object.as_slice()).unwrap();
+        let unwind = added_macho_archive_unwind(&file).unwrap().unwrap().unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let section_index = patch_section_record_index(&file, text.index()).unwrap();
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let input_file_path = hex::encode("input.rlib");
+        let input = "member.rcgu.o";
+        let mut sections = Vec::new();
+
+        assert_eq!(
+            macho_unwind_function_identities(input, &unwind, &sections, &output_file).unwrap_err(),
+            "changed Mach-O unwind function section has no previous output mapping",
+        );
+        supplement_macho_unwind_section_mappings(
+            &input_file_path,
+            input,
+            &unwind,
+            &file,
+            &[SectionRecord {
+                input_file: input_file_path.clone().into(),
+                input: input.into(),
+                section_index,
+                output_offset: output.text_offset + 0x100,
+                size: text.size(),
+            }],
+            &mut sections,
+        )
+        .unwrap()
+        .unwrap();
+
+        let identities =
+            macho_unwind_function_identities(input, &unwind, &sections, &output_file).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].length, 0x258);
     }
 
     #[test]
@@ -44153,6 +44282,7 @@ mod tests {
             &previous_archive,
             &input_file_path,
             &matched,
+            &[],
             &current_resolver,
             &output_file,
             &retired_identifiers,
@@ -44201,6 +44331,7 @@ mod tests {
             &current_archive,
             &input_file_path,
             &reverse_matched,
+            &[],
             &reverse_resolver,
             &output_file,
             &[],
@@ -44465,6 +44596,7 @@ mod tests {
             &current_archive,
             &input_file_path,
             &matched,
+            &[],
             &current_sections,
             &current_resolver,
             &output.bytes,
@@ -44543,6 +44675,7 @@ mod tests {
             &next_archive,
             &input_file_path,
             &next_matched,
+            &[],
             &next_sections,
             &next_resolver,
             &output.bytes,
@@ -44608,6 +44741,7 @@ mod tests {
             &unrelated_archive,
             &input_file_path,
             &matched,
+            &[],
             &current_sections,
             &unrelated_resolver,
             &output.bytes,
