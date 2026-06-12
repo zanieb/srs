@@ -684,6 +684,13 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(artifact_cache_stat(&warm, &["preflight", "finalized"]), 2);
     assert_eq!(artifact_cache_stat(&warm, &["publication", "attempts"]), 0);
     assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
+    // Each warm action hashes its inputs once while constructing the key and
+    // once after materialization. A separate pre-materialization pass would
+    // not strengthen the final comparison against the original key digest.
+    assert_eq!(
+        artifact_cache_stat(&warm, &["hashing", "action_inputs", "calls"]),
+        eligible * 2
+    );
     let restore_phases = &warm["lookup"]["phase_elapsed_us"];
     for phase in [
         "lock_us",

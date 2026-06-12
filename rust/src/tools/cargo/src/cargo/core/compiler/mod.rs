@@ -4088,10 +4088,6 @@ fn restore_rlib_cache(
                 continue;
             }
         }
-        if artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)? != *action_inputs_digest {
-            debug!("not restoring artifact cache entry with action inputs modified during lookup");
-            return Ok(false);
-        }
         let stored_files = entry.join("files");
         let mut restored_files = 0;
         let mut restored_bytes = 0;
