@@ -1112,6 +1112,12 @@ mod tests {
 
         fs::write(&target, b"private target mutation").unwrap();
         assert_eq!(fs::read(&stored).unwrap(), b"example artifact");
+        let error = restore(&manifest_path, &target_root, &cache_root).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("existing artifact cache snapshot target does not match manifest")
+        );
     }
 
     #[test]

@@ -430,6 +430,192 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
     }
 }
 
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zsld-native-incremental are unstable"
+)]
+#[cfg(unix)]
+fn exact_path_snapshot_reconstruction_preserves_sld_native_incremental_state() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+    let mut rustc = cargo_test_support::process("rustc");
+    let output = rustc
+        .arg("--print")
+        .arg("sysroot")
+        .exec_with_output()
+        .unwrap();
+    let sysroot = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let bundled_sld = sysroot
+        .join("lib/rustlib")
+        .join(rustc_host())
+        .join("bin/sld");
+    if !bundled_sld.is_file() {
+        return;
+    }
+
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "snapshot-sld"
+            version = "0.0.1"
+            edition = "2024"
+
+            [dependencies]
+            dependency = { path = "dependency" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", dependency::value()); }\n",
+        )
+        .file(
+            "dependency/Cargo.toml",
+            r#"
+            [package]
+            name = "dependency"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file("dependency/src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .build();
+    let target = project.root().join("snapshot-target");
+    let manifest_path = target.join("srs-artifact-cache-snapshot.json");
+
+    project
+        .cargo("-Zartifact-cache -Zsld-native-incremental build --bin snapshot-sld")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "sld-native-incremental"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST", &manifest_path)
+        .env_remove("SRS_ENCODED_TARGET_RUSTFLAGS")
+        .run();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let records = manifest["records"].as_array().unwrap();
+    assert!(!records.is_empty());
+    let logs = project
+        .glob("snapshot-target/debug/deps/snapshot_sld-*.incr/log")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        logs.len(),
+        1,
+        "bundled SLD did not create one private state log"
+    );
+    let log = &logs[0];
+    let log_before = fs::read(log).unwrap();
+    assert!(
+        String::from_utf8_lossy(&log_before).contains("full relink: no previous incremental state")
+    );
+    for record in records {
+        fs::remove_file(target.join(record["target_path"].as_str().unwrap())).unwrap();
+    }
+
+    let restored = project
+        .cargo("-Zartifact-cache -Zsld-native-incremental build --bin snapshot-sld")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "sld-native-incremental"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .env(
+            "SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST",
+            &manifest_path,
+        )
+        .env_remove("SRS_ENCODED_TARGET_RUSTFLAGS")
+        .run();
+    let stats = artifact_cache_stats(&restored);
+    assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 0);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["build_script", "executions"]),
+        0
+    );
+    assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["snapshot", "restore", "failures"]),
+        0
+    );
+    let reconstructed = artifact_cache_stat(&stats, &["snapshot", "restore", "cloned_files"])
+        + artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]);
+    assert_eq!(reconstructed, records.len() as u64);
+    assert_eq!(fs::read(log).unwrap(), log_before);
+    project
+        .process(target.join("debug/snapshot-sld"))
+        .with_stdout_data("42\n")
+        .run();
+
+    project.change_file("dependency/src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    project
+        .cargo("-Zartifact-cache -Zsld-native-incremental build --bin snapshot-sld")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "sld-native-incremental"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env_remove("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST")
+        .env_remove("SRS_ENCODED_TARGET_RUSTFLAGS")
+        .run();
+    let log_after = fs::read(log).unwrap();
+    let log_tail = log_after
+        .strip_prefix(log_before.as_slice())
+        .expect("SLD replaced rather than appended to the retained state log");
+    let log_tail = String::from_utf8_lossy(log_tail);
+    assert!(
+        log_tail.lines().any(|line| {
+            let Some(count) = line
+                .strip_prefix("reused ")
+                .and_then(|line| {
+                    line.strip_suffix(" isolated rustc work-product inputs by producer digest")
+                })
+                .and_then(|count| count.parse::<u64>().ok())
+            else {
+                return false;
+            };
+            count > 0
+        }),
+        "SLD did not consume retained rustc work-product state:\n{log_tail}"
+    );
+    assert!(
+        !log_tail.contains("full relink: no previous incremental state"),
+        "SLD discarded retained incremental state:\n{log_tail}"
+    );
+    project
+        .process(target.join("debug/snapshot-sld"))
+        .with_stdout_data("43\n")
+        .run();
+}
+
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn exact_path_snapshot_manifest_rejects_corrupt_cache_before_build() {
     let cache = paths::root().join("shared-cache");
