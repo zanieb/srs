@@ -15510,6 +15510,7 @@ fn validate_macho_data_relocations_are_stable(
                         relocation,
                         resolutions,
                         &resolution_lookup,
+                        normalize_rust_archive_patch_inputs,
                     )?
                 {
                     let previous_record = relocation.clone();
@@ -15684,6 +15685,7 @@ fn macho_catalog_data_relocation_target_is_stable(
     current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
     relocation: &RelocationRecord,
     resolutions: &[MachOSymbolResolutionRecord],
+    normalize_rust_archive_patch_inputs: bool,
 ) -> std::result::Result<bool, String> {
     macho_catalog_data_relocation_target_is_stable_with_lookup(
         previous_identity,
@@ -15691,7 +15693,36 @@ fn macho_catalog_data_relocation_target_is_stable(
         relocation,
         resolutions,
         &MachOSymbolResolutionLookup::new(resolutions),
+        normalize_rust_archive_patch_inputs,
     )
+}
+
+fn macho_relocation_target_records_are_stable(
+    previous: Option<&RelocationTargetRecord>,
+    current: Option<&RelocationTargetRecord>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> std::result::Result<bool, String> {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return Ok(previous == current);
+    };
+    if previous.input_file != current.input_file
+        || previous.section_index != current.section_index
+        || previous.section_offset != current.section_offset
+    {
+        return Ok(false);
+    }
+    if previous.input == current.input {
+        return Ok(true);
+    }
+    if !normalize_rust_archive_patch_inputs {
+        return Ok(false);
+    }
+    normalized_archive_input_refs_match(
+        previous.input_file.as_str(),
+        previous.input.as_str(),
+        current.input.as_str(),
+    )
+    .map_err(|error| format!("failed to compare Mach-O data relocation owners: {error:#?}"))
 }
 
 fn macho_catalog_data_relocation_target_is_stable_with_lookup(
@@ -15700,6 +15731,7 @@ fn macho_catalog_data_relocation_target_is_stable_with_lookup(
     relocation: &RelocationRecord,
     resolutions: &[MachOSymbolResolutionRecord],
     resolution_lookup: &MachOSymbolResolutionLookup<'_>,
+    normalize_rust_archive_patch_inputs: bool,
 ) -> std::result::Result<bool, String> {
     let (Some((previous_name, _)), Some((current_name, _))) = (previous_identity, current_identity)
     else {
@@ -15714,7 +15746,11 @@ fn macho_catalog_data_relocation_target_is_stable_with_lookup(
     };
     let resolution = &resolutions[resolution_index];
     Ok(resolution.direct_value == Some(relocation.target_value)
-        && resolution.target == relocation.target
+        && macho_relocation_target_records_are_stable(
+            resolution.target.as_ref(),
+            relocation.target.as_ref(),
+            normalize_rust_archive_patch_inputs,
+        )?
         && relocation.applied_target_value == Some(relocation.target_value))
 }
 
@@ -41361,6 +41397,7 @@ mod tests {
                 &identity,
                 &relocation,
                 &resolutions,
+                false,
             )
             .unwrap()
         );
@@ -41372,6 +41409,7 @@ mod tests {
                 &defined_identity,
                 &relocation,
                 &resolutions,
+                false,
             )
             .unwrap()
         );
@@ -41383,6 +41421,7 @@ mod tests {
                 &identity,
                 &relocation,
                 &resolutions,
+                false,
             )
             .unwrap()
         );
@@ -41395,6 +41434,93 @@ mod tests {
                 &identity,
                 &relocation,
                 &resolutions,
+                false,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn catalog_macho_data_relocation_accepts_normalized_archive_owner() {
+        fn input_ref(input_file: &[u8], identifier: &[u8], range: &[u8]) -> SharedText {
+            let mut input = input_file.to_vec();
+            input.push(0);
+            input.extend_from_slice(identifier);
+            input.push(0);
+            input.extend_from_slice(range);
+            hex::encode(input).into()
+        }
+
+        let target_value = 0x1000_4020;
+        let input_file_bytes = b"libtarget.rlib";
+        let input_file: SharedText = hex::encode(input_file_bytes).into();
+        let previous_input = input_ref(input_file_bytes, b"crate-hash.cgu.old.rcgu.o", b"100:200");
+        let current_input = input_ref(input_file_bytes, b"crate-hash.cgu.new.rcgu.o", b"300:400");
+        let mut relocation = relocation_record(
+            "input.o",
+            1,
+            1,
+            Some(target_value),
+            target_value,
+            Some("_target"),
+            None,
+            8,
+            0,
+            8,
+            0,
+            0,
+        );
+        relocation.applied_target_value = Some(target_value);
+        relocation.target = Some(RelocationTargetRecord {
+            input_file: input_file.clone(),
+            input: current_input,
+            section_index: 3,
+            section_offset: 32,
+        });
+        let identity = Some((b"_target".to_vec(), None));
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(target_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file,
+                input: previous_input,
+                section_index: 3,
+                section_offset: 32,
+            }),
+        }];
+
+        assert!(
+            !macho_catalog_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+                false,
+            )
+            .unwrap()
+        );
+        assert!(
+            macho_catalog_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+                true,
+            )
+            .unwrap()
+        );
+
+        resolutions[0].target.as_mut().unwrap().section_offset += 8;
+        assert!(
+            !macho_catalog_data_relocation_target_is_stable(
+                &identity,
+                &identity,
+                &relocation,
+                &resolutions,
+                true,
             )
             .unwrap()
         );
