@@ -2088,13 +2088,19 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         }
         _ => todo!(),
     };
-    let mut applied_target_value = if rel.r_type == macho::ARM64_RELOC_BRANCH26 {
-        resolution
+    let mut applied_target_value = match rel.r_type {
+        macho::ARM64_RELOC_BRANCH26 => resolution
             .format_specific
             .stub_address
-            .map_or(target_resolution_value, |address| address.get())
-    } else {
-        target_resolution_value
+            .map_or(target_resolution_value, |address| address.get()),
+        macho::ARM64_RELOC_GOT_LOAD_PAGE21
+        | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        | macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+        | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => resolution
+            .format_specific
+            .got_address
+            .map_or(target_resolution_value, |address| address.get()),
+        _ => target_resolution_value,
     };
     if let Some(local_symbol_id) = local_symbol_id
         && let Some((thunked_value, thunk_address)) = maybe_get_thunk_for_relocation::<A>(
@@ -2157,6 +2163,10 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
                 | macho::ARM64_RELOC_BRANCH26
                 | macho::ARM64_RELOC_PAGE21
                 | macho::ARM64_RELOC_PAGEOFF12
+                | macho::ARM64_RELOC_GOT_LOAD_PAGE21
+                | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                | macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+                | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
         )
     {
         let target_symbol = layout.symbol_db.definition(local_symbol_id);

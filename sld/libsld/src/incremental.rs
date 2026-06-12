@@ -3480,9 +3480,14 @@ fn macho_aarch64_relocated_value(
     Some(match r_type {
         object::macho::ARM64_RELOC_UNSIGNED => target_value,
         object::macho::ARM64_RELOC_BRANCH26 => target_value.wrapping_sub(place),
-        object::macho::ARM64_RELOC_PAGE21 => (target_value & !linker_utils::elf::PAGE_MASK_4KB)
+        object::macho::ARM64_RELOC_PAGE21
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => (target_value
+            & !linker_utils::elf::PAGE_MASK_4KB)
             .wrapping_sub(place & !linker_utils::elf::PAGE_MASK_4KB),
-        object::macho::ARM64_RELOC_PAGEOFF12 => target_value,
+        object::macho::ARM64_RELOC_PAGEOFF12
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => target_value,
         _ => return None,
     })
 }
@@ -3495,10 +3500,13 @@ fn macho_aarch64_cross_input_relocation_is_supported(
         return false;
     }
     match relocation.r_type {
-        object::macho::ARM64_RELOC_BRANCH26 | object::macho::ARM64_RELOC_PAGE21 => {
-            relocation.r_pcrel
-        }
-        object::macho::ARM64_RELOC_PAGEOFF12 => !relocation.r_pcrel,
+        object::macho::ARM64_RELOC_BRANCH26
+        | object::macho::ARM64_RELOC_PAGE21
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => relocation.r_pcrel,
+        object::macho::ARM64_RELOC_PAGEOFF12
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => !relocation.r_pcrel,
         _ => false,
     }
 }
@@ -13941,12 +13949,17 @@ fn macho_text_relocation_target_candidates_for_resolution(
     } else {
         Vec::new()
     };
-    candidates.push(if r_type == object::macho::ARM64_RELOC_BRANCH26 {
-        resolution
+    candidates.push(match r_type {
+        object::macho::ARM64_RELOC_BRANCH26 => resolution
             .and_then(|resolution| resolution.stub_address)
-            .unwrap_or(target_value)
-    } else {
-        target_value
+            .unwrap_or(target_value),
+        object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => resolution
+            .and_then(|resolution| resolution.got_address)
+            .unwrap_or(target_value),
+        _ => target_value,
     });
     if r_type == object::macho::ARM64_RELOC_BRANCH26
         && let Some(resolution) = resolution
@@ -47959,7 +47972,7 @@ mod tests {
         let resolutions = [MachOSymbolResolutionRecord {
             name: target_name.clone(),
             direct_value: Some(0x1000),
-            got_address: None,
+            got_address: Some(0x1800),
             stub_address: Some(0x2000),
             thunk_addresses: vec![0x3000],
             target: None,
@@ -47976,6 +47989,17 @@ mod tests {
                 &[0x4000],
             ),
             vec![0x4000, 0x2000, 0x3000]
+        );
+        assert_eq!(
+            macho_text_relocation_target_candidates(
+                &resolutions,
+                &lookup,
+                Some(target_name.as_str()),
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                0x1000,
+                &[],
+            ),
+            vec![0x1800]
         );
     }
 
@@ -54498,6 +54522,15 @@ mod tests {
             macho_aarch64_relocated_value(object::macho::ARM64_RELOC_PAGE21, 0x5000, 0, 0x2ffc,),
             Some(0x3000)
         );
+        assert_eq!(
+            macho_aarch64_relocated_value(
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                0x5000,
+                0,
+                0x2ffc,
+            ),
+            Some(0x3000)
+        );
     }
 
     #[test]
@@ -54569,6 +54602,17 @@ mod tests {
                 r_length: 2,
                 r_extern: true,
                 r_type: object::macho::ARM64_RELOC_BRANCH26,
+            },
+            4,
+        ));
+        assert!(macho_aarch64_cross_input_relocation_is_supported(
+            object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
             },
             4,
         ));
