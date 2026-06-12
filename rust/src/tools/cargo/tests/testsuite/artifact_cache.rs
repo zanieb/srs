@@ -385,6 +385,9 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
         "source_validation_us",
         "entry_validation_us",
         "final_validation_us",
+        "final_identity_validation_us",
+        "final_loader_validation_us",
+        "final_action_validation_us",
         "state_write_us",
     ] {
         assert!(
@@ -392,7 +395,20 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
             "missing restore phase {phase}: {restore_phases}"
         );
     }
-    assert!(restore_phases["final_validation_us"].as_u64().unwrap() > 0);
+    let final_validation = restore_phases["final_validation_us"].as_u64().unwrap();
+    let final_identity = restore_phases["final_identity_validation_us"]
+        .as_u64()
+        .unwrap();
+    let final_loader = restore_phases["final_loader_validation_us"]
+        .as_u64()
+        .unwrap();
+    let final_action = restore_phases["final_action_validation_us"]
+        .as_u64()
+        .unwrap();
+    assert!(final_identity > 0);
+    assert!(final_loader > 0);
+    assert!(final_action > 0);
+    assert!(final_validation >= final_identity + final_loader + final_action);
     let restored = artifact_cache_stat(&warm, &["restore", "files"]);
     assert!(restored > 0);
     assert!(artifact_cache_stat(&warm, &["restore", "logical_bytes"]) > 0);
@@ -2572,7 +2588,9 @@ fn changed_loader_input_after_compilation_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can compute the loader-input digest.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -2627,7 +2645,9 @@ fn changed_loader_input_during_staging_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can begin publication.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -2689,7 +2709,9 @@ fn changed_loader_input_during_restore_forces_compile() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    // A debug Cargo may spend several seconds hashing the compiler identity
+    // before it can begin the restore.
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }

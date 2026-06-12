@@ -1798,10 +1798,18 @@ fn unmodeled_codegen_backend_environment(rustc: &ProcessBuilder) -> bool {
         .get_envs()
         .keys()
         .any(|key| key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some())
-        || std::env::vars_os().any(|(key, _)| {
-            key.to_str()
-                .is_some_and(|key| key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some())
-        })
+        || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the standalone action predicate must inspect inherited arbitrary backend keys"
+            )]
+            let mut inherited = std::env::vars_os();
+            inherited.any(|(key, _)| {
+                key.to_str().is_some_and(|key| {
+                    key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some()
+                })
+            })
+        }
 }
 
 fn unmodeled_sld_provenance_environment(rustc: &ProcessBuilder) -> bool {
@@ -2954,6 +2962,11 @@ mod artifact_cache_key_tests {
             std::fs::create_dir_all(directory).unwrap();
         }
         std::fs::write(&rustc_program, b"rustc").unwrap();
+        std::fs::write(
+            toolchain.join("lib").join("librustc_driver.dylib"),
+            b"\xca\xfe\xba\xbfdriver",
+        )
+        .unwrap();
         let custom_library = custom_loader.join("rustc_driver_dependency");
         let dynamic_elf = |payload: &[u8]| {
             let mut contents = vec![0; 20];
@@ -2967,6 +2980,67 @@ mod artifact_cache_key_tests {
         let (compiler_identity, identity_witness) =
             crate::util::rustc::artifact_cache_identity_for_program_for_test(&rustc_program)
                 .unwrap();
+        #[cfg(unix)]
+        {
+            let toolchain_alias = temp.path().join("toolchain-alias");
+            std::os::unix::fs::symlink(&toolchain, &toolchain_alias).unwrap();
+            let alias_lib = toolchain_alias.join("lib");
+            let aliased_loader_input = compiler_loader_input(
+                paths::dylib_path_envvar(),
+                alias_lib.clone(),
+                alias_lib,
+                Some(&toolchain),
+                output_root.parent().unwrap(),
+                &build_dir,
+                &rustc_cwd,
+            );
+            let canonical_lib = toolchain.join("lib");
+            let canonical_loader_input = compiler_loader_input(
+                paths::dylib_path_envvar(),
+                canonical_lib.clone(),
+                canonical_lib,
+                Some(&toolchain),
+                output_root.parent().unwrap(),
+                &build_dir,
+                &rustc_cwd,
+            );
+            let canonical_digest = compiler_loader_inputs_digest(
+                std::slice::from_ref(&canonical_loader_input),
+                Some(&identity_witness),
+            )
+            .unwrap();
+            let aliased_digest = compiler_loader_inputs_digest(
+                std::slice::from_ref(&aliased_loader_input),
+                Some(&identity_witness),
+            )
+            .unwrap();
+            if cfg!(target_os = "macos") {
+                assert_eq!(canonical_digest, aliased_digest);
+            } else {
+                assert_ne!(canonical_digest, aliased_digest);
+            }
+            assert_eq!(
+                compiler_identity_statically_covers_loader_input(
+                    &identity_witness,
+                    &aliased_loader_input,
+                    &toolchain,
+                    Path::new("lib"),
+                ),
+                cfg!(target_os = "macos")
+            );
+            let replacement_toolchain = temp.path().join("replacement-toolchain");
+            std::fs::create_dir_all(&replacement_toolchain).unwrap();
+            std::os::unix::fs::symlink(toolchain.join("bin"), replacement_toolchain.join("lib"))
+                .unwrap();
+            std::fs::remove_file(&toolchain_alias).unwrap();
+            std::os::unix::fs::symlink(&replacement_toolchain, &toolchain_alias).unwrap();
+            assert!(!compiler_identity_statically_covers_loader_input(
+                &identity_witness,
+                &aliased_loader_input,
+                &toolchain,
+                Path::new("lib"),
+            ));
+        }
         let rustc = ProcessBuilder::new(toolchain.join("rustup-proxy"));
         let loader_input = compiler_loader_input(
             paths::dylib_path_envvar(),
@@ -3255,12 +3329,18 @@ fn artifact_cache_loader_environment_is_modeled(
             && !(cfg!(target_os = "macos") && key.starts_with("DYLD_"))
     }
 
-    std::env::vars_os().all(|(key, value)| {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "loader admission must preserve non-UTF-8 inherited values filtered from GlobalContext::env"
+    )]
+    let inherited_is_modeled = std::env::vars_os().all(|(key, value)| {
         key.to_str()
             .is_some_and(|key| variable_is_modeled(key, &value))
-    }) && gctx
-        .env()
-        .all(|(key, value)| variable_is_modeled(key, OsStr::new(value)))
+    });
+    inherited_is_modeled
+        && gctx
+            .env()
+            .all(|(key, value)| variable_is_modeled(key, OsStr::new(value)))
         && rustc.get_envs().iter().all(|(key, value)| {
             value
                 .as_deref()
@@ -3429,7 +3509,11 @@ fn compiler_loader_inputs_digest(
                 );
                 update_framed_loader_digest(&mut hasher, relative.as_os_str().as_encoded_bytes());
                 hash_contents = identity_witness.is_none_or(|witness| {
-                    !compiler_identity_covers_loader_input(witness, &input.path)
+                    let statically_covered = compiler_identity_statically_covers_loader_input(
+                        witness, input, root, relative,
+                    );
+                    !statically_covered
+                        && !compiler_identity_covers_loader_input(witness, &input.path)
                 });
             }
             CompilerLoaderInputLocation::TargetProfile { root, relative } => {
@@ -3463,6 +3547,32 @@ fn compiler_loader_inputs_digest(
         }
     }
     Ok(hasher.finalize())
+}
+
+fn compiler_identity_statically_covers_loader_input(
+    witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+    input: &CompilerLoaderInput,
+    root: &Path,
+    relative: &Path,
+) -> bool {
+    // The macOS loader searches one directory level. Compiler identity hashes
+    // every file directly under `lib`, while its directory witness detects
+    // additions and removals. The final restore and every publication boundary
+    // validate that witness, so rescanning that root for every unit cannot
+    // discover new information. `bin` remains dynamic because compiler identity
+    // selects runtime libraries by name while loader admission also recognizes
+    // extensionless binaries by magic.
+    // Linux loader modeling is recursive and retains the conservative scan.
+    if !cfg!(target_os = "macos") || relative != Path::new("lib") {
+        return false;
+    }
+    let Ok(actual) = fs::canonicalize(&input.path) else {
+        return false;
+    };
+    let Ok(expected) = fs::canonicalize(root.join(relative)) else {
+        return false;
+    };
+    actual == expected && witness.contains_canonical_directory(&actual)
 }
 
 fn compiler_identity_covers_loader_input(
@@ -3939,15 +4049,38 @@ fn restore_rlib_cache(
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
         let phase_started = stats.map(|_| Instant::now());
-        let inputs_are_current: CargoResult<bool> = (|| {
-            Ok(
-                restore_materialized_identity_witness_is_current(identity_witness)
-                    && compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
-                        == *loader_inputs_digest
-                    && artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats)?
-                        == *action_inputs_digest,
-            )
-        })();
+        let identity_started = stats.map(|_| Instant::now());
+        let identity_is_current =
+            restore_materialized_identity_witness_is_current(identity_witness);
+        if let Some(started) = identity_started
+            && let Some(stats) = stats
+        {
+            stats.restore_phase(RestorePhase::FinalIdentityValidation, started.elapsed());
+        }
+        let inputs_are_current: CargoResult<bool> = if !identity_is_current {
+            Ok(false)
+        } else {
+            let loader_started = stats.map(|_| Instant::now());
+            let loader_result =
+                compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness));
+            if let Some(started) = loader_started
+                && let Some(stats) = stats
+            {
+                stats.restore_phase(RestorePhase::FinalLoaderValidation, started.elapsed());
+            }
+            if loader_result? != *loader_inputs_digest {
+                Ok(false)
+            } else {
+                let action_started = stats.map(|_| Instant::now());
+                let action_result = artifact_cache_action_inputs_digest(rustc, rustc_cwd, stats);
+                if let Some(started) = action_started
+                    && let Some(stats) = stats
+                {
+                    stats.restore_phase(RestorePhase::FinalActionValidation, started.elapsed());
+                }
+                Ok(action_result? == *action_inputs_digest)
+            }
+        };
         if let Some(started) = phase_started
             && let Some(stats) = stats
         {

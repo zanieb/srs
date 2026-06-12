@@ -113,6 +113,14 @@ path. Admitted actions have no target-local dynamic extern and do not invoke the
 linker, so unrelated proc-macro dylibs cannot affect that rustc process. Other
 configured and inherited loader roots remain modeled in the cache key.
 
+On macOS, an immutable compiler `lib` loader root may be reached through a
+rustup toolchain symlink while compiler identity records the release extraction
+path. Cargo canonicalizes that root and skips repeated content scanning only
+when the canonical directory is present in the current compiler-identity
+witness. The witness is revalidated after materialization and at every
+publication boundary. External roots, retargeted symlinks, and Linux recursive
+loader trees retain ordinary content validation.
+
 Linux runs with nonempty `GLIBC_TUNABLES` or nested shared objects in compiler
 loader roots execute normally without restoration. This includes glibc
 hardware-capability candidates in configured or installed compiler loader
@@ -186,10 +194,10 @@ reason, hits and misses, restored and published bytes, materialization mode,
 compiler-identity and action-input hashing, publication, rustc execution, and
 link-producing primary-package rustc actions. The `preflight` object reports
 attempted, already-fresh, dependency-blocked, finalized, and bypassed units plus
-elapsed time. `lookup.phase_elapsed_us`
-separates lock wait, control/source/entry/final validation, and target-state
-writes. No record is produced and no phase clocks or extra file-size reads are
-performed by default.
+elapsed time. `lookup.phase_elapsed_us` separates lock wait,
+control/source/entry validation, final compiler-identity/loader/action-input
+validation, and target-state writes. No record is produced and no phase clocks
+or extra file-size reads are performed by default.
 
 The timing fields are cumulative worker time in microseconds. They can exceed
 command wall time when jobs overlap. `units.cargo_fresh` describes Cargo's

@@ -75,6 +75,7 @@ pub(crate) struct ArtifactCacheIdentityWitness {
 #[derive(Clone, Debug, PartialEq)]
 struct ArtifactCacheDirectoryWitness {
     path: PathBuf,
+    canonical_path: PathBuf,
     modified: std::time::SystemTime,
     #[cfg(unix)]
     device: u64,
@@ -175,6 +176,12 @@ impl ArtifactCacheIdentityWitness {
         self.files
             .binary_search_by(|witness| witness.path.as_path().cmp(path))
             .is_ok()
+    }
+
+    pub(crate) fn contains_canonical_directory(&self, path: &Path) -> bool {
+        self.directories
+            .iter()
+            .any(|witness| witness.canonical_path == path)
     }
 }
 
@@ -520,11 +527,12 @@ fn artifact_cache_identity_witness_for_sysroot(
             return None;
         }
         let canonical = std::fs::canonicalize(path).ok()?;
-        if !visited.insert(canonical) {
+        if !visited.insert(canonical.clone()) {
             return Some(());
         }
         directories.push(ArtifactCacheDirectoryWitness {
             path: path.to_path_buf(),
+            canonical_path: canonical,
             modified: metadata.modified().ok()?,
             #[cfg(unix)]
             device: metadata.dev(),

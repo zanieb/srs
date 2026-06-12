@@ -115,10 +115,24 @@ Restore-phase counters instead found that a redundant pre-materialization
 compiler/action-input validation duplicated the correctness-authoritative
 post-materialization validation. Removing the first pass retained the mutation
 regressions and reduced the Clippy warm median below the disabled control by
-1.35s. The remaining final validation cost was 2.9-3.5s of cumulative worker
-time for Clippy, compared with 138ms for plain Check, and is the next replay
-overhead to remove or share. The cold population tax remains visible, so a
-designated writer should populate shared entries rather than every reader.
+1.35s. Splitting the remaining final validation phase showed 2.984s of one
+3.004s total was compiler-loader validation; identity-witness validation used
+6ms and action-input validation used 14ms. On macOS the loader root was the same
+immutable SRS `lib` directory already hashed by the compiler identity, but
+reached through rustup's toolchain symlink. Binding the canonical directory to
+the identity witness removed the redundant content scan while retaining content
+hashing for external loader roots and conservative recursive validation on
+Linux.
+
+The final same-binary, externally timed comparison used three empty targets per
+state. Warm Clippy took 5.37s, 3.66s, and 3.85s, for a 3.85s median; disabled
+controls took 4.93s, 6.09s, and 5.22s, for a 5.22s median. The warm cache was
+therefore 1.37s (26%) faster despite the noisy first warm sample. Final loader
+validation fell to 105-122ms cumulative and total final validation to
+126-145ms, with the same 25 hits, 45 rustc executions, and one Cargo-fresh
+Build unit. The cold
+population tax remains visible, so a designated writer should populate shared
+entries rather than every reader.
 
 ### Portable Cargo-fresh preflight
 
@@ -149,19 +163,20 @@ and the same pinned `uv-normalize` graph.
 | Build, warm cache, median of 3 | 3.07s | 7 / 9 | 4 | 4 | 19 |
 | Test/no-run, cache disabled, midpoint of 2 | 4.92s | 0 / 0 | 0 | 0 | 26 |
 | Test/no-run, warm cache, midpoint of 2 | 3.15s | 7 / 8 | 4 | 4 | 19 |
-| Clippy, cache disabled | 6.37s | 0 / 0 | 0 | 0 | 70 |
-| Clippy, cold cache | 8.42s | 0 / 25 | 0 | 0 | 70 |
-| Clippy, warm cache, midpoint of 2 | 5.30s | 25 / 25 | 1 | 1 | 45 |
+| Clippy, cache disabled, median of 3 | 5.22s | 0 / 0 | 0 | 0 | 70 |
+| Clippy, cold cache after loader fix | 7.04s | 0 / 25 | 0 | 0 | 70 |
+| Clippy, warm cache after loader fix, median of 3 | 3.85s | 25 / 25 | 1 | 1 | 45 |
 
 The warm Build preflight finalized four dependency libraries and removed them
 from Cargo's dirty queue, improving the exact disabled median by 1.74s and the
 earlier per-unit replay result by 0.78s. Test/no-run improved its disabled
-midpoint by 1.77s. Clippy improved its single disabled control by 1.07s, but
-only one pure Build library became Cargo-fresh; 24 metadata-only Check hits
-still ran through dirty replay and spent 2.91-2.97s of cumulative worker time
-in final validation. Build preflight took 227-250ms and Clippy preflight took
-399-411ms. This makes extending safe graph-wide freshness to Check actions a
-measured next step rather than an assumed optimization.
+midpoint by 1.77s. After removing the redundant loader scan, Clippy improved
+its disabled median by 1.37s, but only one pure Build library became
+Cargo-fresh; 24 metadata-only Check hits still ran through dirty replay. Their
+total final validation was reduced to 126-145ms cumulative. Build preflight
+took 227-250ms and optimized Clippy preflight took 175-205ms. This makes
+extending safe graph-wide freshness to Check actions a smaller, separately
+measurable scheduling optimization rather than a presumed replay fix.
 
 The reviewed implementation was also rerun on the full root command. Every row
 used an empty target; the cold row had no matching entries and the warm row
@@ -473,7 +488,8 @@ build queue. It remains disabled by default and reports:
 - action-input hash calls, failures, and time;
 - total hit and miss lookup time, materialization time, and publication time;
 - restore lock, control validation, source validation, entry validation, final
-  validation, and target-state write time;
+  validation split into compiler-identity witness, loader inputs, and action
+  inputs, and target-state write time;
 - rustc executions; and
 - link-producing primary-package rustc executions and full action time.
 

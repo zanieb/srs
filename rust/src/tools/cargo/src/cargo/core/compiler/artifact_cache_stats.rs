@@ -6,7 +6,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use crate::util::{CargoResult, GlobalContext};
 
 const INELIGIBLE_REASON_COUNT: usize = 11;
-const RESTORE_PHASE_COUNT: usize = 6;
+const RESTORE_PHASE_COUNT: usize = 9;
 
 #[derive(Clone, Copy, Debug)]
 pub enum IneligibleReason {
@@ -37,6 +37,9 @@ pub enum RestorePhase {
     SourceValidation,
     EntryValidation,
     FinalValidation,
+    FinalIdentityValidation,
+    FinalLoaderValidation,
+    FinalActionValidation,
     StateWrite,
 }
 
@@ -52,6 +55,9 @@ impl RestorePhase {
             Self::SourceValidation => "source_validation_us",
             Self::EntryValidation => "entry_validation_us",
             Self::FinalValidation => "final_validation_us",
+            Self::FinalIdentityValidation => "final_identity_validation_us",
+            Self::FinalLoaderValidation => "final_loader_validation_us",
+            Self::FinalActionValidation => "final_action_validation_us",
             Self::StateWrite => "state_write_us",
         }
     }
@@ -63,6 +69,9 @@ impl RestorePhase {
             Self::SourceValidation,
             Self::EntryValidation,
             Self::FinalValidation,
+            Self::FinalIdentityValidation,
+            Self::FinalLoaderValidation,
+            Self::FinalActionValidation,
             Self::StateWrite,
         ]
     }

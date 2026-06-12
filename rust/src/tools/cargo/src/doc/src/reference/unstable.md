@@ -555,6 +555,10 @@ File and directory identity metadata, including Unix change time, remain in a
 process-local witness that detects ordinary completed replacement after identity
 calculation. Concurrent mutation or publication of a toolchain during an active
 Cargo invocation remains outside this model.
+On macOS, Cargo can reuse that witness instead of rescanning an immutable
+compiler `lib` loader root reached through a toolchain symlink. This requires
+the canonical loader directory to be present in the identity witness; external
+roots and retargeted aliases continue through content validation.
 Token-bearing dynamic library search paths, such as Linux `$ORIGIN` or macOS
 `@loader_path`, run normally without restoration rather than being interpreted
 for cache identity. Linux builds with nonempty `GLIBC_TUNABLES` also run
