@@ -4307,11 +4307,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         "removed Mach-O archive member has no patch state".to_owned(),
                     ));
                 };
-                let ownership =
-                    match owned_macho_archive_removal_indices(stored_patch, &delta.removed) {
-                        Ok(ownership) => ownership,
-                        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
-                    };
+                let ownership = match owned_macho_archive_removal_indices(
+                    input.path.as_str(),
+                    stored_patch,
+                    &delta.removed,
+                ) {
+                    Ok(ownership) => ownership,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                };
                 if (!ownership.tracked_indices.is_empty()
                     || !ownership.initially_owned_identifiers.is_empty())
                     && !records_complete
@@ -17372,6 +17375,7 @@ fn archive_member_identifier_delta(
 }
 
 fn owned_macho_archive_removal_indices(
+    input_file_path: &str,
     patch: &FilePatchState,
     removed_identifiers: &[Vec<u8>],
 ) -> std::result::Result<MachOArchiveRemovalOwnership, String> {
@@ -17407,11 +17411,30 @@ fn owned_macho_archive_removal_indices(
         }
         indices.push(index);
     }
-    let initially_owned_identifiers = removed_identifiers
+    let mut initially_owned_identifiers = Vec::new();
+    for identifier in removed_identifiers
         .iter()
         .map(|identifier| archive_member_patch_identifier(identifier))
         .filter(|identifier| remaining.contains(identifier.as_slice()))
-        .collect();
+    {
+        let identifiers = HashSet::from([identifier.clone()]);
+        let mut represented = false;
+        for section in &patch.sections {
+            if normalized_archive_input_ref_matches_identifiers(
+                input_file_path,
+                section.input.as_str(),
+                &identifiers,
+            )
+            .map_err(|error| format!("failed to classify removed archive member: {error:?}"))?
+            {
+                represented = true;
+                break;
+            }
+        }
+        if represented {
+            initially_owned_identifiers.push(identifier);
+        }
+    }
     Ok(MachOArchiveRemovalOwnership {
         tracked_indices: indices,
         initially_owned_identifiers,
@@ -21952,9 +21975,11 @@ fn recycled_macho_symbol_table_patches(
                     .name_bytes()
                     .is_ok_and(|name| name == definition.name.as_slice())
             }) {
-                return Ok(Err(
-                    "added Mach-O archive member definition already exists in output".to_owned(),
-                ));
+                return Ok(Err(format!(
+                    "added Mach-O archive member definition `{}` already exists in output while recycling `{}`",
+                    display_hex_text(&hex::encode(&definition.name)),
+                    display_hex_text(retiring_name.as_str()),
+                )));
             }
             let string_size = u64::try_from(definition.name.len() + 1)
                 .context("Added Mach-O symbol name is too large")?;
@@ -22058,9 +22083,10 @@ fn added_macho_symbol_table_patches(
                 .name_bytes()
                 .is_ok_and(|name| name == definition.name.as_slice())
         }) {
-            return Ok(Err(
-                "added Mach-O archive member definition already exists in output".to_owned(),
-            ));
+            return Ok(Err(format!(
+                "added Mach-O archive member definition `{}` already exists in output",
+                display_hex_text(&hex::encode(&definition.name)),
+            )));
         }
         let Some(symbol_allocation) = allocate_reserved_range(
             remaining_reserved_ranges,
@@ -45806,6 +45832,7 @@ mod tests {
         };
 
         let ownership = owned_macho_archive_removal_indices(
+            "libcrate.rlib",
             &patch,
             &[
                 b"crate.cgu.1.session.rcgu.o".to_vec(),
@@ -45816,18 +45843,22 @@ mod tests {
         assert_eq!(ownership.tracked_indices, vec![0]);
         assert!(ownership.initially_owned_identifiers.is_empty());
         assert!(
-            owned_macho_archive_removal_indices(&patch, &[b"crate.cgu.1.session.rcgu.o".to_vec()],)
-                .unwrap_err()
-                .contains("split an activation cohort")
+            owned_macho_archive_removal_indices(
+                "libcrate.rlib",
+                &patch,
+                &[b"crate.cgu.1.session.rcgu.o".to_vec()],
+            )
+            .unwrap_err()
+            .contains("split an activation cohort")
         );
-        let ownership =
-            owned_macho_archive_removal_indices(&patch, &[b"crate.cgu.3.session.rcgu.o".to_vec()])
-                .unwrap();
+        let ownership = owned_macho_archive_removal_indices(
+            "libcrate.rlib",
+            &patch,
+            &[b"crate.cgu.3.session.rcgu.o".to_vec()],
+        )
+        .unwrap();
         assert!(ownership.tracked_indices.is_empty());
-        assert_eq!(
-            ownership.initially_owned_identifiers,
-            vec![b"crate.cgu.3.rcgu.o".to_vec()]
-        );
+        assert!(ownership.initially_owned_identifiers.is_empty());
         assert_eq!(
             dormant_macho_archive_reactivation_index(
                 &patch,
@@ -45914,6 +45945,16 @@ mod tests {
             sections: vec![section],
             raw_sections: None,
         };
+        let ownership = owned_macho_archive_removal_indices(
+            &input_file,
+            &patch,
+            &[previous_identifier.to_vec()],
+        )
+        .unwrap();
+        assert_eq!(
+            ownership.initially_owned_identifiers,
+            vec![archive_member_patch_identifier(previous_identifier)]
+        );
         let mut state = initially_owned_macho_archive_removal_state(
             &previous,
             &input_file,
