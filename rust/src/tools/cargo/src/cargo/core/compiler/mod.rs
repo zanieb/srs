@@ -77,7 +77,8 @@ use regex::Regex;
 use tracing::{debug, instrument, trace};
 
 use self::artifact_cache_stats::{
-    IneligibleReason, MaterializationKind, MaterializationTotals, RestorePhase, thread_cpu_time,
+    IneligibleReason, MaterializationKind, MaterializationTotals, PublicationOutcome,
+    PublicationSkipReason, RestorePhase, thread_cpu_time,
 };
 pub use self::build_config::UserIntent;
 pub use self::build_config::{
@@ -1748,13 +1749,15 @@ fn rustc(
                 && let Some(stats) = &artifact_cache_stats
             {
                 stats.publication_finished(
-                    store_result.as_ref().map(|stored| *stored).map_err(|_| ()),
+                    store_result.as_ref().copied().map_err(|_| ()),
                     started.elapsed(),
                 );
             }
             match store_result {
-                Ok(true) => debug!("stored artifact cache entry for {}", action.crate_name),
-                Ok(false) => {}
+                Ok(PublicationOutcome::Stored) => {
+                    debug!("stored artifact cache entry for {}", action.crate_name)
+                }
+                Ok(PublicationOutcome::Skipped(_)) => {}
                 Err(error) => {
                     debug!(
                         "ignoring artifact cache store failure for {}: {error:#}",
@@ -4768,6 +4771,10 @@ fn prepare_materialized_rlib_output_for_write(output: &Path) -> CargoResult<()> 
     Ok(())
 }
 
+fn skip_artifact_cache_publication(reason: PublicationSkipReason) -> PublicationOutcome {
+    PublicationOutcome::Skipped(reason)
+}
+
 fn store_rlib_cache(
     entry_root: &Path,
     outputs: &[build_runner::OutputFile],
@@ -4787,18 +4794,31 @@ fn store_rlib_cache(
     max_size: Option<u64>,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
     snapshot: Option<&artifact_cache_snapshot::Recorder>,
-) -> CargoResult<bool> {
+) -> CargoResult<PublicationOutcome> {
     let mut action_inputs_witness = action_inputs_witness.clone();
-    if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
-        debug!("not storing artifact cache entry with generated build-directory inputs");
-        return Ok(false);
+    match rlib_cache_input_support(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
+        RlibCacheInputSupport::Supported => {}
+        RlibCacheInputSupport::MissingDepInfo => {
+            debug!("not storing artifact cache entry without rustc dep-info");
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::SourceInputsUnavailable,
+            ));
+        }
+        RlibCacheInputSupport::GeneratedBuildInput => {
+            debug!("not storing artifact cache entry with generated build-directory inputs");
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::GeneratedBuildInput,
+            ));
+        }
     }
     delay_rlib_cache_input_digest_for_tests()?;
     if !identity_witness.is_current() {
         debug!(
             "not storing artifact cache entry with compiler identity modified during compilation"
         );
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::CompilerIdentityChanged,
+        ));
     }
     if compiler_loader_inputs_digest(loader_input_paths, Some(identity_witness))?
         != *loader_inputs_digest
@@ -4806,7 +4826,9 @@ fn store_rlib_cache(
         debug!(
             "not storing artifact cache entry with compiler loader inputs modified during compilation"
         );
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::LoaderInputsChanged,
+        ));
     }
     if !artifact_cache_action_inputs_are_current(
         rustc,
@@ -4816,7 +4838,9 @@ fn store_rlib_cache(
         stats,
     )? {
         debug!("not storing artifact cache entry with action inputs modified during compilation");
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::ActionInputsChanged,
+        ));
     }
     let Some(inputs_digest) = rlib_cache_inputs_digest_matching_rustc_dep_info(
         rustc_dep_info_loc,
@@ -4825,24 +4849,30 @@ fn store_rlib_cache(
     )?
     else {
         debug!("not storing artifact cache entry with unreadable compiler-discovered inputs");
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::SourceInputsUnavailable,
+        ));
     };
     let cache_root = entry_root.parent().unwrap_or(entry_root);
     paths::create_dir_all(cache_root)?;
     let Some(_action_lock) = try_write_lock_rlib_cache_action(entry_root)? else {
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::ActionLockUnavailable,
+        ));
     };
     if !create_rlib_cache_directory_no_follow(entry_root)? {
         debug!(
             "not storing artifact cache entry under unsupported action root {}",
             entry_root.display()
         );
-        return Ok(false);
+        return Ok(skip_artifact_cache_publication(
+            PublicationSkipReason::UnsupportedActionRoot,
+        ));
     }
     cleanup_abandoned_rlib_cache_action_transients(entry_root);
     let entry = entry_root.join(&inputs_digest);
     let staging = staging_rlib_cache_entry(&entry)?;
-    let result = (|| -> CargoResult<bool> {
+    let result = (|| -> CargoResult<PublicationOutcome> {
         let files = staging.join("files");
         paths::create_dir_all(&files)?;
         #[expect(
@@ -4928,7 +4958,9 @@ fn store_rlib_cache(
                 "not storing artifact cache entry larger than configured maximum: {} > {}",
                 entry_size, max_size
             );
-            return Ok(false);
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::EntryTooLarge,
+            ));
         }
         delay_rlib_cache_publish_for_tests()?;
         if !identity_witness.is_current()
@@ -4951,12 +4983,16 @@ fn store_rlib_cache(
         {
             debug!("not storing artifact cache entry with inputs modified during staging");
             paths::remove_dir_all(&staging)?;
-            return Ok(false);
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::InputsChangedDuringStaging,
+            ));
         }
         let Some(_lock) = lock_rlib_cache_exclusive(cache_root, "publishing artifact cache entry")?
         else {
             paths::remove_dir_all(&staging)?;
-            return Ok(false);
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::PublicationLockUnavailable,
+            ));
         };
         delay_rlib_cache_publish_locked_for_tests()?;
         let mut cache_size = match recorded_rlib_cache_size(cache_root) {
@@ -4983,7 +5019,9 @@ fn store_rlib_cache(
         {
             debug!("not storing artifact cache entry with inputs modified before publication");
             paths::remove_dir_all(&staging)?;
-            return Ok(false);
+            return Ok(skip_artifact_cache_publication(
+                PublicationSkipReason::InputsChangedBeforePublication,
+            ));
         }
         if entry.exists() {
             if entry.join("complete").exists()
@@ -4995,7 +5033,9 @@ fn store_rlib_cache(
                     snapshot.record(&entry, outputs);
                 }
                 paths::remove_dir_all(&staging)?;
-                return Ok(false);
+                return Ok(skip_artifact_cache_publication(
+                    PublicationSkipReason::AlreadyStored,
+                ));
             }
             mark_rlib_cache_size_dirty(cache_root)?;
             quarantine_rlib_cache_entry(&entry)?;
@@ -5007,7 +5047,9 @@ fn store_rlib_cache(
             Err(_error) if entry.join("complete").exists() => {
                 paths::remove_dir_all(&staging)?;
                 reconcile_rlib_cache_size(cache_root, max_size, None)?;
-                return Ok(false);
+                return Ok(skip_artifact_cache_publication(
+                    PublicationSkipReason::ConcurrentPublication,
+                ));
             }
             Err(error) => return Err(error.into()),
         }
@@ -5023,7 +5065,7 @@ fn store_rlib_cache(
         if let Some(snapshot) = snapshot {
             snapshot.record(&entry, outputs);
         }
-        Ok(true)
+        Ok(PublicationOutcome::Stored)
     })();
     if result.is_err() && staging.exists() {
         if let Err(error) = paths::remove_dir_all(&staging) {
@@ -5163,24 +5205,67 @@ fn verify_rlib_cache_inputs(
     Ok(paths::read(&entry.join("inputs.blake3"))?.trim() == digest)
 }
 
-fn rlib_cache_inputs_are_supported(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RlibCacheInputSupport {
+    Supported,
+    MissingDepInfo,
+    GeneratedBuildInput,
+}
+
+fn rlib_cache_input_support(
     rustc_dep_info_loc: &Path,
     rustc_cwd: &Path,
     build_dir: &Path,
     output_root: &Path,
-) -> CargoResult<bool> {
+) -> CargoResult<RlibCacheInputSupport> {
     if !rustc_dep_info_loc.exists() {
-        return Ok(false);
+        return Ok(RlibCacheInputSupport::MissingDepInfo);
     }
     let depinfo = fingerprint::parse_rustc_dep_info(rustc_dep_info_loc)?;
-    Ok(depinfo.files.keys().all(|path| {
+    let has_generated_build_input = depinfo.files.keys().any(|path| {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             rustc_cwd.join(path)
         };
-        !path.starts_with(build_dir) && !path.starts_with(output_root)
-    }))
+        path.starts_with(build_dir) || path.starts_with(output_root)
+    });
+    Ok(if has_generated_build_input {
+        RlibCacheInputSupport::GeneratedBuildInput
+    } else {
+        RlibCacheInputSupport::Supported
+    })
+}
+
+#[cfg(test)]
+mod artifact_cache_input_support_tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_generated_dep_info_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let rustc_cwd = temp.path();
+        let build_dir = rustc_cwd.join("build");
+        let output_root = build_dir.join("debug/deps");
+        let dep_info = rustc_cwd.join("crate.d");
+
+        assert_eq!(
+            rlib_cache_input_support(&dep_info, rustc_cwd, &build_dir, &output_root).unwrap(),
+            RlibCacheInputSupport::MissingDepInfo
+        );
+
+        fs::write(&dep_info, b"output: build/generated.rs\n").unwrap();
+        assert_eq!(
+            rlib_cache_input_support(&dep_info, rustc_cwd, &build_dir, &output_root).unwrap(),
+            RlibCacheInputSupport::GeneratedBuildInput
+        );
+
+        fs::write(&dep_info, b"output: src/lib.rs\n").unwrap();
+        assert_eq!(
+            rlib_cache_input_support(&dep_info, rustc_cwd, &build_dir, &output_root).unwrap(),
+            RlibCacheInputSupport::Supported
+        );
+    }
 }
 
 fn rlib_cache_inputs_digest_matching_rustc_dep_info(

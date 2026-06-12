@@ -259,7 +259,16 @@ fn artifact_cache_stats_from_stderr(stderr: &[u8]) -> serde_json::Value {
         1,
         "expected exactly one artifact cache statistics report:\n{stderr}"
     );
-    serde_json::from_str(reports[0]).unwrap()
+    let report: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
+    let publication = &report["publication"];
+    let skipped = publication["skipped"].as_u64().unwrap();
+    let reasons = publication["skipped_by_reason"].as_object().unwrap();
+    let classified: u64 = reasons.values().map(|value| value.as_u64().unwrap()).sum();
+    assert_eq!(
+        skipped, classified,
+        "every publication skip must have exactly one reason"
+    );
+    report
 }
 
 fn artifact_cache_stat(stats: &serde_json::Value, path: &[&str]) -> u64 {
@@ -941,6 +950,13 @@ fn custom_build_generated_source_remains_unpublished() {
         assert_eq!(artifact_cache_stat(&stats, &["lookup", "misses"]), 1);
         assert_eq!(artifact_cache_stat(&stats, &["publication", "stored"]), 0);
         assert_eq!(artifact_cache_stat(&stats, &["publication", "skipped"]), 1);
+        assert_eq!(
+            artifact_cache_stat(
+                &stats,
+                &["publication", "skipped_by_reason", "generated_build_input"]
+            ),
+            1
+        );
         assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 2);
     }
     assert!(cached_rlibs(&cache).is_empty());
@@ -4360,10 +4376,18 @@ fn oversized_entry_is_not_published() {
         ),
     );
 
-    build_in_target(&project, &target);
+    let stats = artifact_cache_stats(&build_in_target_with_stats(&project, &target));
 
     assert!(cached_rlibs(&cache).is_empty());
     assert!(cached_rlib(&target.join("debug").join("deps")).exists());
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "skipped"]), 1);
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["publication", "skipped_by_reason", "entry_too_large"]
+        ),
+        1
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]

@@ -6,6 +6,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use crate::util::{CargoResult, GlobalContext};
 
 const INELIGIBLE_REASON_COUNT: usize = 13;
+const PUBLICATION_SKIP_REASON_COUNT: usize = 13;
 const RESTORE_PHASE_COUNT: usize = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +31,29 @@ pub enum MaterializationKind {
     Hardlink,
     Copy,
     CrossDeviceCopy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationSkipReason {
+    GeneratedBuildInput,
+    CompilerIdentityChanged,
+    LoaderInputsChanged,
+    ActionInputsChanged,
+    SourceInputsUnavailable,
+    ActionLockUnavailable,
+    UnsupportedActionRoot,
+    EntryTooLarge,
+    InputsChangedDuringStaging,
+    PublicationLockUnavailable,
+    InputsChangedBeforePublication,
+    AlreadyStored,
+    ConcurrentPublication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationOutcome {
+    Stored,
+    Skipped(PublicationSkipReason),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,6 +172,48 @@ impl IneligibleReason {
     }
 }
 
+impl PublicationSkipReason {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::GeneratedBuildInput => "generated_build_input",
+            Self::CompilerIdentityChanged => "compiler_identity_changed",
+            Self::LoaderInputsChanged => "loader_inputs_changed",
+            Self::ActionInputsChanged => "action_inputs_changed",
+            Self::SourceInputsUnavailable => "source_inputs_unavailable",
+            Self::ActionLockUnavailable => "action_lock_unavailable",
+            Self::UnsupportedActionRoot => "unsupported_action_root",
+            Self::EntryTooLarge => "entry_too_large",
+            Self::InputsChangedDuringStaging => "inputs_changed_during_staging",
+            Self::PublicationLockUnavailable => "publication_lock_unavailable",
+            Self::InputsChangedBeforePublication => "inputs_changed_before_publication",
+            Self::AlreadyStored => "already_stored",
+            Self::ConcurrentPublication => "concurrent_publication",
+        }
+    }
+
+    fn all() -> [Self; PUBLICATION_SKIP_REASON_COUNT] {
+        [
+            Self::GeneratedBuildInput,
+            Self::CompilerIdentityChanged,
+            Self::LoaderInputsChanged,
+            Self::ActionInputsChanged,
+            Self::SourceInputsUnavailable,
+            Self::ActionLockUnavailable,
+            Self::UnsupportedActionRoot,
+            Self::EntryTooLarge,
+            Self::InputsChangedDuringStaging,
+            Self::PublicationLockUnavailable,
+            Self::InputsChangedBeforePublication,
+            Self::AlreadyStored,
+            Self::ConcurrentPublication,
+        ]
+    }
+}
+
 pub struct ArtifactCacheStats {
     cache_configured: AtomicBool,
     cargo_fresh: AtomicU64,
@@ -196,6 +262,7 @@ pub struct ArtifactCacheStats {
     publication_attempts: AtomicU64,
     publication_stored: AtomicU64,
     publication_skipped: AtomicU64,
+    publication_skipped_by_reason: [AtomicU64; PUBLICATION_SKIP_REASON_COUNT],
     publication_failures: AtomicU64,
     publication_files: AtomicU64,
     publication_bytes: AtomicU64,
@@ -273,6 +340,7 @@ impl Default for ArtifactCacheStats {
             publication_attempts: AtomicU64::new(0),
             publication_stored: AtomicU64::new(0),
             publication_skipped: AtomicU64::new(0),
+            publication_skipped_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
             publication_failures: AtomicU64::new(0),
             publication_files: AtomicU64::new(0),
             publication_bytes: AtomicU64::new(0),
@@ -452,16 +520,16 @@ impl ArtifactCacheStats {
         Self::add(&self.publication_attempts, 1);
     }
 
-    pub fn publication_finished(&self, result: Result<bool, ()>, elapsed: Duration) {
+    pub fn publication_finished(&self, result: Result<PublicationOutcome, ()>, elapsed: Duration) {
         Self::add(&self.publication_elapsed_us, Self::micros(elapsed));
-        Self::add(
-            match result {
-                Ok(true) => &self.publication_stored,
-                Ok(false) => &self.publication_skipped,
-                Err(()) => &self.publication_failures,
-            },
-            1,
-        );
+        match result {
+            Ok(PublicationOutcome::Stored) => Self::add(&self.publication_stored, 1),
+            Ok(PublicationOutcome::Skipped(reason)) => {
+                Self::add(&self.publication_skipped, 1);
+                Self::add(&self.publication_skipped_by_reason[reason.index()], 1);
+            }
+            Err(()) => Self::add(&self.publication_failures, 1),
+        }
     }
 
     pub fn published(&self, files: u64, bytes: u64) {
@@ -546,6 +614,13 @@ impl ArtifactCacheStats {
                 load(&self.restore_phase_elapsed_us[phase.index()]).into(),
             );
         }
+        let mut publication_skip_reasons = serde_json::Map::new();
+        for reason in PublicationSkipReason::all() {
+            publication_skip_reasons.insert(
+                reason.name().to_string(),
+                load(&self.publication_skipped_by_reason[reason.index()]).into(),
+            );
+        }
         let summary = serde_json::json!({
             "version": 1,
             "configured": self.cache_configured.load(Ordering::Relaxed),
@@ -613,6 +688,7 @@ impl ArtifactCacheStats {
                 "attempts": load(&self.publication_attempts),
                 "stored": load(&self.publication_stored),
                 "skipped": load(&self.publication_skipped),
+                "skipped_by_reason": publication_skip_reasons,
                 "failures": load(&self.publication_failures),
                 "files": load(&self.publication_files),
                 "logical_bytes": load(&self.publication_bytes),
