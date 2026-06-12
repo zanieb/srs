@@ -2805,6 +2805,7 @@ fn finish_macho_cross_input_target_moves(
     reuse_previous_target: bool,
     finish_unmatched: bool,
     input: &FileState,
+    previous_output: &[u8],
 ) -> Result<std::result::Result<(), String>> {
     let mut remaining_moves = Vec::new();
     for target_move in std::mem::take(&mut target_patches.macho_cross_input_target_moves) {
@@ -2899,44 +2900,63 @@ fn finish_macho_cross_input_target_moves(
             .map_or(target_move.current_target_value, |moved| {
                 moved.current_value
             });
-        let Some(written_value) = macho_aarch64_relocated_value_after_target_move(
-            raw_relocation.r_type,
-            previous_written_value,
-            previous_target_value,
-            current_target_value,
-            relocation.addend,
-        ) else {
-            return Ok(Err(format!(
-                "unsupported cross-input Mach-O relocation target patch in {}",
-                display_hex_path(&input.path)
-            )));
-        };
-        let rel_info =
-            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
-                raw_relocation,
-            )
-            .map_err(|error| {
-                crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
-            })?;
-        let Some(deferred_relocation) =
-            deferred_instruction_relocation_patch(rel_info, previous_written_value, written_value)
-        else {
-            return Ok(Err(format!(
-                "unsupported cross-input Mach-O relocation instruction in {}",
-                display_hex_path(&input.path)
-            )));
-        };
         let Ok(size) = usize::try_from(relocation.size) else {
             return Ok(Err(format!(
                 "unsupported cross-input Mach-O relocation size in {}",
                 display_hex_path(&input.path)
             )));
         };
+        let absolute_patch = match macho_aarch64_cross_input_absolute_patch(
+            raw_relocation,
+            relocation.size,
+            relocation.output_offset,
+            previous_output,
+            previous_written_value,
+            previous_target_value,
+            current_target_value,
+        ) {
+            Ok(patch) => patch,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let (written_value, data, deferred_relocation) = if let Some((written, data)) =
+            absolute_patch
+        {
+            (written, data, None)
+        } else {
+            let Some(written) = macho_aarch64_relocated_value_after_target_move(
+                raw_relocation.r_type,
+                previous_written_value,
+                previous_target_value,
+                current_target_value,
+                relocation.addend,
+            ) else {
+                return Ok(Err(format!(
+                    "unsupported cross-input Mach-O relocation target patch in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            let rel_info =
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw_relocation,
+                )
+                .map_err(|error| {
+                    crate::error!("Failed to decode recorded Mach-O target relocation: {error:#?}")
+                })?;
+            let Some(deferred) =
+                deferred_instruction_relocation_patch(rel_info, previous_written_value, written)
+            else {
+                return Ok(Err(format!(
+                    "unsupported cross-input Mach-O relocation instruction in {}",
+                    display_hex_path(&input.path)
+                )));
+            };
+            (written, vec![0; size], Some(deferred))
+        };
         target_patches.output_patches.push(SectionPatch {
             output_offset: relocation.output_offset,
             size: relocation.size,
-            data: vec![0; size],
-            deferred_relocation: Some(deferred_relocation),
+            data,
+            deferred_relocation,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
@@ -4026,19 +4046,62 @@ fn macho_aarch64_cross_input_relocation_is_supported(
     relocation: object::macho::RelocationInfo,
     size: u64,
 ) -> bool {
-    if size != 4 || relocation.r_length != 2 || !relocation.r_extern {
+    if !relocation.r_extern {
         return false;
     }
     match relocation.r_type {
+        object::macho::ARM64_RELOC_UNSIGNED => {
+            !relocation.r_pcrel && matches!((size, relocation.r_length), (4, 2) | (8, 3))
+        }
         object::macho::ARM64_RELOC_BRANCH26
         | object::macho::ARM64_RELOC_PAGE21
         | object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
-        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => relocation.r_pcrel,
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+            size == 4 && relocation.r_length == 2 && relocation.r_pcrel
+        }
         object::macho::ARM64_RELOC_PAGEOFF12
         | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
-        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => !relocation.r_pcrel,
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+            size == 4 && relocation.r_length == 2 && !relocation.r_pcrel
+        }
         _ => false,
     }
+}
+
+fn macho_aarch64_cross_input_absolute_patch(
+    raw_relocation: object::macho::RelocationInfo,
+    size: u64,
+    output_offset: u64,
+    previous_output: &[u8],
+    previous_written_value: u64,
+    previous_target_value: u64,
+    current_target_value: u64,
+) -> std::result::Result<Option<(u64, Vec<u8>)>, String> {
+    if raw_relocation.r_type != object::macho::ARM64_RELOC_UNSIGNED {
+        return Ok(None);
+    }
+    if !macho_aarch64_cross_input_relocation_is_supported(raw_relocation, size) {
+        return Err("unsupported cross-input Mach-O absolute relocation".to_owned());
+    }
+    let chained_slot = macho_chained_fixup_slot_for_output_offset(previous_output, output_offset)?;
+    let written_value = if let Some(slot) = chained_slot {
+        if size != 8 || slot.value != previous_written_value {
+            return Err(
+                "cross-input Mach-O chained rebase record changed before patching".to_owned(),
+            );
+        }
+        let delta = i128::from(current_target_value) - i128::from(previous_target_value);
+        retarget_macho_chained_rebase_value(previous_written_value, delta)?
+    } else {
+        let delta = i128::from(current_target_value) - i128::from(previous_target_value);
+        add_encoded_delta_u64(previous_written_value, delta)
+    };
+    let data = match size {
+        4 => (written_value as u32).to_le_bytes().to_vec(),
+        8 => written_value.to_le_bytes().to_vec(),
+        _ => unreachable!("validated Mach-O absolute relocation size"),
+    };
+    Ok(Some((written_value, data)))
 }
 
 fn macho_aarch64_relocated_value_after_target_move(
@@ -5168,6 +5231,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 true,
                 false,
                 input,
+                previous_output.get()?,
             )? {
                 Ok(()) => {}
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -5431,6 +5495,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 true,
                 true,
                 input,
+                previous_output.get()?,
             )? {
                 Ok(()) => {}
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -8715,6 +8780,7 @@ struct AddedMachOArchiveTextActivations {
 struct ChangedMachOArchiveUnwindMembers {
     members: Vec<AddedMachOArchiveTextMember>,
     retired_entries: Vec<MachOUnwindFunctionIdentity>,
+    current_sections: Vec<PatchSection>,
     previous_input_ranges: Vec<std::ops::Range<usize>>,
     current_input_ranges: Vec<std::ops::Range<usize>>,
 }
@@ -20937,6 +21003,145 @@ fn supplement_macho_unwind_section_mappings(
     Ok(Ok(()))
 }
 
+fn macho_section_semantic_fingerprint(
+    file: &object::File<'_>,
+    section_index: u32,
+) -> Option<blake3::Hash> {
+    let section = file
+        .section_by_index(patch_section_object_index(file, section_index).ok()?)
+        .ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sld-macho-section-semantic-v1");
+    hash_length_prefixed(&mut hasher, section.segment_name_bytes().ok().flatten()?);
+    hash_length_prefixed(&mut hasher, section.name_bytes().ok()?);
+    let object::SectionFlags::MachO { flags } = section.flags() else {
+        return None;
+    };
+    hasher.update(&flags.to_le_bytes());
+    hasher.update(&section.align().to_le_bytes());
+    hasher.update(&section.size().to_le_bytes());
+    hash_length_prefixed(&mut hasher, section.data().ok()?);
+    let relocations = section.relocations().collect::<Vec<_>>();
+    hasher.update(&(relocations.len() as u64).to_le_bytes());
+    for (offset, relocation) in relocations {
+        hasher.update(&offset.to_le_bytes());
+        let object::RelocationFlags::MachO {
+            r_type,
+            r_pcrel,
+            r_length,
+        } = relocation.flags()
+        else {
+            return None;
+        };
+        hasher.update(&[r_type, u8::from(r_pcrel), r_length]);
+        hasher.update(&relocation.addend().to_le_bytes());
+        hasher.update(&[u8::from(relocation.has_implicit_addend())]);
+        hash_macho_semantic_relocation_target(&mut hasher, file, relocation.target())?;
+        match relocation.subtractor() {
+            Some(symbol) => {
+                hasher.update(&[1]);
+                hash_macho_relocation_symbol(&mut hasher, file, symbol)?;
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    Some(hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supplement_current_macho_unwind_section_mappings(
+    input_file_path: &str,
+    previous_input: &str,
+    current_input: &str,
+    unwind: &AddedMachOArchiveUnwind,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    records: &[SectionRecord],
+    existing_sections: &[PatchSection],
+    sections: &mut Vec<PatchSection>,
+) -> Result<std::result::Result<(), String>> {
+    let mut section_indices = unwind
+        .compact_unwind
+        .iter()
+        .flat_map(|compact| {
+            compact
+                .entries
+                .iter()
+                .map(|entry| entry.function.section_index)
+        })
+        .chain(
+            unwind
+                .eh_frame
+                .iter()
+                .flat_map(|eh_frame| eh_frame.fdes.iter().map(|fde| fde.function.section_index)),
+        )
+        .collect::<Vec<_>>();
+    section_indices.sort_unstable();
+    section_indices.dedup();
+
+    for section_index in section_indices {
+        if existing_sections
+            .iter()
+            .chain(sections.iter())
+            .any(|section| section.input == current_input && section.section_index == section_index)
+        {
+            continue;
+        }
+        let mut matching_records = records.iter().filter(|record| {
+            record.input_file == input_file_path
+                && record.input == previous_input
+                && record.section_index == section_index
+        });
+        let Some(record) = matching_records.next() else {
+            continue;
+        };
+        if matching_records.next().is_some() {
+            return Ok(Err(
+                "changed Mach-O unwind target section has ambiguous previous output mappings"
+                    .to_owned(),
+            ));
+        }
+        let Some(previous_fingerprint) =
+            macho_section_semantic_fingerprint(previous_file, section_index)
+        else {
+            return Ok(Err(
+                "could not fingerprint previous Mach-O unwind target section".to_owned(),
+            ));
+        };
+        let Some(current_fingerprint) =
+            macho_section_semantic_fingerprint(current_file, section_index)
+        else {
+            return Ok(Err(
+                "could not fingerprint current Mach-O unwind target section".to_owned(),
+            ));
+        };
+        if previous_fingerprint != current_fingerprint {
+            continue;
+        }
+        let current_section = current_file
+            .section_by_index(patch_section_object_index(current_file, section_index)?)?;
+        if current_section.size() > record.size {
+            return Ok(Err(
+                "changed Mach-O unwind target section exceeds its previous output mapping"
+                    .to_owned(),
+            ));
+        }
+        sections.push(PatchSection {
+            input: current_input.to_owned(),
+            section_index,
+            section_name: patch_section_name_for_matching(&current_section),
+            input_size: current_section.size(),
+            output_offset: record.output_offset,
+            output_size: record.size,
+            data_hash: Some(hash_bytes(current_section.data()?)),
+            cstring_nul_boundaries_hash: None,
+        });
+    }
+    Ok(Ok(()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn changed_macho_archive_unwind_members(
     previous_bytes: &[u8],
@@ -20963,8 +21168,13 @@ fn changed_macho_archive_unwind_members(
         .iter()
         .map(|matched| matched.previous.clone())
         .collect::<Vec<_>>();
+    let existing_current_sections = matched_sections
+        .iter()
+        .map(|matched| matched.current.clone())
+        .collect::<Vec<_>>();
     let mut members = Vec::new();
     let mut retired_entries = Vec::new();
+    let mut current_sections = Vec::new();
     let mut previous_input_ranges = Vec::new();
     let mut current_input_ranges = Vec::new();
     for (previous_input_ref, current_input_ref) in input_pairs {
@@ -21036,6 +21246,20 @@ fn changed_macho_archive_unwind_members(
             Ok(()) => {}
             Err(reason) => return Ok(Err(reason)),
         }
+        match supplement_current_macho_unwind_section_mappings(
+            input_file_path,
+            previous_input_ref.as_str(),
+            current_input_ref.as_str(),
+            &current_unwind,
+            &previous_file,
+            &current_file,
+            section_records,
+            &existing_current_sections,
+            &mut current_sections,
+        )? {
+            Ok(()) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
 
         let previous_ranges = match macho_archive_unwind_input_ranges(
             previous_input,
@@ -21099,6 +21323,7 @@ fn changed_macho_archive_unwind_members(
     Ok(Ok(ChangedMachOArchiveUnwindMembers {
         members,
         retired_entries,
+        current_sections,
         previous_input_ranges,
         current_input_ranges,
     }))
@@ -21263,10 +21488,12 @@ fn changed_macho_archive_unwind_activation(
 
     let selected_indices = (0..changed.members.len()).collect::<Vec<_>>();
     let mut remaining_reserved_ranges = reserved_ranges.to_vec();
+    let mut unwind_sections = current_sections.to_vec();
+    unwind_sections.extend(changed.current_sections.iter().cloned());
     let activation = match added_macho_archive_unwind_activation(
         &changed.members,
         &selected_indices,
-        current_sections,
+        &unwind_sections,
         &output_file,
         resolutions,
         &changed.retired_entries,
@@ -21606,6 +21833,7 @@ fn added_macho_archive_text_activations(
         .collect::<Vec<_>>();
     let mut unwind_sections = sections.clone();
     unwind_sections.extend(existing_current_sections.iter().cloned());
+    unwind_sections.extend(changed_unwind.current_sections.iter().cloned());
     let unwind_patches = match added_macho_archive_unwind_activation(
         &members,
         &unwind_selected_indices,
@@ -23032,6 +23260,40 @@ fn migrated_macho_got_retarget_patch(
     })
 }
 
+fn macho_chained_fixup_slot_for_output_offset(
+    previous_output: &[u8],
+    output_offset: u64,
+) -> std::result::Result<Option<MachOChainedFixupSlot>, String> {
+    let output_file = object::File::parse(previous_output)
+        .map_err(|error| format!("failed to parse output for Mach-O pointer migration: {error}"))?;
+    let Some(table_range) = macho_chained_fixup_table_range(previous_output) else {
+        return Ok(None);
+    };
+    let table = previous_output
+        .get(table_range)
+        .ok_or_else(|| "previous Mach-O chained fixup table is out of bounds".to_owned())?;
+    let Some((data_address, data_size, data_file_offset, data_file_size)) =
+        macho_chained_fixup_data_segment(&output_file)
+    else {
+        return Err("previous Mach-O output has no unique __DATA segment".to_owned());
+    };
+    let mut matching = read_macho_chained_fixup_slots(
+        previous_output,
+        table,
+        data_address,
+        data_size,
+        data_file_offset,
+        data_file_size,
+    )?
+    .into_iter()
+    .filter(|slot| slot.output_offset == output_offset);
+    let slot = matching.next();
+    if matching.next().is_some() {
+        return Err("Mach-O output offset has multiple chained rebase slots".to_owned());
+    }
+    Ok(slot)
+}
+
 fn migrated_macho_chained_rebase_value(
     previous_value: u64,
     previous_target: u64,
@@ -23049,6 +23311,26 @@ fn migrated_macho_chained_rebase_value(
     if decoded_target != previous_target {
         return Err("migrated Mach-O GOT target changed before retargeting".to_owned());
     }
+    let next_stride =
+        (previous_value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT;
+    encode_incremental_macho_chained_rebase(current_target, next_stride)
+}
+
+fn retarget_macho_chained_rebase_value(
+    previous_value: u64,
+    target_delta: i128,
+) -> std::result::Result<u64, String> {
+    if previous_value >> 63 != 0 {
+        return Err("Mach-O chained pointer is a bind".to_owned());
+    }
+    let runtime_offset = previous_value & ((1 << 36) - 1);
+    let high8 = (previous_value >> 36) & 0xff;
+    let previous_target = crate::macho::MACHO_START_MEM_ADDRESS
+        .checked_add(runtime_offset)
+        .map(|address| address | (high8 << 56))
+        .ok_or_else(|| "Mach-O chained rebase target overflowed".to_owned())?;
+    let current_target = add_signed_delta_u64(previous_target, target_delta)
+        .ok_or_else(|| "Mach-O chained rebase target movement overflowed".to_owned())?;
     let next_stride =
         (previous_value & MACHO_CHAINED_PTR_NEXT_MASK) >> MACHO_CHAINED_PTR_NEXT_SHIFT;
     encode_incremental_macho_chained_rebase(current_target, next_stride)
@@ -42805,6 +43087,10 @@ mod tests {
             current,
             encode_incremental_macho_chained_rebase(current_target, 7).unwrap()
         );
+        assert_eq!(
+            retarget_macho_chained_rebase_value(previous, 0x10).unwrap(),
+            encode_incremental_macho_chained_rebase(previous_target + 0x10, 7).unwrap(),
+        );
         assert!(
             migrated_macho_chained_rebase_value(previous, previous_target + 8, current_target)
                 .unwrap_err()
@@ -44144,6 +44430,13 @@ mod tests {
         let input_file_path = hex::encode("input.rlib");
         let input = "member.rcgu.o";
         let mut sections = Vec::new();
+        let record = SectionRecord {
+            input_file: input_file_path.clone().into(),
+            input: input.into(),
+            section_index,
+            output_offset: output.text_offset + 0x100,
+            size: text.size(),
+        };
 
         assert_eq!(
             macho_unwind_function_identities(input, &unwind, &sections, &output_file).unwrap_err(),
@@ -44154,13 +44447,7 @@ mod tests {
             input,
             &unwind,
             &file,
-            &[SectionRecord {
-                input_file: input_file_path.clone().into(),
-                input: input.into(),
-                section_index,
-                output_offset: output.text_offset + 0x100,
-                size: text.size(),
-            }],
+            std::slice::from_ref(&record),
             &mut sections,
         )
         .unwrap()
@@ -44170,6 +44457,45 @@ mod tests {
             macho_unwind_function_identities(input, &unwind, &sections, &output_file).unwrap();
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].length, 0x258);
+
+        let current_input = "current.rcgu.o";
+        let mut current_sections = Vec::new();
+        supplement_current_macho_unwind_section_mappings(
+            &input_file_path,
+            input,
+            current_input,
+            &unwind,
+            &file,
+            &file,
+            std::slice::from_ref(&record),
+            &[],
+            &mut current_sections,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(current_sections.len(), 1);
+        assert_eq!(current_sections[0].input, current_input);
+        assert_eq!(current_sections[0].output_offset, record.output_offset);
+
+        let mut changed_object = object.clone();
+        let (text_offset, _) = text.file_range().unwrap();
+        changed_object[text_offset as usize] ^= 1;
+        let changed_file = object::File::parse(changed_object.as_slice()).unwrap();
+        let mut changed_sections = Vec::new();
+        supplement_current_macho_unwind_section_mappings(
+            &input_file_path,
+            input,
+            current_input,
+            &unwind,
+            &file,
+            &changed_file,
+            std::slice::from_ref(&record),
+            &[],
+            &mut changed_sections,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(changed_sections.is_empty());
     }
 
     #[test]
@@ -55998,6 +56324,32 @@ mod tests {
 
     #[test]
     fn macho_cross_input_relocations_follow_target_moves() {
+        let absolute = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 3,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        };
+        assert!(macho_aarch64_cross_input_relocation_is_supported(
+            absolute, 8,
+        ));
+        let output = test_macho_unwind_output(0x1000);
+        let (written, data) = macho_aarch64_cross_input_absolute_patch(
+            absolute,
+            8,
+            output.text_offset,
+            &output.bytes,
+            0x2010,
+            0x2000,
+            0x3000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(written, 0x3010);
+        assert_eq!(data, 0x3010_u64.to_le_bytes());
+
         assert!(macho_aarch64_cross_input_relocation_is_supported(
             object::macho::RelocationInfo {
                 r_address: 0,
@@ -56397,6 +56749,7 @@ mod tests {
             true,
             true,
             &input,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -56430,6 +56783,7 @@ mod tests {
             true,
             true,
             &input,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -56468,6 +56822,7 @@ mod tests {
             true,
             true,
             &input,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -56489,6 +56844,7 @@ mod tests {
             false,
             true,
             &input,
+            &[],
         )
         .unwrap()
         .unwrap();
