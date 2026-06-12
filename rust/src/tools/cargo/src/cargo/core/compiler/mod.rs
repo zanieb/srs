@@ -361,6 +361,10 @@ const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE";
+const ARTIFACT_CACHE_RESTORE_LOCK_BLOCKED_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_LOCK_BLOCKED_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_FAILURE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_FAILURE";
 const ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_KEY_FAILURE";
 const ARTIFACT_CACHE_FORCE_REBUILD_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_FORCE_REBUILD";
 const ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION_FOR_TESTS: &str =
@@ -4537,6 +4541,13 @@ fn restore_rlib_cache(
     if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if env::var_os(ARTIFACT_CACHE_RESTORE_FAILURE_FOR_TESTS).is_some() {
+        anyhow::bail!("test-only artifact cache restore failure");
+    }
     delay_rlib_cache_restore_for_tests()?;
     let mut entries = fs::read_dir(entry_root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
@@ -5719,6 +5730,15 @@ fn lock_rlib_cache_for_restore(cache_root: &Path) -> CargoResult<Option<Artifact
                 }));
             }
             TryLockResult::WouldBlock if Instant::now() < deadline => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test-only hook is intentionally outside user configuration"
+                )]
+                if let Some(path) =
+                    env::var_os(ARTIFACT_CACHE_RESTORE_LOCK_BLOCKED_READY_FILE_FOR_TESTS)
+                {
+                    fs::write(path, b"blocked")?;
+                }
                 std::thread::sleep(retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(32));
             }

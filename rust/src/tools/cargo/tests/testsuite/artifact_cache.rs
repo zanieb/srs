@@ -261,12 +261,20 @@ fn artifact_cache_stats_from_stderr(stderr: &[u8]) -> serde_json::Value {
     );
     let report: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
     let publication = &report["publication"];
+    let attempts = publication["attempts"].as_u64().unwrap();
+    let stored = publication["stored"].as_u64().unwrap();
     let skipped = publication["skipped"].as_u64().unwrap();
+    let failures = publication["failures"].as_u64().unwrap();
     let reasons = publication["skipped_by_reason"].as_object().unwrap();
     let classified: u64 = reasons.values().map(|value| value.as_u64().unwrap()).sum();
     assert_eq!(
         skipped, classified,
         "every publication skip must have exactly one reason"
+    );
+    assert_eq!(
+        attempts,
+        stored + skipped + failures,
+        "every publication attempt must have exactly one outcome"
     );
     report
 }
@@ -792,6 +800,34 @@ fn artifact_cache_stats_report_build_script_processes() {
         1
     );
     assert!(artifact_cache_stat(&failed, &["build_script", "elapsed_us"]) > 0);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn artifact_cache_stats_report_rustc_failures() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("target-dir");
+    project.change_file("src/lib.rs", "this is not Rust\n");
+
+    let failed = artifact_cache_stats(
+        &project
+            .cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(&target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+            .with_status(101)
+            .with_stderr_contains("[ERROR] expected one of [..]")
+            .run(),
+    );
+    assert_eq!(artifact_cache_stat(&failed, &["rustc", "executions"]), 1);
+    assert_eq!(artifact_cache_stat(&failed, &["rustc", "failures"]), 1);
+    assert!(artifact_cache_stat(&failed, &["rustc", "elapsed_us"]) > 0);
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -3015,7 +3051,7 @@ fn concurrent_restores_share_the_cached_entry() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3068,7 +3104,7 @@ fn concurrent_publishers_converge_on_single_entry() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3125,7 +3161,7 @@ fn distinct_publishers_commit_while_another_action_is_staging() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3211,7 +3247,7 @@ fn abandoned_staging_is_cleaned_before_same_action_republishes() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3240,6 +3276,7 @@ fn restore_waits_for_short_publication_commit() {
     let restored_target = project.root().join("restored-target");
     let ready = project.root().join("publish-locked-ready");
     let release = project.root().join("publish-locked-release");
+    let restore_blocked = project.root().join("restore-lock-blocked");
 
     build_in_target(&project, &producer_target);
     let stored = cached_rlib(&cache);
@@ -3268,7 +3305,7 @@ fn restore_waits_for_short_publication_commit() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let publisher = publisher_command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -3290,12 +3327,30 @@ fn restore_waits_for_short_publication_commit() {
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_LOCK_BLOCKED_READY_FILE",
+            &restore_blocked,
+        )
         .build_command();
     restore_command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let restore = restore_command.spawn().unwrap();
-    sleep_ms(200);
+    let mut restore = restore_command.spawn().unwrap();
+    for _ in 0..400 {
+        if restore_blocked.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(
+        restore_blocked.exists(),
+        "restore did not block on the publication commit lock"
+    );
+    assert!(
+        restore.try_wait().unwrap().is_none(),
+        "restore finished before the publication commit lock was released"
+    );
+    assert!(cached_rlibs(&restored_target.join("debug").join("deps")).is_empty());
     fs::write(&release, b"release").unwrap();
 
     let publisher_output = publisher.wait_with_output().unwrap();
@@ -4262,7 +4317,7 @@ fn cache_store_failure_after_staging_is_cleaned_up() {
     let project = project_with_cache("project", &cache, "hardlink", 42);
     let target = project.root().join("target-dir");
 
-    project
+    let output = project
         .cargo("-Zartifact-cache build --lib")
         .arg("--target-dir")
         .arg(&target)
@@ -4275,7 +4330,15 @@ fn cache_store_failure_after_staging_is_cleaned_up() {
             "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING",
             "1",
         )
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
         .run();
+
+    let stats = artifact_cache_stats(&output);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "attempts"]), 1);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "stored"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "skipped"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "failures"]), 1);
+    assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 1);
 
     assert!(!contains_cache_entry_with_marker(&cache, ".staging-v8-"));
     assert!(cached_rlib(&target.join("debug").join("deps")).exists());
@@ -4500,7 +4563,7 @@ fn lowered_max_size_during_concurrent_restore_causes_a_miss_until_maintenance_ca
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -4665,7 +4728,7 @@ fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -4771,7 +4834,10 @@ fn oversized_entry_is_not_published() {
 
     assert!(cached_rlibs(&cache).is_empty());
     assert!(cached_rlib(&target.join("debug").join("deps")).exists());
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "attempts"]), 1);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "stored"]), 0);
     assert_eq!(artifact_cache_stat(&stats, &["publication", "skipped"]), 1);
+    assert_eq!(artifact_cache_stat(&stats, &["publication", "failures"]), 0);
     assert_eq!(
         artifact_cache_stat(
             &stats,
@@ -4828,19 +4894,30 @@ fn cache_restore_failure_falls_back_to_compile() {
     let consumer_target = project.root().join("consumer-target");
 
     build_in_target(&project, &producer_target);
-    let cached = cached_rlib(&cache);
-    let entry_root = cached
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    fs::remove_dir_all(&entry_root).unwrap();
-    fs::write(&entry_root, b"not a directory").unwrap();
+    let output = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_FAILURE", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .run();
 
-    build_in_target(&project, &consumer_target);
+    let stats = artifact_cache_stats(&output);
+    assert_eq!(artifact_cache_stat(&stats, &["units", "eligible"]), 1);
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "misses"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["lookup", "restore_failures"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&stats, &["restore", "files"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 1);
 
     assert!(cached_rlib(&consumer_target.join("debug").join("deps")).exists());
 }
@@ -5386,7 +5463,7 @@ fn input_changed_after_compilation_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -5447,7 +5524,7 @@ fn same_mtime_input_changed_after_compilation_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
@@ -5502,7 +5579,7 @@ fn same_mtime_input_changed_during_publication_is_not_published() {
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
-    for _ in 0..100 {
+    for _ in 0..400 {
         if ready.exists() {
             break;
         }
