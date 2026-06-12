@@ -2604,7 +2604,7 @@ fn relocation_target_patches_for_input(
         let Some(current) = current else {
             continue;
         };
-        if let Some(value_range) = current.value_range {
+        if let Some(value_range) = current.value_range.clone() {
             input_ranges.push(value_range);
         }
         if current.section_index.0 as u32 == target.section_index
@@ -2985,12 +2985,118 @@ fn finish_macho_cross_input_target_moves(
     Ok(Ok(()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reused_macho_symbol_output_address(
+    previous_bytes: &[u8],
+    input_file_path: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_value: u64,
+    current_file: &object::File<'_>,
+    current: &SymbolPosition,
+    section_records: &[SectionRecord],
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<Option<u64>, String>> {
+    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let Some(previous_input) = previous_resolver.resolve(
+        input_file_path,
+        previous_target.input.as_str(),
+        PatchInputLookup::MatchArchiveMember,
+    )?
+    else {
+        return Ok(Ok(None));
+    };
+    let Ok(previous_file) = object::File::parse(previous_input.bytes) else {
+        return Ok(Ok(None));
+    };
+    if !is_supported_incremental_macho_object(&previous_file)
+        || !is_supported_incremental_macho_object(current_file)
+        || current.section_index.0 as u32 != previous_target.section_index
+    {
+        return Ok(Ok(None));
+    }
+    let section_index = patch_section_record_index(current_file, current.section_index)?;
+    let mut matching_records = section_records.iter().filter(|record| {
+        record.input_file == input_file_path
+            && record.input == previous_target.input
+            && record.section_index == section_index
+    });
+    let Some(record) = matching_records.next() else {
+        return Ok(Ok(None));
+    };
+    if matching_records.next().is_some() {
+        return Ok(Err(
+            "migrated Mach-O symbol section has ambiguous previous output mappings".to_owned(),
+        ));
+    }
+    let Some(previous_fingerprint) =
+        macho_section_semantic_fingerprint(&previous_file, section_index)
+    else {
+        return Ok(Ok(None));
+    };
+    let Some(current_fingerprint) = macho_section_semantic_fingerprint(current_file, section_index)
+    else {
+        return Ok(Ok(None));
+    };
+    if previous_fingerprint != current_fingerprint {
+        return Ok(Ok(None));
+    }
+    let current_section = current_file.section_by_index(current.section_index)?;
+    if current_section.size() > record.size
+        || current.section_offset >= current_section.size()
+        || previous_target.section_offset >= record.size
+    {
+        return Ok(Ok(None));
+    }
+    let Some(previous_output_offset) = record
+        .output_offset
+        .checked_add(previous_target.section_offset)
+    else {
+        return Ok(Err(
+            "migrated Mach-O symbol previous output offset overflowed".to_owned(),
+        ));
+    };
+    if macho_output_address_for_file_offset(output_file, previous_output_offset)
+        != Some(previous_value)
+    {
+        return Ok(Err(
+            "migrated Mach-O symbol previous output mapping changed".to_owned(),
+        ));
+    }
+    let Some(current_output_offset) = record.output_offset.checked_add(current.section_offset)
+    else {
+        return Ok(Err(
+            "migrated Mach-O symbol current output offset overflowed".to_owned(),
+        ));
+    };
+    let current_value = macho_output_address_for_file_offset(output_file, current_output_offset);
+    Ok(Ok(current_value))
+}
+
+#[cfg(test)]
 fn update_macho_symbol_resolutions_for_input(
     resolutions: &mut [MachOSymbolResolutionRecord],
     input: &FileState,
     bytes: &[u8],
     allow_added_archive_retirement: bool,
     output_context: Option<(&[MatchedPatchSection], &[u8])>,
+) -> Result<std::result::Result<MachOSymbolResolutionUpdates, String>> {
+    update_macho_symbol_resolutions_for_input_with_reuse(
+        resolutions,
+        input,
+        bytes,
+        allow_added_archive_retirement,
+        output_context,
+        None,
+    )
+}
+
+fn update_macho_symbol_resolutions_for_input_with_reuse(
+    resolutions: &mut [MachOSymbolResolutionRecord],
+    input: &FileState,
+    bytes: &[u8],
+    allow_added_archive_retirement: bool,
+    output_context: Option<(&[MatchedPatchSection], &[u8])>,
+    reuse_context: Option<(&[u8], &[SectionRecord])>,
 ) -> Result<std::result::Result<MachOSymbolResolutionUpdates, String>> {
     let output_file = output_context
         .map(|(_, output)| object::File::parse(output))
@@ -3120,7 +3226,7 @@ fn update_macho_symbol_resolutions_for_input(
                 ));
             }
         };
-        if let Some(value_range) = current.value_range {
+        if let Some(value_range) = current.value_range.clone() {
             input_ranges.push(value_range);
         }
         if current.section_index.0 as u32 != target.section_index {
@@ -3156,6 +3262,25 @@ fn update_macho_symbol_resolutions_for_input(
                 )?
             {
                 current_value = Some(previous_value);
+            }
+            if current_value.is_none()
+                && let Some((previous_bytes, section_records)) = reuse_context
+            {
+                current_value = match reused_macho_symbol_output_address(
+                    previous_bytes,
+                    input.path.as_str(),
+                    target,
+                    previous_value,
+                    &indexed_input.file,
+                    &current,
+                    section_records,
+                    output_file
+                        .as_ref()
+                        .expect("output context requires parsed output"),
+                )? {
+                    Ok(value) => value,
+                    Err(reason) => return Ok(Err(reason)),
+                };
             }
             if current_value.is_none()
                 && allow_added_archive_retirement
@@ -5138,10 +5263,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             let mut macho_resolution_updates = {
                 timing_phase!("Refresh changed Mach-O symbol resolutions");
+                let previous_bytes = previous_snapshot_bytes.get()?;
                 let owns_active_changed_definitions = retained_macho_archive_members
                     .iter()
                     .any(|state| state.kind.is_changed_definitions() && state.active);
-                match update_macho_symbol_resolutions_for_input(
+                match update_macho_symbol_resolutions_for_input_with_reuse(
                     &mut previous.macho_symbol_resolutions,
                     input,
                     &bytes,
@@ -5149,6 +5275,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         || !retired_macho_archive_activations.is_empty()
                         || owns_active_changed_definitions,
                     Some((&matched_sections, previous_output.get()?)),
+                    previous_bytes.map(|bytes| (bytes, previous.sections.as_slice())),
                 )? {
                     Ok(updates) => updates,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -41266,6 +41393,75 @@ mod tests {
         assert_eq!(updates.moves[0].current_value, current_value);
         assert_eq!(updates.moves[0].previous_target.section_offset, 0);
         assert_eq!(updates.moves[0].current_target.section_offset, 0);
+    }
+
+    #[test]
+    fn macho_symbol_resolution_reuses_proven_section_owner() {
+        let object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let current_file = object::File::parse(object.as_slice()).unwrap();
+        let text = current_file.section_by_name("__text").unwrap();
+        let input_file_path = hex::encode("input.rlib");
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"old.rcgu.o".to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let previous = builder.into_inner().unwrap();
+        let mut entries = ArchiveIterator::from_archive_bytes(&previous).unwrap();
+        let ArchiveEntry::Regular(member) = entries.next().unwrap().unwrap() else {
+            panic!("expected regular archive member");
+        };
+        let previous_input = resolved_patch_input_ref(
+            &input_file_path,
+            &input_file_path,
+            PatchInputBytes {
+                bytes: member.entry_data,
+                file_offset: member.data_offset,
+                archive_identifier: Some(member.ident.as_slice()),
+            },
+        )
+        .unwrap();
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let output_offset = output.text_offset + 0x100;
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, output_offset).unwrap();
+        let target = RelocationTargetRecord {
+            input_file: input_file_path.clone().into(),
+            input: previous_input.clone().into(),
+            section_index: text.index().0 as u32,
+            section_offset: 0,
+        };
+        let current = SymbolPosition {
+            section_index: text.index(),
+            section_offset: 0,
+            value_range: None,
+        };
+        let records = [SectionRecord {
+            input_file: input_file_path.clone().into(),
+            input: previous_input.into(),
+            section_index: patch_section_record_index(&current_file, text.index()).unwrap(),
+            output_offset,
+            size: text.size(),
+        }];
+
+        assert_eq!(
+            reused_macho_symbol_output_address(
+                &previous,
+                &input_file_path,
+                &target,
+                previous_value,
+                &current_file,
+                &current,
+                &records,
+                &output_file,
+            )
+            .unwrap()
+            .unwrap(),
+            Some(previous_value),
+        );
     }
 
     #[test]
