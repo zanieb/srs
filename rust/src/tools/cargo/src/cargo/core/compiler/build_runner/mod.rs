@@ -268,6 +268,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                         .as_ref()
                         .map(|summary| {
                             (
+                                summary.cloned_files,
+                                summary.cloned_bytes,
                                 summary.copied_files,
                                 summary.copied_bytes,
                                 summary.existing_files,

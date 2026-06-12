@@ -404,11 +404,14 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
     assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 0);
     assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
     assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 2);
-    assert_eq!(
-        artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]),
-        records.len() as u64
-    );
-    assert!(artifact_cache_stat(&stats, &["snapshot", "restore", "copied_logical_bytes"]) > 0);
+    let cloned_files = artifact_cache_stat(&stats, &["snapshot", "restore", "cloned_files"]);
+    let copied_files = artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]);
+    assert_eq!(cloned_files + copied_files, records.len() as u64);
+    let cloned_bytes =
+        artifact_cache_stat(&stats, &["snapshot", "restore", "cloned_logical_bytes"]);
+    let copied_bytes =
+        artifact_cache_stat(&stats, &["snapshot", "restore", "copied_logical_bytes"]);
+    assert!(cloned_bytes + copied_bytes > 0);
 
     for (target_output, cache_output, contents, target_mtime, cache_mtime) in expected {
         assert_eq!(fs::read(&target_output).unwrap(), contents);

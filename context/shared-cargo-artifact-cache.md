@@ -111,12 +111,13 @@ proc macros, final links, and other nonportable target state.
 After extracting such a thin snapshot at its original absolute target path,
 set `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` to the extracted
 manifest. Before Cargo parses build-script state or calculates any fingerprint,
-it verifies every referenced cache entry, copies each omitted output back, and
-restores its original mode and mtime. Copying is required: changing the mtime
-of a hardlink would mutate the shared cache entry. Reconstructing the original
-mtime ordering lets the retained target fingerprints remain authoritative
-instead of making proc macros and downstream outputs stale at the restore
-time.
+it verifies every referenced cache entry, reconstructs each omitted output, and
+restores its original mode and mtime. On a same-filesystem target Cargo first
+tries a copy-on-write clone and falls back to a byte copy. Both give the target
+a distinct inode; hardlinks are never used because changing their mtime would
+mutate the shared cache entry. Reconstructing the original mtime ordering lets
+the retained target fingerprints remain authoritative instead of making proc
+macros and downstream outputs stale at the restore time.
 
 This is an exact-path workload layer, not a portable artifact identity. The
 archive key must bind the source revision, command/profile/features, SRS and
@@ -237,8 +238,9 @@ control/source/entry validation, final compiler-identity/loader/action-input
 validation, and target-state writes. No record is produced and no phase clocks
 or extra file-size reads are performed by default.
 When thin snapshot collection or reconstruction is requested, the `snapshot`
-object separately reports manifest-owned files/logical bytes, reconstructed
-and already-present files/logical bytes, failures, and elapsed time.
+object separately reports manifest-owned files/logical bytes, copy-on-write
+cloned files, byte-copied files, already-present files/logical bytes, failures,
+and elapsed time.
 
 The timing fields are cumulative worker time in microseconds. They can exceed
 command wall time when jobs overlap. `units.cargo_fresh` describes Cargo's

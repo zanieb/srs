@@ -5,7 +5,7 @@
 //! target outputs must never share writable inodes with cache entries.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -40,6 +40,8 @@ struct PendingRecord {
 /// Counts files handled by [`restore`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RestoreSummary {
+    pub cloned_files: u64,
+    pub cloned_bytes: u64,
     pub copied_files: u64,
     pub copied_bytes: u64,
     pub existing_files: u64,
@@ -79,6 +81,12 @@ struct RestorePlan {
     stored: PathBuf,
     record: SnapshotRecord,
     already_exists: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconstructionKind {
+    Cloned,
+    Copied,
 }
 
 impl Recorder {
@@ -422,9 +430,7 @@ pub fn restore(
             );
         }
         let stored_metadata = regular_file_metadata(&stored, "artifact cache file")?;
-        if stored_metadata.len() != record.size
-            || rlib_cache_digest(&stored)? != record.cache_digest
-        {
+        if stored_metadata.len() != record.size {
             bail!(
                 "artifact cache snapshot metadata does not match cache file `{}`",
                 stored.display()
@@ -480,39 +486,24 @@ pub fn restore(
             );
         }
 
-        let mut temporary = tempfile::Builder::new()
-            .prefix(".srs-artifact-snapshot-")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary snapshot output beside `{}`",
-                    plan.target.display()
-                )
-            })?;
-        let mut source = File::open(&plan.stored).with_context(|| {
-            format!(
-                "failed to open artifact cache snapshot source `{}`",
-                plan.stored.display()
-            )
-        })?;
-        let copied = io::copy(&mut source, temporary.as_file_mut()).with_context(|| {
-            format!(
-                "failed to copy artifact cache snapshot source `{}`",
-                plan.stored.display()
-            )
-        })?;
+        let (mut temporary, copied, reconstruction) =
+            clone_or_copy_file(&plan.stored, parent, true)?;
         if copied != plan.record.size {
             bail!(
                 "artifact cache snapshot source changed while copying `{}`",
                 plan.stored.display()
             );
         }
+        temporary.flush()?;
         set_file_mode(temporary.as_file(), plan.record.mode)?;
-        filetime::set_file_mtime(
-            temporary.path(),
-            filetime::FileTime::from_unix_time(plan.record.mtime_sec, plan.record.mtime_nsec),
+        filetime::set_file_handle_times(
+            temporary.as_file(),
+            None,
+            Some(filetime::FileTime::from_unix_time(
+                plan.record.mtime_sec,
+                plan.record.mtime_nsec,
+            )),
         )?;
-        temporary.as_file_mut().flush()?;
         let temporary_metadata = regular_file_metadata(temporary.path(), "temporary output")?;
         if !file_matches_record(temporary.path(), &temporary_metadata, &plan.record)? {
             bail!(
@@ -529,10 +520,180 @@ pub fn restore(
                     plan.target.display()
                 )
             })?;
-        summary.copied_files += 1;
-        summary.copied_bytes += plan.record.size;
+        match reconstruction {
+            ReconstructionKind::Cloned => {
+                summary.cloned_files += 1;
+                summary.cloned_bytes += plan.record.size;
+            }
+            ReconstructionKind::Copied => {
+                summary.copied_files += 1;
+                summary.copied_bytes += plan.record.size;
+            }
+        }
     }
     Ok(summary)
+}
+
+fn clone_or_copy_file(
+    source_path: &Path,
+    destination_parent: &Path,
+    allow_clone: bool,
+) -> CargoResult<(tempfile::NamedTempFile, u64, ReconstructionKind)> {
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        source_options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut source = source_options.open(source_path).with_context(|| {
+        format!(
+            "failed to open artifact cache snapshot source `{}`",
+            source_path.display()
+        )
+    })?;
+    if !source.metadata()?.file_type().is_file() {
+        bail!(
+            "artifact cache snapshot source is not a regular file: {}",
+            source_path.display()
+        );
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        all(
+            target_os = "linux",
+            not(any(target_arch = "sparc", target_arch = "sparc64"))
+        )
+    )))]
+    let _ = allow_clone;
+
+    #[cfg(target_vendor = "apple")]
+    if allow_clone {
+        let cloned = tempfile::Builder::new()
+            .prefix(".srs-artifact-snapshot-")
+            .make_in(destination_parent, |destination| {
+                clone_file_to_path(&source, destination)?;
+                match open_snapshot_output(destination) {
+                    Ok(file) => Ok(file),
+                    Err(error) => {
+                        let _ = fs::remove_file(destination);
+                        Err(error)
+                    }
+                }
+            });
+        match cloned {
+            Ok(destination) => {
+                return Ok((
+                    destination,
+                    source.metadata()?.len(),
+                    ReconstructionKind::Cloned,
+                ));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "copy-on-write clone failed for snapshot output in {}: {error}",
+                    destination_parent.display()
+                );
+            }
+        }
+    }
+
+    let mut destination = tempfile::Builder::new()
+        .prefix(".srs-artifact-snapshot-")
+        .tempfile_in(destination_parent)
+        .with_context(|| {
+            format!(
+                "failed to create temporary artifact cache snapshot output in `{}`",
+                destination_parent.display()
+            )
+        })?;
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    if allow_clone {
+        match try_clone_file(&source, destination.as_file()) {
+            Ok(true) => {
+                return Ok((
+                    destination,
+                    source.metadata()?.len(),
+                    ReconstructionKind::Cloned,
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!("copy-on-write clone failed for snapshot output: {error}");
+            }
+        }
+        drop(destination);
+        destination = tempfile::Builder::new()
+            .prefix(".srs-artifact-snapshot-")
+            .tempfile_in(destination_parent)?;
+    }
+
+    let copied = io::copy(&mut source, destination.as_file_mut()).with_context(|| {
+        format!(
+            "failed to copy artifact cache snapshot source `{}`",
+            source_path.display()
+        )
+    })?;
+    Ok((destination, copied, ReconstructionKind::Copied))
+}
+
+#[cfg(target_vendor = "apple")]
+fn clone_file_to_path(source: &File, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // Match byte-copy ownership: the restored target belongs to the restoring
+    // process, not to a possibly differently owned cache source. This flag is
+    // declared by clonefile(2), but is not exposed by libc.
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot destination contains a NUL byte",
+        )
+    })?;
+    let result = unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            CLONE_NOOWNERCOPY,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_snapshot_output(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "sparc", target_arch = "sparc64"))
+))]
+fn try_clone_file(source: &File, destination: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let result = unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    if result == 0 {
+        return Ok(true);
+    }
+    Err(io::Error::last_os_error())
 }
 
 fn manifest_json(manifest: &SnapshotManifest) -> CargoResult<Vec<u8>> {
@@ -917,8 +1078,11 @@ mod tests {
 
         fs::remove_file(&target).unwrap();
         let summary = restore(&manifest_path, &target_root, &cache_root).unwrap();
-        assert_eq!(summary.copied_files, 1);
-        assert_eq!(summary.copied_bytes, b"example artifact".len() as u64);
+        assert_eq!(summary.cloned_files + summary.copied_files, 1);
+        assert_eq!(
+            summary.cloned_bytes + summary.copied_bytes,
+            b"example artifact".len() as u64
+        );
         assert_eq!(fs::read(&target).unwrap(), b"example artifact");
 
         let second = restore(&manifest_path, &target_root, &cache_root).unwrap();
@@ -945,5 +1109,21 @@ mod tests {
                 (stored_metadata.dev(), stored_metadata.ino())
             );
         }
+
+        fs::write(&target, b"private target mutation").unwrap();
+        assert_eq!(fs::read(&stored).unwrap(), b"example artifact");
+    }
+
+    #[test]
+    fn reconstruction_falls_back_to_a_byte_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"copied artifact").unwrap();
+
+        let (file, bytes, kind) = clone_or_copy_file(&source, temp.path(), false).unwrap();
+
+        assert_eq!(kind, ReconstructionKind::Copied);
+        assert_eq!(bytes, b"copied artifact".len() as u64);
+        assert_eq!(fs::read(file.path()).unwrap(), b"copied artifact");
     }
 }

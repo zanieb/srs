@@ -202,8 +202,10 @@ pub struct ArtifactCacheStats {
     build_script_executions: AtomicU64,
     build_script_failures: AtomicU64,
     build_script_elapsed_us: AtomicU64,
-    snapshot_restore_files: AtomicU64,
-    snapshot_restore_bytes: AtomicU64,
+    snapshot_restore_cloned_files: AtomicU64,
+    snapshot_restore_cloned_bytes: AtomicU64,
+    snapshot_restore_copied_files: AtomicU64,
+    snapshot_restore_copied_bytes: AtomicU64,
     snapshot_restore_existing_files: AtomicU64,
     snapshot_restore_existing_bytes: AtomicU64,
     snapshot_restore_failures: AtomicU64,
@@ -273,8 +275,10 @@ impl Default for ArtifactCacheStats {
             build_script_executions: AtomicU64::new(0),
             build_script_failures: AtomicU64::new(0),
             build_script_elapsed_us: AtomicU64::new(0),
-            snapshot_restore_files: AtomicU64::new(0),
-            snapshot_restore_bytes: AtomicU64::new(0),
+            snapshot_restore_cloned_files: AtomicU64::new(0),
+            snapshot_restore_cloned_bytes: AtomicU64::new(0),
+            snapshot_restore_copied_files: AtomicU64::new(0),
+            snapshot_restore_copied_bytes: AtomicU64::new(0),
             snapshot_restore_existing_files: AtomicU64::new(0),
             snapshot_restore_existing_bytes: AtomicU64::new(0),
             snapshot_restore_failures: AtomicU64::new(0),
@@ -469,14 +473,23 @@ impl ArtifactCacheStats {
 
     pub fn snapshot_restore_finished(
         &self,
-        result: Result<(u64, u64, u64, u64), ()>,
+        result: Result<(u64, u64, u64, u64, u64, u64), ()>,
         elapsed: Duration,
     ) {
         Self::add(&self.snapshot_restore_elapsed_us, Self::micros(elapsed));
         match result {
-            Ok((files, bytes, existing_files, existing_bytes)) => {
-                Self::add(&self.snapshot_restore_files, files);
-                Self::add(&self.snapshot_restore_bytes, bytes);
+            Ok((
+                cloned_files,
+                cloned_bytes,
+                copied_files,
+                copied_bytes,
+                existing_files,
+                existing_bytes,
+            )) => {
+                Self::add(&self.snapshot_restore_cloned_files, cloned_files);
+                Self::add(&self.snapshot_restore_cloned_bytes, cloned_bytes);
+                Self::add(&self.snapshot_restore_copied_files, copied_files);
+                Self::add(&self.snapshot_restore_copied_bytes, copied_bytes);
                 Self::add(&self.snapshot_restore_existing_files, existing_files);
                 Self::add(&self.snapshot_restore_existing_bytes, existing_bytes);
             }
@@ -591,8 +604,10 @@ impl ArtifactCacheStats {
             },
             "snapshot": {
                 "restore": {
-                    "copied_files": load(&self.snapshot_restore_files),
-                    "copied_logical_bytes": load(&self.snapshot_restore_bytes),
+                    "cloned_files": load(&self.snapshot_restore_cloned_files),
+                    "cloned_logical_bytes": load(&self.snapshot_restore_cloned_bytes),
+                    "copied_files": load(&self.snapshot_restore_copied_files),
+                    "copied_logical_bytes": load(&self.snapshot_restore_copied_bytes),
                     "existing_files": load(&self.snapshot_restore_existing_files),
                     "existing_logical_bytes": load(&self.snapshot_restore_existing_bytes),
                     "failures": load(&self.snapshot_restore_failures),

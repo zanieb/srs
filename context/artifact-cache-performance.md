@@ -283,15 +283,36 @@ equivalent format preserving nanosecond mtimes and modes) is required. Restore
 also requires the same artifact-cache policy used by the writer, because the
 completion-stamp output contract participates in Cargo freshness.
 
-The full root target shows why the composition remains worth measuring at that
-scale. A
-prototype omitted 764 cache-owned `.rlib`/`.rmeta` files / 597.1 MB logical and
-reduced a zstd-3 archive from 412.0 MB to 237.2 MB, or 42.4%. The retained
-target still contained about 440 MB of uncached library pairs, 413 MB of final
-executable copies, 134 MB under `build/`, and 88 MB of proc-macro dylibs. Cargo
+The full root target confirms the composition at scale. A cold population run
+stored all 382 eligible entries and emitted a manifest for 764 outputs / 597.1
+MB logical in 1.01s. It took 89.24s and executed 562 rustc actions plus 56
+build-script processes; the manifest does not make the writer cheaper. PAX tar
+plus zstd level 3 compressed the complete target to 394 MiB and the thin target
+to 227 MiB, a 42.4% reduction.
+
+The first retained reconstruction streamed every cache output and redundantly
+hashed the already verified source a second time. Its Cargo phase took 3.57s.
+The measured follow-up uses a same-filesystem copy-on-write clone when
+available, falls back to a byte copy, and retains the post-reconstruction
+digest check. Removing only the redundant source digest and adding the clone
+path reduced the final Cargo median to 1.89s. All three thin trials cloned 764
+files / 597.1 MB, byte-copied none, kept all 562 units Cargo-fresh, and executed
+zero rustc actions and zero build scripts.
+
+| Layer | Compressed | Extract samples | Cargo samples | End-to-end median |
+| --- | ---: | --- | --- | ---: |
+| Thin plus reconstructed cache outputs | 227 MiB | 2.92s, 2.90s, 2.82s | 2.70s, 1.85s, 1.89s | 4.75s |
+| Full target snapshot | 394 MiB | 4.95s, 3.70s, 3.71s | 0.94s, 0.52s, 0.48s | 4.22s |
+
+The thin layer is 0.53s slower at the local median but transfers 167 MiB less.
+Ignoring request latency, it wins once effective archive transfer bandwidth is
+below about 315 MiB/s. Network transfer was not measured, so both layers
+remain useful integration controls: full is the fastest local fallback, while
+thin avoids paying remote-cache bandwidth for bytes already present in the
+portable artifact cache. The retained target still contains uncached library
+pairs, final executable copies, `build/` state, and proc-macro dylibs. Cargo
 must emit the omission manifest; external matching by extension, basename,
-inode, size, or mtime is not a safe product protocol. Until the completion-time
-contract exists, the full target snapshot wins on measured speed.
+inode, size, or mtime is not a safe product protocol.
 
 ### Full uv root build
 
@@ -538,6 +559,31 @@ SLD link state belongs with a workload target snapshot for incremental edits.
 It does not help a fresh target until the root binary and Cargo fingerprints
 have also been restored.
 
+For uv PR 19754, integrate the layers without changing any workload command:
+
+1. Give each workload a stable absolute target path and a key covering the uv
+   revision, lock/config inputs, SRS/cache schema, OS/architecture, backend,
+   linker, profile, features, and command shape.
+2. Let one designated writer restore the portable cache, run the original
+   command with `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST`, and publish the
+   portable cache plus a PAX thin target archive that omits exactly the
+   manifest-owned paths.
+3. Let readers restore both layers, extract the thin archive at the same target
+   path, and set `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` for the
+   unchanged Cargo command. A failed explicit reconstruction discards that
+   target and falls back to the full snapshot or ordinary build.
+4. Retain separate keys and single-writer lanes for root build, Clippy,
+   nextest, generated files, and profiling. Pair the root/profiling snapshot
+   with SLD state only when measuring incremental edits.
+5. Upload the structured JSON line with job timing. Gate rollout on zero
+   restore failures, zero unexpected rustc/build-script executions after a
+   snapshot hit, and an end-to-end median win including archive transfer.
+
+The local full-root result supplies a useful policy boundary: prefer thin when
+effective archive transfer is below roughly 315 MiB/s; otherwise a full target
+snapshot remains the faster fallback. Re-measure that threshold on the actual
+cache service rather than encoding the local number permanently.
+
 ### Portable SRS product layer
 
 Implement in measured order:
@@ -589,8 +635,8 @@ build queue. It remains disabled by default and reports:
   inputs, and target-state write time;
 - rustc executions;
 - build-script process executions, failures, and time;
-- exact-path snapshot manifest/reconstruction files, logical bytes, failures,
-  and time; and
+- exact-path snapshot manifest/reconstruction copy-on-write clones, byte
+  copies, already-present files, logical bytes, failures, and time; and
 - link-producing primary-package rustc executions and full action time.
 
 Phase totals are cumulative worker time and may exceed wall time when jobs run
