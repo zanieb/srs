@@ -2589,7 +2589,7 @@ fn update_macho_symbol_resolutions_for_input(
     let mut reusable_branch_targets = Vec::new();
     let mut retiring_names = Vec::new();
     let mut changed = false;
-    let mut requested_names_by_input = HashMap::<SharedText, Vec<SharedText>>::new();
+    let mut requested_names = Vec::new();
     for resolution in resolutions.iter() {
         let Some(target) = resolution
             .target
@@ -2598,15 +2598,42 @@ fn update_macho_symbol_resolutions_for_input(
         else {
             continue;
         };
-        requested_names_by_input
-            .entry(target.input.clone())
-            .or_default()
-            .push(resolution.name.clone());
+        requested_names.push((resolution.name.clone(), target.input.clone()));
     }
-    let resolver = (!requested_names_by_input.is_empty())
+    let resolver = (!requested_names.is_empty())
         .then(|| PatchInputResolver::new(bytes, true))
         .transpose()?;
-    let mut indexed_inputs = HashMap::<SharedText, IndexedMachOSymbolCatalogInput<'_>>::new();
+    let archive_symbol_inputs = MachOArchiveSymbolInputLookup::new(bytes)?;
+    let mut resolved_inputs_by_name = HashMap::new();
+    let mut requested_names_by_current_input = HashMap::<String, Vec<SharedText>>::new();
+    for (name, previous_input) in requested_names {
+        let input_bytes = if let Some(input_bytes) = archive_symbol_inputs
+            .as_ref()
+            .and_then(|lookup| lookup.get(name.as_str()))
+        {
+            Some(input_bytes)
+        } else {
+            resolver
+                .as_ref()
+                .expect("requested Mach-O symbol names require an input resolver")
+                .resolve(
+                    input.path.as_str(),
+                    previous_input.as_str(),
+                    PatchInputLookup::MatchArchiveMember,
+                )?
+        };
+        let Some(input_bytes) = input_bytes else {
+            continue;
+        };
+        let current_input =
+            resolved_patch_input_ref(input.path.as_str(), previous_input.as_str(), input_bytes)?;
+        requested_names_by_current_input
+            .entry(current_input.clone())
+            .or_default()
+            .push(name.clone());
+        resolved_inputs_by_name.insert(name, (input_bytes, current_input));
+    }
+    let mut indexed_inputs = HashMap::<String, IndexedMachOSymbolCatalogInput<'_>>::new();
     for resolution in resolutions {
         let Some(target) = resolution
             .target
@@ -2616,49 +2643,60 @@ fn update_macho_symbol_resolutions_for_input(
             continue;
         };
         let previous_input = target.input.clone();
-        if !indexed_inputs.contains_key(&previous_input) {
-            let Some(input_bytes) = resolver
-                .as_ref()
-                .expect("requested Mach-O symbol names require an input resolver")
-                .resolve(
-                    input.path.as_str(),
-                    previous_input.as_str(),
-                    PatchInputLookup::MatchArchiveMember,
-                )?
-            else {
-                return Ok(Err(format!(
-                    "could not resolve Mach-O symbol catalog input {} for {} in {}",
-                    display_hex_text(&previous_input),
-                    display_hex_text(&resolution.name),
-                    display_hex_path(&input.path),
-                )));
+        let Some((input_bytes, current_input)) = resolved_inputs_by_name.get(&resolution.name)
+        else {
+            if allow_added_archive_retirement
+                && resolution.direct_value.is_some()
+                && resolution.got_address.is_none()
+                && resolution.stub_address.is_none()
+                && resolution.thunk_addresses.is_empty()
+            {
+                retiring_names.push(resolution.name.clone());
+                continue;
+            }
+            return Ok(Err(format!(
+                "could not resolve Mach-O symbol catalog input {} for {} in {}",
+                display_hex_text(&previous_input),
+                display_hex_text(&resolution.name),
+                display_hex_path(&input.path),
+            )));
+        };
+        if !indexed_inputs.contains_key(current_input) {
+            let file = match object::File::parse(input_bytes.bytes) {
+                Ok(file) => file,
+                Err(error) => {
+                    if allow_added_archive_retirement
+                        && resolution.direct_value.is_some()
+                        && resolution.got_address.is_none()
+                        && resolution.stub_address.is_none()
+                        && resolution.thunk_addresses.is_empty()
+                    {
+                        retiring_names.push(resolution.name.clone());
+                        continue;
+                    }
+                    return Err(error)
+                        .context("Failed to parse changed Mach-O symbol catalog input");
+                }
             };
-            let file = object::File::parse(input_bytes.bytes)
-                .context("Failed to parse changed Mach-O symbol catalog input")?;
-            let current_input = resolved_patch_input_ref(
-                input.path.as_str(),
-                previous_input.as_str(),
-                input_bytes,
-            )?;
             let positions = indexed_unique_symbol_positions(
                 input_bytes.bytes,
                 input_bytes.file_offset,
                 &file,
-                requested_names_by_input
-                    .get(&previous_input)
-                    .expect("recorded input has requested Mach-O symbol names"),
+                requested_names_by_current_input
+                    .get(current_input)
+                    .expect("resolved input has requested Mach-O symbol names"),
             )?;
             indexed_inputs.insert(
-                previous_input.clone(),
+                current_input.clone(),
                 IndexedMachOSymbolCatalogInput {
                     file,
-                    current_input,
+                    current_input: current_input.clone(),
                     positions,
                 },
             );
         }
         let indexed_input = indexed_inputs
-            .get(&previous_input)
+            .get(current_input)
             .expect("requested Mach-O symbol input was indexed");
         let current = match indexed_input.positions.get(&resolution.name) {
             Some(IndexedSymbolPosition::Unique(current)) => current.clone(),
@@ -40250,6 +40288,70 @@ mod tests {
             unmapped_resolutions[0].target.as_ref().unwrap().input,
             resolutions[0].target.as_ref().unwrap().input
         );
+    }
+
+    #[test]
+    fn macho_symbol_resolution_moves_to_unique_archive_member() {
+        fn archive(input_file: &str, identifier: &[u8], object: &[u8]) -> (Vec<u8>, String) {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            let archive = builder.into_inner().unwrap();
+            let ArchiveMemberMatch::Unique(member) =
+                patch_archive_member_bytes(&archive, identifier).unwrap()
+            else {
+                panic!("expected unique archive member");
+            };
+            let input_ref = resolved_patch_input_ref(input_file, input_file, member).unwrap();
+            (archive, input_ref)
+        }
+
+        let input_file = hex::encode("libarchive.rlib");
+        let object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let (previous, previous_input) =
+            archive(&input_file, b"crate-hash.old-cgu.session.rcgu.o", &object);
+        let (current, current_input) =
+            archive(&input_file, b"crate-hash.new-cgu.session.rcgu.o", &object);
+        let input = FileState {
+            path: input_file.clone(),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_file.into(),
+                input: previous_input.into(),
+                section_index: 2,
+                section_offset: 0,
+            }),
+        }];
+
+        let updates = update_macho_symbol_resolutions_for_input(
+            &mut resolutions,
+            &input,
+            &current,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(updates.changed);
+        assert!(updates.moves.is_empty());
+        assert_eq!(resolutions[0].target.as_ref().unwrap().input, current_input);
+        assert_eq!(resolutions[0].direct_value, Some(0x1000));
     }
 
     #[test]
