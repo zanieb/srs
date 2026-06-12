@@ -1681,9 +1681,17 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         .as_ref()
         .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
     let previous_inputs_by_path = previous_input_files_by_path(previous.as_ref());
-    let remapped_codegen_inputs = remap_renamed_codegen_units
+    let remapped_codegen_units_are_canonical = remap_renamed_codegen_units
+        && rustc_codegen_input_block_is_canonicalizable(common, &output, &stable_dir);
+    let remapped_codegen_inputs = remapped_codegen_units_are_canonical
         .then(|| {
-            remapped_rustc_codegen_input_targets(common, &output, &stable_dir, previous.as_ref())
+            remapped_rustc_codegen_input_targets(
+                common,
+                &output,
+                &stable_dir,
+                previous.as_ref(),
+                provenance.as_ref(),
+            )
         })
         .unwrap_or_default();
     let mut stabilized = 0;
@@ -1755,7 +1763,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         input.spec = InputSpec::File(target.into_boxed_path());
         stabilized += 1;
     }
-    if remap_renamed_codegen_units {
+    if remapped_codegen_units_are_canonical {
         canonicalize_stable_rustc_codegen_input_order(common, &output, &stable_dir);
     }
 
@@ -1994,11 +2002,12 @@ fn remapped_rustc_codegen_input_targets(
     output: &Path,
     stable_dir: &Path,
     previous: Option<&PersistedState>,
+    provenance: Option<&HashMap<PathBuf, String>>,
 ) -> HashMap<PathBuf, PathBuf> {
-    let Some(previous) = previous else {
+    let (Some(previous), Some(provenance)) = (previous, provenance) else {
         return HashMap::new();
     };
-    let current = common
+    let mut current = common
         .inputs
         .iter()
         .filter_map(|input| {
@@ -2011,75 +2020,204 @@ fn remapped_rustc_codegen_input_targets(
                 .then_some((source.to_path_buf(), target))
         })
         .collect::<Vec<_>>();
-    let current_targets = current
+    if current
         .iter()
-        .map(|(_, target)| target.clone())
-        .collect::<HashSet<_>>();
-    if current_targets.len() != current.len() {
+        .map(|(_, target)| target)
+        .collect::<HashSet<_>>()
+        .len()
+        != current.len()
+    {
         return HashMap::new();
     }
-    let previous_paths = previous
+    if current
+        .iter()
+        .any(|(source, _)| !provenance.contains_key(source))
+    {
+        return HashMap::new();
+    }
+    let previous_hashes = previous
         .input_files
         .iter()
-        .filter_map(|input| decode_path(&input.path).ok())
+        .filter_map(|input| Some((decode_path(&input.path).ok()?, input.content.hash.as_str())))
+        .collect::<HashMap<_, _>>();
+    let fixed_targets = current
+        .iter()
+        .filter_map(|(source, target)| {
+            (previous_hashes.get(target).copied() == provenance.get(source).map(String::as_str))
+                .then_some(target.clone())
+        })
         .collect::<HashSet<_>>();
-    let new_sources = current
-        .into_iter()
-        .filter(|(_, target)| !previous_paths.contains(target))
-        .collect::<Vec<_>>();
-    let vacated_targets = previous_paths
-        .into_iter()
+    current.retain(|(_, target)| !fixed_targets.contains(target));
+    if current.is_empty() {
+        return HashMap::new();
+    }
+    let previous_targets = previous_hashes
+        .into_keys()
         .filter(|path| {
             is_stable_rustc_codegen_input(path, output, stable_dir)
-                && !current_targets.contains(path)
+                && !fixed_targets.contains(path)
                 && path.is_file()
         })
-        .collect::<Vec<_>>();
-    if new_sources.is_empty() || vacated_targets.is_empty() {
+        .collect::<HashSet<_>>();
+    if previous_targets.is_empty() {
         return HashMap::new();
     }
 
-    let current_symbols = new_sources
+    let current_symbols = current
         .iter()
-        .filter_map(|(source, _)| {
-            macho_global_definition_names(source).map(|names| (source.clone(), names))
+        .map(|(source, natural_target)| {
+            (
+                source.clone(),
+                natural_target.clone(),
+                macho_global_definition_names(source).unwrap_or_default(),
+            )
         })
         .collect::<Vec<_>>();
-    let previous_symbols = vacated_targets
+    let previous_symbols = previous_targets
         .iter()
-        .filter_map(|target| {
-            macho_global_definition_names(target).map(|names| (target.clone(), names))
+        .map(|target| {
+            (
+                target.clone(),
+                macho_global_definition_names(target).unwrap_or_default(),
+            )
         })
         .collect::<Vec<_>>();
-    let mut candidates = current_symbols
+    assigned_rustc_codegen_input_targets(&current_symbols, &previous_symbols)
+}
+
+fn assigned_rustc_codegen_input_targets(
+    current: &[(PathBuf, PathBuf, HashSet<Vec<u8>>)],
+    previous: &[(PathBuf, HashSet<Vec<u8>>)],
+) -> HashMap<PathBuf, PathBuf> {
+    let mut current = current.to_vec();
+    current.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut columns = previous
         .iter()
-        .flat_map(|(source, current_names)| {
-            previous_symbols
+        .map(|(target, _)| target.clone())
+        .chain(current.iter().map(|(_, target, _)| target.clone()))
+        .collect::<Vec<_>>();
+    columns.sort_unstable();
+    columns.dedup();
+    let previous_names = previous
+        .iter()
+        .map(|(target, names)| (target.clone(), names))
+        .collect::<HashMap<_, _>>();
+    let maximum_overlap = current
+        .iter()
+        .flat_map(|(_, _, current_names)| {
+            previous
                 .iter()
-                .filter_map(move |(target, previous_names)| {
-                    let overlap = current_names.intersection(previous_names).count();
-                    (overlap != 0).then_some((overlap, source.clone(), target.clone()))
+                .map(move |(_, names)| current_names.intersection(names).count())
+        })
+        .max()
+        .unwrap_or(0);
+    let previous_target_bonus = maximum_overlap
+        .saturating_mul(current.len())
+        .saturating_add(1);
+    let weights = current
+        .iter()
+        .map(|(_, natural_target, current_names)| {
+            columns
+                .iter()
+                .map(|target| {
+                    let previous = previous_names.get(target);
+                    let overlap = previous
+                        .map(|names| current_names.intersection(names).count())
+                        .unwrap_or(0);
+                    if target == natural_target {
+                        Some(overlap + usize::from(previous.is_some()) * previous_target_bonus)
+                    } else if previous.is_some() && overlap != 0 {
+                        Some(previous_target_bonus + overlap)
+                    } else {
+                        None
+                    }
                 })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    let mut used_sources = HashSet::new();
-    let mut used_targets = HashSet::new();
+    let assignment = maximum_weight_bipartite_assignment(&weights);
     let mut remapped = HashMap::new();
-    for (_, source, target) in candidates {
-        if !used_sources.contains(&source) && !used_targets.contains(&target) {
-            used_sources.insert(source.clone());
-            used_targets.insert(target.clone());
-            remapped.insert(source, target);
+    for ((source, natural_target, _), column) in current.into_iter().zip(assignment) {
+        let Some(target) = columns.get(column) else {
+            return HashMap::new();
+        };
+        if target != &natural_target {
+            remapped.insert(source, target.clone());
         }
     }
     remapped
+}
+
+fn maximum_weight_bipartite_assignment(weights: &[Vec<Option<usize>>]) -> Vec<usize> {
+    let row_count = weights.len();
+    let column_count = weights.first().map_or(0, Vec::len);
+    if row_count == 0 || column_count < row_count {
+        return Vec::new();
+    }
+    let invalid_cost = i128::MAX / 8;
+    let mut row_potential = vec![0_i128; row_count + 1];
+    let mut column_potential = vec![0_i128; column_count + 1];
+    let mut matched_row = vec![0_usize; column_count + 1];
+    let mut predecessor = vec![0_usize; column_count + 1];
+    for row in 1..=row_count {
+        matched_row[0] = row;
+        let mut minimum = vec![invalid_cost; column_count + 1];
+        let mut used = vec![false; column_count + 1];
+        let mut column = 0;
+        loop {
+            used[column] = true;
+            let active_row = matched_row[column];
+            let mut delta = invalid_cost;
+            let mut next_column = 0;
+            for candidate in 1..=column_count {
+                if used[candidate] {
+                    continue;
+                }
+                let cost = weights[active_row - 1][candidate - 1]
+                    .map(|weight| -(weight as i128))
+                    .unwrap_or(invalid_cost);
+                let reduced = cost - row_potential[active_row] - column_potential[candidate];
+                if reduced < minimum[candidate] {
+                    minimum[candidate] = reduced;
+                    predecessor[candidate] = column;
+                }
+                if minimum[candidate] < delta {
+                    delta = minimum[candidate];
+                    next_column = candidate;
+                }
+            }
+            if next_column == 0 || delta == invalid_cost {
+                return Vec::new();
+            }
+            for candidate in 0..=column_count {
+                if used[candidate] {
+                    row_potential[matched_row[candidate]] += delta;
+                    column_potential[candidate] -= delta;
+                } else {
+                    minimum[candidate] -= delta;
+                }
+            }
+            column = next_column;
+            if matched_row[column] == 0 {
+                break;
+            }
+        }
+        loop {
+            let previous_column = predecessor[column];
+            matched_row[column] = matched_row[previous_column];
+            column = previous_column;
+            if column == 0 {
+                break;
+            }
+        }
+    }
+    let mut assignment = vec![usize::MAX; row_count];
+    for (column, &row) in matched_row.iter().enumerate().skip(1) {
+        if row != 0 {
+            assignment[row - 1] = column - 1;
+        }
+    }
+    assignment
 }
 
 fn macho_global_definition_names(path: &Path) -> Option<HashSet<Vec<u8>>> {
@@ -2107,6 +2245,32 @@ fn is_stable_rustc_codegen_input(path: &Path, output: &Path, stable_dir: &Path) 
             .is_some_and(|name| {
                 name.starts_with(&format!("{output_name}.")) && name.ends_with(".rcgu.o")
             })
+}
+
+fn rustc_codegen_input_block_is_canonicalizable(
+    common: &crate::args::CommonArgs,
+    output: &Path,
+    stable_dir: &Path,
+) -> bool {
+    let indices = common
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            let InputSpec::File(path) = &input.spec else {
+                return None;
+            };
+            let stable_name = stable_rustc_input_name(path, output)?;
+            is_stable_rustc_codegen_input(&stable_dir.join(stable_name), output, stable_dir)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    !indices.is_empty()
+        && indices.windows(2).all(|pair| pair[1] == pair[0] + 1)
+        && indices.into_iter().all(|index| {
+            common.inputs[index].search_first.is_none()
+                && common.inputs[index].modifiers == crate::args::Modifiers::default()
+        })
 }
 
 fn canonicalize_stable_rustc_codegen_input_order(
@@ -33994,9 +34158,23 @@ mod tests {
                 modifiers: crate::args::Modifiers::default(),
             })
             .collect();
+        assert!(rustc_codegen_input_block_is_canonicalizable(
+            &common,
+            &output,
+            &stable_dir
+        ));
 
-        let remapped =
-            remapped_rustc_codegen_input_targets(&common, &output, &stable_dir, Some(&previous));
+        let provenance = HashMap::from([
+            (current_a.clone(), hash_bytes(&a)),
+            (current_b.clone(), hash_bytes(&b)),
+        ]);
+        let remapped = remapped_rustc_codegen_input_targets(
+            &common,
+            &output,
+            &stable_dir,
+            Some(&previous),
+            Some(&provenance),
+        );
         assert_eq!(remapped.get(&current_a), Some(&previous_a));
         assert_eq!(remapped.get(&current_b), Some(&previous_b));
 
@@ -34011,6 +34189,93 @@ mod tests {
             common.inputs[1].spec,
             InputSpec::File(previous_b.into_boxed_path())
         );
+
+        let names = |prefix: u8, count: usize| {
+            (0..count)
+                .map(|index| vec![prefix, index as u8])
+                .collect::<HashSet<_>>()
+        };
+        let a_primary = names(b'a', 10);
+        let a_secondary = names(b'c', 9);
+        let b_primary = names(b'b', 8);
+        let current = vec![
+            (
+                PathBuf::from("current-a"),
+                PathBuf::from("natural-a"),
+                a_primary.union(&a_secondary).cloned().collect(),
+            ),
+            (
+                PathBuf::from("current-b"),
+                PathBuf::from("natural-b"),
+                b_primary.clone(),
+            ),
+        ];
+        let previous = vec![
+            (
+                PathBuf::from("previous-x"),
+                a_primary.union(&b_primary).cloned().collect(),
+            ),
+            (PathBuf::from("previous-y"), a_secondary),
+        ];
+        let assigned = assigned_rustc_codegen_input_targets(&current, &previous);
+        assert_eq!(
+            assigned.get(Path::new("current-a")),
+            Some(&PathBuf::from("previous-y"))
+        );
+        assert_eq!(
+            assigned.get(Path::new("current-b")),
+            Some(&PathBuf::from("previous-x"))
+        );
+
+        let current = vec![
+            (
+                PathBuf::from("current-a"),
+                PathBuf::from("previous-a"),
+                HashSet::from([b"y".to_vec()]),
+            ),
+            (
+                PathBuf::from("current-c"),
+                PathBuf::from("current-c"),
+                HashSet::from([b"x".to_vec()]),
+            ),
+        ];
+        let previous = vec![
+            (PathBuf::from("previous-a"), HashSet::from([b"x".to_vec()])),
+            (PathBuf::from("previous-b"), HashSet::from([b"y".to_vec()])),
+        ];
+        let assigned = assigned_rustc_codegen_input_targets(&current, &previous);
+        assert_eq!(
+            assigned.get(Path::new("current-a")),
+            Some(&PathBuf::from("previous-b"))
+        );
+        assert_eq!(
+            assigned.get(Path::new("current-c")),
+            Some(&PathBuf::from("previous-a"))
+        );
+
+        let mut non_contiguous = crate::args::CommonArgs::default();
+        non_contiguous.inputs = vec![
+            crate::args::Input {
+                spec: InputSpec::File(current_a.into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            },
+            crate::args::Input {
+                spec: InputSpec::File(PathBuf::from("libdependency.rlib").into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            },
+            crate::args::Input {
+                spec: InputSpec::File(current_b.into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            },
+        ];
+        assert!(!rustc_codegen_input_block_is_canonicalizable(
+            &non_contiguous,
+            &output,
+            &stable_dir
+        ));
     }
 
     #[test]
