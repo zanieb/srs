@@ -1207,7 +1207,39 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     &previous,
                     &changed_inputs_to_patch,
                 ));
-        let result = if should_start_with_filtered_records {
+        let changed_archive_member_set = should_start_with_filtered_records
+            && changed_inputs_have_archive_member_set_changes(
+                &previous,
+                &changed_inputs_to_patch,
+                args.should_normalize_rust_archive_patch_inputs(),
+            )?;
+        let result = if changed_archive_member_set {
+            let Some(mut full_previous) = PersistedState::read(&state_dir)? else {
+                return Ok(false);
+            };
+            refresh_snapshotted_rewritten_input_metadata(
+                &state_dir,
+                &mut full_previous,
+                &rewritten_inputs,
+            );
+            apply_preclassified_unchanged_rustc_rlibs(
+                &mut full_previous,
+                &preclassified_unchanged_inputs,
+            );
+            append_log(
+                &state_dir,
+                "loaded complete records for changed archive member set before loading inputs",
+            )?;
+            patch_changed_inputs(
+                args,
+                &state_dir,
+                full_previous,
+                current_link_start.clone(),
+                ChangedInputRecordCoverage::Complete,
+                &changed_inputs_to_patch,
+                &metadata_update_input_indices,
+            )?
+        } else if should_start_with_filtered_records {
             let complete_macho_symbol_resolutions =
                 previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
             append_log(
@@ -2025,6 +2057,51 @@ fn changed_inputs_have_macho_text_patch_sections(
                     .any(|section| section.section_name.as_deref() == Some("__TEXT,__text"))
             })
     })
+}
+
+fn changed_inputs_have_archive_member_set_changes(
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    for (input_index, path) in changed_inputs {
+        let previous_input = &previous.input_files[*input_index];
+        let previous_proof = previous_input
+            .patch
+            .as_ref()
+            .and_then(|patch| patch.archive_member_set_proof.as_ref());
+        if previous_proof.is_none() && previous_input.rustc_raw_object_manifest.is_none() {
+            continue;
+        }
+        let Some((bytes, _)) = read_file_with_stable_identity(path)? else {
+            return Ok(true);
+        };
+        let current_manifest =
+            rustc_rlib_provenance(&bytes).and_then(|provenance| provenance.raw_object_manifest);
+        if let (Some(previous_manifest), Some(current_manifest)) = (
+            previous_input.rustc_raw_object_manifest.as_ref(),
+            current_manifest.as_ref(),
+        ) && rustc_rlib_raw_object_delta(previous_manifest, current_manifest)
+            .is_some_and(|delta| !delta.added.is_empty() || !delta.removed.is_empty())
+        {
+            return Ok(true);
+        }
+        let Some(previous_proof) = previous_proof else {
+            continue;
+        };
+        let Some(current_proof) = archive_member_set_proof(&bytes)? else {
+            return Ok(true);
+        };
+        let hashes_match = if normalize_rust_archive_patch_inputs {
+            previous_proof.normalized_ordered_hash == current_proof.normalized_ordered_hash
+        } else {
+            previous_proof.raw_ordered_hash == current_proof.raw_ordered_hash
+        };
+        if previous_proof.member_count != current_proof.member_count || !hashes_match {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn changed_inputs_need_records_to_derive_patch_metadata(
@@ -45764,6 +45841,91 @@ mod tests {
         assert_eq!(
             archive_member_set_proof_matches_current(&input, &direct_previous_patch, None, false),
             Some(false)
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let current_path = temp.path().join("libarchive.rlib");
+        let mut previous_state = state("args", b"output", &[]);
+        previous_state.input_files = vec![input.clone()];
+        std::fs::write(&current_path, &renamed).unwrap();
+        assert!(
+            !changed_inputs_have_archive_member_set_changes(
+                &previous_state,
+                &[(0, current_path.clone())],
+                true,
+            )
+            .unwrap(),
+            "normalized Rust invocation churn should keep filtered records",
+        );
+        assert!(
+            changed_inputs_have_archive_member_set_changes(
+                &previous_state,
+                &[(0, current_path.clone())],
+                false,
+            )
+            .unwrap(),
+            "raw archive identity changes should load complete records",
+        );
+        std::fs::write(&current_path, &reordered).unwrap();
+        assert!(
+            changed_inputs_have_archive_member_set_changes(
+                &previous_state,
+                &[(0, current_path)],
+                true,
+            )
+            .unwrap(),
+            "member-set changes should load complete records",
+        );
+
+        let digest_one = "1".repeat(blake3::OUT_LEN * 2);
+        let digest_two = "2".repeat(blake3::OUT_LEN * 2);
+        let digest_changed = "3".repeat(blake3::OUT_LEN * 2);
+        let (previous_rlib, previous_manifest) = rustc_rlib_with_raw_object_manifest(&[
+            (b"crate-hash.one.old.rcgu.o", digest_one.as_str(), b"one"),
+            (b"crate-hash.two.old.rcgu.o", digest_two.as_str(), b"two"),
+        ]);
+        let (changed_rlib, _) = rustc_rlib_with_raw_object_manifest(&[
+            (
+                b"crate-hash.one.new.rcgu.o",
+                digest_changed.as_str(),
+                b"changed",
+            ),
+            (b"crate-hash.two.new.rcgu.o", digest_two.as_str(), b"two"),
+        ]);
+        let (removed_rlib, _) = rustc_rlib_with_raw_object_manifest(&[(
+            b"crate-hash.one.new.rcgu.o".as_slice(),
+            digest_changed.as_str(),
+            b"changed".as_slice(),
+        )]);
+        let manifest_path = temp.path().join("libmanifest.rlib");
+        let mut manifest_state = state("args", b"output", &[]);
+        manifest_state.input_files = vec![FileState {
+            path: encode_path(&manifest_path),
+            content: FileContentState::from_bytes(&previous_rlib),
+            snapshot_identity: None,
+            rustc_link_content_digest: Some(previous_manifest.link_content_digest.clone()),
+            rustc_raw_object_manifest: Some(previous_manifest),
+            patch: None,
+        }];
+        std::fs::write(&manifest_path, changed_rlib).unwrap();
+        assert!(
+            !changed_inputs_have_archive_member_set_changes(
+                &manifest_state,
+                &[(0, manifest_path.clone())],
+                true,
+            )
+            .unwrap(),
+            "same-member content changes should keep filtered records",
+        );
+        std::fs::write(&manifest_path, removed_rlib).unwrap();
+        assert!(
+            changed_inputs_have_archive_member_set_changes(
+                &manifest_state,
+                &[(0, manifest_path)],
+                true,
+            )
+            .unwrap(),
+            "raw-object removal should load complete records",
         );
 
         let direct_input = FileState {
