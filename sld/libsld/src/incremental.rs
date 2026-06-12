@@ -1659,16 +1659,16 @@ fn input_content_is_anchored_before_link_start(
 pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> Result<()> {
     remove_empty_rustc_raw_dylib_search_paths(args);
 
-    let (common, output) = match args {
+    let (common, output, remap_renamed_codegen_units) = match args {
         crate::args::Args::Elf(args) if args.common.incremental => {
-            (&mut args.common, args.output.clone())
+            (&mut args.common, args.output.clone(), false)
         }
         crate::args::Args::MachO(args)
             if args.common.incremental
                 && std::env::var_os(STABILIZE_RUSTC_TRANSIENT_INPUTS_ENV)
                     .is_some_and(|value| value == "1") =>
         {
-            (&mut args.common, args.output.clone())
+            (&mut args.common, args.output.clone(), true)
         }
         _ => return Ok(()),
     };
@@ -1681,6 +1681,11 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         .as_ref()
         .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
     let previous_inputs_by_path = previous_input_files_by_path(previous.as_ref());
+    let remapped_codegen_inputs = remap_renamed_codegen_units
+        .then(|| {
+            remapped_rustc_codegen_input_targets(common, &output, &stable_dir, previous.as_ref())
+        })
+        .unwrap_or_default();
     let mut stabilized = 0;
     let mut matched_producer_digests = 0;
     let mut reused_isolated = 0;
@@ -1692,7 +1697,10 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             continue;
         };
         let source = source.to_path_buf();
-        let target = stable_dir.join(stable_name);
+        let target = remapped_codegen_inputs
+            .get(&source)
+            .cloned()
+            .unwrap_or_else(|| stable_dir.join(stable_name));
         let producer_digest = provenance
             .as_ref()
             .and_then(|provenance| provenance.get(&source));
@@ -1747,6 +1755,9 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         input.spec = InputSpec::File(target.into_boxed_path());
         stabilized += 1;
     }
+    if remap_renamed_codegen_units {
+        canonicalize_stable_rustc_codegen_input_order(common, &output, &stable_dir);
+    }
 
     if stabilized > 0 {
         append_log(
@@ -1763,6 +1774,25 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             &format!(
                 "reused {reused_isolated} isolated rustc work-product input{} by producer digest",
                 if reused_isolated == 1 { "" } else { "s" }
+            ),
+        )?;
+    }
+    if !remapped_codegen_inputs.is_empty() {
+        append_log(
+            &state_dir,
+            &format!(
+                "remapped {} rustc codegen-unit input{} to vacated stable slot{}",
+                remapped_codegen_inputs.len(),
+                if remapped_codegen_inputs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if remapped_codegen_inputs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
             ),
         )?;
     }
@@ -1957,6 +1987,153 @@ fn stable_rustc_input_name(path: &Path, output: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(format!("{crate_name}.{codegen_unit}.rcgu.o")))
+}
+
+fn remapped_rustc_codegen_input_targets(
+    common: &crate::args::CommonArgs,
+    output: &Path,
+    stable_dir: &Path,
+    previous: Option<&PersistedState>,
+) -> HashMap<PathBuf, PathBuf> {
+    let Some(previous) = previous else {
+        return HashMap::new();
+    };
+    let current = common
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let InputSpec::File(source) = &input.spec else {
+                return None;
+            };
+            let stable_name = stable_rustc_input_name(source, output)?;
+            let target = stable_dir.join(stable_name);
+            is_stable_rustc_codegen_input(&target, output, stable_dir)
+                .then_some((source.to_path_buf(), target))
+        })
+        .collect::<Vec<_>>();
+    let current_targets = current
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<HashSet<_>>();
+    if current_targets.len() != current.len() {
+        return HashMap::new();
+    }
+    let previous_paths = previous
+        .input_files
+        .iter()
+        .filter_map(|input| decode_path(&input.path).ok())
+        .collect::<HashSet<_>>();
+    let new_sources = current
+        .into_iter()
+        .filter(|(_, target)| !previous_paths.contains(target))
+        .collect::<Vec<_>>();
+    let vacated_targets = previous_paths
+        .into_iter()
+        .filter(|path| {
+            is_stable_rustc_codegen_input(path, output, stable_dir)
+                && !current_targets.contains(path)
+                && path.is_file()
+        })
+        .collect::<Vec<_>>();
+    if new_sources.is_empty() || vacated_targets.is_empty() {
+        return HashMap::new();
+    }
+
+    let current_symbols = new_sources
+        .iter()
+        .filter_map(|(source, _)| {
+            macho_global_definition_names(source).map(|names| (source.clone(), names))
+        })
+        .collect::<Vec<_>>();
+    let previous_symbols = vacated_targets
+        .iter()
+        .filter_map(|target| {
+            macho_global_definition_names(target).map(|names| (target.clone(), names))
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = current_symbols
+        .iter()
+        .flat_map(|(source, current_names)| {
+            previous_symbols
+                .iter()
+                .filter_map(move |(target, previous_names)| {
+                    let overlap = current_names.intersection(previous_names).count();
+                    (overlap != 0).then_some((overlap, source.clone(), target.clone()))
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut used_sources = HashSet::new();
+    let mut used_targets = HashSet::new();
+    let mut remapped = HashMap::new();
+    for (_, source, target) in candidates {
+        if !used_sources.contains(&source) && !used_targets.contains(&target) {
+            used_sources.insert(source.clone());
+            used_targets.insert(target.clone());
+            remapped.insert(source, target);
+        }
+    }
+    remapped
+}
+
+fn macho_global_definition_names(path: &Path) -> Option<HashSet<Vec<u8>>> {
+    let bytes = std::fs::read(path).ok()?;
+    let file = object::File::parse(bytes.as_slice()).ok()?;
+    if file.format() != object::BinaryFormat::MachO {
+        return None;
+    }
+    Some(
+        file.symbols()
+            .filter(|symbol| symbol.is_global() && !symbol.is_undefined() && !symbol.is_weak())
+            .filter_map(|symbol| symbol.name_bytes().ok().map(<[u8]>::to_vec))
+            .collect(),
+    )
+}
+
+fn is_stable_rustc_codegen_input(path: &Path, output: &Path, stable_dir: &Path) -> bool {
+    let Some(output_name) = output.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.parent() == Some(stable_dir)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(&format!("{output_name}.")) && name.ends_with(".rcgu.o")
+            })
+}
+
+fn canonicalize_stable_rustc_codegen_input_order(
+    common: &mut crate::args::CommonArgs,
+    output: &Path,
+    stable_dir: &Path,
+) {
+    let mut indices_and_paths = common
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            let InputSpec::File(path) = &input.spec else {
+                return None;
+            };
+            is_stable_rustc_codegen_input(path, output, stable_dir)
+                .then_some((index, path.to_path_buf()))
+        })
+        .collect::<Vec<_>>();
+    let indices = indices_and_paths
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    indices_and_paths.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+    for (index, (_, path)) in indices.into_iter().zip(indices_and_paths) {
+        common.inputs[index].spec = InputSpec::File(path.into_boxed_path());
+    }
 }
 
 fn metadata_update_indices_for_inputs(
@@ -33759,6 +33936,80 @@ mod tests {
                 output,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn renamed_rustc_codegen_inputs_reuse_vacated_slots_by_symbol_overlap() {
+        fn renamed_object(first: &[u8; 5], second: &[u8; 5]) -> Vec<u8> {
+            let mut object = test_macho_object(&[0; 8], &[0; 8], 0);
+            let text = object
+                .windows(b"_text".len())
+                .position(|window| window == b"_text")
+                .unwrap();
+            object[text..text + first.len()].copy_from_slice(first);
+            let data = object
+                .windows(b"_data".len())
+                .position(|window| window == b"_data")
+                .unwrap();
+            object[data..data + second.len()].copy_from_slice(second);
+            object
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("deps").join("uv-abc123");
+        let stable_dir = state_dir_for_output(&output).join(STABLE_RUSTC_INPUT_DIR);
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let previous_a = stable_dir.join("uv-abc123.old-a.rcgu.o");
+        let previous_b = stable_dir.join("uv-abc123.old-b.rcgu.o");
+        let current_a = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.new-a.session.rcgu.o");
+        let current_b = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.new-b.session.rcgu.o");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let a = renamed_object(b"_aaaa", b"_aaad");
+        let b = renamed_object(b"_bbbb", b"_bbbd");
+        std::fs::write(&previous_a, &a).unwrap();
+        std::fs::write(&previous_b, &b).unwrap();
+        std::fs::write(&current_a, &a).unwrap();
+        std::fs::write(&current_b, &b).unwrap();
+        let previous = state(
+            "args",
+            b"output",
+            &[
+                (previous_a.to_str().unwrap(), a.as_slice()),
+                (previous_b.to_str().unwrap(), b.as_slice()),
+            ],
+        );
+        let mut common = crate::args::CommonArgs::default();
+        common.inputs = [&current_b, &current_a]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+
+        let remapped =
+            remapped_rustc_codegen_input_targets(&common, &output, &stable_dir, Some(&previous));
+        assert_eq!(remapped.get(&current_a), Some(&previous_a));
+        assert_eq!(remapped.get(&current_b), Some(&previous_b));
+
+        common.inputs[0].spec = InputSpec::File(previous_b.clone().into_boxed_path());
+        common.inputs[1].spec = InputSpec::File(previous_a.clone().into_boxed_path());
+        canonicalize_stable_rustc_codegen_input_order(&mut common, &output, &stable_dir);
+        assert_eq!(
+            common.inputs[0].spec,
+            InputSpec::File(previous_a.into_boxed_path())
+        );
+        assert_eq!(
+            common.inputs[1].spec,
+            InputSpec::File(previous_b.into_boxed_path())
         );
     }
 
