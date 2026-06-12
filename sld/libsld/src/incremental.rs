@@ -13417,6 +13417,17 @@ impl<'a> MachOSymbolResolutionLookup<'a> {
             .and_then(|index| resolutions.get(index))
     }
 
+    fn unique_index_encoded(
+        &self,
+        encoded_name: &str,
+    ) -> std::result::Result<Option<usize>, String> {
+        match self.indices_by_name.get(encoded_name).copied() {
+            Some(Some(index)) => Ok(Some(index)),
+            Some(None) => Err("ambiguous Mach-O symbol resolution catalog entry".to_owned()),
+            None => Ok(None),
+        }
+    }
+
     fn get_name<'b>(
         &self,
         resolutions: &'b [MachOSymbolResolutionRecord],
@@ -14992,6 +15003,7 @@ fn validate_macho_data_relocations_are_stable(
         .collect::<HashSet<_>>();
     let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
         && current_resolver.normalize_rust_archive_patch_inputs;
+    let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
     let relocation_section_index = MachORelocationSectionIndex::new(
         relocations,
         input.path.as_str(),
@@ -15198,11 +15210,12 @@ fn validate_macho_data_relocations_are_stable(
                 }
                 if macho_relocation_target_is_global(&previous_file, previous_context.target)
                     && macho_relocation_target_is_global(&current_file, current_context.target)
-                    && macho_catalog_data_relocation_target_is_stable(
+                    && macho_catalog_data_relocation_target_is_stable_with_lookup(
                         &previous_identity,
                         &current_identity,
                         relocation,
                         resolutions,
+                        &resolution_lookup,
                     )?
                 {
                     let previous_record = relocation.clone();
@@ -15371,11 +15384,28 @@ fn macho_data_relocation_semantics_are_stable(
         && previous_identity == current_identity
 }
 
+#[cfg(test)]
 fn macho_catalog_data_relocation_target_is_stable(
     previous_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
     current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
     relocation: &RelocationRecord,
     resolutions: &[MachOSymbolResolutionRecord],
+) -> std::result::Result<bool, String> {
+    macho_catalog_data_relocation_target_is_stable_with_lookup(
+        previous_identity,
+        current_identity,
+        relocation,
+        resolutions,
+        &MachOSymbolResolutionLookup::new(resolutions),
+    )
+}
+
+fn macho_catalog_data_relocation_target_is_stable_with_lookup(
+    previous_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+    current_identity: &Option<(Vec<u8>, Option<object::SectionIndex>)>,
+    relocation: &RelocationRecord,
+    resolutions: &[MachOSymbolResolutionRecord],
+    resolution_lookup: &MachOSymbolResolutionLookup<'_>,
 ) -> std::result::Result<bool, String> {
     let (Some((previous_name, _)), Some((current_name, _))) = (previous_identity, current_identity)
     else {
@@ -15385,9 +15415,7 @@ fn macho_catalog_data_relocation_target_is_stable(
         return Ok(false);
     }
     let encoded_name = hex::encode(previous_name);
-    let Some(resolution_index) =
-        macho_symbol_resolution_index_for_name(resolutions, &encoded_name)?
-    else {
+    let Some(resolution_index) = resolution_lookup.unique_index_encoded(&encoded_name)? else {
         return Ok(false);
     };
     let resolution = &resolutions[resolution_index];
@@ -46899,6 +46927,10 @@ mod tests {
                 .get_encoded(&resolutions, target_name.as_str())
                 .and_then(|resolution| resolution.direct_value),
             Some(0x1000)
+        );
+        assert_eq!(
+            lookup.unique_index_encoded(target_name.as_str()).unwrap(),
+            Some(0)
         );
         drop(lookup);
 
