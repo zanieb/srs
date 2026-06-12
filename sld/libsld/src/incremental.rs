@@ -3267,6 +3267,156 @@ fn reconcile_migrated_added_macho_symbol_resolutions(
     Ok(migrations)
 }
 
+fn finalize_retired_macho_archive_symbol_resolutions(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    retired: &[RetiredMachOArchiveActivation],
+) -> std::result::Result<(), String> {
+    for state in retired {
+        for owned in &state.symbol_resolutions {
+            let Some(index) =
+                macho_symbol_resolution_index_for_name(resolutions, owned.name.as_str())?
+            else {
+                continue;
+            };
+            if resolutions[index].target == owned.target {
+                resolutions.remove(index);
+            }
+        }
+        for rollback in &state.rollback_symbol_resolutions {
+            match macho_symbol_resolution_index_for_name(resolutions, rollback.name.as_str())? {
+                None => resolutions.push(rollback.clone()),
+                Some(index) if resolutions[index] == *rollback => {}
+                Some(index)
+                    if state.symbol_resolutions.iter().any(|owned| {
+                        owned.name == rollback.name && resolutions[index].target != owned.target
+                    }) => {}
+                Some(_) => {
+                    return Err(
+                        "removed Mach-O archive member rollback symbol conflicts with a live resolution"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    resolutions.sort_unstable();
+    resolutions.dedup();
+    Ok(())
+}
+
+fn combined_macho_text_relocation_retiring_names(
+    retiring_names: &[SharedText],
+    retired: &[RetiredMachOArchiveActivation],
+    migrations: &[MachOSymbolResolutionMove],
+) -> Vec<SharedText> {
+    let migrated_names = migrations
+        .iter()
+        .map(|migration| &migration.name)
+        .collect::<HashSet<_>>();
+    let mut names = retiring_names
+        .iter()
+        .chain(retired.iter().flat_map(|state| {
+            state
+                .symbol_resolutions
+                .iter()
+                .map(|resolution| &resolution.name)
+        }))
+        .filter(|name| !migrated_names.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn restored_macho_archive_resolution_names(
+    retired: &[RetiredMachOArchiveActivation],
+    migrations: &[MachOSymbolResolutionMove],
+) -> Vec<SharedText> {
+    let migrated_names = migrations
+        .iter()
+        .map(|migration| &migration.name)
+        .collect::<HashSet<_>>();
+    retired
+        .iter()
+        .flat_map(|state| &state.rollback_symbol_resolutions)
+        .filter(|resolution| !migrated_names.contains(&resolution.name))
+        .map(|resolution| resolution.name.clone())
+        .collect()
+}
+
+fn migrated_macho_archive_rollback_symbol_resolutions(
+    retired: &[RetiredMachOArchiveActivation],
+    migrations: &[MachOSymbolResolutionMove],
+) -> std::result::Result<Vec<MachOSymbolResolutionRecord>, String> {
+    let migrated_names = migrations
+        .iter()
+        .map(|migration| &migration.name)
+        .collect::<HashSet<_>>();
+    let mut transferred = Vec::<MachOSymbolResolutionRecord>::new();
+    for resolution in retired
+        .iter()
+        .flat_map(|state| &state.rollback_symbol_resolutions)
+        .filter(|resolution| migrated_names.contains(&resolution.name))
+    {
+        match macho_symbol_resolution_index_for_name(&transferred, resolution.name.as_str())? {
+            None => transferred.push(resolution.clone()),
+            Some(index) if transferred[index] == *resolution => {}
+            Some(_) => {
+                return Err(
+                    "migrated Mach-O symbol has conflicting rollback resolutions".to_owned(),
+                );
+            }
+        }
+    }
+    transferred.sort_unstable();
+    Ok(transferred)
+}
+
+fn stored_macho_archive_rollback_patch(
+    forward: &StoredOutputPatch,
+    previous_output: &[u8],
+    retired: &[RetiredMachOArchiveActivation],
+) -> std::result::Result<StoredOutputPatch, String> {
+    let start = usize::try_from(forward.output_offset)
+        .map_err(|_| "Mach-O archive rollback patch offset is too large".to_owned())?;
+    let end = start
+        .checked_add(forward.data.len())
+        .ok_or_else(|| "Mach-O archive rollback patch range overflowed".to_owned())?;
+    let mut composed = None::<&[u8]>;
+    for rollback in retired.iter().flat_map(|state| &state.rollback_patches) {
+        let rollback_start = usize::try_from(rollback.output_offset)
+            .map_err(|_| "retired Mach-O archive rollback offset is too large".to_owned())?;
+        let rollback_end = rollback_start
+            .checked_add(rollback.data.len())
+            .ok_or_else(|| "retired Mach-O archive rollback range overflowed".to_owned())?;
+        if start >= rollback_end || rollback_start >= end {
+            continue;
+        }
+        if start != rollback_start || end != rollback_end {
+            return Err(
+                "new Mach-O archive ownership partially overlaps a retired rollback patch"
+                    .to_owned(),
+            );
+        }
+        if composed.is_some_and(|data| data != rollback.data.as_slice()) {
+            return Err("retired Mach-O archive rollback patches conflict".to_owned());
+        }
+        composed = Some(&rollback.data);
+    }
+    let data = match composed {
+        Some(data) => data.to_vec(),
+        None => previous_output
+            .get(start..end)
+            .ok_or_else(|| "Mach-O archive rollback patch is outside output".to_owned())?
+            .to_vec(),
+    };
+    Ok(StoredOutputPatch {
+        output_offset: forward.output_offset,
+        data,
+    })
+}
+
 fn deferred_instruction_relocation_patch(
     rel_info: RelocationKindInfo,
     previous_written_value: u64,
@@ -3999,12 +4149,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             };
             let added_archive_member_identifiers = archive_member_delta
                 .as_ref()
-                .filter(|delta| delta.removed.is_empty() && !delta.added.is_empty())
+                .filter(|delta| !delta.added.is_empty())
                 .map(|delta| delta.added.clone());
             let mut retired_macho_archive_activations = Vec::new();
             if let Some(delta) = archive_member_delta
                 .as_ref()
-                .filter(|delta| delta.added.is_empty() && !delta.removed.is_empty())
+                .filter(|delta| !delta.removed.is_empty())
             {
                 let Some(stored_patch) = input.patch.as_ref() else {
                     return Ok(ChangedInputPatchResult::Unsupported(
@@ -4180,40 +4330,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             true
                         }
                     });
-                    previous.macho_symbol_resolutions.retain(|resolution| {
+                    for resolution in &previous.macho_symbol_resolutions {
                         if resolution.target.as_ref().is_some_and(|target| {
                             target.input_file == input.path
                                 && member_inputs.contains(target.input.as_str())
                         }) {
                             state.symbol_resolutions.push(resolution.clone());
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    for rollback in &state.rollback_symbol_resolutions {
-                        match macho_symbol_resolution_index_for_name(
-                            &previous.macho_symbol_resolutions,
-                            rollback.name.as_str(),
-                        ) {
-                            Ok(None) => {}
-                            Ok(Some(_)) => {
-                                return Ok(ChangedInputPatchResult::Unsupported(
-                                    "removed Mach-O archive member rollback symbol conflicts with \
-                                     a live resolution"
-                                        .to_owned(),
-                                ));
-                            }
-                            Err(reason) => {
-                                return Ok(ChangedInputPatchResult::Unsupported(reason));
-                            }
                         }
                     }
-                    previous
-                        .macho_symbol_resolutions
-                        .extend(state.rollback_symbol_resolutions.iter().cloned());
-                    previous.macho_symbol_resolutions.sort_unstable();
-                    previous.macho_symbol_resolutions.dedup();
                     if retirement.newly_tracked {
                         if let Err(reason) = retain_initial_macho_archive_removal_transaction(
                             state,
@@ -4633,6 +4757,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let migrated_macho_resolution_moves = if let Some(activation) =
                 added_macho_archive_text_activation.as_mut()
             {
+                let migrations = match reconcile_migrated_added_macho_symbol_resolutions(
+                    &mut previous.macho_symbol_resolutions,
+                    activation,
+                    &mut macho_resolution_updates.retiring_names,
+                ) {
+                    Ok(migrations) => migrations,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                };
                 let mut rollback_symbol_resolutions =
                     Vec::with_capacity(macho_resolution_updates.retiring_names.len());
                 for name in &macho_resolution_updates.retiring_names {
@@ -4653,6 +4785,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     rollback_symbol_resolutions
                         .push(previous.macho_symbol_resolutions[index].clone());
                 }
+                match migrated_macho_archive_rollback_symbol_resolutions(
+                    &retired_macho_archive_activations,
+                    &migrations,
+                ) {
+                    Ok(transferred) => rollback_symbol_resolutions.extend(transferred),
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                }
+                rollback_symbol_resolutions.sort_unstable();
+                rollback_symbol_resolutions.dedup();
                 let [state] = activation.member_states.as_mut_slice() else {
                     return Ok(ChangedInputPatchResult::Unsupported(
                         "added Mach-O archive activation has no unique ownership state".to_owned(),
@@ -4667,17 +4808,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     ));
                 }
                 state.rollback_symbol_resolutions = rollback_symbol_resolutions;
-                match reconcile_migrated_added_macho_symbol_resolutions(
-                    &mut previous.macho_symbol_resolutions,
-                    activation,
-                    &mut macho_resolution_updates.retiring_names,
-                ) {
-                    Ok(migrations) => migrations,
-                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
-                }
+                migrations
             } else {
                 Vec::new()
             };
+            if let Err(reason) = finalize_retired_macho_archive_symbol_resolutions(
+                &mut previous.macho_symbol_resolutions,
+                &retired_macho_archive_activations,
+            ) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
             if !migrated_macho_resolution_moves.is_empty() {
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
@@ -4688,19 +4828,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .chain(&migrated_macho_resolution_moves)
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut macho_text_relocation_retiring_names = macho_resolution_updates
-                .retiring_names
-                .iter()
-                .cloned()
-                .chain(retired_macho_archive_activations.iter().flat_map(|state| {
-                    state
-                        .symbol_resolutions
-                        .iter()
-                        .map(|resolution| resolution.name.clone())
-                }))
-                .collect::<Vec<_>>();
-            macho_text_relocation_retiring_names.sort_unstable();
-            macho_text_relocation_retiring_names.dedup();
+            let macho_text_relocation_retiring_names =
+                combined_macho_text_relocation_retiring_names(
+                    &macho_resolution_updates.retiring_names,
+                    &retired_macho_archive_activations,
+                    &migrated_macho_resolution_moves,
+                );
             if let Err(reason) = restore_deferred_macho_symbol_resolutions(
                 &mut previous.macho_symbol_resolutions,
                 retired_macho_archive_activations
@@ -5268,12 +5401,28 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 }),
                         )
                         .collect::<Vec<_>>();
-                    archive_diff_allows_owned_macho_member_addition(
+                    let removed_identifiers = retired_macho_archive_activations
+                        .iter()
+                        .flat_map(|state| {
+                            state
+                                .members
+                                .iter()
+                                .map(|member| member.normalized_identifier.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    let restored_names = restored_macho_archive_resolution_names(
+                        &retired_macho_archive_activations,
+                        &migrated_macho_resolution_moves,
+                    );
+                    archive_diff_allows_owned_macho_member_exchange(
                         previous_bytes,
                         &bytes,
                         input.path.as_str(),
                         &matched_sections,
+                        &current_resolver,
+                        &removed_identifiers,
                         &ignored_archive_identifiers,
+                        &restored_names,
                         &previous_unwind_input_ranges,
                         &current_unwind_input_ranges,
                     )?
@@ -5419,15 +5568,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     .map(|member| member.normalized_identifier.clone())
                             })
                             .collect::<Vec<_>>();
-                        let restored_names = retired_macho_archive_activations
-                            .iter()
-                            .flat_map(|state| {
-                                state
-                                    .rollback_symbol_resolutions
-                                    .iter()
-                                    .map(|resolution| resolution.name.clone())
-                            })
-                            .collect::<Vec<_>>();
+                        let restored_names = restored_macho_archive_resolution_names(
+                            &retired_macho_archive_activations,
+                            &migrated_macho_resolution_moves,
+                        );
                         let previous_unwind_input_ranges = added_macho_archive_text_activation
                             .as_ref()
                             .into_iter()
@@ -5458,13 +5602,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     }),
                             )
                             .collect::<Vec<_>>();
-                        archive_diff_allows_owned_macho_member_removal(
+                        let added_identifiers = added_macho_archive_text_activation
+                            .as_ref()
+                            .map(|activation| activation.normalized_identifiers.as_slice())
+                            .unwrap_or_default();
+                        archive_diff_allows_owned_macho_member_exchange(
                             previous_bytes,
                             &bytes,
                             input.path.as_str(),
                             &matched_sections,
                             &current_resolver,
                             &removed_identifiers,
+                            added_identifiers,
                             &restored_names,
                             &previous_unwind_input_ranges,
                             &current_unwind_input_ranges,
@@ -5879,19 +6028,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 let rollback_patches = match forward_patches
                     .iter()
                     .map(|patch| {
-                        let start = usize::try_from(patch.output_offset).map_err(|_| {
-                            "Mach-O archive rollback patch offset is too large".to_owned()
-                        })?;
-                        let end = start.checked_add(patch.data.len()).ok_or_else(|| {
-                            "Mach-O archive rollback patch range overflowed".to_owned()
-                        })?;
-                        let data = previous_output.get(start..end).ok_or_else(|| {
-                            "Mach-O archive rollback patch is outside output".to_owned()
-                        })?;
-                        Ok(StoredOutputPatch {
-                            output_offset: patch.output_offset,
-                            data: data.to_vec(),
-                        })
+                        stored_macho_archive_rollback_patch(
+                            patch,
+                            previous_output,
+                            &retired_macho_archive_activations,
+                        )
                     })
                     .collect::<std::result::Result<Vec<_>, String>>()
                 {
@@ -5926,6 +6067,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &mut retired_macho_archive_rollback_patches,
                 &changed_macho_archive_unwind_patches,
             );
+            for current in [
+                changed_macho_definition_patches.as_slice(),
+                added_macho_archive_symbol_table_patches.as_slice(),
+                added_macho_archive_chained_fixup_patches.as_slice(),
+                added_macho_archive_unwind_patches.as_slice(),
+                reactivated_macho_archive_output_patches.as_slice(),
+            ] {
+                remove_plain_patches_shadowed_by_exact_current_ranges(
+                    &mut retired_macho_archive_rollback_patches,
+                    current,
+                );
+            }
             let macho_text_auxiliary_patches = macho_text_section_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.auxiliary_patches))
@@ -18771,6 +18924,7 @@ fn archive_diff_allows_changed_macho_symbols(
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
 
+#[cfg(test)]
 fn archive_diff_allows_owned_macho_member_removal(
     previous_bytes: &[u8],
     current_bytes: &[u8],
@@ -18778,6 +18932,33 @@ fn archive_diff_allows_owned_macho_member_removal(
     matched_sections: &[MatchedPatchSection],
     current_resolver: &PatchInputResolver<'_>,
     removed_identifiers: &[Vec<u8>],
+    restored_names: &[SharedText],
+    previous_extra_ranges: &[std::ops::Range<usize>],
+    current_extra_ranges: &[std::ops::Range<usize>],
+) -> Result<bool> {
+    archive_diff_allows_owned_macho_member_exchange(
+        previous_bytes,
+        current_bytes,
+        input_file_path,
+        matched_sections,
+        current_resolver,
+        removed_identifiers,
+        &[],
+        restored_names,
+        previous_extra_ranges,
+        current_extra_ranges,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn archive_diff_allows_owned_macho_member_exchange(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    removed_identifiers: &[Vec<u8>],
+    added_identifiers: &[Vec<u8>],
     restored_names: &[SharedText],
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
@@ -18797,7 +18978,7 @@ fn archive_diff_allows_owned_macho_member_removal(
             return Ok(false);
         };
         let Some(current_definition_counts) =
-            archive_macho_defined_symbol_counts(current_bytes, &[], &restored_names)?
+            archive_macho_defined_symbol_counts(current_bytes, added_identifiers, &restored_names)?
         else {
             return Ok(false);
         };
@@ -18845,7 +19026,7 @@ fn archive_diff_allows_owned_macho_member_removal(
     let current_fingerprint = archive_macho_member_retirement_fingerprint(
         current_bytes,
         &current_ranges,
-        &[],
+        added_identifiers,
         &restored_names,
     )?;
     if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
@@ -18882,13 +19063,14 @@ fn archive_diff_allows_owned_macho_member_removal(
         current_bytes,
         &current_ranges,
         &current_owned,
-        &[],
+        added_identifiers,
         &restored_names,
         true,
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
 
+#[cfg(test)]
 fn archive_diff_allows_owned_macho_member_addition(
     previous_bytes: &[u8],
     current_bytes: &[u8],
@@ -18898,24 +19080,17 @@ fn archive_diff_allows_owned_macho_member_addition(
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
 ) -> Result<bool> {
-    let reverse_current_resolver = PatchInputResolver::new(previous_bytes, true)?;
-    let reverse_matched_sections = matched_sections
-        .iter()
-        .map(|section| MatchedPatchSection {
-            previous: section.current.clone(),
-            current: section.previous.clone(),
-        })
-        .collect::<Vec<_>>();
-    archive_diff_allows_owned_macho_member_removal(
-        current_bytes,
+    archive_diff_allows_owned_macho_member_exchange(
         previous_bytes,
+        current_bytes,
         input_file_path,
-        &reverse_matched_sections,
-        &reverse_current_resolver,
+        matched_sections,
+        &PatchInputResolver::new(current_bytes, true)?,
+        &[],
         added_identifiers,
         &[],
-        current_extra_ranges,
         previous_extra_ranges,
+        current_extra_ranges,
     )
 }
 
@@ -20419,6 +20594,7 @@ fn added_macho_archive_text_activations(
             *added_member,
             &other_members,
             resolutions,
+            retiring_names,
         )? {
             Ok(member) => member,
             Err(reason) => return Ok(Err(reason)),
@@ -20473,13 +20649,28 @@ fn added_macho_archive_text_activations(
         .sum();
     let mut sections = Vec::with_capacity(section_count);
     let mut records = Vec::with_capacity(section_count);
-    let selected_definitions = selected_indices
+    let mut selected_definitions = selected_indices
         .iter()
         .flat_map(|&member_index| {
             (0..members[member_index].definitions.len())
                 .map(move |definition_index| (member_index, definition_index))
         })
         .collect::<Vec<_>>();
+    for (retiring_index, retiring_name) in retiring_names.iter().enumerate() {
+        let Some(matching_index) = selected_definitions
+            .iter()
+            .enumerate()
+            .skip(retiring_index)
+            .find_map(|(index, &(member_index, definition_index))| {
+                (hex::encode(&members[member_index].definitions[definition_index].name)
+                    == retiring_name.as_str())
+                .then_some(index)
+            })
+        else {
+            continue;
+        };
+        selected_definitions.swap(retiring_index, matching_index);
+    }
     let mut symbol_resolutions = Vec::with_capacity(selected_definitions.len());
     for &member_index in &selected_indices {
         let member = &members[member_index];
@@ -21425,15 +21616,6 @@ fn recycled_macho_symbol_table_patches(
     {
         let member = &members[member_index];
         let definition = &member.definitions[definition_index];
-        if output_file.symbols().any(|symbol| {
-            symbol
-                .name_bytes()
-                .is_ok_and(|name| name == definition.name.as_slice())
-        }) {
-            return Ok(Err(
-                "added Mach-O archive member definition already exists in output".to_owned(),
-            ));
-        }
         let Some(previous_resolution_index) =
             macho_symbol_resolution_index_for_name(previous_resolutions, retiring_name.as_str())?
         else {
@@ -21484,27 +21666,45 @@ fn recycled_macho_symbol_table_patches(
             ));
         }
 
-        let string_size = u64::try_from(definition.name.len() + 1)
-            .context("Added Mach-O symbol name is too large")?;
-        let Some(string_allocation) = allocate_reserved_range(
-            remaining_reserved_ranges,
-            string_output_section_id,
-            0,
-            string_size,
-        )?
-        else {
-            return Ok(Err(
-                "insufficient incremental reserve for added Mach-O symbol name".to_owned(),
-            ));
-        };
-        let Some(string_index) = string_allocation
-            .output_offset
-            .checked_sub(string_table_offset)
-            .and_then(|offset| u32::try_from(offset).ok())
-        else {
-            return Ok(Err(
-                "added Mach-O symbol name is outside the string table".to_owned()
-            ));
+        let same_name = definition.name == decoded_retiring_name;
+        let (string_index, string_allocation) = if same_name {
+            (
+                u32::from_le_bytes(old_entry[..4].try_into().expect("checked symbol entry")),
+                None,
+            )
+        } else {
+            if output_file.symbols().any(|symbol| {
+                symbol
+                    .name_bytes()
+                    .is_ok_and(|name| name == definition.name.as_slice())
+            }) {
+                return Ok(Err(
+                    "added Mach-O archive member definition already exists in output".to_owned(),
+                ));
+            }
+            let string_size = u64::try_from(definition.name.len() + 1)
+                .context("Added Mach-O symbol name is too large")?;
+            let Some(allocation) = allocate_reserved_range(
+                remaining_reserved_ranges,
+                string_output_section_id,
+                0,
+                string_size,
+            )?
+            else {
+                return Ok(Err(
+                    "insufficient incremental reserve for added Mach-O symbol name".to_owned(),
+                ));
+            };
+            let Some(index) = allocation
+                .output_offset
+                .checked_sub(string_table_offset)
+                .and_then(|offset| u32::try_from(offset).ok())
+            else {
+                return Ok(Err(
+                    "added Mach-O symbol name is outside the string table".to_owned()
+                ));
+            };
+            (index, Some(allocation))
         };
         let Some(value) = resolution.direct_value else {
             return Ok(Err(
@@ -21519,16 +21719,18 @@ fn recycled_macho_symbol_table_patches(
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
         });
-        let mut name = definition.name.clone();
-        name.push(0);
-        patches.push(SectionPatch {
-            output_offset: string_allocation.output_offset,
-            size: string_allocation.size,
-            data: name,
-            deferred_relocation: None,
-            preserve_ranges: Vec::new(),
-            adjustments: Vec::new(),
-        });
+        if let Some(string_allocation) = string_allocation {
+            let mut name = definition.name.clone();
+            name.push(0);
+            patches.push(SectionPatch {
+                output_offset: string_allocation.output_offset,
+                size: string_allocation.size,
+                data: name,
+                deferred_relocation: None,
+                preserve_ranges: Vec::new(),
+                adjustments: Vec::new(),
+            });
+        }
     }
     Ok(Ok((patches, retiring_names.to_vec())))
 }
@@ -24385,6 +24587,7 @@ fn added_macho_archive_text_member(
     added_member: PatchInputBytes<'_>,
     other_members: &[&[u8]],
     resolutions: &[MachOSymbolResolutionRecord],
+    retiring_names: &[SharedText],
 ) -> Result<std::result::Result<AddedMachOArchiveTextMember, String>> {
     let file = object::File::parse(added_member.bytes)
         .context("Failed to parse added Mach-O text archive member")?;
@@ -24574,6 +24777,9 @@ fn added_macho_archive_text_member(
         if resolutions
             .iter()
             .any(|resolution| resolution.name.as_str() == encoded_name)
+            && !retiring_names
+                .iter()
+                .any(|retiring| retiring.as_str() == encoded_name)
         {
             return Ok(Err(
                 "added Mach-O archive member definition already has a resolution".to_owned(),
@@ -40136,7 +40342,7 @@ mod tests {
             thunk_addresses: Vec::new(),
             target: Some(current_target.clone()),
         };
-        let mut resolutions = vec![old_resolution];
+        let mut resolutions = vec![old_resolution.clone()];
         let mut activation = AddedMachOArchiveTextActivations {
             normalized_identifiers: Vec::new(),
             member_states: Vec::new(),
@@ -40165,7 +40371,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolutions, vec![new_resolution]);
+        assert_eq!(resolutions, vec![new_resolution.clone()]);
         assert!(activation.symbol_resolutions.is_empty());
         assert!(retiring_names.is_empty());
         assert_eq!(
@@ -40177,6 +40383,53 @@ mod tests {
                 previous_target,
                 current_target,
             }]
+        );
+
+        let rollback_resolution = MachOSymbolResolutionRecord {
+            direct_value: Some(0x1000),
+            target: Some(RelocationTargetRecord {
+                input: SharedText::from(hex::encode("rollback.o")),
+                ..old_resolution.target.clone().unwrap()
+            }),
+            ..old_resolution.clone()
+        };
+        let retired = [RetiredMachOArchiveActivation {
+            state: MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: Vec::new(),
+                active: false,
+                sections: Vec::new(),
+                relocations: Vec::new(),
+                symbol_resolutions: vec![old_resolution],
+                rollback_symbol_resolutions: vec![rollback_resolution],
+                forward_patches: Vec::new(),
+                rollback_patches: vec![StoredOutputPatch {
+                    output_offset: 4,
+                    data: vec![0; 4],
+                }],
+            },
+            newly_tracked: true,
+        }];
+        finalize_retired_macho_archive_symbol_resolutions(&mut resolutions, &retired).unwrap();
+        assert_eq!(resolutions, vec![new_resolution]);
+        assert!(combined_macho_text_relocation_retiring_names(&[], &retired, &moves,).is_empty());
+        assert!(restored_macho_archive_resolution_names(&retired, &moves).is_empty());
+        assert_eq!(
+            migrated_macho_archive_rollback_symbol_resolutions(&retired, &moves).unwrap(),
+            retired[0].rollback_symbol_resolutions,
+        );
+        assert_eq!(
+            stored_macho_archive_rollback_patch(
+                &StoredOutputPatch {
+                    output_offset: 4,
+                    data: vec![2; 4],
+                },
+                &[1; 8],
+                &retired,
+            )
+            .unwrap()
+            .data,
+            vec![0; 4],
         );
     }
 
@@ -40910,6 +41163,28 @@ mod tests {
                 &input_file,
                 &reverse_matched,
                 &[archive_member_patch_identifier(removed_identifier)],
+                &[],
+                &[],
+            )
+            .unwrap()
+        );
+
+        let added_identifier = b"crate-hash.cgu.3.session.rcgu.o";
+        let replaced = archive(&[
+            (kept_identifier, current_kept.as_slice()),
+            (added_identifier, removed.as_slice()),
+        ]);
+        let replaced_resolver = PatchInputResolver::new(&replaced, true).unwrap();
+        assert!(
+            archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &replaced,
+                &input_file,
+                &matched,
+                &replaced_resolver,
+                &[archive_member_patch_identifier(removed_identifier)],
+                &[archive_member_patch_identifier(added_identifier)],
+                &[],
                 &[],
                 &[],
             )
@@ -45409,6 +45684,7 @@ mod tests {
             },
             &[],
             &[],
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -45429,6 +45705,45 @@ mod tests {
                     private_external: false,
                 },
             ]
+        );
+
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
+        assert!(matches!(
+            added_macho_archive_text_member(
+                "input.o",
+                PatchInputBytes {
+                    bytes: &object,
+                    file_offset: 0,
+                    archive_identifier: None,
+                },
+                &[],
+                std::slice::from_ref(&resolution),
+                &[],
+            )
+            .unwrap(),
+            Err(reason) if reason.contains("already has a resolution")
+        ));
+        assert!(
+            added_macho_archive_text_member(
+                "input.o",
+                PatchInputBytes {
+                    bytes: &object,
+                    file_offset: 0,
+                    archive_identifier: None,
+                },
+                &[],
+                std::slice::from_ref(&resolution),
+                std::slice::from_ref(&resolution.name),
+            )
+            .unwrap()
+            .is_ok()
         );
     }
 
@@ -55412,5 +55727,9 @@ mod tests {
 
         assert_eq!(rollback.len(), 1);
         assert_eq!(rollback[0].output_offset, 32);
+
+        let replacement_symbol = [patch(32, 8, vec![2; 8])];
+        remove_plain_patches_shadowed_by_exact_current_ranges(&mut rollback, &replacement_symbol);
+        assert!(rollback.is_empty());
     }
 }
