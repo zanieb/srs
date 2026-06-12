@@ -990,12 +990,23 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
     let current_link_start = write_link_start_marker(&state_dir)?;
 
     if args.should_write_trace_file() || args.common().save_dir.is_active() {
+        append_log(
+            &state_dir,
+            "incremental fast path unavailable before loading inputs: trace or save output requested",
+        )?;
         return Ok(false);
     }
-    if args
+    if let Some(dependency_file) = args
         .dependency_file()
-        .is_some_and(|dependency_file| !dependency_file.exists())
+        .filter(|dependency_file| !dependency_file.exists())
     {
+        append_log(
+            &state_dir,
+            &format!(
+                "incremental fast path unavailable before loading inputs: dependency file `{}` is missing",
+                dependency_file.display(),
+            ),
+        )?;
         return Ok(false);
     }
 
@@ -1013,14 +1024,28 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
         timing_phase!("Read incremental fast-path metadata");
         PersistedState::read_metadata(&state_dir).unwrap_or_default()
     }) else {
+        append_log(
+            &state_dir,
+            "incremental fast path unavailable before loading inputs: no readable state metadata",
+        )?;
         return Ok(false);
     };
 
     if previous.args_hash != args_hash(args) {
+        append_log(
+            &state_dir,
+            "incremental fast path unavailable before loading inputs: exact linker arguments changed",
+        )?;
         return Ok(false);
     }
     let current_sld_version = sld_version(args);
-    if sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version).is_some() {
+    if let Some(reason) =
+        sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version)
+    {
+        append_log(
+            &state_dir,
+            &format!("incremental fast path unavailable before loading inputs: {reason}"),
+        )?;
         return Ok(false);
     }
     if previous.needs_indexed_macho_resolution_migration() {
@@ -1036,7 +1061,13 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
         match retained_output_snapshot_matches_previous(&state_dir, &previous.output, args.output())
         {
             Ok(true) => Some(previous.output.clone()),
-            Ok(false) => return Ok(false),
+            Ok(false) => {
+                append_log(
+                    &state_dir,
+                    "incremental fast path unavailable before loading inputs: retained output snapshot changed",
+                )?;
+                return Ok(false);
+            }
             Err(error) => {
                 append_log(
                     &state_dir,
@@ -1058,6 +1089,10 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             )?
         }
     {
+        append_log(
+            &state_dir,
+            "incremental fast path unavailable before loading inputs: output content changed",
+        )?;
         return Ok(false);
     }
 
@@ -1210,6 +1245,10 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             )?;
         let result = if changed_archive_member_set {
             let Some(mut full_previous) = PersistedState::read(&state_dir)? else {
+                append_log(
+                    &state_dir,
+                    "changed-input patch unavailable before loading inputs: complete state is missing",
+                )?;
                 return Ok(false);
             };
             refresh_snapshotted_rewritten_input_metadata(
