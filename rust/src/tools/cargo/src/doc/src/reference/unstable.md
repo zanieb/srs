@@ -652,7 +652,10 @@ reasons, hits and misses, restored and published files and logical bytes,
 hardlinks, configured copies and cross-device copies, compiler identity and
 action-input hashing, per-phase restore validation, materialization,
 publication, graph-wide freshness preflight, rustc execution, and
-link-producing primary-package rustc actions.
+link-producing primary-package rustc actions. Dynamic-library externs and
+compiler wrappers have separate admission reasons. Build-script process
+execution, nonzero or `cargo::error` failure, and elapsed totals are reported
+separately from the rustc work that compiles build-script executables.
 The latter includes frontend and code generation and is not linker-only time.
 The feature is disabled by default.
 

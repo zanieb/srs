@@ -1037,11 +1037,12 @@ impl ArtifactCacheActionBuilder {
             &rustc_host,
             &dependency_search_paths,
         ) {
+            let reason = unmodeled_rustc_action_reason(rustc);
             if let Some(stats) = stats {
-                stats.ineligible(IneligibleReason::UnmodeledRustcAction);
+                stats.ineligible(reason);
             }
             debug!(
-                "artifact cache admission rejected for {crate_name}: rustc action is not safely modeled"
+                "artifact cache admission rejected for {crate_name}: rustc action is not safely modeled ({reason:?})"
             );
             return Ok(None);
         }
@@ -1998,6 +1999,34 @@ fn rlib_action_is_cacheable_with_search_paths(
             .any(|pair| pair[0] == "-Z" && !modeled_unstable_flag(&pair[1]))
 }
 
+fn unmodeled_rustc_action_reason(rustc: &ProcessBuilder) -> IneligibleReason {
+    if rustc.get_programs().count() != 1 {
+        return IneligibleReason::CompilerWrapper;
+    }
+
+    let args = rustc.get_args().collect::<Vec<_>>();
+    let is_dynamic_extern = |argument: &OsStr| {
+        let argument = argument.to_string_lossy();
+        [".dylib", ".so", ".dll"]
+            .iter()
+            .any(|suffix| argument.ends_with(suffix))
+    };
+    let has_dynamic_extern = args
+        .windows(2)
+        .any(|pair| pair[0] == "--extern" && is_dynamic_extern(pair[1]))
+        || args.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .strip_prefix("--extern=")
+                .is_some_and(|argument| is_dynamic_extern(OsStr::new(argument)))
+        });
+    if has_dynamic_extern {
+        IneligibleReason::DynamicExtern
+    } else {
+        IneligibleReason::UnmodeledRustcAction
+    }
+}
+
 #[cfg(test)]
 mod artifact_cache_admission_tests {
     use super::*;
@@ -2011,6 +2040,38 @@ mod artifact_cache_admission_tests {
             .arg("--out-dir")
             .arg("target/debug/deps");
         rustc
+    }
+
+    #[test]
+    fn unmodeled_action_reasons_distinguish_wrappers_and_dynamic_externs() {
+        let mut dynamic_extern = ordinary_library_command("dep-info,metadata");
+        dynamic_extern
+            .arg("--extern")
+            .arg("derive=/target/libderive.dylib");
+        assert_eq!(
+            unmodeled_rustc_action_reason(&dynamic_extern),
+            IneligibleReason::DynamicExtern
+        );
+        let mut compact_dynamic_extern = ordinary_library_command("dep-info,metadata");
+        compact_dynamic_extern.arg("--extern=derive=/target/libderive.so");
+        assert_eq!(
+            unmodeled_rustc_action_reason(&compact_dynamic_extern),
+            IneligibleReason::DynamicExtern
+        );
+
+        let wrapped =
+            ordinary_library_command("dep-info,metadata").wrapped(Some(Path::new("clippy-driver")));
+        assert_eq!(
+            unmodeled_rustc_action_reason(&wrapped),
+            IneligibleReason::CompilerWrapper
+        );
+
+        let mut other = ordinary_library_command("dep-info,metadata");
+        other.arg("--test");
+        assert_eq!(
+            unmodeled_rustc_action_reason(&other),
+            IneligibleReason::UnmodeledRustcAction
+        );
     }
 
     fn ordinary_rlib_command() -> ProcessBuilder {

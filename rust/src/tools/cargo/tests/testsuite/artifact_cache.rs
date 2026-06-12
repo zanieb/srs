@@ -290,6 +290,86 @@ fn artifact_cache_stats_are_disabled_by_default() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn artifact_cache_stats_report_build_script_processes() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                "#,
+            ),
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                println!("cargo::rerun-if-changed=build.rs");
+            }
+            "#,
+        )
+        .build();
+    let target = project.root().join("target-dir");
+
+    let cold = artifact_cache_stats(&build_in_target_with_stats(&project, &target));
+    assert_eq!(
+        artifact_cache_stat(&cold, &["build_script", "executions"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&cold, &["build_script", "failures"]), 0);
+    assert!(artifact_cache_stat(&cold, &["build_script", "elapsed_us"]) >= 20_000);
+
+    let fresh = artifact_cache_stats(&build_in_target_with_stats(&project, &target));
+    assert_eq!(
+        artifact_cache_stat(&fresh, &["build_script", "executions"]),
+        0
+    );
+    assert_eq!(
+        artifact_cache_stat(&fresh, &["build_script", "failures"]),
+        0
+    );
+    assert_eq!(
+        artifact_cache_stat(&fresh, &["build_script", "elapsed_us"]),
+        0
+    );
+
+    project.change_file(
+        "build.rs",
+        "fn main() { println!(\"cargo::error=failed\"); }\n",
+    );
+    let failed = artifact_cache_stats(
+        &project
+            .cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(&target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+            .with_status(101)
+            .with_stderr_contains("[ERROR] build script logged errors")
+            .run(),
+    );
+    assert_eq!(
+        artifact_cache_stat(&failed, &["build_script", "executions"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&failed, &["build_script", "failures"]),
+        1
+    );
+    assert!(artifact_cache_stat(&failed, &["build_script", "elapsed_us"]) > 0);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     let cache = paths::root().join("shared-cache");
     let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
@@ -769,7 +849,7 @@ fn rustc_wrappers_are_not_cacheable() {
     let project = project_with_cache("project", &cache, "hardlink", 42);
     let target = project.root().join("target-dir");
 
-    project
+    let output = project
         .cargo("-Zartifact-cache build --lib")
         .arg("--target-dir")
         .arg(&target)
@@ -779,9 +859,25 @@ fn rustc_wrappers_are_not_cacheable() {
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
         .env("RUSTC_WRAPPER", tools::echo_wrapper())
         .run();
 
+    let stats = artifact_cache_stats(&output);
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["units", "ineligible_by_reason", "compiler_wrapper"]
+        ),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(
+            &stats,
+            &["units", "ineligible_by_reason", "unmodeled_rustc_action"]
+        ),
+        0
+    );
     assert!(cached_rlibs(&cache).is_empty());
 }
 

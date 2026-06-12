@@ -197,6 +197,72 @@ aggregate-speed claim. The remaining 85 eligible misses and 180 ineligible
 actions also show why a build-script/nonportable-state layer or thin workload
 snapshot is still needed.
 
+### Remaining Clippy critical path
+
+The generic action-rejection counter originally hid two different classes.
+The structured summary now reports direct dynamic-library externs and compiler
+wrappers separately. A warm scoped Clippy run reported 13 `dynamic_extern`
+units, two `compiler_wrapper` units, 11 proc macros, nine build-script
+executables, nine package libraries with build scripts, and one test-mode unit.
+No units remained in the generic `unmodeled_rustc_action` bucket.
+
+The same run measured 14.40s of cumulative rustc worker time and nine build
+script processes using another 6.39s cumulatively. An earlier Cargo timing trace
+split the rustc work more precisely:
+
+| Remaining class | Units | Cumulative job time |
+| --- | ---: | ---: |
+| Proc-macro producers | 11 | 4.73s |
+| Metadata consumers with proc-macro dylib externs | 13 | 4.17s |
+| Libraries belonging to packages with build scripts | 9 | 1.97s |
+| Build-script executables | 9 | 1.12s |
+| Actual Clippy wrapper actions | 2 | 0.16s |
+| Test-mode Check | 1 | 0.12s |
+
+The nine build-script process executions added 4.54s in that trace. These are
+overlapping worker totals rather than additive wall time, but they account for
+the remaining work and establish the next order: model proc-macro producers and
+their direct consumers, then build-script state and generated trees. A
+composite Clippy identity covers only two units in this graph and is not the
+primary fix.
+
+### Check preflight and thin-snapshot experiment
+
+An experimental extension admitted metadata-only Check units to the graph-wide
+freshness preflight. Focused tests covered copy immutability, two-unit dependency
+closure, partial caches, forced execution, cached warning denial, and source
+mutation after materialization. It finalized 14 units instead of one, but kept
+45 rustc executions. Alternating same-binary controls were neutral: the old
+preflight median was 4.43s and the Check-enabled median was 4.39s. The additional
+fingerprint work therefore was not retained as a standalone product change.
+
+The experiment was also composed with a same-path thin snapshot. The prototype
+omitted exactly the 29 target outputs / 29.86 MB that matched verified portable
+entries, rather than filtering arbitrary files by suffix. The full scoped
+target compressed to 24 MB and the thin target to 15 MB. Results were:
+
+| Restored layer | Extract | Cargo | End to end | Cargo-fresh | rustc executions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Thin snapshot plus portable cache | 0.21s | 4.28s | 4.49s | 29 | 30 |
+| Full same-path target snapshot | 0.26s | 0.52s | 0.78s | 70 | 0 |
+
+The portable cache restored all 25 eligible actions from the thin snapshot,
+but its new completion mtimes made retained proc macros and downstream
+fingerprints stale. A useful thin layer therefore needs a Cargo-produced
+reconstructible-output manifest plus an exact-path snapshot completion epoch or
+per-output ordering metadata. Restore must preserve the dependency ordering of
+retained state, or atomically recompute every affected retained fingerprint.
+Simply adding Check preflight does not make a thin archive Cargo-fresh.
+
+The full root target shows why the composition remains worth designing. A
+prototype omitted 764 cache-owned `.rlib`/`.rmeta` files / 597.1 MB logical and
+reduced a zstd-3 archive from 412.0 MB to 237.2 MB, or 42.4%. The retained
+target still contained about 440 MB of uncached library pairs, 413 MB of final
+executable copies, 134 MB under `build/`, and 88 MB of proc-macro dylibs. Cargo
+must emit the omission manifest; external matching by extension, basename,
+inode, size, or mtime is not a safe product protocol. Until the completion-time
+contract exists, the full target snapshot wins on measured speed.
+
 ### Full uv root build
 
 The representative command was:
@@ -481,6 +547,7 @@ build queue. It remains disabled by default and reports:
   finalizations, bypasses, and elapsed time;
 - eligible dirty units, hits, misses, and key failures;
 - ineligible units by reason;
+- direct dynamic-extern and compiler-wrapper rejection counts;
 - publication success, rejection, and failure;
 - restored and published files/logical bytes;
 - accepted hardlink, configured-copy, and cross-device fallback counts;
@@ -490,7 +557,8 @@ build queue. It remains disabled by default and reports:
 - restore lock, control validation, source validation, entry validation, final
   validation split into compiler-identity witness, loader inputs, and action
   inputs, and target-state write time;
-- rustc executions; and
+- rustc executions;
+- build-script process executions, failures, and time; and
 - link-producing primary-package rustc executions and full action time.
 
 Phase totals are cumulative worker time and may exceed wall time when jobs run

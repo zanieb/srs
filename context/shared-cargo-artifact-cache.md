@@ -192,9 +192,13 @@ stderr after Cargo's build queue finishes. The record begins with
 `srs-artifact-cache-stats=` and reports Cargo-fresh units, cache admission by
 reason, hits and misses, restored and published bytes, materialization mode,
 compiler-identity and action-input hashing, publication, rustc execution, and
-link-producing primary-package rustc actions. The `preflight` object reports
-attempted, already-fresh, dependency-blocked, finalized, and bypassed units plus
-elapsed time. `lookup.phase_elapsed_us` separates lock wait,
+link-producing primary-package rustc actions. Direct dynamic externs and
+compiler wrappers have distinct admission reasons. The `build_script` object
+reports executed build-script processes, nonzero or `cargo::error` failures,
+and cumulative process time;
+their rustc compilation remains in the `rustc` object. The `preflight` object
+reports attempted, already-fresh, dependency-blocked, finalized, and bypassed
+units plus elapsed time. `lookup.phase_elapsed_us` separates lock wait,
 control/source/entry validation, final compiler-identity/loader/action-input
 validation, and target-state writes. No record is produced and no phase clocks
 or extra file-size reads are performed by default.

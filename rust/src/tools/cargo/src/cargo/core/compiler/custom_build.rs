@@ -49,6 +49,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// A build script instruction that tells Cargo to display an error after the
 /// build script has finished running. Read [the doc] for more.
@@ -509,6 +510,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     let extra_verbose = bcx.gctx.extra_verbose();
     let (prev_output, prev_script_out_dir) = prev_build_output(build_runner, unit);
     let metadata_hash = build_runner.get_run_build_script_metadata(unit);
+    let artifact_cache_stats = build_runner.artifact_cache_stats.clone();
 
     paths::create_dir_all(&script_dir)?;
     paths::create_dir_all(&script_out_dir)?;
@@ -590,6 +592,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         let prefix = format!("[{} {}] ", id.name(), id.version());
         let mut log_messages_in_case_of_panic = Vec::new();
         let span = tracing::debug_span!("build_script", process = cmd.to_string());
+        let build_script_started = artifact_cache_stats.as_ref().map(|_| Instant::now());
         let output = span.in_scope(|| {
             cmd.exec_with_streaming(
                 &mut |stdout| {
@@ -637,6 +640,15 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
                 build_error_context
             })
         });
+        let build_script_failed = output.is_err()
+            || log_messages_in_case_of_panic
+                .iter()
+                .any(|(severity, _)| *severity == Severity::Error);
+        if let Some(started) = build_script_started
+            && let Some(stats) = &artifact_cache_stats
+        {
+            stats.build_script_finished(started.elapsed(), build_script_failed);
+        }
 
         // If the build failed
         if let Err(error) = output {
@@ -649,10 +661,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             return Err(error);
         }
         // ... or it logged any errors
-        else if log_messages_in_case_of_panic
-            .iter()
-            .any(|(severity, _)| *severity == Severity::Error)
-        {
+        else if build_script_failed {
             insert_log_messages_in_build_outputs(
                 build_script_outputs,
                 id,

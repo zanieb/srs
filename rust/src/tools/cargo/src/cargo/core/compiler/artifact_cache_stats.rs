@@ -5,10 +5,10 @@ use portable_atomic::{AtomicU64, Ordering};
 
 use crate::util::{CargoResult, GlobalContext};
 
-const INELIGIBLE_REASON_COUNT: usize = 11;
+const INELIGIBLE_REASON_COUNT: usize = 13;
 const RESTORE_PHASE_COUNT: usize = 9;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IneligibleReason {
     TargetNotLibrary,
     ProcMacro,
@@ -18,6 +18,8 @@ pub enum IneligibleReason {
     UnsupportedHost,
     UnmodeledLoaderEnvironment,
     UnmodeledLoaderInputs,
+    DynamicExtern,
+    CompilerWrapper,
     UnmodeledRustcAction,
     CompilerIdentityUnavailable,
     KeyGenerationFailure,
@@ -119,6 +121,8 @@ impl IneligibleReason {
             Self::UnsupportedHost => "unsupported_host",
             Self::UnmodeledLoaderEnvironment => "unmodeled_loader_environment",
             Self::UnmodeledLoaderInputs => "unmodeled_loader_inputs",
+            Self::DynamicExtern => "dynamic_extern",
+            Self::CompilerWrapper => "compiler_wrapper",
             Self::UnmodeledRustcAction => "unmodeled_rustc_action",
             Self::CompilerIdentityUnavailable => "compiler_identity_unavailable",
             Self::KeyGenerationFailure => "key_generation_failure",
@@ -135,6 +139,8 @@ impl IneligibleReason {
             Self::UnsupportedHost,
             Self::UnmodeledLoaderEnvironment,
             Self::UnmodeledLoaderInputs,
+            Self::DynamicExtern,
+            Self::CompilerWrapper,
             Self::UnmodeledRustcAction,
             Self::CompilerIdentityUnavailable,
             Self::KeyGenerationFailure,
@@ -193,6 +199,9 @@ pub struct ArtifactCacheStats {
     rustc_executions: AtomicU64,
     rustc_failures: AtomicU64,
     rustc_elapsed_us: AtomicU64,
+    build_script_executions: AtomicU64,
+    build_script_failures: AtomicU64,
+    build_script_elapsed_us: AtomicU64,
     primary_link_rustc_executions: AtomicU64,
     primary_link_rustc_failures: AtomicU64,
     primary_link_rustc_elapsed_us: AtomicU64,
@@ -251,6 +260,9 @@ impl Default for ArtifactCacheStats {
             rustc_executions: AtomicU64::new(0),
             rustc_failures: AtomicU64::new(0),
             rustc_elapsed_us: AtomicU64::new(0),
+            build_script_executions: AtomicU64::new(0),
+            build_script_failures: AtomicU64::new(0),
+            build_script_elapsed_us: AtomicU64::new(0),
             primary_link_rustc_executions: AtomicU64::new(0),
             primary_link_rustc_failures: AtomicU64::new(0),
             primary_link_rustc_elapsed_us: AtomicU64::new(0),
@@ -427,6 +439,14 @@ impl ArtifactCacheStats {
         }
     }
 
+    pub fn build_script_finished(&self, elapsed: Duration, failed: bool) {
+        Self::add(&self.build_script_executions, 1);
+        Self::add(&self.build_script_elapsed_us, Self::micros(elapsed));
+        if failed {
+            Self::add(&self.build_script_failures, 1);
+        }
+    }
+
     pub fn report(&self, gctx: &GlobalContext) -> CargoResult<()> {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let mut reasons = serde_json::Map::new();
@@ -515,6 +535,11 @@ impl ArtifactCacheStats {
                 "executions": load(&self.rustc_executions),
                 "failures": load(&self.rustc_failures),
                 "elapsed_us": load(&self.rustc_elapsed_us),
+            },
+            "build_script": {
+                "executions": load(&self.build_script_executions),
+                "failures": load(&self.build_script_failures),
+                "elapsed_us": load(&self.build_script_elapsed_us),
             },
             "primary_link_rustc": {
                 "executions": load(&self.primary_link_rustc_executions),
