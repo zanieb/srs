@@ -5,7 +5,7 @@ use portable_atomic::{AtomicU64, Ordering};
 
 use crate::util::{CargoResult, GlobalContext};
 
-const INELIGIBLE_REASON_COUNT: usize = 13;
+const INELIGIBLE_REASON_COUNT: usize = 14;
 const PUBLICATION_SKIP_REASON_COUNT: usize = 13;
 const RESTORE_PHASE_COUNT: usize = 9;
 
@@ -21,6 +21,7 @@ pub enum IneligibleReason {
     UnmodeledLoaderInputs,
     DynamicExtern,
     CompilerWrapper,
+    CustomExecutor,
     UnmodeledRustcAction,
     CompilerIdentityUnavailable,
     KeyGenerationFailure,
@@ -147,6 +148,7 @@ impl IneligibleReason {
             Self::UnmodeledLoaderInputs => "unmodeled_loader_inputs",
             Self::DynamicExtern => "dynamic_extern",
             Self::CompilerWrapper => "compiler_wrapper",
+            Self::CustomExecutor => "custom_executor",
             Self::UnmodeledRustcAction => "unmodeled_rustc_action",
             Self::CompilerIdentityUnavailable => "compiler_identity_unavailable",
             Self::KeyGenerationFailure => "key_generation_failure",
@@ -165,6 +167,7 @@ impl IneligibleReason {
             Self::UnmodeledLoaderInputs,
             Self::DynamicExtern,
             Self::CompilerWrapper,
+            Self::CustomExecutor,
             Self::UnmodeledRustcAction,
             Self::CompilerIdentityUnavailable,
             Self::KeyGenerationFailure,

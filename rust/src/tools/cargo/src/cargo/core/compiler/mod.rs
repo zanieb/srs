@@ -365,6 +365,8 @@ const ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_
 const ARTIFACT_CACHE_FORCE_REBUILD_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_FORCE_REBUILD";
 const ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION";
+const ARTIFACT_CACHE_EXECUTOR_INIT_LOG_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_EXECUTOR_INIT_LOG";
 const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING";
 const ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS: &str =
@@ -498,6 +500,17 @@ pub trait Executor: Send + Sync + 'static {
     /// the work is actually executed).
     fn init(&self, _build_runner: &BuildRunner<'_, '_>, _unit: &Unit) {}
 
+    /// Whether this executor preserves rustc's ordinary command semantics so
+    /// a verified artifact can safely replace a call to [`Self::exec`].
+    ///
+    /// Custom executors must opt in explicitly. An executor that changes the
+    /// compiler, its arguments, its inputs, or its outputs is not compatible
+    /// unless those changes are independently represented in the artifact
+    /// cache action identity.
+    fn artifact_cache_compatible(&self) -> bool {
+        false
+    }
+
     /// In case of an `Err`, Cargo will not continue with the build process for
     /// this package.
     fn exec(
@@ -526,6 +539,7 @@ pub(super) fn artifact_cache_freshness_preflight(
     exec: &Arc<dyn Executor>,
 ) -> CargoResult<()> {
     if build_runner.bcx.build_config.artifact_cache.is_none()
+        || !exec.artifact_cache_compatible()
         || build_runner.bcx.gctx.cli_unstable().fine_grain_locking
         || sld_native_incremental_requested(build_runner)
     {
@@ -661,7 +675,7 @@ fn artifact_cache_freshness_preflight_unit(
         stats.preflight_attempted();
     }
 
-    if artifact_cache_freshness_preflight_restore(build_runner, unit)? {
+    if artifact_cache_freshness_preflight_restore(build_runner, exec, unit)? {
         restored.insert(unit.clone());
         Ok(true)
     } else {
@@ -689,6 +703,7 @@ fn artifact_cache_freshness_preflight_candidate(
 
 fn artifact_cache_freshness_preflight_restore(
     build_runner: &mut BuildRunner<'_, '_>,
+    exec: &Arc<dyn Executor>,
     unit: &Unit,
 ) -> CargoResult<bool> {
     fingerprint::prepare_init(build_runner, unit)?;
@@ -696,6 +711,7 @@ fn artifact_cache_freshness_preflight_restore(
     fingerprint::invalidate_restored_target(build_runner, unit)?;
 
     let mut rustc = prepare_rustc(build_runner, unit)?;
+    initialize_executor_once(build_runner, exec, unit);
     let outputs = build_runner.outputs(unit)?;
     let output_root = build_runner.files().output_dir(unit);
     let rustc_dep_info_loc = rustc_dep_info_loc(build_runner, unit, &output_root);
@@ -717,6 +733,7 @@ fn artifact_cache_freshness_preflight_restore(
         &build_dir,
         &output_root,
         &cwd,
+        exec.artifact_cache_compatible(),
     )?;
     builder.record_static_rejection(build_runner.artifact_cache_stats.as_deref());
 
@@ -804,6 +821,26 @@ fn artifact_cache_freshness_preflight_restore(
 pub struct DefaultExecutor;
 
 impl Executor for DefaultExecutor {
+    fn artifact_cache_compatible(&self) -> bool {
+        true
+    }
+
+    fn init(&self, _build_runner: &BuildRunner<'_, '_>, unit: &Unit) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only hook is intentionally outside user configuration"
+        )]
+        if let Some(path) = env::var_os(ARTIFACT_CACHE_EXECUTOR_INIT_LOG_FOR_TESTS) {
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("failed to open artifact cache executor init test log");
+            writeln!(log, "{}", unit.target.crate_name())
+                .expect("failed to write artifact cache executor init test log");
+        }
+    }
+
     #[instrument(name = "rustc", skip_all, fields(package = id.name().as_str(), process = cmd.to_string()))]
     fn exec(
         &self,
@@ -937,12 +974,18 @@ impl ArtifactCacheActionBuilder {
         build_dir: &Path,
         output_root: &Path,
         cwd: &Path,
+        executor_artifact_cache_compatible: bool,
     ) -> CargoResult<Self> {
         let Some(config) = build_runner.bcx.build_config.artifact_cache.clone() else {
             return Ok(Self::Disabled);
         };
         let crate_name = unit.target.crate_name().to_string();
-        let rejection = if !unit.target.is_lib() {
+        let rejection = if !executor_artifact_cache_compatible {
+            Some((
+                IneligibleReason::CustomExecutor,
+                "custom executor did not opt in to artifact cache substitution",
+            ))
+        } else if !unit.target.is_lib() {
             Some((
                 IneligibleReason::TargetNotLibrary,
                 "target is not a library",
@@ -1389,7 +1432,7 @@ fn rustc(
     let stabilize_sld_rustc_transient_inputs =
         rustc.get_env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS");
 
-    exec.init(build_runner, unit);
+    initialize_executor_once(build_runner, exec, unit);
     let exec = exec.clone();
 
     let root_output = build_runner.files().host_dest().map(|v| v.to_path_buf());
@@ -1417,6 +1460,7 @@ fn rustc(
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = build_sbom(build_runner, unit)?;
     let artifact_cache_freshness_stamp = build_runner.bcx.build_config.artifact_cache.is_some()
+        && exec.artifact_cache_compatible()
         && unit.target.is_lib()
         && !unit.target.proc_macro()
         && artifact_cache_compile_mode_is_supported(unit.mode)
@@ -1438,6 +1482,7 @@ fn rustc(
                 &build_dir,
                 &root,
                 &cwd,
+                exec.artifact_cache_compatible(),
             )
         })
         .transpose()?;
@@ -1837,6 +1882,16 @@ fn rustc(
             }
         }
         Ok(())
+    }
+}
+
+fn initialize_executor_once(
+    build_runner: &mut BuildRunner<'_, '_>,
+    exec: &Arc<dyn Executor>,
+    unit: &Unit,
+) {
+    if build_runner.executor_initialized_units.insert(unit.clone()) {
+        exec.init(build_runner, unit);
     }
 }
 

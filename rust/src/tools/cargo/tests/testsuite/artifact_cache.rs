@@ -1385,6 +1385,55 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn freshness_preflight_initializes_the_executor_once() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let init_log = project.root().join("executor-init.log");
+    let build = |target: &Path| {
+        artifact_cache_stats(
+            &project
+                .cargo("-Zartifact-cache build --lib")
+                .arg("--target-dir")
+                .arg(target)
+                .masquerade_as_nightly_cargo(&["artifact-cache"])
+                .env(
+                    cargo_util::paths::dylib_path_envvar(),
+                    isolated_loader_path(),
+                )
+                .env("CARGO_INCREMENTAL", "1")
+                .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+                .env("__CARGO_TEST_ARTIFACT_CACHE_EXECUTOR_INIT_LOG", &init_log)
+                .run(),
+        )
+    };
+    let initialized_units = || {
+        fs::read_to_string(&init_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let cold = build(&project.root().join("cold-target"));
+    assert_eq!(artifact_cache_stat(&cold, &["preflight", "attempted"]), 1);
+    assert_eq!(artifact_cache_stat(&cold, &["lookup", "misses"]), 1);
+    assert_eq!(initialized_units(), ["foo"]);
+
+    fs::remove_file(&init_log).unwrap();
+    let warm = build(&project.root().join("warm-target"));
+    assert_eq!(artifact_cache_stat(&warm, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["preflight", "finalized"]), 1);
+    assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
+    assert_eq!(initialized_units(), ["foo"]);
+
+    fs::remove_file(&init_log).unwrap();
+    let fresh = build(&project.root().join("warm-target"));
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "cargo_fresh"]), 1);
+    assert_eq!(artifact_cache_stat(&fresh, &["preflight", "attempted"]), 0);
+    assert!(!init_log.exists());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn interrupted_preflight_does_not_commit_cargo_freshness() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);

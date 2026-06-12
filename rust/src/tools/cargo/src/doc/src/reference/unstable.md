@@ -531,7 +531,8 @@ non-test metadata-only Check outputs across build directories through a shared
 content cache. Artifact restoration is
 currently supported only on macOS and Linux hosts. It is intentionally limited
 to non-proc-macro library actions whose finalized inputs are modeled. Compiler
-wrappers, explicitly configured compiler drivers, SBOM side outputs, profiling
+wrappers, custom Cargo executors that do not explicitly opt in to cache
+substitution, explicitly configured compiler drivers, SBOM side outputs, profiling
 side outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc
 version identity overrides, profile-guided compiler inputs, arbitrary LLVM
 backend arguments, host CPU auto-detection such as `-Ctarget-cpu=native`,

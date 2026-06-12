@@ -110,6 +110,11 @@ pub struct BuildRunner<'a, 'gctx> {
     /// consumes these so custom executors are still queried exactly once per
     /// unit.
     pub(super) preflight_force_rebuilds: HashMap<Unit, bool>,
+    /// Units whose executor initialization hook has already run. Artifact
+    /// cache preflight prepares rustc actions before ordinary scheduling, so a
+    /// preflight miss must not initialize the same unit a second time when it
+    /// falls back to dirty execution.
+    pub(super) executor_initialized_units: HashSet<Unit>,
 }
 
 struct ArtifactCacheStatsReportGuard<'a> {
@@ -209,6 +214,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             artifact_cache_snapshot_restore,
             preflight_artifact_cache_states: HashMap::new(),
             preflight_force_rebuilds: HashMap::new(),
+            executor_initialized_units: HashSet::new(),
         })
     }
 

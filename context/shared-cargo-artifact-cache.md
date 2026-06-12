@@ -59,6 +59,8 @@ the build script itself as restored or fresh.
 
 Restoration is skipped for inputs including:
 
+- custom Cargo executors that do not explicitly attest that cached artifacts
+  can safely replace their `exec` callback
 - wrapped `rustc` invocations
 - explicitly configured or otherwise unmodeled compiler dispatch
 - self-profile builds and rustc tracing runs
