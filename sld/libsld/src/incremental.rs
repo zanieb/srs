@@ -4707,9 +4707,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .map(|member| member.normalized_identifier.clone())
                 })
                 .collect::<Vec<_>>();
+            let reactivated_macho_archive_identifiers = added_macho_archive_text_activation
+                .as_ref()
+                .filter(|activation| activation.reactivated)
+                .into_iter()
+                .flat_map(|activation| activation.normalized_identifiers.iter().cloned())
+                .collect::<Vec<_>>();
             let mut changed_macho_archive_unwind_activation = if args
                 .should_activate_macho_archive_members()
-                && added_macho_archive_text_activation.is_none()
+                && added_macho_archive_text_activation
+                    .as_ref()
+                    .is_none_or(|activation| activation.reactivated)
             {
                 let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
                     return Ok(ChangedInputPatchResult::Unsupported(
@@ -4737,6 +4745,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .as_ref()
                         .is_some_and(ChangedMachODefinitionActivation::owns_changed_unwind),
                     &retired_macho_archive_identifiers,
+                    &reactivated_macho_archive_identifiers,
                 )? {
                     Ok(activation) => activation,
                     Err(reason) => {
@@ -20094,7 +20103,8 @@ fn archive_diff_allows_changed_macho_unwind(
     matched_sections: &[MatchedPatchSection],
     current_resolver: &PatchInputResolver<'_>,
     changed: &ChangedMachOArchiveUnwindMembers,
-    retired_identifiers: &[Vec<u8>],
+    ignored_previous_identifiers: &[Vec<u8>],
+    ignored_current_identifiers: &[Vec<u8>],
 ) -> Result<bool> {
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let Some(mut previous_ranges) = patch_ranges_with_resolver(
@@ -20130,7 +20140,7 @@ fn archive_diff_allows_changed_macho_unwind(
         &previous_ranges,
         None,
         false,
-        retired_identifiers,
+        ignored_previous_identifiers,
         &[],
     )?
     else {
@@ -20141,7 +20151,7 @@ fn archive_diff_allows_changed_macho_unwind(
         &current_ranges,
         None,
         false,
-        &[],
+        ignored_current_identifiers,
         &[],
     )?
     else {
@@ -20150,20 +20160,20 @@ fn archive_diff_allows_changed_macho_unwind(
     if previous_fingerprint == current_fingerprint {
         return Ok(true);
     }
-    if retired_identifiers.is_empty() {
+    if ignored_previous_identifiers.is_empty() && ignored_current_identifiers.is_empty() {
         return Ok(false);
     }
 
     let previous_fingerprint = archive_macho_member_retirement_fingerprint(
         previous_bytes,
         &previous_ranges,
-        retired_identifiers,
+        ignored_previous_identifiers,
         &HashSet::new(),
     )?;
     let current_fingerprint = archive_macho_member_retirement_fingerprint(
         current_bytes,
         &current_ranges,
-        &[],
+        ignored_current_identifiers,
         &HashSet::new(),
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
@@ -20183,7 +20193,8 @@ fn changed_macho_archive_unwind_activation(
     added_definition_names: &[SharedText],
     retired_definition_names: &[SharedText],
     reuse_owned_output: bool,
-    excluded_identifiers: &[Vec<u8>],
+    ignored_previous_identifiers: &[Vec<u8>],
+    ignored_current_identifiers: &[Vec<u8>],
 ) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for changed unwind metadata")?;
@@ -20193,7 +20204,7 @@ fn changed_macho_archive_unwind_activation(
         matched_sections,
         current_resolver,
         &output_file,
-        excluded_identifiers,
+        ignored_previous_identifiers,
     )? {
         Ok(changed) => changed,
         Err(reason) => return Ok(Err(reason)),
@@ -20208,7 +20219,8 @@ fn changed_macho_archive_unwind_activation(
         matched_sections,
         current_resolver,
         &changed,
-        excluded_identifiers,
+        ignored_previous_identifiers,
+        ignored_current_identifiers,
     )?;
     let allows_unwind_and_definitions = !allows_unwind_only
         && archive_diff_allows_changed_macho_symbols(
@@ -20217,8 +20229,8 @@ fn changed_macho_archive_unwind_activation(
             input_file_path,
             matched_sections,
             current_resolver,
-            excluded_identifiers,
-            &[],
+            ignored_previous_identifiers,
+            ignored_current_identifiers,
             &changed.previous_input_ranges,
             &changed.current_input_ranges,
             added_definition_names,
@@ -42305,7 +42317,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_macho_archive_unwind_proof_composes_with_member_retirement() {
+    fn changed_macho_archive_unwind_proof_composes_with_member_set_changes() {
         let previous_object = test_observed_049_macho_unwind_object(false);
         let mut current_object = previous_object.clone();
         let (compact_length_offset, eh_frame_length_offset, text_offset) = {
@@ -42430,6 +42442,7 @@ mod tests {
                 &current_resolver,
                 &changed,
                 &[],
+                &[],
             )
             .unwrap(),
             "ordinary unwind replacement must not ignore removed members or local symbols",
@@ -42443,9 +42456,57 @@ mod tests {
                 &current_resolver,
                 &changed,
                 &retired_identifiers,
+                &[],
             )
             .unwrap(),
             "retirement proof should ignore only the retired member and masked local definition",
+        );
+
+        let reverse_matched = matched
+            .iter()
+            .map(|section| MatchedPatchSection {
+                previous: section.current.clone(),
+                current: section.previous.clone(),
+            })
+            .collect::<Vec<_>>();
+        let reverse_resolver = PatchInputResolver::new(&previous_archive, true).unwrap();
+        let reverse_changed = changed_macho_archive_unwind_members(
+            &current_archive,
+            &input_file_path,
+            &reverse_matched,
+            &reverse_resolver,
+            &output_file,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !archive_diff_allows_changed_macho_unwind(
+                &current_archive,
+                &previous_archive,
+                &input_file_path,
+                &reverse_matched,
+                &reverse_resolver,
+                &reverse_changed,
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "ordinary unwind replacement must not ignore added members or local symbols",
+        );
+        assert!(
+            archive_diff_allows_changed_macho_unwind(
+                &current_archive,
+                &previous_archive,
+                &input_file_path,
+                &reverse_matched,
+                &reverse_resolver,
+                &reverse_changed,
+                &[],
+                &retired_identifiers,
+            )
+            .unwrap(),
+            "addition proof should ignore only the added member and masked local definition",
         );
     }
 
@@ -42686,6 +42747,7 @@ mod tests {
             &[],
             false,
             &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -42763,6 +42825,7 @@ mod tests {
             &[],
             false,
             &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -42826,6 +42889,7 @@ mod tests {
             &[],
             &[],
             false,
+            &[],
             &[],
         )
         .unwrap();
