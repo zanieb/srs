@@ -27,3 +27,6 @@ jobs:
 
       - name: Verify SRS Cargo wrapper
         run: ./scripts/test-cargo-srs-wrapper.sh
+
+      - name: Verify artifact cache benchmark harness
+        run: python3 ./scripts/test_benchmark_artifact_cache.py

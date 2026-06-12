@@ -1,0 +1,148 @@
+{
+  "build_script": {
+    "elapsed_us": 0,
+    "executions": 0,
+    "failures": 0
+  },
+  "configured": true,
+  "hashing": {
+    "action_inputs": {
+      "bytes": 0,
+      "calls": 0,
+      "failures": 0,
+      "files": 0,
+      "wall_us": 0,
+      "witness_checks": 0,
+      "witness_fallbacks": 0,
+      "witness_fast_paths": 0,
+      "witness_wall_us": 0
+    },
+    "compiler_identity": {
+      "bytes": 0,
+      "calls": 1,
+      "computation_cpu_us": 2,
+      "computation_wall_us": 2,
+      "computations": 1,
+      "cpu_us": 2,
+      "files": 0,
+      "reuse_cpu_us": 0,
+      "reuse_wall_us": 0,
+      "reuses": 0,
+      "wall_us": 2
+    }
+  },
+  "lookup": {
+    "elapsed_us": 0,
+    "hit_elapsed_us": 0,
+    "hits": 0,
+    "miss_elapsed_us": 0,
+    "misses": 0,
+    "phase_elapsed_us": {
+      "control_validation_us": 0,
+      "entry_validation_us": 0,
+      "final_action_validation_us": 0,
+      "final_identity_validation_us": 0,
+      "final_loader_validation_us": 0,
+      "final_validation_us": 0,
+      "lock_us": 0,
+      "source_validation_us": 0,
+      "state_write_us": 0
+    },
+    "restore_failures": 0
+  },
+  "materialization": {
+    "copied_files": 0,
+    "copied_logical_bytes": 0,
+    "cross_device_copied_files": 0,
+    "cross_device_copied_logical_bytes": 0,
+    "elapsed_us": 0,
+    "hardlinked_files": 0,
+    "hardlinked_logical_bytes": 0
+  },
+  "preflight": {
+    "already_fresh": 0,
+    "attempted": 0,
+    "blocked_by_dependency": 0,
+    "bypassed": 0,
+    "elapsed_us": 5,
+    "finalized": 0
+  },
+  "primary_link_rustc": {
+    "elapsed_us": 0,
+    "executions": 0,
+    "failures": 0
+  },
+  "publication": {
+    "attempts": 0,
+    "elapsed_us": 0,
+    "failures": 0,
+    "files": 0,
+    "logical_bytes": 0,
+    "skipped": 0,
+    "skipped_by_reason": {
+      "action_inputs_changed": 0,
+      "action_lock_unavailable": 0,
+      "already_stored": 0,
+      "compiler_identity_changed": 0,
+      "concurrent_publication": 0,
+      "entry_too_large": 0,
+      "generated_build_input": 0,
+      "inputs_changed_before_publication": 0,
+      "inputs_changed_during_staging": 0,
+      "loader_inputs_changed": 0,
+      "publication_lock_unavailable": 0,
+      "source_inputs_unavailable": 0,
+      "unsupported_action_root": 0
+    },
+    "stored": 0
+  },
+  "restore": {
+    "files": 0,
+    "logical_bytes": 0
+  },
+  "rustc": {
+    "elapsed_us": 41233,
+    "executions": 1,
+    "failures": 0
+  },
+  "snapshot": {
+    "manifest": {
+      "elapsed_us": 0,
+      "failures": 0,
+      "files": 0,
+      "logical_bytes": 0
+    },
+    "restore": {
+      "cloned_files": 0,
+      "cloned_logical_bytes": 0,
+      "copied_files": 0,
+      "copied_logical_bytes": 0,
+      "elapsed_us": 0,
+      "existing_files": 0,
+      "existing_logical_bytes": 0,
+      "failures": 0
+    }
+  },
+  "units": {
+    "cargo_fresh": 0,
+    "eligible": 0,
+    "ineligible": 1,
+    "ineligible_by_reason": {
+      "compile_mode": 0,
+      "compiler_identity_unavailable": 1,
+      "compiler_wrapper": 0,
+      "custom_build_script": 0,
+      "custom_executor": 0,
+      "dynamic_extern": 0,
+      "key_generation_failure": 0,
+      "proc_macro": 0,
+      "sbom": 0,
+      "target_not_library": 0,
+      "unmodeled_loader_environment": 0,
+      "unmodeled_loader_inputs": 0,
+      "unmodeled_rustc_action": 0,
+      "unsupported_host": 0
+    }
+  },
+  "version": 1
+}

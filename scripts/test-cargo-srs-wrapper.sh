@@ -171,6 +171,34 @@ assert_env_does_not_contain linux-default "SRS_TARGET_CODEGEN_BACKEND"
 assert_env_does_not_contain linux-default "SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS"
 assert_env_does_not_contain linux-default "RUSTFLAGS"
 
+SRS_CARGO_ARTIFACT_CACHE_STATS=1 \
+SRS_TEST_UNAME_S=Linux \
+SRS_TEST_UNAME_M=x86_64 \
+    run_wrapper linux-clippy clippy --workspace --all-targets
+assert_args linux-clippy \
+    -Z checksum-freshness \
+    -Z artifact-cache \
+    -Z host-config \
+    -Z target-applies-to-host \
+    --config 'target-applies-to-host=false' \
+    --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
+    clippy --workspace --all-targets
+assert_env_contains linux-clippy "SRS_CARGO_ARTIFACT_CACHE_STATS=1"
+
+SRS_CARGO_ARTIFACT_CACHE_STATS=1 \
+SRS_TEST_UNAME_S=Linux \
+SRS_TEST_UNAME_M=x86_64 \
+    run_wrapper linux-nextest nextest run --profile ci-linux
+assert_args linux-nextest \
+    -Z checksum-freshness \
+    -Z artifact-cache \
+    -Z host-config \
+    -Z target-applies-to-host \
+    --config 'target-applies-to-host=false' \
+    --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
+    nextest run --profile ci-linux
+assert_env_contains linux-nextest "SRS_CARGO_ARTIFACT_CACHE_STATS=1"
+
 SRS_CARGO_ARTIFACT_CACHE=0 \
 SRS_TEST_UNAME_S=Linux \
 SRS_TEST_UNAME_M=x86_64 \
