@@ -168,6 +168,28 @@ witness and detect ordinary completed replacement of watched installed files or
 directory trees after identity calculation. Concurrent mutation or publication
 of a toolchain during an active Cargo invocation remains outside the cache model.
 
+## Action-input validation
+
+Modeled rustc action inputs are content-hashed when Cargo creates the portable
+cache key. Cargo revalidates those inputs after output materialization and at
+publication boundaries so an input changed during the build cannot restore or
+publish a stale artifact.
+
+For file-only actions on APFS, Cargo keeps a process-local witness containing
+the path, length, modification time, device, inode, and Unix change time. An
+unchanged witness can satisfy a later validation without rereading the same
+file contents. Any metadata change falls back to the ordinary content hash; if
+the digest is unchanged, Cargo refreshes the witness and continues. Present
+input trees disable this fast path for the whole action, and non-APFS hosts
+always use content hashing at every validation boundary. Missing inputs are
+witnessed so their later appearance also forces full validation. Symlinked or
+otherwise unsupported input leaves are rejected from caching, and the action
+runs normally.
+
+The witness never enters the persistent key and is not portable across Cargo
+processes or runners. It only avoids redundant reads after content identity has
+already been established in the current process.
+
 ## Capacity And Concurrency
 
 The cache is unbounded by default. When a size limit is configured, completed
@@ -237,6 +259,8 @@ units plus elapsed time. `lookup.phase_elapsed_us` separates lock wait,
 control/source/entry validation, final compiler-identity/loader/action-input
 validation, and target-state writes. No record is produced and no phase clocks
 or extra file-size reads are performed by default.
+The `hashing.action_inputs` object also reports process-local witness checks,
+fast paths, fallbacks to full hashing, and cumulative witness time.
 When thin snapshot collection or reconstruction is requested, the `snapshot`
 object separately reports manifest-owned files/logical bytes, copy-on-write
 cloned files, byte-copied files, already-present files/logical bytes, failures,

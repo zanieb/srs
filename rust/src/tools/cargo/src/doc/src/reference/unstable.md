@@ -559,6 +559,18 @@ On macOS, Cargo can reuse that witness instead of rescanning an immutable
 compiler `lib` loader root reached through a toolchain symlink. This requires
 the canonical loader directory to be present in the identity witness; external
 roots and retargeted aliases continue through content validation.
+Modeled rustc action inputs are content-hashed when Cargo constructs the
+portable cache key and are revalidated after materialization and at publication
+boundaries. For file-only inputs on APFS, Cargo can use a process-local witness
+of path, length, modification time, device, inode, and Unix change time to
+avoid rereading unchanged contents at a later boundary. Any metadata change
+falls back to full content hashing and refreshes the witness only when the
+digest still matches. Present input trees disable the fast path for that
+action, while non-APFS hosts always use content hashing. Missing inputs are
+witnessed so their later appearance forces validation. Symlinked or otherwise
+unsupported action-input leaves make the action run normally without cache
+restoration or publication. The witness is never persisted or included in the
+cross-runner key.
 Token-bearing dynamic library search paths, such as Linux `$ORIGIN` or macOS
 `@loader_path`, run normally without restoration rather than being interpreted
 for cache identity. Linux builds with nonempty `GLIBC_TUNABLES` also run
@@ -656,6 +668,8 @@ link-producing primary-package rustc actions. Dynamic-library externs and
 compiler wrappers have separate admission reasons. Build-script process
 execution, nonzero or `cargo::error` failure, and elapsed totals are reported
 separately from the rustc work that compiles build-script executables.
+The action-input hashing object also reports process-local witness checks,
+fast paths, fallbacks to full content hashing, and cumulative witness time.
 The `snapshot` object reports exact-path manifest files/logical bytes and
 copy-on-write cloned, byte-copied, or already-present files/logical bytes,
 failures, and elapsed time when the thin target layer is requested.

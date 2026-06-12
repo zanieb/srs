@@ -369,6 +369,29 @@ identity remained only 0.23-0.30s wall per Cargo process. The measurements
 support a workload snapshot for these graphs and do not support weakening
 linked-action identity merely to raise the per-unit hit count.
 
+The generation control also exposed redundant validation within one Cargo
+process. The original warm run performed 1,236 full action-input content
+hashes. Removing a validation that was immediately superseded after
+materialization reduced a later same-machine run to 930 hashes and 8.82s of
+cumulative hashing, with a directional 72.92s wall time. A process-local input
+witness then reduced two further empty-target runs to 465 full hashes each:
+the initial 385 action identities plus 80 content-hash fallbacks after witness
+revalidation, all of which still matched the original digest. Those runs spent
+6.24s and 6.67s hashing action inputs and 16.6ms and 20.4ms checking 545
+witnesses, and completed in 50.39s and 53.55s. Both retained the same 305 hits,
+80 misses, 188 Cargo-fresh units, 257 rustc executions, and 55 build-script
+executions.
+
+These sequential wall times are still directional samples, not medians: the
+cache and filesystem state evolved between stages. The stronger result is the
+mechanical reduction from 930 to 465 content scans under the same action
+population. Content still defines every action identity. The fast path is
+limited to file-only inputs on APFS, whose inode and change-time semantics are
+strong enough for the process-local witness. Present input trees, non-APFS
+filesystems, symlinked inputs, and every metadata change retain or fall back to
+full content hashing. This optimization therefore reduces replay overhead
+without changing cross-runner keys or trusting portable metadata.
+
 ### Full uv root build
 
 The representative command was:
@@ -683,7 +706,8 @@ build queue. It remains disabled by default and reports:
 - restored and published files/logical bytes;
 - accepted hardlink, configured-copy, and cross-device fallback counts;
 - compiler identity files/bytes, one-time wall/CPU time, and reuse count;
-- action-input hash calls, failures, and time;
+- action-input hash calls, failures, and time, plus process-local witness
+  checks, fast paths, fallbacks, and time;
 - total hit and miss lookup time, materialization time, and publication time;
 - restore lock, control validation, source validation, entry validation, final
   validation split into compiler-identity witness, loader inputs, and action
