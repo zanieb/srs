@@ -42,6 +42,16 @@ The cache is deliberately limited to verified ordinary-library Build outputs
 and non-test metadata-only Check outputs.
 Builds that use unmodeled inputs execute normally without artifact restoration.
 
+A package's custom build script is always executed or made fresh through
+Cargo's normal build-script state. After it has run, Cargo may cache the
+package's finalized ordinary-library rustc action when the final arguments,
+environment, dynamic-loader inputs, and complete `OUT_DIR` trees are modeled.
+Build-script directives that introduce native libraries, external search
+roots, linker arguments, unsafe loader behavior, or other unsupported inputs
+still make that action ineligible. If rustc dep-info names a generated source
+under a build/output directory, Cargo does not publish the action yet. This
+runtime admission never treats the build script itself as restored or fresh.
+
 Restoration is skipped for inputs including:
 
 - wrapped `rustc` invocations
@@ -94,8 +104,10 @@ if runtime command preparation diverges from preflight. Executor-forced units
 bypass both preflight and runtime restoration. The preflight currently excludes
 metadata-only Check actions, packages with build scripts, proc macros, artifact
 dependencies, SBOM output, fine-grained target locking, and SLD native
-incremental builds. Those cases continue to use the existing per-unit cache or
-normal compilation.
+incremental builds. A finalized library action from a package with a build
+script can still use the per-unit cache after the script runs; the other
+excluded cases continue to use the existing per-unit cache or normal
+compilation where supported.
 
 ## Exact-path thin target snapshots
 

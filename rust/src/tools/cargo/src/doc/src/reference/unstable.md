@@ -530,19 +530,30 @@ The `artifact-cache` feature reuses verified ordinary-library Build outputs and
 non-test metadata-only Check outputs across build directories through a shared
 content cache. Artifact restoration is
 currently supported only on macOS and Linux hosts. It is intentionally limited
-to non-proc-macro library builds without build scripts, compiler wrappers,
-explicitly configured compiler drivers, SBOM side outputs, profiling side
-outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc version
-identity overrides, profile-guided compiler inputs, arbitrary LLVM backend
-arguments, host CPU auto-detection such as `-Ctarget-cpu=native`, external
-codegen backend libraries, runtime Cranelift or GCC backend controls, custom target
-specifications or target search paths, explicit sysroot overrides, Windows
-GNU-family targets whose raw-dylib support can invoke unmodeled `dlltool`
-programs, unmodeled unstable rustc options, unmodeled dynamic loader overrides,
-unmodeled dependency search paths, inherited SLD work-product provenance
-controls, or unsupported native-link or extra-output inputs.
+to non-proc-macro library actions whose finalized inputs are modeled. Compiler
+wrappers, explicitly configured compiler drivers, SBOM side outputs, profiling
+side outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc
+version identity overrides, profile-guided compiler inputs, arbitrary LLVM
+backend arguments, host CPU auto-detection such as `-Ctarget-cpu=native`,
+external codegen backend libraries, runtime Cranelift or GCC backend controls,
+custom target specifications or target search paths, explicit sysroot
+overrides, Windows GNU-family targets whose raw-dylib support can invoke
+unmodeled `dlltool` programs, unmodeled unstable rustc options, unmodeled
+dynamic loader overrides, unmodeled dependency search paths, inherited SLD
+work-product provenance controls, and unsupported native-link or extra-output
+inputs run normally without artifact restoration.
 The modeled unstable rustc options are named sysroot codegen backends and
 `-Zpreserve-duplicate-constants={yes,no}`.
+
+Custom build scripts always execute or become fresh through Cargo's ordinary
+build-script state. After a script runs, its package's finalized
+ordinary-library rustc action can use the artifact cache when the final command,
+environment, dynamic-loader inputs, and complete `OUT_DIR` trees are modeled.
+Native-link directives and other unsupported final inputs remain ineligible.
+Cargo does not publish an action when rustc dep-info names a generated source
+under a build/output directory, so generated inputs are not treated as portable
+before their paths can be translated safely. This does not cache or restore the
+build-script execution itself.
 Cache keys preserve source-location and a portable BLAKE3 content identity for
 modeled Cargo-selected compiler paths, installed sysroot compiler and target
 library files, cache-safe installed codegen backend contents, and
