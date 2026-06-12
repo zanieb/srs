@@ -382,6 +382,46 @@ struct ArtifactCachePublicationLock {
     _process_lock: RwLockWriteGuard<'static, ()>,
     _filesystem_lock: crate::util::FileLock,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArtifactCacheKey {
+    entry_root: PathBuf,
+    loader_inputs_digest: blake3::Hash,
+    action_inputs_digest: blake3::Hash,
+}
+
+#[derive(Debug)]
+struct PreparedArtifactCacheAction {
+    crate_name: String,
+    config: build_config::ArtifactCacheConfig,
+    key: ArtifactCacheKey,
+    identity_witness: crate::util::rustc::ArtifactCacheIdentityWitness,
+    loader_input_paths: Vec<CompilerLoaderInput>,
+}
+
+#[derive(Debug)]
+enum ArtifactCacheActionBuilder {
+    Disabled,
+    Rejected {
+        reason: IneligibleReason,
+    },
+    Candidate {
+        crate_name: String,
+        config: build_config::ArtifactCacheConfig,
+        identity_provider: crate::util::rustc::ArtifactCacheIdentityProvider,
+        compiler_program: PathBuf,
+        identity_program: PathBuf,
+        loader_input_paths: Vec<CompilerLoaderInput>,
+        dependency_search_paths: Vec<OsString>,
+        portable_remaps: Vec<(OsString, OsString)>,
+        build_dir: PathBuf,
+        output_root: PathBuf,
+        cwd: PathBuf,
+        rustc_verbose_version: String,
+        rustc_host: String,
+    },
+}
+
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
 
 pub(super) fn artifact_cache_compile_mode_is_supported(mode: CompileMode) -> bool {
@@ -541,6 +581,246 @@ fn compile<'gctx>(
     Ok(())
 }
 
+impl ArtifactCacheActionBuilder {
+    fn record_static_rejection(&self, stats: Option<&artifact_cache_stats::ArtifactCacheStats>) {
+        if let Self::Rejected { reason } = self
+            && let Some(stats) = stats
+        {
+            stats.ineligible(*reason);
+        }
+    }
+
+    fn new(
+        build_runner: &BuildRunner<'_, '_>,
+        unit: &Unit,
+        rustc: &ProcessBuilder,
+        sbom_files: &[PathBuf],
+        build_dir: &Path,
+        output_root: &Path,
+        cwd: &Path,
+    ) -> CargoResult<Self> {
+        let Some(config) = build_runner.bcx.build_config.artifact_cache.clone() else {
+            return Ok(Self::Disabled);
+        };
+        let crate_name = unit.target.crate_name().to_string();
+        let rejection = if !unit.target.is_lib() {
+            Some((
+                IneligibleReason::TargetNotLibrary,
+                "target is not a library",
+            ))
+        } else if unit.target.proc_macro() {
+            Some((IneligibleReason::ProcMacro, "target is a proc macro"))
+        } else if !artifact_cache_compile_mode_is_supported(unit.mode) {
+            Some((
+                IneligibleReason::CompileMode,
+                "compile mode is not supported",
+            ))
+        } else if unit.pkg.has_custom_build() {
+            Some((
+                IneligibleReason::CustomBuildScript,
+                "package has a custom build script",
+            ))
+        } else if !sbom_files.is_empty() {
+            Some((IneligibleReason::Sbom, "SBOM output is enabled"))
+        } else if !artifact_cache_host_is_supported() {
+            Some((
+                IneligibleReason::UnsupportedHost,
+                "host platform is unsupported",
+            ))
+        } else if !artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, rustc) {
+            Some((
+                IneligibleReason::UnmodeledLoaderEnvironment,
+                "compiler loader environment is not safely modeled",
+            ))
+        } else {
+            None
+        };
+        if let Some((reason, description)) = rejection {
+            debug!("artifact cache admission rejected for {crate_name}: {description}");
+            return Ok(Self::Rejected { reason });
+        }
+
+        let identity_provider = build_runner.bcx.rustc().artifact_cache_identity_provider();
+        let compiler_program = build_runner.bcx.rustc().path.clone();
+        let identity_program = identity_provider
+            .program()
+            .unwrap_or(&compiler_program)
+            .to_path_buf();
+        let loader_input_paths = compiler_loader_input_paths(
+            build_runner.bcx.gctx,
+            rustc,
+            &identity_program,
+            build_dir,
+            output_root,
+            cwd,
+        );
+        if !artifact_cache_loader_input_paths_are_modeled(&loader_input_paths) {
+            let description = "compiler loader inputs are not safely modeled";
+            debug!("artifact cache admission rejected for {crate_name}: {description}");
+            return Ok(Self::Rejected {
+                reason: IneligibleReason::UnmodeledLoaderInputs,
+            });
+        }
+        let dependency_search_paths = lib_search_paths(build_runner, unit)?
+            .chunks_exact(2)
+            .filter(|pair| pair[0] == OsStr::new("-L"))
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>();
+        let source_id = unit.pkg.package_id().source_id();
+        let package_replacement = if source_id.is_git() {
+            "/__cargo_artifact_cache_git_checkouts"
+        } else if source_id.is_registry() {
+            "/__cargo_artifact_cache_registry_sources"
+        } else if unit
+            .pkg
+            .root()
+            .strip_prefix(build_runner.bcx.ws.root())
+            .is_ok()
+        {
+            "/__cargo_artifact_cache_workspace"
+        } else {
+            "/__cargo_artifact_cache_package"
+        };
+        let portable_remaps = [
+            (package_remap(build_runner, unit), package_replacement),
+            (
+                build_dir_remap(build_runner),
+                "/__cargo_artifact_cache_build_dir",
+            ),
+            (
+                sysroot_remap(build_runner, unit),
+                "/__cargo_artifact_cache_compiler_sysroot/lib/rustlib/src/rust",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(argument, replacement)| artifact_cache_portable_remap(argument, replacement))
+        .collect::<Vec<_>>();
+
+        Ok(Self::Candidate {
+            crate_name,
+            config,
+            identity_provider,
+            compiler_program,
+            identity_program,
+            loader_input_paths,
+            dependency_search_paths,
+            portable_remaps,
+            build_dir: build_dir.to_path_buf(),
+            output_root: output_root.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            rustc_verbose_version: build_runner.bcx.rustc().verbose_version.clone(),
+            rustc_host: build_runner.bcx.rustc().host.to_string(),
+        })
+    }
+
+    fn describe(
+        self,
+        rustc: &mut ProcessBuilder,
+        stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+    ) -> CargoResult<Option<PreparedArtifactCacheAction>> {
+        let Self::Candidate {
+            crate_name,
+            config,
+            identity_provider,
+            compiler_program,
+            identity_program,
+            mut loader_input_paths,
+            dependency_search_paths,
+            portable_remaps,
+            build_dir,
+            output_root,
+            cwd,
+            rustc_verbose_version,
+            rustc_host,
+        } = self
+        else {
+            return Ok(None);
+        };
+
+        if !rlib_action_is_cacheable_with_search_paths(
+            rustc,
+            &output_root,
+            &compiler_program,
+            &rustc_host,
+            &dependency_search_paths,
+        ) {
+            if let Some(stats) = stats {
+                stats.ineligible(IneligibleReason::UnmodeledRustcAction);
+            }
+            debug!(
+                "artifact cache admission rejected for {crate_name}: rustc action is not safely modeled"
+            );
+            return Ok(None);
+        }
+        if remove_cargo_injected_loader_path(rustc, &output_root)? {
+            loader_input_paths.retain(|input| {
+                input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != output_root
+            });
+        }
+
+        let identity_started = stats.map(|_| (Instant::now(), thread_cpu_time()));
+        let (identity_snapshot, identity_computed) = identity_provider.identity_snapshot();
+        if let Some((started, cpu_started)) = identity_started
+            && let Some(stats) = stats
+        {
+            let (files, bytes) = identity_snapshot
+                .as_ref()
+                .map_or((0, 0), |(_, _, files, bytes)| (*files, *bytes));
+            stats.compiler_identity(
+                identity_computed,
+                files,
+                bytes,
+                started.elapsed(),
+                thread_cpu_time().saturating_sub(cpu_started),
+            );
+        }
+        let Some((compiler_identity, identity_witness, _, _)) = identity_snapshot else {
+            if let Some(stats) = stats {
+                stats.ineligible(IneligibleReason::CompilerIdentityUnavailable);
+            }
+            debug!(
+                "artifact cache admission rejected for {crate_name}: portable compiler identity is unavailable"
+            );
+            return Ok(None);
+        };
+
+        let key = match rlib_cache_entry(
+            &config.dir,
+            rustc,
+            &build_dir,
+            &output_root,
+            &rustc_verbose_version,
+            &compiler_identity,
+            &identity_program,
+            &dependency_search_paths,
+            &portable_remaps,
+            &loader_input_paths,
+            Some(&identity_witness),
+            &cwd,
+            stats,
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                if let Some(stats) = stats {
+                    stats.ineligible(IneligibleReason::KeyGenerationFailure);
+                }
+                debug!("ignoring artifact cache key failure for {crate_name}: {error:#}");
+                return Ok(None);
+            }
+        };
+        if let Some(stats) = stats {
+            stats.eligible();
+        }
+        Ok(Some(PreparedArtifactCacheAction {
+            crate_name,
+            config,
+            key,
+            identity_witness,
+            loader_input_paths,
+        }))
+    }
+}
+
 /// Generates the warning message used when fallible doc-scrape units fail,
 /// either for rustdoc or rustc.
 fn make_failed_scrape_diagnostic(
@@ -618,8 +898,6 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let rustc_verbose_version = build_runner.bcx.rustc().verbose_version.clone();
-    let rustc_host = build_runner.bcx.rustc().host.to_string();
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
     let message_cache_path = build_runner.files().message_cache_path(unit);
     let show_cached_diagnostics = unit.show_warnings(build_runner.bcx.gctx);
@@ -643,129 +921,15 @@ fn rustc(
         && artifact_cache_compile_mode_is_supported(unit.mode)
         && !unit.pkg.has_custom_build()
         && sbom_files.is_empty();
-    let configured_artifact_cache = build_runner.bcx.build_config.artifact_cache.clone();
-    let artifact_cache_rejection = configured_artifact_cache.as_ref().and_then(|_| {
-        if !unit.target.is_lib() {
-            Some((
-                IneligibleReason::TargetNotLibrary,
-                "target is not a library",
-            ))
-        } else if unit.target.proc_macro() {
-            Some((IneligibleReason::ProcMacro, "target is a proc macro"))
-        } else if !artifact_cache_compile_mode_is_supported(unit.mode) {
-            Some((
-                IneligibleReason::CompileMode,
-                "compile mode is not supported",
-            ))
-        } else if unit.pkg.has_custom_build() {
-            Some((
-                IneligibleReason::CustomBuildScript,
-                "package has a custom build script",
-            ))
-        } else if !sbom_files.is_empty() {
-            Some((IneligibleReason::Sbom, "SBOM output is enabled"))
-        } else if !artifact_cache_host_is_supported() {
-            Some((
-                IneligibleReason::UnsupportedHost,
-                "host platform is unsupported",
-            ))
-        } else if !artifact_cache_loader_environment_is_modeled(build_runner.bcx.gctx, &rustc) {
-            Some((
-                IneligibleReason::UnmodeledLoaderEnvironment,
-                "compiler loader environment is not safely modeled",
-            ))
-        } else {
-            None
-        }
-    });
-    if let Some((_, description)) = artifact_cache_rejection {
-        debug!(
-            "artifact cache admission rejected for {}: {description}",
-            unit.target.crate_name()
-        );
-    }
-    let artifact_cache = configured_artifact_cache.filter(|_| artifact_cache_rejection.is_none());
-    let artifact_cache_identity_provider = artifact_cache
-        .as_ref()
-        .map(|_| build_runner.bcx.rustc().artifact_cache_identity_provider());
-    let artifact_cache_compiler_program = build_runner.bcx.rustc().path.clone();
-    let artifact_cache_identity_program = artifact_cache_identity_provider
-        .as_ref()
-        .and_then(|provider| provider.program())
-        .unwrap_or(&artifact_cache_compiler_program)
-        .to_path_buf();
-    let mut artifact_cache_loader_input_paths = artifact_cache
-        .as_ref()
-        .map(|_| {
-            compiler_loader_input_paths(
-                build_runner.bcx.gctx,
-                &rustc,
-                &artifact_cache_identity_program,
-                &build_dir,
-                &root,
-                &cwd,
-            )
-        })
-        .unwrap_or_default();
-    let loader_inputs_are_modeled = artifact_cache.as_ref().is_none_or(|_| {
-        artifact_cache_loader_input_paths_are_modeled(&artifact_cache_loader_input_paths)
-    });
-    if !loader_inputs_are_modeled {
-        debug!(
-            "artifact cache admission rejected for {}: compiler loader inputs are not safely modeled",
-            unit.target.crate_name()
-        );
-    }
-    let artifact_cache = artifact_cache.filter(|_| loader_inputs_are_modeled);
-    let artifact_cache_dependency_search_paths = artifact_cache
-        .as_ref()
-        .map(|_| {
-            lib_search_paths(build_runner, unit).map(|args| {
-                args.chunks_exact(2)
-                    .filter(|pair| pair[0] == OsStr::new("-L"))
-                    .map(|pair| pair[1].clone())
-                    .collect::<Vec<_>>()
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let artifact_cache_portable_remaps = artifact_cache
-        .as_ref()
-        .map(|_| {
-            let source_id = unit.pkg.package_id().source_id();
-            let package_replacement = if source_id.is_git() {
-                "/__cargo_artifact_cache_git_checkouts"
-            } else if source_id.is_registry() {
-                "/__cargo_artifact_cache_registry_sources"
-            } else if unit
-                .pkg
-                .root()
-                .strip_prefix(build_runner.bcx.ws.root())
-                .is_ok()
-            {
-                "/__cargo_artifact_cache_workspace"
-            } else {
-                "/__cargo_artifact_cache_package"
-            };
-            [
-                (package_remap(build_runner, unit), package_replacement),
-                (
-                    build_dir_remap(build_runner),
-                    "/__cargo_artifact_cache_build_dir",
-                ),
-                (
-                    sysroot_remap(build_runner, unit),
-                    "/__cargo_artifact_cache_compiler_sysroot/lib/rustlib/src/rust",
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(argument, replacement)| {
-                artifact_cache_portable_remap(argument, replacement)
-            })
-            .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let cache_crate_name = unit.target.crate_name().to_string();
+    let artifact_cache_builder = ArtifactCacheActionBuilder::new(
+        build_runner,
+        unit,
+        &rustc,
+        &sbom_files,
+        &build_dir,
+        &root,
+        &cwd,
+    )?;
 
     let hide_diagnostics_for_scrape_unit = build_runner.bcx.unit_can_fail_for_docscraping(unit)
         && !matches!(
@@ -791,13 +955,7 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        if let Some(stats) = &artifact_cache_stats {
-            if let Some((reason, _)) = artifact_cache_rejection {
-                stats.ineligible(reason);
-            } else if !loader_inputs_are_modeled {
-                stats.ineligible(IneligibleReason::UnmodeledLoaderInputs);
-            }
-        }
+        artifact_cache_builder.record_static_rejection(artifact_cache_stats.as_deref());
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
@@ -847,109 +1005,15 @@ fn rustc(
         // Record the invocation before reading cache-discovered inputs so edits
         // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        let action_is_cacheable = artifact_cache.as_ref().is_none_or(|_| {
-            rlib_action_is_cacheable_with_search_paths(
-                &rustc,
-                &root,
-                &artifact_cache_compiler_program,
-                &rustc_host,
-                &artifact_cache_dependency_search_paths,
-            )
-        });
-        if !action_is_cacheable {
-            if let Some(stats) = &artifact_cache_stats {
-                stats.ineligible(IneligibleReason::UnmodeledRustcAction);
-            }
-            debug!(
-                "artifact cache admission rejected for {cache_crate_name}: rustc action is not safely modeled"
-            );
-        }
-        let artifact_cache = artifact_cache.as_ref().filter(|_| action_is_cacheable);
-        if artifact_cache.is_some() && remove_cargo_injected_loader_path(&mut rustc, &root)? {
-            artifact_cache_loader_input_paths.retain(|input| {
-                input.source != OsStr::new(paths::dylib_path_envvar()) || input.path != root
-            });
-        }
-        let identity_started = (artifact_cache.is_some() && artifact_cache_stats.is_some())
-            .then(|| (Instant::now(), thread_cpu_time()));
-        let (identity_snapshot, identity_computed) = artifact_cache
-            .as_ref()
-            .and_then(|_| artifact_cache_identity_provider.as_ref())
-            .map_or((None, false), |provider| provider.identity_snapshot());
-        if let Some((started, cpu_started)) = identity_started
-            && let Some(stats) = &artifact_cache_stats
-        {
-            let (files, bytes) = identity_snapshot
-                .as_ref()
-                .map_or((0, 0), |(_, _, files, bytes)| (*files, *bytes));
-            stats.compiler_identity(
-                identity_computed,
-                files,
-                bytes,
-                started.elapsed(),
-                thread_cpu_time().saturating_sub(cpu_started),
-            );
-        }
-        let (artifact_cache_compiler_identity, artifact_cache_identity_witness) = identity_snapshot
-            .map_or((None, None), |(identity, witness, _, _)| {
-                (Some(identity), Some(witness))
-            });
-        if artifact_cache.is_some() && artifact_cache_compiler_identity.is_none() {
-            if let Some(stats) = &artifact_cache_stats {
-                stats.ineligible(IneligibleReason::CompilerIdentityUnavailable);
-            }
-            debug!(
-                "artifact cache admission rejected for {cache_crate_name}: portable compiler identity is unavailable"
-            );
-        }
-        let cache_entry = match artifact_cache.zip(artifact_cache_compiler_identity.as_ref()) {
-            Some((cache, compiler_identity)) => match rlib_cache_entry(
-                &cache.dir,
-                &rustc,
-                &build_dir,
-                &root,
-                &rustc_verbose_version,
-                compiler_identity,
-                &artifact_cache_identity_program,
-                &artifact_cache_dependency_search_paths,
-                &artifact_cache_portable_remaps,
-                &artifact_cache_loader_input_paths,
-                artifact_cache_identity_witness.as_ref(),
-                &cwd,
-                artifact_cache_stats.as_deref(),
-            ) {
-                Ok(entry) => Some(entry),
-                Err(error) => {
-                    if let Some(stats) = &artifact_cache_stats {
-                        stats.ineligible(IneligibleReason::KeyGenerationFailure);
-                    }
-                    debug!("ignoring artifact cache key failure for {cache_crate_name}: {error:#}");
-                    None
-                }
-            },
-            None => None,
-        };
-        if cache_entry.is_some()
-            && let Some(stats) = &artifact_cache_stats
-        {
-            stats.eligible();
-        }
-        let restore_started = cache_entry
-            .is_some()
-            .then(|| artifact_cache_stats.as_ref().map(|_| Instant::now()))
-            .flatten();
+        let artifact_cache_action =
+            artifact_cache_builder.describe(&mut rustc, artifact_cache_stats.as_deref())?;
+        let restore_started =
+            (artifact_cache_action.is_some() && artifact_cache_stats.is_some()).then(Instant::now);
         let mut restore_failed = false;
-        let cache_hit = match cache_entry
-            .as_ref()
-            .zip(artifact_cache)
-            .zip(artifact_cache_identity_witness.as_ref())
-        {
-            Some((
-                ((entry, loader_inputs_digest, action_inputs_digest), cache),
-                identity_witness,
-            )) => {
+        let cache_hit = match artifact_cache_action.as_ref() {
+            Some(action) => {
                 match restore_rlib_cache(
-                    entry,
+                    &action.key.entry_root,
                     outputs.as_slice(),
                     &rustc_dep_info_loc,
                     &message_cache_path,
@@ -957,23 +1021,24 @@ fn rustc(
                     &cwd,
                     &pkg_root,
                     &root,
-                    identity_witness,
-                    &artifact_cache_loader_input_paths,
-                    loader_inputs_digest,
-                    action_inputs_digest,
+                    &action.identity_witness,
+                    &action.loader_input_paths,
+                    &action.key.loader_inputs_digest,
+                    &action.key.action_inputs_digest,
                     if mode.is_check() {
                         ArtifactCacheMaterialization::Copy
                     } else {
-                        cache.materialization
+                        action.config.materialization
                     },
-                    cache.max_size,
+                    action.config.max_size,
                     artifact_cache_stats.as_deref(),
                 ) {
                     Ok(cache_hit) => cache_hit,
                     Err(error) => {
                         restore_failed = true;
                         debug!(
-                            "ignoring artifact cache restore failure for {cache_crate_name}: {error:#}"
+                            "ignoring artifact cache restore failure for {}: {error:#}",
+                            action.crate_name
                         );
                         false
                     }
@@ -988,7 +1053,10 @@ fn rustc(
         }
 
         if cache_hit {
-            debug!("artifact cache hit for {cache_crate_name}");
+            debug!(
+                "artifact cache hit for {}",
+                artifact_cache_action.as_ref().unwrap().crate_name
+            );
             let mut replay_options = OutputOptions {
                 format: output_options.format,
                 cache_cell: None,
@@ -1173,17 +1241,13 @@ fn rustc(
             paths::set_file_time_no_err(stamp, timestamp);
         }
 
-        if !cache_hit
-            && let Some(((entry, loader_inputs_digest, action_inputs_digest), cache)) =
-                cache_entry.as_ref().zip(artifact_cache)
-            && let Some(identity_witness) = artifact_cache_identity_witness.as_ref()
-        {
+        if !cache_hit && let Some(action) = artifact_cache_action.as_ref() {
             if let Some(stats) = &artifact_cache_stats {
                 stats.publication_attempt();
             }
             let publication_started = artifact_cache_stats.as_ref().map(|_| Instant::now());
             let store_result = store_rlib_cache(
-                entry,
+                &action.key.entry_root,
                 outputs.as_slice(),
                 &rustc_dep_info_loc,
                 &message_cache_path,
@@ -1192,12 +1256,12 @@ fn rustc(
                 &pkg_root,
                 &build_dir,
                 &root,
-                identity_witness,
-                &artifact_cache_loader_input_paths,
-                loader_inputs_digest,
-                action_inputs_digest,
+                &action.identity_witness,
+                &action.loader_input_paths,
+                &action.key.loader_inputs_digest,
+                &action.key.action_inputs_digest,
                 &rustc,
-                cache.max_size,
+                action.config.max_size,
                 artifact_cache_stats.as_deref(),
             );
             if let Some(started) = publication_started
@@ -1209,11 +1273,12 @@ fn rustc(
                 );
             }
             match store_result {
-                Ok(true) => debug!("stored artifact cache entry for {cache_crate_name}"),
+                Ok(true) => debug!("stored artifact cache entry for {}", action.crate_name),
                 Ok(false) => {}
                 Err(error) => {
                     debug!(
-                        "ignoring artifact cache store failure for {cache_crate_name}: {error:#}"
+                        "ignoring artifact cache store failure for {}: {error:#}",
+                        action.crate_name
                     );
                 }
             }
@@ -2069,7 +2134,7 @@ fn rlib_cache_entry(
     identity_witness: Option<&crate::util::rustc::ArtifactCacheIdentityWitness>,
     rustc_cwd: &Path,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
-) -> CargoResult<(PathBuf, blake3::Hash, blake3::Hash)> {
+) -> CargoResult<ArtifactCacheKey> {
     #[expect(
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
@@ -2206,11 +2271,11 @@ fn rlib_cache_entry(
         }
         hasher.update(b"\0");
     }
-    Ok((
-        cache_root.join(hasher.finalize().to_hex().as_str()),
+    Ok(ArtifactCacheKey {
+        entry_root: cache_root.join(hasher.finalize().to_hex().as_str()),
         loader_inputs_digest,
         action_inputs_digest,
-    ))
+    })
 }
 
 fn artifact_cache_portable_remap(
@@ -2520,7 +2585,7 @@ mod artifact_cache_key_tests {
                 None,
             )
             .unwrap()
-            .0
+            .entry_root
         };
 
         let first = cache_entry();
