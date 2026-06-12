@@ -2029,24 +2029,36 @@ fn remapped_rustc_codegen_input_targets(
     {
         return HashMap::new();
     }
-    if current
-        .iter()
-        .any(|(source, _)| !provenance.contains_key(source))
-    {
-        return HashMap::new();
-    }
     let previous_hashes = previous
         .input_files
         .iter()
         .filter_map(|input| Some((decode_path(&input.path).ok()?, input.content.hash.as_str())))
         .collect::<HashMap<_, _>>();
+    let mut current_hashes = HashMap::with_capacity(current.len());
+    for (source, _) in &current {
+        let hash = if let Some(hash) = provenance.get(source) {
+            hash.clone()
+        } else {
+            let Ok(bytes) = std::fs::read(source) else {
+                return HashMap::new();
+            };
+            hash_bytes(&bytes)
+        };
+        current_hashes.insert(source.clone(), hash);
+    }
     let fixed_targets = current
         .iter()
         .filter_map(|(source, target)| {
-            (previous_hashes.get(target).copied() == provenance.get(source).map(String::as_str))
+            (previous_hashes.get(target).copied() == current_hashes.get(source).map(String::as_str))
                 .then_some(target.clone())
         })
         .collect::<HashSet<_>>();
+    if current
+        .iter()
+        .any(|(source, target)| !provenance.contains_key(source) && !fixed_targets.contains(target))
+    {
+        return HashMap::new();
+    }
     current.retain(|(_, target)| !fixed_targets.contains(target));
     if current.is_empty() {
         return HashMap::new();
@@ -34177,6 +34189,43 @@ mod tests {
         );
         assert_eq!(remapped.get(&current_a), Some(&previous_a));
         assert_eq!(remapped.get(&current_b), Some(&previous_b));
+
+        let previous_extra = stable_dir.join("uv-abc123.extra.rcgu.o");
+        let current_extra = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.extra.session.rcgu.o");
+        let extra = renamed_object(b"_cccc", b"_cccd");
+        std::fs::write(&previous_extra, &extra).unwrap();
+        std::fs::write(&current_extra, &extra).unwrap();
+        let previous_with_extra = state(
+            "args",
+            b"output",
+            &[
+                (previous_a.to_str().unwrap(), a.as_slice()),
+                (previous_b.to_str().unwrap(), b.as_slice()),
+                (previous_extra.to_str().unwrap(), extra.as_slice()),
+            ],
+        );
+        let mut common_with_extra = crate::args::CommonArgs::default();
+        common_with_extra.inputs = [&current_b, &current_extra, &current_a]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        let remapped = remapped_rustc_codegen_input_targets(
+            &common_with_extra,
+            &output,
+            &stable_dir,
+            Some(&previous_with_extra),
+            Some(&provenance),
+        );
+        assert_eq!(remapped.get(&current_a), Some(&previous_a));
+        assert_eq!(remapped.get(&current_b), Some(&previous_b));
+        assert!(!remapped.contains_key(&current_extra));
 
         common.inputs[0].spec = InputSpec::File(previous_b.clone().into_boxed_path());
         common.inputs[1].spec = InputSpec::File(previous_a.clone().into_boxed_path());
