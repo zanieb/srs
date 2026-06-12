@@ -3647,6 +3647,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         .iter()
         .map(|(_, path)| path.clone())
         .collect::<Vec<_>>();
+    let mut indexed_changed_input_macho_definitions = None;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
@@ -4761,46 +4762,62 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     })
                     .transpose()?;
                 if let Some(previous_resolver) = previous_resolver.as_ref() {
-                    let replays = match macho_text_relocation_replays_for_input(
-                        &previous.relocations,
-                        &mut previous.macho_symbol_resolutions,
-                        &macho_text_relocation_retiring_names,
-                        input,
-                        &changed_input_paths,
-                        &matched_sections,
-                        previous_resolver,
-                        &current_resolver,
-                        previous_output.get()?,
-                        &mut relocation_target_patches,
-                        &macho_resolution_moves,
-                        record_coverage.has_changed_input_records(),
-                    )? {
-                        Ok(replays) => replays,
-                        Err(reason) if reason == MACHO_TEXT_RELOCATION_RECORDS_REQUIRED => {
-                            return Ok(ChangedInputPatchResult::RequiresChangedInputRecords(
-                                reason,
-                            ));
+                    if indexed_changed_input_macho_definitions.is_none() {
+                        timing_phase!("Index changed Mach-O definitions");
+                        indexed_changed_input_macho_definitions =
+                            Some(changed_input_macho_definitions(&changed_input_paths)?);
+                    }
+                    let replays = {
+                        timing_phase!("Replay changed Mach-O text relocations");
+                        match macho_text_relocation_replays_for_input(
+                            &previous.relocations,
+                            &mut previous.macho_symbol_resolutions,
+                            &macho_text_relocation_retiring_names,
+                            input,
+                            indexed_changed_input_macho_definitions
+                                .as_ref()
+                                .and_then(Option::as_ref),
+                            &matched_sections,
+                            previous_resolver,
+                            &current_resolver,
+                            previous_output.get()?,
+                            &mut relocation_target_patches,
+                            &macho_resolution_moves,
+                            record_coverage.has_changed_input_records(),
+                        )? {
+                            Ok(replays) => replays,
+                            Err(reason) if reason == MACHO_TEXT_RELOCATION_RECORDS_REQUIRED => {
+                                return Ok(ChangedInputPatchResult::RequiresChangedInputRecords(
+                                    reason,
+                                ));
+                            }
+                            Err(reason)
+                                if !record_coverage.has_complete_macho_symbol_resolutions()
+                                    && reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED) =>
+                            {
+                                return Ok(
+                                    ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                                        reason,
+                                    ),
+                                );
+                            }
+                            Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                         }
-                        Err(reason)
-                            if !record_coverage.has_complete_macho_symbol_resolutions()
-                                && reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED) =>
-                        {
-                            return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
-                                reason,
-                            ));
-                        }
-                        Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                     };
-                    match validate_macho_data_relocations_are_stable(
-                        &mut previous.relocations[..stable_relocation_count],
-                        &previous.macho_symbol_resolutions,
-                        input,
-                        &matched_sections,
-                        previous_resolver,
-                        &current_resolver,
-                        previous_output.get()?,
-                        &relocation_target_patches.macho_target_moves,
-                    )? {
+                    let data_relocations_are_stable = {
+                        timing_phase!("Validate changed Mach-O data relocations");
+                        validate_macho_data_relocations_are_stable(
+                            &mut previous.relocations[..stable_relocation_count],
+                            &previous.macho_symbol_resolutions,
+                            input,
+                            &matched_sections,
+                            previous_resolver,
+                            &current_resolver,
+                            previous_output.get()?,
+                            &relocation_target_patches.macho_target_moves,
+                        )?
+                    };
+                    match data_relocations_are_stable {
                         Ok(changed) => {
                             if changed {
                                 if !records_complete {
@@ -7979,6 +7996,7 @@ impl MatchedPatchSection {
     }
 }
 
+#[cfg(test)]
 fn matched_patch_section_preserves_relocation_record_locations(
     section: &MatchedPatchSection,
 ) -> bool {
@@ -8038,6 +8056,7 @@ fn section_record_matches_patch_section(
         )?)
 }
 
+#[cfg(test)]
 fn macho_relocation_record_matches_patch_section(
     input_file_path: &str,
     relocation: &RelocationRecord,
@@ -8130,22 +8149,37 @@ impl MachORelocationSectionIndex {
         section: &PatchSection,
         normalize_rust_archive_patch_inputs: bool,
     ) -> Result<&[usize]> {
+        self.indices_for_ref(
+            input_file_path,
+            section.input.as_str(),
+            section.section_index,
+            normalize_rust_archive_patch_inputs,
+        )
+    }
+
+    fn indices_for_ref(
+        &self,
+        input_file_path: &str,
+        input_ref: &str,
+        section_index: u32,
+        normalize_rust_archive_patch_inputs: bool,
+    ) -> Result<&[usize]> {
         if normalize_rust_archive_patch_inputs
-            && let Some(parsed) = parse_patch_input_ref(input_file_path, section.input.as_str())?
+            && let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)?
             && !parsed.identifier.is_empty()
         {
             let identifier = archive_member_patch_identifier(&parsed.identifier);
             return Ok(self
                 .normalized
-                .get(&section.section_index)
+                .get(&section_index)
                 .and_then(|values| values.get(identifier.as_slice()))
                 .map(Vec::as_slice)
                 .unwrap_or_default());
         }
         Ok(self
             .exact
-            .get(&section.section_index)
-            .and_then(|values| values.get(section.input.as_str()))
+            .get(&section_index)
+            .and_then(|values| values.get(input_ref))
             .map(Vec::as_slice)
             .unwrap_or_default())
     }
@@ -13131,71 +13165,113 @@ fn missing_macho_replacement_resolution<'a>(
         })
 }
 
-fn retained_macho_output_definition_resolution(
-    output_file: &object::File<'_>,
-    name: &[u8],
-) -> Option<MachOSymbolResolutionRecord> {
-    let mut matched = None;
-    for symbol in output_file.symbols() {
-        if symbol.is_undefined()
-            || !symbol.is_global()
-            || symbol.is_weak()
-            || symbol.name_bytes().ok()? != name
-        {
-            continue;
-        }
-        let section = output_file.section_by_index(symbol.section_index()?).ok()?;
-        if section.segment_name_bytes().ok().flatten() != Some(b"__TEXT".as_slice())
-            || section.name_bytes().ok() != Some(b"__text".as_slice())
-            || matched.replace(symbol.address()).is_some()
-        {
-            return None;
-        }
-    }
-    let direct_value = matched?;
-    Some(MachOSymbolResolutionRecord {
-        name: hex::encode(name).into(),
-        direct_value: Some(direct_value),
-        got_address: None,
-        stub_address: None,
-        thunk_addresses: Vec::new(),
-        target: None,
-    })
+struct MachOOutputTextDefinitionLookup {
+    addresses_by_name: HashMap<Vec<u8>, Option<u64>>,
 }
 
-fn changed_input_defines_macho_symbol(path: &Path, name: &[u8]) -> Result<bool> {
-    let Some((bytes, _)) = read_file_with_stable_identity(path)? else {
-        return Ok(true);
-    };
-    if let Ok(archive) = object::read::archive::ArchiveFile::parse(bytes.as_slice()) {
-        let Some(symbols) = archive.symbols()? else {
-            return Ok(true);
-        };
-        for symbol in symbols {
-            if symbol?.name() == name {
-                return Ok(true);
+impl MachOOutputTextDefinitionLookup {
+    fn new(output_file: &object::File<'_>) -> Option<Self> {
+        let text_sections = output_file
+            .sections()
+            .filter(|section| {
+                section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+                    && section.name_bytes().ok() == Some(b"__text".as_slice())
+            })
+            .map(|section| section.index())
+            .collect::<HashSet<_>>();
+        let mut addresses_by_name = HashMap::new();
+        for symbol in output_file.symbols() {
+            if symbol.is_undefined() || !symbol.is_global() || symbol.is_weak() {
+                continue;
+            }
+            let name = symbol.name_bytes().ok()?.to_vec();
+            let address = symbol
+                .section_index()
+                .filter(|index| text_sections.contains(index))
+                .map(|_| symbol.address());
+            match addresses_by_name.entry(name) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(address);
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = None;
+                }
             }
         }
-        return Ok(false);
+        Some(Self { addresses_by_name })
     }
-    let Ok(file) = object::File::parse(bytes.as_slice()) else {
-        return Ok(true);
-    };
-    Ok(file.symbols().any(|symbol| {
-        !symbol.is_undefined()
-            && symbol.is_global()
-            && !symbol.is_weak()
-            && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
-    }))
+
+    fn resolution(&self, name: &[u8]) -> Option<MachOSymbolResolutionRecord> {
+        let direct_value = self.addresses_by_name.get(name).copied().flatten()?;
+        Some(MachOSymbolResolutionRecord {
+            name: hex::encode(name).into(),
+            direct_value: Some(direct_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        })
+    }
 }
 
-fn changed_inputs_define_macho_symbol(paths: &[PathBuf], name: &[u8]) -> Result<bool> {
+fn changed_input_macho_definitions(paths: &[PathBuf]) -> Result<Option<HashSet<Vec<u8>>>> {
+    let mut definitions = HashSet::new();
     for path in paths {
-        if changed_input_defines_macho_symbol(path, name)? {
-            return Ok(true);
+        let Some((bytes, _)) = read_file_with_stable_identity(path)? else {
+            return Ok(None);
+        };
+        if let Ok(archive) = object::read::archive::ArchiveFile::parse(bytes.as_slice()) {
+            let Some(symbols) = archive.symbols()? else {
+                return Ok(None);
+            };
+            for symbol in symbols {
+                definitions.insert(symbol?.name().to_vec());
+            }
+            continue;
         }
+        let Ok(file) = object::File::parse(bytes.as_slice()) else {
+            return Ok(None);
+        };
+        definitions.extend(
+            file.symbols()
+                .filter(|symbol| !symbol.is_undefined() && symbol.is_global() && !symbol.is_weak())
+                .map(|symbol| symbol.name_bytes().map(Vec::from))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
     }
-    Ok(false)
+    Ok(Some(definitions))
+}
+
+struct MatchedCurrentSectionLookup<'a> {
+    output_offsets: HashMap<(&'a str, u32), Option<u64>>,
+}
+
+impl<'a> MatchedCurrentSectionLookup<'a> {
+    fn new(matched_sections: &'a [MatchedPatchSection]) -> Self {
+        let mut output_offsets = HashMap::new();
+        for section in matched_sections {
+            let key = (
+                section.current.input.as_str(),
+                section.current.section_index,
+            );
+            match output_offsets.entry(key) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(section.current.output_offset));
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+        Self { output_offsets }
+    }
+
+    fn output_offset(&self, input: &str, section_index: u32) -> Option<u64> {
+        self.output_offsets
+            .get(&(input, section_index))
+            .copied()
+            .flatten()
+    }
 }
 
 fn macho_output_address_for_current_section_offset(
@@ -13206,11 +13282,28 @@ fn macho_output_address_for_current_section_offset(
     section_index: object::SectionIndex,
     section_offset: u64,
 ) -> Option<u64> {
+    macho_output_address_for_current_section_offset_with_lookup(
+        output_file,
+        &MatchedCurrentSectionLookup::new(matched_sections),
+        current_file,
+        input,
+        section_index,
+        section_offset,
+    )
+}
+
+fn macho_output_address_for_current_section_offset_with_lookup(
+    output_file: &object::File<'_>,
+    matched_sections: &MatchedCurrentSectionLookup<'_>,
+    current_file: &object::File<'_>,
+    input: &str,
+    section_index: object::SectionIndex,
+    section_offset: u64,
+) -> Option<u64> {
     let section_index = patch_section_record_index(current_file, section_index).ok()?;
-    let section = matched_sections.iter().find(|section| {
-        section.current.input == input && section.current.section_index == section_index
-    })?;
-    let file_offset = section.current.output_offset.checked_add(section_offset)?;
+    let file_offset = matched_sections
+        .output_offset(input, section_index)?
+        .checked_add(section_offset)?;
     macho_output_address_for_file_offset(output_file, file_offset)
 }
 
@@ -13220,6 +13313,7 @@ fn unique_macho_target_value(values: impl IntoIterator<Item = u64>) -> Option<u6
     values.all(|candidate| candidate == value).then_some(value)
 }
 
+#[cfg(test)]
 fn macho_output_address_for_current_target(
     output_file: &object::File<'_>,
     current_file: &object::File<'_>,
@@ -13229,7 +13323,27 @@ fn macho_output_address_for_current_target(
     target: &RelocationTargetRecord,
     previous_target: &RelocationTargetRecord,
 ) -> Option<u64> {
-    if let Some(value) = macho_output_address_for_current_section_offset(
+    macho_output_address_for_current_target_with_lookup(
+        output_file,
+        current_file,
+        &MatchedCurrentSectionLookup::new(matched_sections),
+        relocations,
+        resolutions,
+        target,
+        previous_target,
+    )
+}
+
+fn macho_output_address_for_current_target_with_lookup(
+    output_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    matched_sections: &MatchedCurrentSectionLookup<'_>,
+    relocations: &[RelocationRecord],
+    resolutions: &[MachOSymbolResolutionRecord],
+    target: &RelocationTargetRecord,
+    previous_target: &RelocationTargetRecord,
+) -> Option<u64> {
+    if let Some(value) = macho_output_address_for_current_section_offset_with_lookup(
         output_file,
         matched_sections,
         current_file,
@@ -13432,12 +13546,17 @@ fn recorded_macho_branch_target_candidate(
 struct RecordedMachOBranchTargetCandidates<'a> {
     relocations: &'a [RelocationRecord],
     branch_indices_by_name: HashMap<&'a str, Vec<usize>>,
+    indices_by_target: HashMap<&'a RelocationTargetRecord, Vec<usize>>,
 }
 
 impl<'a> RecordedMachOBranchTargetCandidates<'a> {
     fn new(relocations: &'a [RelocationRecord]) -> Self {
         let mut branch_indices_by_name = HashMap::<&str, Vec<usize>>::new();
+        let mut indices_by_target = HashMap::<&RelocationTargetRecord, Vec<usize>>::new();
         for (index, relocation) in relocations.iter().enumerate() {
+            if let Some(target) = relocation.target.as_ref() {
+                indices_by_target.entry(target).or_default().push(index);
+            }
             let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
                 continue;
             };
@@ -13454,6 +13573,7 @@ impl<'a> RecordedMachOBranchTargetCandidates<'a> {
         Self {
             relocations,
             branch_indices_by_name,
+            indices_by_target,
         }
     }
 
@@ -13489,11 +13609,13 @@ impl<'a> RecordedMachOBranchTargetCandidates<'a> {
                 })
                 .collect()
         } else {
-            self.relocations
-                .iter()
-                .filter_map(|relocation| {
+            target
+                .and_then(|target| self.indices_by_target.get(target))
+                .into_iter()
+                .flatten()
+                .filter_map(|index| {
                     recorded_macho_branch_target_candidate(
-                        relocation,
+                        &self.relocations[*index],
                         target_name,
                         false,
                         target,
@@ -13550,6 +13672,14 @@ impl<'a> RecordedMachOBranchTargetCandidates<'a> {
                 .iter()
                 .map(|index| &self.relocations[*index])
                 .find(|relocation| target.is_none() || relocation.target.as_ref() == target)
+        {
+            return relocation.target_symbol_id;
+        }
+        if let Some(indices) = target.and_then(|target| self.indices_by_target.get(target))
+            && let Some(relocation) = indices
+                .iter()
+                .map(|index| &self.relocations[*index])
+                .find(|relocation| relocation.target_name.as_ref() == target_name)
         {
             return relocation.target_symbol_id;
         }
@@ -13628,7 +13758,7 @@ fn rematerialized_macho_text_relocation_replay(
     patch_section: &MatchedPatchSection,
     current_file: &object::File<'_>,
     current_context: &MachOTextRelocationContext,
-    matched_sections: &[MatchedPatchSection],
+    matched_sections: &MatchedCurrentSectionLookup<'_>,
     previous_output: &[u8],
     output_file: &object::File<'_>,
 ) -> Result<std::result::Result<MachOTextRelocationReplay, String>> {
@@ -13690,7 +13820,7 @@ fn rematerialized_macho_text_relocation_replay(
                     section_index: current_target.section_index,
                     section_offset,
                 };
-                let Some(value) = macho_output_address_for_current_target(
+                let Some(value) = macho_output_address_for_current_target_with_lookup(
                     output_file,
                     current_file,
                     matched_sections,
@@ -13762,7 +13892,7 @@ fn rematerialized_macho_text_relocation_replay(
                 section_index: current_target.section_index,
                 section_offset: 0,
             };
-            let Some(value) = macho_output_address_for_current_target(
+            let Some(value) = macho_output_address_for_current_target_with_lookup(
                 output_file,
                 current_file,
                 matched_sections,
@@ -13870,22 +14000,54 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
     input: &FileState,
 ) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool), String> {
     let mut affected_names = HashSet::<SharedText>::new();
-    let mut current_references =
-        HashMap::<SharedText, Vec<(u64, Option<RelocationTargetRecord>)>>::new();
+    let relocation_section_index = MachORelocationSectionIndex::new(
+        relocations,
+        input.path.as_str(),
+        normalize_rust_archive_patch_inputs,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut rematerialized_relocation_indices = HashSet::new();
+    for (input_file, previous_input, previous_section_index, _, _) in rematerialized_sections {
+        if input_file != &input.path {
+            continue;
+        }
+        let indices = relocation_section_index
+            .indices_for_ref(
+                input.path.as_str(),
+                previous_input,
+                *previous_section_index,
+                normalize_rust_archive_patch_inputs,
+            )
+            .map_err(|error| error.to_string())?;
+        rematerialized_relocation_indices.extend(indices.iter().copied());
+    }
 
-    for relocation in relocations {
-        let Some(target_name) = relocation.target_name.as_ref() else {
+    for relocation_index in &rematerialized_relocation_indices {
+        if let Some(target_name) = relocations[*relocation_index].target_name.as_ref() {
+            affected_names.insert(target_name.clone());
+        }
+    }
+    for replay in replays
+        .iter()
+        .filter(|replay| replay.relocation_index.is_none() && replay.target_is_global)
+    {
+        let Some(target_name) = replay.target_name.as_ref() else {
             continue;
         };
-        if relocation_is_in_rematerialized_macho_text_section(
-            relocation,
-            rematerialized_sections,
-            normalize_rust_archive_patch_inputs,
-        )
-        .map_err(|error| error.to_string())?
-        {
-            affected_names.insert(target_name.clone());
-        } else {
+        affected_names.insert(target_name.clone());
+    }
+
+    let mut current_references =
+        HashMap::<SharedText, Vec<(u64, Option<RelocationTargetRecord>)>>::new();
+    for (relocation_index, relocation) in relocations.iter().enumerate() {
+        let Some(target_name) = relocation
+            .target_name
+            .as_ref()
+            .filter(|target_name| affected_names.contains(*target_name))
+        else {
+            continue;
+        };
+        if !rematerialized_relocation_indices.contains(&relocation_index) {
             current_references
                 .entry(target_name.clone())
                 .or_default()
@@ -13899,7 +14061,6 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
         let Some(target_name) = replay.target_name.as_ref() else {
             continue;
         };
-        affected_names.insert(target_name.clone());
         current_references
             .entry(target_name.clone())
             .or_default()
@@ -14128,7 +14289,7 @@ fn macho_text_relocation_replays_for_input(
     resolutions: &mut Vec<MachOSymbolResolutionRecord>,
     retiring_names: &[SharedText],
     input: &FileState,
-    changed_input_paths: &[PathBuf],
+    changed_input_macho_definitions: Option<&HashSet<Vec<u8>>>,
     matched_sections: &[MatchedPatchSection],
     previous_resolver: &PatchInputResolver<'_>,
     current_resolver: &PatchInputResolver<'_>,
@@ -14190,14 +14351,22 @@ fn macho_text_relocation_replays_for_input(
     let mut target_input_ranges = Vec::new();
     let mut target_output_symbols = Vec::new();
     let mut retained_output_resolutions = Vec::new();
+    let output_text_definitions = {
+        timing_phase!("Index previous Mach-O output text definitions");
+        MachOOutputTextDefinitionLookup::new(&output_file)
+    };
     let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
         && current_resolver.normalize_rust_archive_patch_inputs;
     let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
-    let relocation_section_index = MachORelocationSectionIndex::new(
-        relocations,
-        input.path.as_str(),
-        normalize_rust_archive_patch_inputs,
-    )?;
+    let matched_current_sections = MatchedCurrentSectionLookup::new(matched_sections);
+    let relocation_section_index = {
+        timing_phase!("Index persisted Mach-O text relocations");
+        MachORelocationSectionIndex::new(
+            relocations,
+            input.path.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+    };
     let recorded_branch_targets = std::cell::OnceCell::new();
     let mut sections_by_input = HashMap::<(&str, &str), Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
@@ -14210,6 +14379,8 @@ fn macho_text_relocation_replays_for_input(
             .push(section);
     }
 
+    let compare_changed_macho_text_sections =
+        crate::timing_guard!("Compare changed Mach-O text sections");
     for ((previous_input_ref, current_input_ref), sections) in sections_by_input {
         let Some(current_input_bytes) = current_resolver.resolve(
             input.path.as_str(),
@@ -14237,9 +14408,12 @@ fn macho_text_relocation_replays_for_input(
         };
         let previous_file = object::File::parse(previous_input_bytes.bytes)
             .context("Failed to parse previous Mach-O text replay input")?;
+        let current_section_indices = PatchSectionIndexLookup::new(&current_file);
+        let previous_section_indices = PatchSectionIndexLookup::new(&previous_file);
 
         for patch_section in sections {
-            let Some(current_index) = patch_section_index(&current_file, &patch_section.current)?
+            let Some(current_index) =
+                current_section_indices.index(&current_file, &patch_section.current)?
             else {
                 return Ok(Err(format!(
                     "missing current Mach-O text patch section in {}",
@@ -14257,7 +14431,7 @@ fn macho_text_relocation_replays_for_input(
             }
 
             let Some(previous_index) =
-                patch_section_index(&previous_file, &patch_section.previous)?
+                previous_section_indices.index(&previous_file, &patch_section.previous)?
             else {
                 return Ok(Err(format!(
                     "missing previous Mach-O text patch section in {}",
@@ -14399,9 +14573,11 @@ fn macho_text_relocation_replays_for_input(
                 ) else {
                     break;
                 };
-                let retained_resolution =
-                    retained_macho_output_definition_resolution(&output_file, current_name);
-                if changed_inputs_define_macho_symbol(changed_input_paths, current_name)?
+                let retained_resolution = output_text_definitions
+                    .as_ref()
+                    .and_then(|definitions| definitions.resolution(current_name));
+                if changed_input_macho_definitions
+                    .is_none_or(|definitions| definitions.contains(current_name))
                     || retained_resolution.is_none()
                 {
                     return Ok(Err(format!(
@@ -14436,7 +14612,7 @@ fn macho_text_relocation_replays_for_input(
                         patch_section,
                         &current_file,
                         current_context,
-                        matched_sections,
+                        &matched_current_sections,
                         previous_output,
                         &output_file,
                     )? {
@@ -14749,6 +14925,7 @@ fn macho_text_relocation_replays_for_input(
             }
         }
     }
+    drop(compare_changed_macho_text_sections);
 
     if consumed_target_moves.len() != target_moves.len() {
         return Ok(Err(format!(
@@ -14764,15 +14941,18 @@ fn macho_text_relocation_replays_for_input(
     target_patches.output_symbols.extend(target_output_symbols);
     drop(resolution_lookup);
     resolutions.extend(retained_output_resolutions.iter().cloned());
-    let reconciled = reconcile_rematerialized_macho_symbol_resolutions(
-        resolutions,
-        relocations,
-        &replays,
-        &rematerialized_sections,
-        normalize_rust_archive_patch_inputs,
-        retiring_names,
-        input,
-    );
+    let reconciled = {
+        timing_phase!("Reconcile rematerialized Mach-O symbol resolutions");
+        reconcile_rematerialized_macho_symbol_resolutions(
+            resolutions,
+            relocations,
+            &replays,
+            &rematerialized_sections,
+            normalize_rust_archive_patch_inputs,
+            retiring_names,
+            input,
+        )
+    };
     let retained_output_resolution_names = retained_output_resolutions
         .iter()
         .map(|resolution| resolution.name.as_str())
@@ -14812,6 +14992,11 @@ fn validate_macho_data_relocations_are_stable(
         .collect::<HashSet<_>>();
     let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
         && current_resolver.normalize_rust_archive_patch_inputs;
+    let relocation_section_index = MachORelocationSectionIndex::new(
+        relocations,
+        input.path.as_str(),
+        normalize_rust_archive_patch_inputs,
+    )?;
     let mut changed = false;
     let mut sections_by_input = HashMap::<(&str, &str), Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
@@ -14851,11 +15036,14 @@ fn validate_macho_data_relocations_are_stable(
         };
         let previous_file = object::File::parse(previous_input_bytes.bytes)
             .context("Failed to parse previous Mach-O data relocation input")?;
+        let current_section_indices = PatchSectionIndexLookup::new(&current_file);
+        let previous_section_indices = PatchSectionIndexLookup::new(&previous_file);
         let mut unmatched_target_stability =
             HashMap::<MachODataRelocationTargetStabilityKey, bool>::new();
 
         for patch_section in sections {
-            let Some(current_index) = patch_section_index(&current_file, &patch_section.current)?
+            let Some(current_index) =
+                current_section_indices.index(&current_file, &patch_section.current)?
             else {
                 return Ok(Err(format!(
                     "missing current Mach-O data patch section in {}",
@@ -14867,7 +15055,7 @@ fn validate_macho_data_relocations_are_stable(
                 .context("Missing current Mach-O data relocation section")?;
 
             let Some(previous_index) =
-                patch_section_index(&previous_file, &patch_section.previous)?
+                previous_section_indices.index(&previous_file, &patch_section.previous)?
             else {
                 return Ok(Err(format!(
                     "missing previous Mach-O data patch section in {}",
@@ -14877,25 +15065,24 @@ fn validate_macho_data_relocations_are_stable(
             let previous_section = previous_file
                 .section_by_index(previous_index)
                 .context("Missing previous Mach-O data relocation section")?;
-            let mut relocation_indices = Vec::new();
-            for (index, relocation) in relocations.iter().enumerate() {
-                let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
-                    continue;
-                };
-                if raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
-                    && !raw.r_pcrel
-                    && raw.r_length == 3
-                    && macho_relocation_record_matches_patch_section(
-                        input.path.as_str(),
-                        relocation,
-                        &patch_section.previous,
-                        normalize_rust_archive_patch_inputs,
-                    )?
-                {
-                    relocation_indices.push(index);
-                }
-            }
-            relocation_indices.sort_by_key(|index| relocations[*index].relocation_offset);
+            let relocation_indices = relocation_section_index
+                .indices(
+                    input.path.as_str(),
+                    &patch_section.previous,
+                    normalize_rust_archive_patch_inputs,
+                )?
+                .iter()
+                .copied()
+                .filter(|index| {
+                    decode_macho_aarch64_relocation_kind(relocations[*index].kind).is_some_and(
+                        |raw| {
+                            raw.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                                && !raw.r_pcrel
+                                && raw.r_length == 3
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
             // Newly activated sections are present in `matched_sections` before their
             // provisional relocation records are materialized. Only validate sections
             // with persisted relocation state; direct patch eligibility separately
@@ -25317,25 +25504,46 @@ fn x86_64_elf_got_relaxation_candidates<'data>(
     Ok(Some(candidates))
 }
 
+struct PatchSectionIndexLookup {
+    unique_by_name: HashMap<String, Option<object::SectionIndex>>,
+}
+
+impl PatchSectionIndexLookup {
+    fn new(file: &object::File<'_>) -> Self {
+        let mut unique_by_name = HashMap::new();
+        for section in file.sections() {
+            let Some(name) = patch_section_name_for_matching(&section) else {
+                continue;
+            };
+            match unique_by_name.entry(name) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(section.index()));
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+        Self { unique_by_name }
+    }
+
+    fn index(
+        &self,
+        file: &object::File<'_>,
+        patch_section: &PatchSection,
+    ) -> Result<Option<object::SectionIndex>> {
+        let Some(name) = patch_section.section_name.as_deref() else {
+            return patch_section_object_index(file, patch_section.section_index).map(Some);
+        };
+        Ok(self.unique_by_name.get(name).copied().flatten())
+    }
+}
+
 fn patch_section_index(
     file: &object::File<'_>,
     patch_section: &PatchSection,
 ) -> Result<Option<object::SectionIndex>> {
-    let Some(name) = patch_section.section_name.as_deref() else {
-        return patch_section_object_index(file, patch_section.section_index).map(Some);
-    };
-
-    let mut matches = file.sections().filter_map(|section| {
-        (patch_section_name_for_matching(&section).as_deref() == Some(name))
-            .then(|| section.index())
-    });
-    let Some(index) = matches.next() else {
-        return Ok(None);
-    };
-    if matches.next().is_some() {
-        return Ok(None);
-    }
-    Ok(Some(index))
+    PatchSectionIndexLookup::new(file).index(file, patch_section)
 }
 
 #[cfg(test)]
@@ -47263,6 +47471,7 @@ mod tests {
         relocation.applied_target_value = Some(previous_target_value);
         let previous_resolver = PatchInputResolver::new(&previous, false).unwrap();
         let current_resolver = PatchInputResolver::new(&current, false).unwrap();
+        let changed_definitions = HashSet::new();
         let mut resolutions = Vec::new();
         let mut target_patches = RelocationTargetPatches {
             input_ranges: Vec::new(),
@@ -47278,7 +47487,7 @@ mod tests {
             &mut resolutions,
             &[],
             &input,
-            &[],
+            Some(&changed_definitions),
             &matched,
             &previous_resolver,
             &current_resolver,
@@ -47321,7 +47530,7 @@ mod tests {
             &mut resolutions,
             &[],
             &input,
-            &[],
+            Some(&changed_definitions),
             &matched,
             &previous_resolver,
             &current_resolver,
@@ -47357,8 +47566,10 @@ mod tests {
         let (previous_output, text_range, written_value) =
             recorded_branch_output(0x1000, 0x1000, 0);
         let output_file = object::File::parse(previous_output.as_slice()).unwrap();
-        let retained_resolution =
-            retained_macho_output_definition_resolution(&output_file, b"_text").unwrap();
+        let retained_resolution = MachOOutputTextDefinitionLookup::new(&output_file)
+            .unwrap()
+            .resolution(b"_text")
+            .unwrap();
         let current_target_value = retained_resolution.direct_value.unwrap();
         let input = state("args", b"output", &[("changed.o", &previous)])
             .input_files
@@ -47412,6 +47623,7 @@ mod tests {
         relocation.applied_target_value = Some(0x1000);
         let previous_resolver = PatchInputResolver::new(&previous, false).unwrap();
         let current_resolver = PatchInputResolver::new(&current, false).unwrap();
+        let changed_definitions = HashSet::new();
         let mut resolutions = Vec::new();
         let mut target_patches = RelocationTargetPatches {
             input_ranges: Vec::new(),
@@ -47427,7 +47639,7 @@ mod tests {
             &mut resolutions,
             &[],
             &input,
-            &[],
+            Some(&changed_definitions),
             &matched,
             &previous_resolver,
             &current_resolver,
@@ -47467,12 +47679,15 @@ mod tests {
             macho_cross_input_target_moves: Vec::new(),
             changed_relocation_indices: Vec::new(),
         };
+        let changed_definition_paths = [changed_definition.path().to_owned()];
+        let changed_definitions =
+            changed_input_macho_definitions(&changed_definition_paths).unwrap();
         let result = macho_text_relocation_replays_for_input(
             std::slice::from_ref(&relocation),
             &mut resolutions,
             &[],
             &input,
-            &[changed_definition.path().to_owned()],
+            changed_definitions.as_ref(),
             &matched,
             &previous_resolver,
             &current_resolver,
@@ -47543,6 +47758,7 @@ mod tests {
         let resolution_lookup = MachOSymbolResolutionLookup::new(&resolutions);
         let recorded_branch_targets =
             RecordedMachOBranchTargetCandidates::new(std::slice::from_ref(&relocation));
+        let matched_current_sections = MatchedCurrentSectionLookup::new(&matched);
 
         let replay = rematerialized_macho_text_relocation_replay(
             std::slice::from_ref(&relocation),
@@ -47554,7 +47770,7 @@ mod tests {
             &matched[0],
             &current_file,
             &contexts[0],
-            &matched,
+            &matched_current_sections,
             &previous_output,
             &output_file,
         )
