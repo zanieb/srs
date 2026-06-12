@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -211,6 +212,7 @@ class BenchmarkArtifactCacheTest(unittest.TestCase):
             jobs=8,
             materialization="hardlink",
             run_directory=Path("/results/run"),
+            toolchain_bin=Path("/toolchain/bin"),
         )
         self.assertEqual(
             environment["CARGO_ENCODED_RUSTFLAGS"],
@@ -235,6 +237,9 @@ class BenchmarkArtifactCacheTest(unittest.TestCase):
         )
         self.assertNotIn("CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE", environment)
         self.assertNotIn("SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE", environment)
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0], "/toolchain/bin"
+        )
 
     def test_workload_file_contains_exact_commands(self) -> None:
         workloads = benchmark.load_workloads(

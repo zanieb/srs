@@ -100,6 +100,7 @@ SELECTED_ENVIRONMENT = (
     "CARGO_TARGET_DIR",
     "CARGO_TERM_COLOR",
     "CARGO_UNSTABLE_ARTIFACT_CACHE",
+    "PATH",
     "CARGO_BUILD_ARTIFACT_CACHE_DIR",
     "CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION",
     "CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE",
@@ -577,6 +578,7 @@ def benchmark_environment(
     jobs: int,
     materialization: str,
     run_directory: Path,
+    toolchain_bin: Path,
 ) -> dict[str, str]:
     environment = dict(base)
     for key in (
@@ -626,6 +628,9 @@ def benchmark_environment(
             "CARGO_INCREMENTAL": "0",
             "CARGO_TARGET_DIR": str(target),
             "CARGO_TERM_COLOR": "never",
+            "PATH": str(toolchain_bin)
+            + os.pathsep
+            + environment.get("PATH", os.defpath),
             "SRS_CARGO_ARTIFACT_CACHE_STATS": "1",
             "CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION": materialization,
             "SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION": materialization,
@@ -1352,6 +1357,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             jobs=args.jobs,
             materialization=args.materialization,
             run_directory=population_directory,
+            toolchain_bin=cargo.parent,
         )
         result = run_invocation(
             cargo=cargo,
@@ -1399,6 +1405,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     jobs=args.jobs,
                     materialization=args.materialization,
                     run_directory=run_directory,
+                    toolchain_bin=cargo.parent,
                 )
                 result = run_invocation(
                     cargo=cargo,
