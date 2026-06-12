@@ -551,9 +551,12 @@ ordinary-library rustc action can use the artifact cache when the final command,
 environment, dynamic-loader inputs, and complete `OUT_DIR` trees are modeled.
 Native-link directives and other unsupported final inputs remain ineligible.
 Cargo does not publish an action when rustc dep-info names a generated source
-under a build/output directory, so generated inputs are not treated as portable
-before their paths can be translated safely. This does not cache or restore the
-build-script execution itself.
+under a build/output directory. Dep-info currently cannot distinguish an
+`OUT_DIR` value used only to locate a remapped compiler input from a value
+embedded semantically in crate metadata or code, so path translation alone is
+not a safe portability contract. A future expansion needs an explicit contract,
+such as compiler path-only-use attestation or a stable virtual generated root.
+This does not cache or restore the build-script execution itself.
 Cache keys preserve source-location and a portable BLAKE3 content identity for
 modeled Cargo-selected compiler paths, installed sysroot compiler and target
 library files, cache-safe installed codegen backend contents, and
@@ -674,7 +677,8 @@ stderr after the build queue and begins with
 reasons, hits and misses, restored and published files and logical bytes,
 hardlinks, configured copies and cross-device copies, compiler identity and
 action-input hashing, per-phase restore validation, materialization,
-publication, graph-wide freshness preflight, rustc execution, and
+publication and mutually exclusive publication-skip reasons, graph-wide
+freshness preflight, rustc execution, and
 link-producing primary-package rustc actions. Dynamic-library externs and
 compiler wrappers have separate admission reasons. Build-script process
 execution, nonzero or `cargo::error` failure, and elapsed totals are reported

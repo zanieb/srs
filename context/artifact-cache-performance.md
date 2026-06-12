@@ -421,6 +421,32 @@ portable. Restored output increased from 610 files / 496.1 MB to 674 files /
 sets improved by 3.85s (7.4%); the stronger mechanical result is 32 fewer rustc
 executions with the command and script population unchanged.
 
+The eight skips were `assert_cmd`, `crunchy`, `mime_guess`, `oid_registry`, two
+`serde_core` variants, `target_lexicon`, and `uv_python`. The 85 entries stored
+again by each warm run were mostly their dependency cascade rather than 85
+independent roots: one `serde_core` variant reached 68 of them. A retained-graph
+projection puts an isolated fix for the eight roots at 365 hits and 197 rustc
+executions, versus the measured 337 and 225. Reaching the full eligible ceiling
+of 430 hits / 132 rustc executions also requires the overlapping proc-macro and
+native producer closures; those numbers are ceilings, not measured results.
+After adding typed publication-skip statistics, another empty-target rerun
+reported 93 attempts as 85 stores plus exactly eight `generated_build_input`
+skips; every other skip reason and the failure count were zero. Its 56.38s wall
+time was outside the preceding samples and is retained as an accounting check,
+not a performance result.
+
+Generated-input portability cannot be obtained by deleting the publication
+guard or rewriting dep-info alone. A controlled rustc probe made generated
+`file!()` output byte-identical across target paths with a build-directory
+remap, but adding `env!("OUT_DIR")` as semantic crate data made `.rmeta` and
+`.rlib` differ again. Current dep-info records both cases identically. A safe
+portable expansion therefore needs an explicit path-semantics contract. One
+option is a rustc attestation that the environment value was consumed only to
+locate a remapped compiler input; another is a stable virtual `OUT_DIR` whose
+filesystem resolution and semantic string value are both controlled. Until one
+of those contracts exists, the exact-path thin snapshot owns these generated
+actions.
+
 The first current-code target populated 37 of the new variants. Its Rust build
 completed and emitted the expected statistics, but an overly narrow measurement
 `PATH` broke the later Prettier invocation, so that failed end-to-end sample is
@@ -635,7 +661,9 @@ the script runs. Skipping the script or making the whole package Cargo-fresh
 still requires a capsule that binds the build-script executable, observed
 environment, parsed stdout directives, watched inputs, native search inputs,
 and the complete portable `OUT_DIR` tree. Generated dep-info paths must also be
-translated before those actions can be published portably.
+represented structurally, and current `env!("OUT_DIR")` tracking needs an
+explicit path-semantics contract such as rustc path-only-use attestation or a
+stable virtual generated root before those actions can be published portably.
 
 A thin snapshot should then be compared with the full profile snapshot. It
 should omit `.rlib`/`.rmeta` bytes supplied by the portable layers and contain
@@ -767,9 +795,11 @@ Implement in measured order:
 5. Add a composite identity for Clippy that covers the ordered wrapper chain,
    `clippy-driver`, rustc, and the sysroot.
 6. Keep finalized ordinary library actions from packages with build scripts in
-   the runtime cache after the script runs. Canonicalize generated dep-info
-   paths before publishing those remaining variants, and do not skip the script
-   until its full execution state has a verified portable capsule.
+   the runtime cache after the script runs. Keep generated-input variants in the
+   exact-path snapshot until a compiler attestation or stable virtual generated
+   root distinguishes a portable input locator from a runner-local semantic
+   `OUT_DIR` value, and do not skip the script until its full execution state
+   has a verified portable capsule.
 7. Keep verified pure-Build-library prewarming before Cargo scheduling,
    recompute current fingerprints rather than copying producer fingerprints,
    and add fine-grained target-lock support before broadening its scope.
@@ -793,7 +823,7 @@ build queue. It remains disabled by default and reports:
 - eligible dirty units, hits, misses, and key failures;
 - ineligible units by reason;
 - direct dynamic-extern and compiler-wrapper rejection counts;
-- publication success, rejection, and failure;
+- publication success, failure, and mutually exclusive skip reasons;
 - restored and published files/logical bytes;
 - accepted hardlink, configured-copy, and cross-device fallback counts;
 - compiler identity files/bytes, one-time wall/CPU time, and reuse count;

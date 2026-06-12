@@ -49,8 +49,13 @@ environment, dynamic-loader inputs, and complete `OUT_DIR` trees are modeled.
 Build-script directives that introduce native libraries, external search
 roots, linker arguments, unsafe loader behavior, or other unsupported inputs
 still make that action ineligible. If rustc dep-info names a generated source
-under a build/output directory, Cargo does not publish the action yet. This
-runtime admission never treats the build script itself as restored or fresh.
+under a build/output directory, Cargo does not publish the action. Rewriting
+that path is not sufficient: current dep-info cannot distinguish an `OUT_DIR`
+value used only to locate a remapped input from one embedded semantically in the
+crate. These generated actions remain in the exact-path snapshot layer until
+there is an explicit path-semantics contract, such as rustc path-only-use
+attestation or a stable virtual generated root. Runtime admission never treats
+the build script itself as restored or fresh.
 
 Restoration is skipped for inputs including:
 
@@ -272,7 +277,9 @@ compiler-identity and action-input hashing, publication, rustc execution, and
 link-producing primary-package rustc actions. Direct dynamic externs and
 compiler wrappers have distinct admission reasons. The `build_script` object
 reports executed build-script processes, nonzero or `cargo::error` failures,
-and cumulative process time;
+and cumulative process time. `publication.skipped_by_reason` classifies every
+nonfailure publication skip, including generated build inputs, input mutation,
+lock fallback, size limits, and already-stored entries;
 their rustc compilation remains in the `rustc` object. The `preflight` object
 reports attempted, already-fresh, dependency-blocked, finalized, and bypassed
 units plus elapsed time. `lookup.phase_elapsed_us` separates lock wait,
