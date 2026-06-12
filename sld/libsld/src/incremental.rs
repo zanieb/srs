@@ -20903,7 +20903,7 @@ fn added_macho_archive_text_activations(
             }
         }
     }
-    let seed_references = match added_macho_archive_seed_references(
+    let mut seed_references = match added_macho_archive_seed_references(
         input_file_path,
         matched_sections,
         current_resolver,
@@ -20912,16 +20912,20 @@ fn added_macho_archive_text_activations(
         Ok(references) => references,
         Err(reason) => return Ok(Err(reason)),
     };
+    for retiring_name in retiring_names {
+        let name = hex::decode(retiring_name.as_str())
+            .context("Malformed retiring Mach-O symbol resolution name")?;
+        if definitions.contains_key(&name) {
+            seed_references.push(name);
+        }
+    }
+    seed_references.sort_unstable();
+    seed_references.dedup();
     let selected_indices =
         selected_added_macho_archive_member_indices(&members, &definitions, seed_references);
     if selected_indices.is_empty() {
         return Ok(Err(
             "added Mach-O archive members are not referenced by changed text".to_owned(),
-        ));
-    }
-    if selected_indices.len() != members.len() {
-        return Ok(Err(
-            "could not prove all added Mach-O archive members are selected".to_owned(),
         ));
     }
     let output_file = object::File::parse(previous_output)
@@ -20933,28 +20937,13 @@ fn added_macho_archive_text_activations(
         .sum();
     let mut sections = Vec::with_capacity(section_count);
     let mut records = Vec::with_capacity(section_count);
-    let mut selected_definitions = selected_indices
+    let selected_definitions = selected_indices
         .iter()
         .flat_map(|&member_index| {
             (0..members[member_index].definitions.len())
                 .map(move |definition_index| (member_index, definition_index))
         })
         .collect::<Vec<_>>();
-    for (retiring_index, retiring_name) in retiring_names.iter().enumerate() {
-        let Some(matching_index) = selected_definitions
-            .iter()
-            .enumerate()
-            .skip(retiring_index)
-            .find_map(|(index, &(member_index, definition_index))| {
-                (hex::encode(&members[member_index].definitions[definition_index].name)
-                    == retiring_name.as_str())
-                .then_some(index)
-            })
-        else {
-            continue;
-        };
-        selected_definitions.swap(retiring_index, matching_index);
-    }
     let mut symbol_resolutions = Vec::with_capacity(selected_definitions.len());
     for &member_index in &selected_indices {
         let member = &members[member_index];
@@ -21027,10 +21016,25 @@ fn added_macho_archive_text_activations(
             });
         }
     }
-    if retiring_names.len() > symbol_resolutions.len() {
-        return Ok(Err(
-            "removed Mach-O symbols exceed selected new definitions".to_owned(),
-        ));
+    let (selected_definitions, recycling_retiring_names) =
+        ordered_macho_archive_definitions_for_recycling(
+            &members,
+            &selected_definitions,
+            retiring_names,
+        );
+    let symbol_resolutions_by_name = symbol_resolutions
+        .into_iter()
+        .map(|resolution| (resolution.name.clone(), resolution))
+        .collect::<HashMap<_, _>>();
+    let mut symbol_resolutions = Vec::with_capacity(selected_definitions.len());
+    for &(member_index, definition_index) in &selected_definitions {
+        let name = hex::encode(&members[member_index].definitions[definition_index].name);
+        let Some(resolution) = symbol_resolutions_by_name.get(name.as_str()) else {
+            return Ok(Err(
+                "added Mach-O archive definition has no matching resolution".to_owned(),
+            ));
+        };
+        symbol_resolutions.push(resolution.clone());
     }
     let migrated_names = match inherit_migrated_macho_symbol_resolution_metadata(
         resolutions,
@@ -21040,14 +21044,15 @@ fn added_macho_archive_text_activations(
         Ok(names) => names,
         Err(reason) => return Ok(Err(reason)),
     };
+    let recycling_count = recycling_retiring_names.len();
     let (mut symbol_table_patches, recycled_symbol_resolution_names) =
         match recycled_macho_symbol_table_patches(
             previous_output,
             &output_file,
             &members,
-            &selected_definitions[..retiring_names.len()],
-            &symbol_resolutions[..retiring_names.len()],
-            retiring_names,
+            &selected_definitions[..recycling_count],
+            &symbol_resolutions[..recycling_count],
+            &recycling_retiring_names,
             resolutions,
             &mut remaining_reserved_ranges,
         )? {
@@ -21058,8 +21063,8 @@ fn added_macho_archive_text_activations(
         previous_output,
         &output_file,
         &members,
-        &selected_definitions[retiring_names.len()..],
-        &symbol_resolutions[retiring_names.len()..],
+        &selected_definitions[recycling_count..],
+        &symbol_resolutions[recycling_count..],
         &mut remaining_reserved_ranges,
     )? {
         Ok(patches) => patches,
@@ -21157,8 +21162,8 @@ fn added_macho_archive_text_activations(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
-    let mut member_identities = Vec::with_capacity(selected_indices.len());
-    for &member_index in &selected_indices {
+    let mut member_identities = Vec::with_capacity(changed_unwind_member_start);
+    for member_index in 0..changed_unwind_member_start {
         let member = &members[member_index];
         let Some(input_bytes) = current_resolver.resolve(
             input_file_path,
@@ -25323,6 +25328,34 @@ fn selected_added_macho_archive_member_indices(
     let mut selected = selected.into_iter().collect::<Vec<_>>();
     selected.sort_unstable();
     selected
+}
+
+fn ordered_macho_archive_definitions_for_recycling(
+    members: &[AddedMachOArchiveTextMember],
+    selected_definitions: &[(usize, usize)],
+    retiring_names: &[SharedText],
+) -> (Vec<(usize, usize)>, Vec<SharedText>) {
+    let mut remaining = selected_definitions.to_vec();
+    let mut unmatched_retiring_names = Vec::new();
+    let mut ordered_definitions = Vec::with_capacity(remaining.len());
+    let mut ordered_retiring_names = Vec::with_capacity(retiring_names.len());
+    for retiring_name in retiring_names {
+        let Some(index) = remaining
+            .iter()
+            .position(|&(member_index, definition_index)| {
+                hex::encode(&members[member_index].definitions[definition_index].name)
+                    == retiring_name.as_str()
+            })
+        else {
+            unmatched_retiring_names.push(retiring_name.clone());
+            continue;
+        };
+        ordered_definitions.push(remaining.remove(index));
+        ordered_retiring_names.push(retiring_name.clone());
+    }
+    ordered_retiring_names.extend(unmatched_retiring_names.into_iter().take(remaining.len()));
+    ordered_definitions.extend(remaining);
+    (ordered_definitions, ordered_retiring_names)
 }
 
 fn added_macho_archive_text_relocation_replays(
@@ -46260,6 +46293,33 @@ mod tests {
             )
             .is_empty()
         );
+
+        let selected_definitions = vec![(0, 0), (0, 1), (1, 0), (2, 0), (3, 0)];
+        let retiring_names = vec![
+            SharedText::from(hex::encode("_missing")),
+            SharedText::from(hex::encode("_second")),
+            SharedText::from(hex::encode("_first")),
+        ];
+        let (ordered, ordered_retiring_names) = ordered_macho_archive_definitions_for_recycling(
+            &members,
+            &selected_definitions,
+            &retiring_names,
+        );
+        assert_eq!(ordered[..2], [(1, 0), (0, 0)]);
+        assert_eq!(
+            ordered_retiring_names,
+            [
+                retiring_names[1].clone(),
+                retiring_names[2].clone(),
+                retiring_names[0].clone(),
+            ]
+        );
+        assert_eq!(ordered.len(), selected_definitions.len());
+
+        let (ordered, ordered_retiring_names) =
+            ordered_macho_archive_definitions_for_recycling(&members, &[(0, 0)], &retiring_names);
+        assert_eq!(ordered, [(0, 0)]);
+        assert_eq!(ordered_retiring_names, [retiring_names[2].clone()]);
     }
 
     #[test]
