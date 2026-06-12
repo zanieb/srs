@@ -3,8 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::core::PackageId;
+use crate::core::compiler::artifact_cache_snapshot;
 use crate::core::compiler::artifact_cache_stats::ArtifactCacheStats;
 use crate::core::compiler::compilation::{self, UnitOutput};
 use crate::core::compiler::locking::LockManager;
@@ -95,6 +97,11 @@ pub struct BuildRunner<'a, 'gctx> {
     pub lock_manager: Arc<LockManager>,
     /// Optional per-invocation artifact cache instrumentation.
     pub artifact_cache_stats: Option<Arc<ArtifactCacheStats>>,
+    /// Opt-in ownership manifest for exact-path thin target snapshots.
+    pub(super) artifact_cache_snapshot: Option<Arc<artifact_cache_snapshot::Recorder>>,
+    /// A previously emitted ownership manifest to reconstruct before Cargo
+    /// calculates any target fingerprints.
+    artifact_cache_snapshot_restore: Option<PathBuf>,
     /// Cache actions already described and missed during the graph-wide
     /// freshness preflight. Dirty execution reuses them without hashing the
     /// same inputs a second time.
@@ -103,6 +110,21 @@ pub struct BuildRunner<'a, 'gctx> {
     /// consumes these so custom executors are still queried exactly once per
     /// unit.
     pub(super) preflight_force_rebuilds: HashMap<Unit, bool>,
+}
+
+struct ArtifactCacheStatsReportGuard<'a> {
+    stats: Option<Arc<ArtifactCacheStats>>,
+    gctx: &'a crate::util::GlobalContext,
+}
+
+impl Drop for ArtifactCacheStatsReportGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(stats) = &self.stats
+            && let Err(error) = stats.report(self.gctx)
+        {
+            debug!("failed to report artifact cache statistics: {error:#}");
+        }
+    }
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -133,6 +155,36 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             }
             stats
         });
+        let env_path = |key| {
+            bcx.gctx.get_env_os(key).map(|value| {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    path
+                } else {
+                    bcx.gctx.cwd().join(path)
+                }
+            })
+        };
+        let snapshot_manifest = env_path("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST");
+        let artifact_cache_snapshot_restore =
+            env_path("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST");
+        let artifact_cache_snapshot = if let Some(path) = snapshot_manifest {
+            let config = bcx.build_config.artifact_cache.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST requires the artifact cache"
+                )
+            })?;
+            Some(Arc::new(artifact_cache_snapshot::Recorder::new(
+                path,
+                bcx.ws.target_dir().into_path_unlocked(),
+                config.dir.clone(),
+            )?))
+        } else {
+            None
+        };
+        if artifact_cache_snapshot_restore.is_some() && bcx.build_config.artifact_cache.is_none() {
+            bail!("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST requires the artifact cache");
+        }
 
         Ok(Self {
             bcx,
@@ -153,6 +205,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),
             lock_manager: Arc::new(LockManager::new()),
             artifact_cache_stats,
+            artifact_cache_snapshot,
+            artifact_cache_snapshot_restore,
             preflight_artifact_cache_states: HashMap::new(),
             preflight_force_rebuilds: HashMap::new(),
         })
@@ -198,6 +252,44 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         self.lto = super::lto::generate(self.bcx)?;
         self.prepare_units()?;
         self.prepare()?;
+        if let Some(manifest) = &self.artifact_cache_snapshot_restore {
+            let config = self.bcx.build_config.artifact_cache.as_ref().unwrap();
+            let started = self.artifact_cache_stats.as_ref().map(|_| Instant::now());
+            let restore_result = artifact_cache_snapshot::restore(
+                manifest,
+                &self.bcx.ws.target_dir().into_path_unlocked(),
+                &config.dir,
+            );
+            if let Some(started) = started
+                && let Some(stats) = &self.artifact_cache_stats
+            {
+                stats.snapshot_restore_finished(
+                    restore_result
+                        .as_ref()
+                        .map(|summary| {
+                            (
+                                summary.copied_files,
+                                summary.copied_bytes,
+                                summary.existing_files,
+                                summary.existing_bytes,
+                            )
+                        })
+                        .map_err(|_| ()),
+                    started.elapsed(),
+                );
+            }
+            if let Err(error) = restore_result {
+                if let Some(stats) = &self.artifact_cache_stats
+                    && let Err(report_error) = stats.report(self.bcx.gctx)
+                {
+                    debug!("failed to report artifact cache statistics: {report_error:#}");
+                }
+                return Err(error);
+            }
+        }
+        if let Some(snapshot) = &self.artifact_cache_snapshot {
+            snapshot.invalidate_output()?;
+        }
         custom_build::build_map(&mut self)?;
         self.check_collisions()?;
         self.compute_metadata_for_doc_units();
@@ -226,13 +318,18 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        let execute_result = queue.execute(&mut self);
-        if let Some(stats) = &self.artifact_cache_stats
-            && let Err(error) = stats.report(self.bcx.gctx)
-        {
-            debug!("failed to report artifact cache statistics: {error:#}");
+        if let Err(error) = queue.execute(&mut self) {
+            if let Some(stats) = &self.artifact_cache_stats
+                && let Err(report_error) = stats.report(self.bcx.gctx)
+            {
+                debug!("failed to report artifact cache statistics: {report_error:#}");
+            }
+            return Err(error);
         }
-        execute_result?;
+        let _stats_report = ArtifactCacheStatsReportGuard {
+            stats: self.artifact_cache_stats.clone(),
+            gctx: self.bcx.gctx,
+        };
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
@@ -337,6 +434,22 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     .native_dirs
                     .insert(dir.clone().into_path_buf());
             }
+        }
+        if let Some(snapshot) = &self.artifact_cache_snapshot {
+            let started = self.artifact_cache_stats.as_ref().map(|_| Instant::now());
+            let write_result = snapshot.write();
+            if let Some(started) = started
+                && let Some(stats) = &self.artifact_cache_stats
+            {
+                stats.snapshot_manifest_finished(
+                    write_result
+                        .as_ref()
+                        .map(|summary| (summary.files, summary.logical_bytes))
+                        .map_err(|_| ()),
+                    started.elapsed(),
+                );
+            }
+            write_result?;
         }
         Ok(self.compilation)
     }

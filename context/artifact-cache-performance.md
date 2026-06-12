@@ -248,13 +248,43 @@ target compressed to 24 MB and the thin target to 15 MB. Results were:
 
 The portable cache restored all 25 eligible actions from the thin snapshot,
 but its new completion mtimes made retained proc macros and downstream
-fingerprints stale. A useful thin layer therefore needs a Cargo-produced
-reconstructible-output manifest plus an exact-path snapshot completion epoch or
-per-output ordering metadata. Restore must preserve the dependency ordering of
-retained state, or atomically recompute every affected retained fingerprint.
-Simply adding Check preflight does not make a thin archive Cargo-fresh.
+fingerprints stale. Simply adding Check preflight did not make that archive
+Cargo-fresh.
 
-The full root target shows why the composition remains worth designing. A
+The retained implementation instead emits a Cargo-produced ownership manifest
+after a successful population build. It records the exact target-relative file,
+verified cache entry and digest, mode, size, and nanosecond mtime for every
+cache-owned output. After extracting a thin archive at the same absolute target
+path, Cargo verifies the completed cache entries, copies the omitted files back,
+and restores their original metadata before parsing build-script state or
+calculating any fingerprint. This reconstructs the writer target's dependency
+ordering without copying producer fingerprints or mutating cache hardlinks.
+
+The same scoped Clippy graph was rerun three times per layer with an optimized
+Cargo. Both archives used PAX metadata and zstd level 3. The manifest certified
+29 outputs / 29.86 MB; emitting it used 35.8ms during the population run.
+
+| Layer | Compressed | Extract median | Cargo median | End-to-end median | Cargo-fresh | rustc / build scripts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Thin plus reconstructed cache outputs | 16.15 MB | 0.17s | 0.22s | 0.39s | 70 | 0 / 0 |
+| Full target snapshot | 25.24 MB | 0.20s | 0.16s | 0.35s | 70 | 0 / 0 |
+
+Thin end-to-end samples were 0.44s, 0.38s, and 0.39s. Full samples were
+0.35s, 0.40s, and 0.35s. Reconstruction copied the 29 files in 71-76ms. The
+thin layer was only 40ms slower at the local median while reducing compressed
+bytes by 36.0%; unlike the earlier 4.49s prototype, it made every unit fresh.
+The full archive remains a useful control and fallback, while the thin layer is
+now viable when transfer size matters.
+
+Archive metadata is part of the correctness protocol. A default tar archive
+that rounded retained files to whole-second mtimes reproduced partial
+invalidation: only 37 units stayed fresh and 25 rustc actions reran. PAX (or an
+equivalent format preserving nanosecond mtimes and modes) is required. Restore
+also requires the same artifact-cache policy used by the writer, because the
+completion-stamp output contract participates in Cargo freshness.
+
+The full root target shows why the composition remains worth measuring at that
+scale. A
 prototype omitted 764 cache-owned `.rlib`/`.rmeta` files / 597.1 MB logical and
 reduced a zstd-3 archive from 412.0 MB to 237.2 MB, or 42.4%. The retained
 target still contained about 440 MB of uncached library pairs, 413 MB of final
@@ -558,7 +588,9 @@ build queue. It remains disabled by default and reports:
   validation split into compiler-identity witness, loader inputs, and action
   inputs, and target-state write time;
 - rustc executions;
-- build-script process executions, failures, and time; and
+- build-script process executions, failures, and time;
+- exact-path snapshot manifest/reconstruction files, logical bytes, failures,
+  and time; and
 - link-producing primary-package rustc executions and full action time.
 
 Phase totals are cumulative worker time and may exceed wall time when jobs run

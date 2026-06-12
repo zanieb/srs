@@ -97,6 +97,40 @@ dependencies, SBOM output, fine-grained target locking, and SLD native
 incremental builds. Those cases continue to use the existing per-unit cache or
 normal compilation.
 
+## Exact-path thin target snapshots
+
+SRS Cargo can emit an ownership manifest for a successful artifact-cache
+population build by setting
+`SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST=/path/to/manifest.json`. The
+manifest lists only target outputs whose bytes still match a completed,
+verified cache entry. It records their target-relative paths, cache entry and
+file digests, Unix modes, and nanosecond mtimes. Snapshot tooling can omit
+exactly those files while retaining Cargo fingerprints, build-script state,
+proc macros, final links, and other nonportable target state.
+
+After extracting such a thin snapshot at its original absolute target path,
+set `SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` to the extracted
+manifest. Before Cargo parses build-script state or calculates any fingerprint,
+it verifies every referenced cache entry, copies each omitted output back, and
+restores its original mode and mtime. Copying is required: changing the mtime
+of a hardlink would mutate the shared cache entry. Reconstructing the original
+mtime ordering lets the retained target fingerprints remain authoritative
+instead of making proc macros and downstream outputs stale at the restore
+time.
+
+This is an exact-path workload layer, not a portable artifact identity. The
+archive key must bind the source revision, command/profile/features, SRS and
+cache schema, host and target, backend/linker, Cargo configuration, runner
+image, and exact workspace and target paths. A missing, corrupt, path-mismatched,
+or timestamp-incompatible entry makes explicit reconstruction fail before any
+compiler job starts; discard that target and fall back to a full snapshot or a
+clean build. Enable manifest collection during the population build. Version 1
+does not rediscover ownership from a later all-fresh invocation. The archive
+must preserve nanosecond mtimes and Unix modes (for example, PAX tar metadata);
+whole-second timestamp rounding invalidates retained downstream fingerprints.
+Keep the artifact-cache policy enabled during restore because its completion
+stamp participates in the target fingerprint contract.
+
 ## Compiler Identity
 
 Each cache key includes the BLAKE3 contents and relative paths of the sysroot
@@ -202,6 +236,9 @@ units plus elapsed time. `lookup.phase_elapsed_us` separates lock wait,
 control/source/entry validation, final compiler-identity/loader/action-input
 validation, and target-state writes. No record is produced and no phase clocks
 or extra file-size reads are performed by default.
+When thin snapshot collection or reconstruction is requested, the `snapshot`
+object separately reports manifest-owned files/logical bytes, reconstructed
+and already-present files/logical bytes, failures, and elapsed time.
 
 The timing fields are cumulative worker time in microseconds. They can exceed
 command wall time when jobs overlap. `units.cargo_fresh` describes Cargo's

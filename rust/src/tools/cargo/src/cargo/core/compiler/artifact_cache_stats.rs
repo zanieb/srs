@@ -202,6 +202,16 @@ pub struct ArtifactCacheStats {
     build_script_executions: AtomicU64,
     build_script_failures: AtomicU64,
     build_script_elapsed_us: AtomicU64,
+    snapshot_restore_files: AtomicU64,
+    snapshot_restore_bytes: AtomicU64,
+    snapshot_restore_existing_files: AtomicU64,
+    snapshot_restore_existing_bytes: AtomicU64,
+    snapshot_restore_failures: AtomicU64,
+    snapshot_restore_elapsed_us: AtomicU64,
+    snapshot_manifest_files: AtomicU64,
+    snapshot_manifest_bytes: AtomicU64,
+    snapshot_manifest_failures: AtomicU64,
+    snapshot_manifest_elapsed_us: AtomicU64,
     primary_link_rustc_executions: AtomicU64,
     primary_link_rustc_failures: AtomicU64,
     primary_link_rustc_elapsed_us: AtomicU64,
@@ -263,6 +273,16 @@ impl Default for ArtifactCacheStats {
             build_script_executions: AtomicU64::new(0),
             build_script_failures: AtomicU64::new(0),
             build_script_elapsed_us: AtomicU64::new(0),
+            snapshot_restore_files: AtomicU64::new(0),
+            snapshot_restore_bytes: AtomicU64::new(0),
+            snapshot_restore_existing_files: AtomicU64::new(0),
+            snapshot_restore_existing_bytes: AtomicU64::new(0),
+            snapshot_restore_failures: AtomicU64::new(0),
+            snapshot_restore_elapsed_us: AtomicU64::new(0),
+            snapshot_manifest_files: AtomicU64::new(0),
+            snapshot_manifest_bytes: AtomicU64::new(0),
+            snapshot_manifest_failures: AtomicU64::new(0),
+            snapshot_manifest_elapsed_us: AtomicU64::new(0),
             primary_link_rustc_executions: AtomicU64::new(0),
             primary_link_rustc_failures: AtomicU64::new(0),
             primary_link_rustc_elapsed_us: AtomicU64::new(0),
@@ -447,6 +467,34 @@ impl ArtifactCacheStats {
         }
     }
 
+    pub fn snapshot_restore_finished(
+        &self,
+        result: Result<(u64, u64, u64, u64), ()>,
+        elapsed: Duration,
+    ) {
+        Self::add(&self.snapshot_restore_elapsed_us, Self::micros(elapsed));
+        match result {
+            Ok((files, bytes, existing_files, existing_bytes)) => {
+                Self::add(&self.snapshot_restore_files, files);
+                Self::add(&self.snapshot_restore_bytes, bytes);
+                Self::add(&self.snapshot_restore_existing_files, existing_files);
+                Self::add(&self.snapshot_restore_existing_bytes, existing_bytes);
+            }
+            Err(()) => Self::add(&self.snapshot_restore_failures, 1),
+        }
+    }
+
+    pub fn snapshot_manifest_finished(&self, result: Result<(u64, u64), ()>, elapsed: Duration) {
+        Self::add(&self.snapshot_manifest_elapsed_us, Self::micros(elapsed));
+        match result {
+            Ok((files, bytes)) => {
+                Self::add(&self.snapshot_manifest_files, files);
+                Self::add(&self.snapshot_manifest_bytes, bytes);
+            }
+            Err(()) => Self::add(&self.snapshot_manifest_failures, 1),
+        }
+    }
+
     pub fn report(&self, gctx: &GlobalContext) -> CargoResult<()> {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let mut reasons = serde_json::Map::new();
@@ -540,6 +588,22 @@ impl ArtifactCacheStats {
                 "executions": load(&self.build_script_executions),
                 "failures": load(&self.build_script_failures),
                 "elapsed_us": load(&self.build_script_elapsed_us),
+            },
+            "snapshot": {
+                "restore": {
+                    "copied_files": load(&self.snapshot_restore_files),
+                    "copied_logical_bytes": load(&self.snapshot_restore_bytes),
+                    "existing_files": load(&self.snapshot_restore_existing_files),
+                    "existing_logical_bytes": load(&self.snapshot_restore_existing_bytes),
+                    "failures": load(&self.snapshot_restore_failures),
+                    "elapsed_us": load(&self.snapshot_restore_elapsed_us),
+                },
+                "manifest": {
+                    "files": load(&self.snapshot_manifest_files),
+                    "logical_bytes": load(&self.snapshot_manifest_bytes),
+                    "failures": load(&self.snapshot_manifest_failures),
+                    "elapsed_us": load(&self.snapshot_manifest_elapsed_us),
+                },
             },
             "primary_link_rustc": {
                 "executions": load(&self.primary_link_rustc_executions),

@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+mod artifact_cache_snapshot;
 mod artifact_cache_stats;
 mod build_config;
 pub(crate) mod build_context;
@@ -702,6 +703,7 @@ fn artifact_cache_freshness_preflight_restore(
         &output_root,
         unit.mode,
         build_runner.artifact_cache_stats.as_deref(),
+        build_runner.artifact_cache_snapshot.as_deref(),
     );
     if !cache_hit {
         build_runner
@@ -1136,6 +1138,7 @@ fn restore_artifact_cache_action(
     output_root: &Path,
     mode: CompileMode,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+    snapshot: Option<&artifact_cache_snapshot::Recorder>,
 ) -> bool {
     let restore_started = (action.is_some() && stats.is_some()).then(Instant::now);
     let mut restore_failed = false;
@@ -1160,6 +1163,7 @@ fn restore_artifact_cache_action(
             },
             action.config.max_size,
             stats,
+            snapshot,
         ) {
             Ok(cache_hit) => cache_hit,
             Err(error) => {
@@ -1288,6 +1292,7 @@ fn rustc(
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
     let artifact_cache_stats = build_runner.artifact_cache_stats.clone();
+    let artifact_cache_snapshot = build_runner.artifact_cache_snapshot.clone();
 
     let name = unit.pkg.name();
 
@@ -1495,6 +1500,7 @@ fn rustc(
                     &root,
                     mode,
                     artifact_cache_stats.as_deref(),
+                    artifact_cache_snapshot.as_deref(),
                 );
                 (action, hit)
             }
@@ -1673,6 +1679,7 @@ fn rustc(
                 &rustc,
                 action.config.max_size,
                 artifact_cache_stats.as_deref(),
+                artifact_cache_snapshot.as_deref(),
             );
             if let Some(started) = publication_started
                 && let Some(stats) = &artifact_cache_stats
@@ -3984,6 +3991,7 @@ fn restore_rlib_cache(
     materialization: ArtifactCacheMaterialization,
     max_size: Option<u64>,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+    snapshot: Option<&artifact_cache_snapshot::Recorder>,
 ) -> CargoResult<bool> {
     if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
@@ -4184,6 +4192,9 @@ fn restore_rlib_cache(
         if let Some(stats) = stats {
             stats.restored(restored_files, restored_bytes, &materialization_totals);
         }
+        if let Some(snapshot) = snapshot {
+            snapshot.record(&entry, outputs);
+        }
         drop(lock);
         cleanup_corrupt_rlib_cache_entries(cache_root, &corrupt_entries, outputs, max_size);
         return Ok(true);
@@ -4303,6 +4314,7 @@ fn store_rlib_cache(
     rustc: &ProcessBuilder,
     max_size: Option<u64>,
     stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+    snapshot: Option<&artifact_cache_snapshot::Recorder>,
 ) -> CargoResult<bool> {
     if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
         debug!("not storing artifact cache entry with generated build-directory inputs");
@@ -4490,6 +4502,9 @@ fn store_rlib_cache(
                 && artifact_cache_entry_size(&entry)
                     .is_ok_and(|size| rlib_cache_size_within_limit(size, max_size))
             {
+                if let Some(snapshot) = snapshot {
+                    snapshot.record(&entry, outputs);
+                }
                 paths::remove_dir_all(&staging)?;
                 return Ok(false);
             }
@@ -4515,6 +4530,9 @@ fn store_rlib_cache(
         }
         if let Some(stats) = stats {
             stats.published(entry_files, entry_size);
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.record(&entry, outputs);
         }
         Ok(true)
     })();

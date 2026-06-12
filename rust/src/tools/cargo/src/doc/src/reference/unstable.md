@@ -656,8 +656,36 @@ link-producing primary-package rustc actions. Dynamic-library externs and
 compiler wrappers have separate admission reasons. Build-script process
 execution, nonzero or `cargo::error` failure, and elapsed totals are reported
 separately from the rustc work that compiles build-script executables.
+The `snapshot` object reports exact-path manifest files/logical bytes and
+reconstructed or already-present files/logical bytes, failures, and elapsed
+time when the thin target layer is requested.
 The latter includes frontend and code generation and is not linker-only time.
 The feature is disabled by default.
+
+SRS builds can also describe artifact-cache-owned target outputs for an
+exact-path thin target snapshot. Set
+`SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST=/path/to/manifest.json` during the
+population build. Cargo writes the manifest atomically only after the command
+succeeds. Snapshot tooling may omit only the listed files. After extracting the
+remaining target state at the same absolute target path, set
+`SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST` to that manifest. Cargo
+verifies the completed cache entries and file digests, copies the omitted files
+back, and restores their recorded modes and nanosecond mtimes before parsing
+build-script state or calculating fingerprints. Reconstruction deliberately
+copies rather than hardlinks so restoring a target mtime cannot mutate the
+shared cache.
+
+The thin manifest is not portable target state. Its enclosing archive key must
+bind the exact workspace/target path and workload domain in addition to the
+source, toolchain, host/target, backend, linker, profile, features, and Cargo
+configuration. Missing, corrupt, path-mismatched, or unrepresentable entries
+make explicit restoration fail before compiler work begins. Version 1 must be
+collected during the population build; an all-fresh later invocation does not
+rediscover prior ownership. The archive must preserve nanosecond mtimes and
+file modes, such as through PAX tar metadata; whole-second timestamp rounding
+invalidates retained dependents. Restore with the same artifact-cache policy as
+the writer because its completion stamp participates in the fingerprint output
+contract.
 
 Elapsed values are cumulative worker microseconds and can exceed command wall
 time under parallel execution. Cargo-fresh units are scheduling decisions;

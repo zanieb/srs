@@ -290,6 +290,229 @@ fn artifact_cache_stats_are_disabled_by_default() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.0.1"
+            edition = "2024"
+
+            [dependencies]
+            dependency = { path = "dependency" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { assert_eq!(dependency::value(), 42); }\n",
+        )
+        .file(
+            "dependency/Cargo.toml",
+            r#"
+            [package]
+            name = "dependency"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file("dependency/src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .build();
+    let target = project.root().join("snapshot-target");
+    let manifest_path = target.join("srs-artifact-cache-snapshot.json");
+
+    let populated = project
+        .cargo("-Zartifact-cache build --bin foo")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST", &manifest_path)
+        .run();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["target_root"], target.to_string_lossy().as_ref());
+    let records = manifest["records"].as_array().unwrap();
+    assert!(!records.is_empty());
+    let populated = artifact_cache_stats(&populated);
+    assert_eq!(
+        artifact_cache_stat(&populated, &["snapshot", "manifest", "files"]),
+        records.len() as u64
+    );
+    assert!(artifact_cache_stat(&populated, &["snapshot", "manifest", "logical_bytes"]) > 0);
+
+    let mut expected = Vec::new();
+    for record in records {
+        let target_output = target.join(record["target_path"].as_str().unwrap());
+        let cache_output = cache
+            .join(record["cache_entry"].as_str().unwrap())
+            .join("files")
+            .join(record["cache_filename"].as_str().unwrap());
+        let target_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&target_output).unwrap());
+        let cache_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&cache_output).unwrap());
+        let contents = fs::read(&target_output).unwrap();
+        assert_eq!(contents, fs::read(&cache_output).unwrap());
+        expected.push((
+            target_output.clone(),
+            cache_output,
+            contents,
+            target_mtime,
+            cache_mtime,
+        ));
+        fs::remove_file(target_output).unwrap();
+    }
+
+    let restored = project
+        .cargo("-Zartifact-cache build --bin foo")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+        .env(
+            "SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST",
+            &manifest_path,
+        )
+        .run();
+    let stats = artifact_cache_stats(&restored);
+    assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 2);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]),
+        records.len() as u64
+    );
+    assert!(artifact_cache_stat(&stats, &["snapshot", "restore", "copied_logical_bytes"]) > 0);
+
+    for (target_output, cache_output, contents, target_mtime, cache_mtime) in expected {
+        assert_eq!(fs::read(&target_output).unwrap(), contents);
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&target_output).unwrap()),
+            target_mtime
+        );
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&fs::metadata(cache_output).unwrap()),
+            cache_mtime
+        );
+    }
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn exact_path_snapshot_manifest_rejects_corrupt_cache_before_build() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("snapshot-target");
+    let manifest_path = target.join("srs-artifact-cache-snapshot.json");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST", &manifest_path)
+        .run();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let record = &manifest["records"].as_array().unwrap()[0];
+    let target_output = target.join(record["target_path"].as_str().unwrap());
+    let cache_output = cache
+        .join(record["cache_entry"].as_str().unwrap())
+        .join("files")
+        .join(record["cache_filename"].as_str().unwrap());
+    fs::remove_file(target_output).unwrap();
+    fs::write(cache_output, b"corrupt").unwrap();
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_RESTORE_MANIFEST",
+            &manifest_path,
+        )
+        .with_status(101)
+        .with_stderr_contains("[ERROR] artifact cache snapshot references corrupt cache file [..]")
+        .run();
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn failed_population_removes_an_old_snapshot_manifest() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("snapshot-target");
+    let manifest_path = target.join("srs-artifact-cache-snapshot.json");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST", &manifest_path)
+        .run();
+    assert!(manifest_path.is_file());
+
+    fs::write(project.root().join("src/lib.rs"), "this is not rust").unwrap();
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SRS_CARGO_ARTIFACT_CACHE_SNAPSHOT_MANIFEST", &manifest_path)
+        .with_status(101)
+        .with_stderr_contains("[ERROR] expected one of [..]")
+        .run();
+    assert!(!manifest_path.exists());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn artifact_cache_stats_report_build_script_processes() {
     let cache = paths::root().join("shared-cache");
     let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
