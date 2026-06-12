@@ -136,6 +136,12 @@ impl IneligibleReason {
 pub struct ArtifactCacheStats {
     cache_configured: AtomicBool,
     cargo_fresh: AtomicU64,
+    preflight_attempted: AtomicU64,
+    preflight_already_fresh: AtomicU64,
+    preflight_blocked_by_dependency: AtomicU64,
+    preflight_finalized: AtomicU64,
+    preflight_bypassed: AtomicU64,
+    preflight_elapsed_us: AtomicU64,
     eligible: AtomicU64,
     ineligible: [AtomicU64; INELIGIBLE_REASON_COUNT],
     hits: AtomicU64,
@@ -188,6 +194,12 @@ impl Default for ArtifactCacheStats {
         Self {
             cache_configured: AtomicBool::new(false),
             cargo_fresh: AtomicU64::new(0),
+            preflight_attempted: AtomicU64::new(0),
+            preflight_already_fresh: AtomicU64::new(0),
+            preflight_blocked_by_dependency: AtomicU64::new(0),
+            preflight_finalized: AtomicU64::new(0),
+            preflight_bypassed: AtomicU64::new(0),
+            preflight_elapsed_us: AtomicU64::new(0),
             eligible: AtomicU64::new(0),
             ineligible: std::array::from_fn(|_| AtomicU64::new(0)),
             hits: AtomicU64::new(0),
@@ -252,6 +264,30 @@ impl ArtifactCacheStats {
 
     pub fn cargo_fresh(&self) {
         Self::add(&self.cargo_fresh, 1);
+    }
+
+    pub fn preflight_attempted(&self) {
+        Self::add(&self.preflight_attempted, 1);
+    }
+
+    pub fn preflight_already_fresh(&self) {
+        Self::add(&self.preflight_already_fresh, 1);
+    }
+
+    pub fn preflight_blocked_by_dependency(&self) {
+        Self::add(&self.preflight_blocked_by_dependency, 1);
+    }
+
+    pub fn preflight_finalized(&self) {
+        Self::add(&self.preflight_finalized, 1);
+    }
+
+    pub fn preflight_bypassed(&self) {
+        Self::add(&self.preflight_bypassed, 1);
+    }
+
+    pub fn preflight_finished(&self, elapsed: Duration) {
+        Self::add(&self.preflight_elapsed_us, Self::micros(elapsed));
     }
 
     pub fn ineligible(&self, reason: IneligibleReason) {
@@ -406,6 +442,14 @@ impl ArtifactCacheStats {
                 "eligible": load(&self.eligible),
                 "ineligible": ineligible,
                 "ineligible_by_reason": reasons,
+            },
+            "preflight": {
+                "attempted": load(&self.preflight_attempted),
+                "already_fresh": load(&self.preflight_already_fresh),
+                "blocked_by_dependency": load(&self.preflight_blocked_by_dependency),
+                "finalized": load(&self.preflight_finalized),
+                "bypassed": load(&self.preflight_bypassed),
+                "elapsed_us": load(&self.preflight_elapsed_us),
             },
             "lookup": {
                 "hits": load(&self.hits),

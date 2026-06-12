@@ -346,6 +346,12 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(artifact_cache_stat(&cold, &["publication", "skipped"]), 0);
     assert_eq!(artifact_cache_stat(&cold, &["publication", "failures"]), 0);
     assert_eq!(artifact_cache_stat(&cold, &["rustc", "executions"]), 2);
+    assert_eq!(artifact_cache_stat(&cold, &["preflight", "attempted"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&cold, &["preflight", "blocked_by_dependency"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&cold, &["preflight", "finalized"]), 0);
     assert_eq!(
         artifact_cache_stat(&cold, &["hashing", "compiler_identity", "computations"]),
         1
@@ -367,6 +373,9 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     assert_eq!(eligible, hits + misses);
     assert_eq!(hits, 2);
     assert_eq!(misses, 0);
+    assert_eq!(artifact_cache_stat(&warm, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&warm, &["preflight", "attempted"]), 2);
+    assert_eq!(artifact_cache_stat(&warm, &["preflight", "finalized"]), 2);
     assert_eq!(artifact_cache_stat(&warm, &["publication", "attempts"]), 0);
     assert_eq!(artifact_cache_stat(&warm, &["rustc", "executions"]), 0);
     let restore_phases = &warm["lookup"]["phase_elapsed_us"];
@@ -401,10 +410,273 @@ fn artifact_cache_stats_report_cold_warm_and_cargo_fresh_units() {
     let fresh = artifact_cache_stats(&build_in_target_with_stats(&project, &consumer_target));
     assert_eq!(fresh["configured"].as_bool(), Some(true));
     assert_eq!(artifact_cache_stat(&fresh, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&fresh, &["preflight", "attempted"]), 0);
+    assert_eq!(
+        artifact_cache_stat(&fresh, &["preflight", "already_fresh"]),
+        2
+    );
     assert_eq!(artifact_cache_stat(&fresh, &["units", "eligible"]), 0);
     assert_eq!(artifact_cache_stat(&fresh, &["lookup", "hits"]), 0);
     assert_eq!(artifact_cache_stat(&fresh, &["lookup", "misses"]), 0);
     assert_eq!(artifact_cache_stat(&fresh, &["rustc", "executions"]), 0);
+
+    let project_entry = cached_rlibs(&cache)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("libproject-"))
+        })
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::remove_dir_all(project_entry).unwrap();
+    let partial_target = project.root().join("partial-target");
+    let partial = artifact_cache_stats(&build_in_target_with_stats(&project, &partial_target));
+    assert_eq!(artifact_cache_stat(&partial, &["units", "eligible"]), 2);
+    assert_eq!(artifact_cache_stat(&partial, &["lookup", "hits"]), 1);
+    assert_eq!(artifact_cache_stat(&partial, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&partial, &["units", "cargo_fresh"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&partial, &["preflight", "attempted"]),
+        2
+    );
+    assert_eq!(
+        artifact_cache_stat(&partial, &["preflight", "finalized"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&partial, &["rustc", "executions"]), 1);
+    assert_eq!(artifact_cache_stat(&partial, &["publication", "stored"]), 1);
+
+    project.change_file("dependency/src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    let changed = artifact_cache_stats(&build_in_target_with_stats(&project, &partial_target));
+    assert_eq!(artifact_cache_stat(&changed, &["units", "eligible"]), 2);
+    assert_eq!(artifact_cache_stat(&changed, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&changed, &["lookup", "misses"]), 2);
+    assert_eq!(
+        artifact_cache_stat(&changed, &["preflight", "attempted"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&changed, &["preflight", "blocked_by_dependency"]),
+        1
+    );
+    assert_eq!(artifact_cache_stat(&changed, &["rustc", "executions"]), 2);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn interrupted_preflight_does_not_commit_cargo_freshness() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    build_in_target(&project, &producer_target);
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_PREFLIGHT_FAILURE_AFTER_FINGERPRINT_JSON",
+            "1",
+        )
+        .with_status(101)
+        .with_stderr_contains(
+            "[ERROR] test-only artifact cache preflight failure after fingerprint JSON",
+        )
+        .with_stderr_does_not_contain("[COMPILING]")
+        .run();
+
+    fs::remove_dir_all(&cache).unwrap();
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/project/foo)")
+        .run();
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn forced_rebuild_bypasses_preflight_and_runtime_cache_restore() {
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "project"
+            version = "0.0.1"
+            edition = "2024"
+
+            [dependencies]
+            dependency = { path = "dependency" }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn value() -> u32 { dependency::value() }\n",
+        )
+        .file(
+            "dependency/Cargo.toml",
+            r#"
+            [package]
+            name = "dependency"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file("dependency/src/lib.rs", "pub fn value() -> u32 { 42 }\n")
+        .build();
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    build_in_target(&project, &producer_target);
+    let forced = artifact_cache_stats(
+        &project
+            .cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(&consumer_target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+            .env("__CARGO_TEST_ARTIFACT_CACHE_FORCE_REBUILD", "1")
+            .run(),
+    );
+    assert_eq!(artifact_cache_stat(&forced, &["preflight", "bypassed"]), 2);
+    assert_eq!(artifact_cache_stat(&forced, &["preflight", "finalized"]), 0);
+    assert_eq!(artifact_cache_stat(&forced, &["units", "eligible"]), 0);
+    assert_eq!(artifact_cache_stat(&forced, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&forced, &["lookup", "misses"]), 0);
+    assert_eq!(artifact_cache_stat(&forced, &["rustc", "executions"]), 2);
+
+    let fresh = artifact_cache_stats(&build_in_target_with_stats(&project, &consumer_target));
+    assert_eq!(artifact_cache_stat(&fresh, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&fresh, &["rustc", "executions"]), 0);
+
+    let check_producer_target = project.root().join("check-producer-target");
+    let check_consumer_target = project.root().join("check-consumer-target");
+    let check_cold = artifact_cache_stats(&check_in_target_with_stats(
+        &project,
+        &check_producer_target,
+    ));
+    assert_eq!(
+        artifact_cache_stat(&check_cold, &["publication", "stored"]),
+        2
+    );
+    let forced_check = artifact_cache_stats(
+        &project
+            .cargo("-Zartifact-cache check --lib")
+            .arg("--target-dir")
+            .arg(&check_consumer_target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+            .env("__CARGO_TEST_ARTIFACT_CACHE_FORCE_REBUILD", "1")
+            .run(),
+    );
+    assert_eq!(
+        artifact_cache_stat(&forced_check, &["units", "eligible"]),
+        0
+    );
+    assert_eq!(artifact_cache_stat(&forced_check, &["lookup", "hits"]), 0);
+    assert_eq!(artifact_cache_stat(&forced_check, &["lookup", "misses"]), 0);
+    assert_eq!(
+        artifact_cache_stat(&forced_check, &["rustc", "executions"]),
+        2
+    );
+
+    let fresh_check = artifact_cache_stats(&check_in_target_with_stats(
+        &project,
+        &check_consumer_target,
+    ));
+    assert_eq!(
+        artifact_cache_stat(&fresh_check, &["units", "cargo_fresh"]),
+        2
+    );
+    assert_eq!(
+        artifact_cache_stat(&fresh_check, &["rustc", "executions"]),
+        0
+    );
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn runtime_command_change_discards_preflight_cache_action() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let changed_target = project.root().join("changed-target");
+    let final_target = project.root().join("final-target");
+
+    build_in_target(&project, &producer_target);
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    let changed = artifact_cache_stats(
+        &project
+            .cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(&changed_target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env("SRS_CARGO_ARTIFACT_CACHE_STATS", "1")
+            .env("__CARGO_TEST_ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION", "1")
+            .run(),
+    );
+    assert_eq!(artifact_cache_stat(&changed, &["lookup", "misses"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["preflight", "bypassed"]), 1);
+    assert_eq!(artifact_cache_stat(&changed, &["rustc", "executions"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&changed, &["publication", "attempts"]),
+        0
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+
+    let final_build = artifact_cache_stats(&build_in_target_with_stats(&project, &final_target));
+    assert_eq!(artifact_cache_stat(&final_build, &["lookup", "misses"]), 1);
+    assert_eq!(
+        artifact_cache_stat(&final_build, &["rustc", "executions"]),
+        1
+    );
+    assert_eq!(
+        artifact_cache_stat(&final_build, &["publication", "stored"]),
+        1
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 2);
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]

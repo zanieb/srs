@@ -72,6 +72,31 @@ Source-input publication assumes ordinary filesystem writes update modification
 times. Mutating a source while Cargo is compiling it and deliberately preserving
 an older modification time is outside the cache model.
 
+## Portable Cargo Freshness
+
+Before ordinary scheduling, Cargo walks reachable fingerprint dependencies in
+postorder and tries to restore eligible pure Build-library closures. A unit can
+be finalized only when every fingerprint dependency is already fresh in the
+current target or was successfully finalized earlier in the same preflight.
+The producer's Cargo fingerprint is never copied or trusted. Cargo verifies the
+shared action and source inputs, restores outputs and dep-info, calculates the
+fingerprint from the current consumer graph and filesystem state, writes the
+detailed fingerprint, and writes the short fingerprint hash last as the commit
+marker. Normal scheduling then reads that consumer-local state and treats a
+successfully finalized unit as Cargo-fresh.
+
+A cache miss, corrupt entry, missing generated input, incomplete dependency
+closure, mutation during restore, or failure before the final short-hash write
+leaves the unit dirty and falls back to the ordinary rustc path. Cold misses
+reuse the already-described cache action during dirty execution but are
+revalidated before publication, and a command/environment digest rejects reuse
+if runtime command preparation diverges from preflight. Executor-forced units
+bypass both preflight and runtime restoration. The preflight currently excludes
+metadata-only Check actions, packages with build scripts, proc macros, artifact
+dependencies, SBOM output, fine-grained target locking, and SLD native
+incremental builds. Those cases continue to use the existing per-unit cache or
+normal compilation.
+
 ## Compiler Identity
 
 Each cache key includes the BLAKE3 contents and relative paths of the sysroot
@@ -159,7 +184,9 @@ stderr after Cargo's build queue finishes. The record begins with
 `srs-artifact-cache-stats=` and reports Cargo-fresh units, cache admission by
 reason, hits and misses, restored and published bytes, materialization mode,
 compiler-identity and action-input hashing, publication, rustc execution, and
-link-producing primary-package rustc actions. `lookup.phase_elapsed_us`
+link-producing primary-package rustc actions. The `preflight` object reports
+attempted, already-fresh, dependency-blocked, finalized, and bypassed units plus
+elapsed time. `lookup.phase_elapsed_us`
 separates lock wait, control/source/entry/final validation, and target-state
 writes. No record is produced and no phase clocks or extra file-size reads are
 performed by default.

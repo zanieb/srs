@@ -575,6 +575,20 @@ ordinary filesystem writes update modification times; mutating a source during
 compilation while deliberately preserving an older modification time is outside
 the cache model.
 
+Before ordinary scheduling, Cargo tries to make reachable pure Build-library
+dependency closures fresh from verified cache entries. Dependencies are
+processed before their consumers, and a unit is finalized only when each
+fingerprint dependency is already fresh or was restored in the same preflight.
+Cargo does not copy the producer's fingerprint. It restores the verified
+outputs and dep-info, calculates a fingerprint from the current consumer graph
+and filesystem state, and writes the short fingerprint hash last as the
+freshness commit marker. A miss, incomplete closure, failed validation, or
+interrupted commit falls back to normal dirty scheduling. This preflight does
+not satisfy executor-forced rebuilds, and cold misses are reused during dirty
+execution only when the final command and environment still match the prepared
+action. It does not yet cover metadata-only Check actions, packages with build
+scripts, fine-grained target locking, or SLD native incremental builds.
+
 Enable it with `-Zartifact-cache` and configure the shared directory:
 
 ```toml
@@ -633,7 +647,8 @@ stderr after the build queue and begins with
 reasons, hits and misses, restored and published files and logical bytes,
 hardlinks, configured copies and cross-device copies, compiler identity and
 action-input hashing, per-phase restore validation, materialization,
-publication, rustc execution, and link-producing primary-package rustc actions.
+publication, graph-wide freshness preflight, rustc execution, and
+link-producing primary-package rustc actions.
 The latter includes frontend and code generation and is not linker-only time.
 The feature is disabled by default.
 

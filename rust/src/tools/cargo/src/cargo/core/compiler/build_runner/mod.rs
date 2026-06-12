@@ -8,7 +8,7 @@ use crate::core::PackageId;
 use crate::core::compiler::artifact_cache_stats::ArtifactCacheStats;
 use crate::core::compiler::compilation::{self, UnitOutput};
 use crate::core::compiler::locking::LockManager;
-use crate::core::compiler::{self, Unit, UserIntent, artifact};
+use crate::core::compiler::{self, PreflightArtifactCacheState, Unit, UserIntent, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use anyhow::{Context as _, bail};
@@ -95,6 +95,14 @@ pub struct BuildRunner<'a, 'gctx> {
     pub lock_manager: Arc<LockManager>,
     /// Optional per-invocation artifact cache instrumentation.
     pub artifact_cache_stats: Option<Arc<ArtifactCacheStats>>,
+    /// Cache actions already described and missed during the graph-wide
+    /// freshness preflight. Dirty execution reuses them without hashing the
+    /// same inputs a second time.
+    pub(super) preflight_artifact_cache_states: HashMap<Unit, PreflightArtifactCacheState>,
+    /// Forced-rebuild decisions queried during freshness preflight. Scheduling
+    /// consumes these so custom executors are still queried exactly once per
+    /// unit.
+    pub(super) preflight_force_rebuilds: HashMap<Unit, bool>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -145,6 +153,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),
             lock_manager: Arc::new(LockManager::new()),
             artifact_cache_stats,
+            preflight_artifact_cache_states: HashMap::new(),
+            preflight_force_rebuilds: HashMap::new(),
         })
     }
 
@@ -191,6 +201,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         custom_build::build_map(&mut self)?;
         self.check_collisions()?;
         self.compute_metadata_for_doc_units();
+
+        super::artifact_cache_freshness_preflight(&mut self, exec)?;
 
         // We need to make sure that if there were any previous docs already compiled,
         // they were compiled with the same Rustc version that we're currently using.

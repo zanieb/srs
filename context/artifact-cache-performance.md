@@ -120,6 +120,68 @@ time for Clippy, compared with 138ms for plain Check, and is the next replay
 overhead to remove or share. The cold population tax remains visible, so a
 designated writer should populate shared entries rather than every reader.
 
+### Portable Cargo-fresh preflight
+
+The next iteration restores cacheable Build-library dependency closures before
+Cargo's ordinary fingerprint walk. It never copies a producer fingerprint.
+Instead, it verifies the current action and source inputs, materializes the
+artifact and dep-info, calculates a fingerprint from the consumer's current
+unit graph and filesystem state, and writes the short fingerprint hash last as
+the freshness commit marker. A dependency must already be Cargo-fresh or have
+completed the same protocol earlier in the preflight. Any miss, incomplete
+input closure, failed validation, or interrupted commit falls back to normal
+dirty scheduling.
+
+The first implementation deliberately covers only ordinary pure Build-library
+units. It excludes packages with build scripts, proc macros, artifact
+dependencies, SBOM outputs, SLD native incremental work, and fine-grained
+target locking. Check artifacts remain cacheable per unit but do not yet enter
+the graph-wide freshness protocol.
+
+The following controlled reruns used the reviewed optimized Cargo, exact
+current-code cache-disabled controls, LLVM codegen, empty target directories,
+and the same pinned `uv-normalize` graph.
+
+| Command and state | Wall | Hits / eligible | Preflight finalized | Cargo-fresh | rustc executions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Build, cache disabled, median of 3 | 4.81s | 0 / 0 | 0 | 0 | 26 |
+| Build, cold cache | 5.08s | 0 / 9 | 0 | 0 | 26 |
+| Build, warm cache, median of 3 | 3.07s | 7 / 9 | 4 | 4 | 19 |
+| Test/no-run, cache disabled, midpoint of 2 | 4.92s | 0 / 0 | 0 | 0 | 26 |
+| Test/no-run, warm cache, midpoint of 2 | 3.15s | 7 / 8 | 4 | 4 | 19 |
+| Clippy, cache disabled | 6.37s | 0 / 0 | 0 | 0 | 70 |
+| Clippy, cold cache | 8.42s | 0 / 25 | 0 | 0 | 70 |
+| Clippy, warm cache, midpoint of 2 | 5.30s | 25 / 25 | 1 | 1 | 45 |
+
+The warm Build preflight finalized four dependency libraries and removed them
+from Cargo's dirty queue, improving the exact disabled median by 1.74s and the
+earlier per-unit replay result by 0.78s. Test/no-run improved its disabled
+midpoint by 1.77s. Clippy improved its single disabled control by 1.07s, but
+only one pure Build library became Cargo-fresh; 24 metadata-only Check hits
+still ran through dirty replay and spent 2.91-2.97s of cumulative worker time
+in final validation. Build preflight took 227-250ms and Clippy preflight took
+399-411ms. This makes extending safe graph-wide freshness to Check actions a
+measured next step rather than an assumed optimization.
+
+The reviewed implementation was also rerun on the full root command. Every row
+used an empty target; the cold row had no matching entries and the warm row
+reused the entries it published.
+
+| State | Wall samples | Hits / eligible | Preflight finalized | Cargo-fresh | rustc executions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cache disabled | 56.04s | 0 / 0 | 0 | 0 | 562 |
+| Cold artifact cache | 59.67s | 0 / 382 | 0 | 0 | 562 |
+| Warm artifact cache | 54.40s | 297 / 382 | 179 | 179 | 265 |
+
+The warm run was 1.64s faster than the exact disabled control. It restored 594
+files / 341.7 MB, made 179 units Cargo-fresh, and avoided 297 rustc executions.
+Preflight took 2.07s wall after limiting fingerprint work to reachable
+candidates, while the two remaining primary link actions consumed 6.56s
+cumulatively. A single local pair is directional evidence, not a stable
+aggregate-speed claim. The remaining 85 eligible misses and 180 ineligible
+actions also show why a build-script/nonportable-state layer or thin workload
+snapshot is still needed.
+
 ### Full uv root build
 
 The representative command was:
@@ -272,13 +334,12 @@ which each layer owns a different portability boundary:
 | SLD state | Exact linked action and root output | Private linker state paired with the root binary | Full relink |
 | Release compiler identity | Verified SRS installer | Preverified relative content digest plus extraction witness | Hash the installed toolchain |
 
-Portable freshness must run as a graph-wide preflight before the first normal
+Portable freshness now runs as a graph-wide preflight before the first normal
 fingerprint calculation. Restoring a unit after Cargo has recursively memoized
-dependent fingerprints is too late. The implementation therefore needs to
-factor a side-effect-free cache action description out of `rustc()`, walk the
-unit graph in dependency order, and admit a unit only when every fingerprint
-dependency is already Cargo-fresh or has been successfully restored in the
-same preflight closure.
+dependent fingerprints is too late. The implementation factors the shared
+cache action description out of `rustc()`, walks the unit graph in dependency
+order, and admits a unit only when every fingerprint dependency is already
+Cargo-fresh or has been successfully restored in the same preflight closure.
 
 For each admitted unit the preflight must:
 
@@ -301,9 +362,20 @@ fingerprint commit can only leave the unit dirty. Restored hardlinks remain
 immutable and are detached before any compiler, linker, or external tool can
 mutate them.
 
-This protocol should first cover the existing pure Build-library and non-test
-metadata-only Check eligibility. Clippy-wrapped actions require a separate
-composite action identity covering wrapper order and arguments,
+The implementation first performs a cheap candidate scan so unrelated roots do
+not pay a duplicate fingerprint walk. Executor-forced units bypass both
+preflight restoration and the ordinary runtime cache path. A cold preflight miss
+also records a canonical command/environment digest; dirty execution reuses the
+prepared action only if the runtime command still matches, otherwise it compiles
+without cache publication. Focused regressions cover forced rebuilds, command
+drift, and failure after detailed fingerprint JSON is written but before the
+short-hash commit marker.
+
+The current protocol covers pure Build-library units. Non-test metadata-only
+Check actions are cacheable but still use per-unit dirty replay until their
+mtime-sensitive target state can safely be finalized in the graph-wide
+preflight. Clippy-wrapped actions require a separate composite action identity
+covering wrapper order and arguments,
 `clippy-driver`, rustc/sysroot, dynamic loader inputs, lint levels, relevant
 environment, and `.clippy.toml`/configuration inputs, with diagnostic replay.
 Packages with build scripts remain outside the portable closure until a capsule
@@ -372,8 +444,9 @@ Implement in measured order:
 6. Admit ordinary library actions from packages with build scripts only after
    generated trees and embedded build paths have a stable, verified portable
    representation.
-7. Prewarm verified pure-library chains before Cargo scheduling and recompute
-   current fingerprints rather than copying producer fingerprints.
+7. Keep verified pure-Build-library prewarming before Cargo scheduling,
+   recompute current fingerprints rather than copying producer fingerprints,
+   and add fine-grained target-lock support before broadening its scope.
 8. Generalize linked-action identity and output manifests before caching proc
    macros, build-script executables, test binaries, debug sidecars, and final
    links.
@@ -389,6 +462,8 @@ hermetic output contract.
 build queue. It remains disabled by default and reports:
 
 - Cargo-fresh units;
+- preflight attempts, already-fresh and dependency-blocked units, successful
+  finalizations, bypasses, and elapsed time;
 - eligible dirty units, hits, misses, and key failures;
 - ineligible units by reason;
 - publication success, rejection, and failure;
@@ -423,9 +498,11 @@ prove locally that:
 - target-path and generated-input portability tests stay green; and
 - replay time is materially below the avoided rustc time.
 
-After those gates, uv PR 19754 can combine the repaired artifact layer with
-job-specific target snapshots and compare equivalent runner classes. The
-aggregate CI acceptance target still requires that final integration rerun.
+The pure Build-library closure now demonstrates the local scheduling gate, but
+Check replay, fine-grained locking, and the nonportable build-script closure
+remain open. After those gates, uv PR 19754 can combine the repaired artifact
+layer with job-specific target snapshots and compare equivalent runner classes.
+The aggregate CI acceptance target still requires that final integration rerun.
 
 ### uv PR 19754 integration path
 

@@ -502,12 +502,7 @@ pub fn prepare_target(
     // directory sources which will use this hook to perform an integrity check
     // on all files in the source to ensure they haven't changed. If they have
     // changed then an error is issued.
-    let source_id = unit.pkg.package_id().source_id();
-    let sources = bcx.packages.sources();
-    let source = sources
-        .get(source_id)
-        .ok_or_else(|| internal("missing package source"))?;
-    source.verify(unit.pkg.package_id())?;
+    verify_source(build_runner, unit)?;
 
     // Clear out the old fingerprint file if it exists. This protects when
     // compilation is interrupted leaving a corrupt file. For example, a
@@ -581,6 +576,15 @@ pub fn prepare_target(
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
+}
+
+pub(super) fn verify_source(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<()> {
+    let source_id = unit.pkg.package_id().source_id();
+    let sources = build_runner.bcx.packages.sources();
+    let source = sources
+        .get(source_id)
+        .ok_or_else(|| internal("missing package source"))?;
+    source.verify(unit.pkg.package_id())
 }
 
 /// Dependency edge information for fingerprints. This is generated for each
@@ -1989,7 +1993,6 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     // as we can use the full hash.
     let hash = fingerprint.hash_u64();
     debug!("write fingerprint ({:x}) : {}", hash, loc.display());
-    paths::write(loc, util::to_hex(hash).as_bytes())?;
 
     let json = serde_json::to_string(fingerprint).unwrap();
     if cfg!(debug_assertions) {
@@ -1997,7 +2000,70 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
         assert_eq!(f.hash_u64(), hash);
     }
     paths::write(&loc.with_extension("json"), json.as_bytes())?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if std::env::var_os("__CARGO_TEST_ARTIFACT_CACHE_PREFLIGHT_FAILURE_AFTER_FINGERPRINT_JSON")
+        .is_some()
+    {
+        return Err(internal(
+            "test-only artifact cache preflight failure after fingerprint JSON".to_string(),
+        ));
+    }
+    // The short hash is the freshness commit marker. Write it last so a
+    // failure while persisting diagnostic state cannot make partial work look
+    // fresh.
+    paths::write(loc, util::to_hex(hash).as_bytes())?;
     Ok(())
+}
+
+pub(super) fn invalidate_restored_target(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<()> {
+    let loc = build_runner.files().fingerprint_file_path(unit, "");
+    if loc.exists() {
+        paths::write(&loc, b"")?;
+    }
+    Ok(())
+}
+
+pub(super) fn restored_target_is_fresh(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<bool> {
+    let loc = build_runner.files().fingerprint_file_path(unit, "");
+    let fingerprint = calculate(build_runner, unit)?;
+    Ok(matches!(
+        compare_old_fingerprint(
+            unit,
+            &loc,
+            &fingerprint,
+            build_runner.bcx.gctx.cli_unstable().mtime_on_use,
+            false,
+        ),
+        FingerprintComparison::Fresh
+    ))
+}
+
+pub(super) fn clear_calculated_target(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) {
+    build_runner.fingerprints.remove(unit);
+    build_runner.mtime_cache.clear();
+    build_runner.checksum_cache.clear();
+}
+
+pub(super) fn commit_restored_target(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<bool> {
+    let fingerprint = calculate(build_runner, unit)?;
+    if !fingerprint.fs_status.up_to_date() {
+        return Ok(false);
+    }
+    let loc = build_runner.files().fingerprint_file_path(unit, "");
+    write_fingerprint(&loc, &fingerprint)?;
+    Ok(true)
 }
 
 /// Prepare for work when a package starts to build

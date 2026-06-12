@@ -360,6 +360,9 @@ const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
 const ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE";
 const ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_KEY_FAILURE";
+const ARTIFACT_CACHE_FORCE_REBUILD_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_FORCE_REBUILD";
+const ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION";
 const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING";
 const ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS: &str =
@@ -391,12 +394,18 @@ struct ArtifactCacheKey {
 }
 
 #[derive(Debug)]
-struct PreparedArtifactCacheAction {
+pub(super) struct PreparedArtifactCacheAction {
     crate_name: String,
     config: build_config::ArtifactCacheConfig,
     key: ArtifactCacheKey,
     identity_witness: crate::util::rustc::ArtifactCacheIdentityWitness,
     loader_input_paths: Vec<CompilerLoaderInput>,
+    command_digest: blake3::Hash,
+}
+
+pub(super) enum PreflightArtifactCacheState {
+    Miss(PreparedArtifactCacheAction),
+    Bypassed,
 }
 
 #[derive(Debug)]
@@ -458,7 +467,287 @@ pub trait Executor: Send + Sync + 'static {
     /// Queried when queuing each unit of work. If it returns true, then the
     /// unit will always be rebuilt, independent of whether it needs to be.
     fn force_rebuild(&self, _unit: &Unit) -> bool {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only hook is intentionally outside user configuration"
+        )]
+        std::env::var_os(ARTIFACT_CACHE_FORCE_REBUILD_FOR_TESTS).is_some()
+    }
+}
+
+pub(super) fn artifact_cache_freshness_preflight(
+    build_runner: &mut BuildRunner<'_, '_>,
+    exec: &Arc<dyn Executor>,
+) -> CargoResult<()> {
+    if build_runner.bcx.build_config.artifact_cache.is_none()
+        || build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        || sld_native_incremental_requested(build_runner)
+    {
+        return Ok(());
+    }
+    let preflight_started = build_runner
+        .artifact_cache_stats
+        .as_ref()
+        .map(|_| Instant::now());
+    debug_assert!(build_runner.fingerprints.is_empty());
+    let roots = build_runner.bcx.roots.clone();
+    let mut discovered = HashSet::new();
+    let mut candidates = Vec::new();
+    for unit in &roots {
+        artifact_cache_freshness_preflight_candidates(
+            build_runner,
+            unit,
+            &mut discovered,
+            &mut candidates,
+        )?;
+    }
+    let mut visited = HashSet::new();
+    let mut restored = HashSet::new();
+    for unit in &candidates {
+        artifact_cache_freshness_preflight_unit(
+            build_runner,
+            exec,
+            unit,
+            &mut visited,
+            &mut restored,
+        )?;
+    }
+
+    // Recalculate from the committed consumer-side state during ordinary
+    // scheduling. The files on disk, not the preflight memoization, remain the
+    // freshness authority.
+    build_runner.fingerprints.clear();
+    build_runner.mtime_cache.clear();
+    build_runner.checksum_cache.clear();
+    if let Some(started) = preflight_started
+        && let Some(stats) = &build_runner.artifact_cache_stats
+    {
+        stats.preflight_finished(started.elapsed());
+    }
+    Ok(())
+}
+
+fn artifact_cache_freshness_preflight_candidates(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    visited: &mut HashSet<Unit>,
+    candidates: &mut Vec<Unit>,
+) -> CargoResult<()> {
+    if !visited.insert(unit.clone()) {
+        return Ok(());
+    }
+    for dep in build_runner.unit_deps(unit).iter() {
+        artifact_cache_freshness_preflight_candidates(
+            build_runner,
+            &dep.unit,
+            visited,
+            candidates,
+        )?;
+    }
+    if artifact_cache_freshness_preflight_candidate(build_runner, unit)? {
+        candidates.push(unit.clone());
+    }
+    Ok(())
+}
+
+fn artifact_cache_freshness_preflight_unit(
+    build_runner: &mut BuildRunner<'_, '_>,
+    exec: &Arc<dyn Executor>,
+    unit: &Unit,
+    visited: &mut HashSet<Unit>,
+    restored: &mut HashSet<Unit>,
+) -> CargoResult<bool> {
+    if !visited.insert(unit.clone()) {
+        return Ok(restored.contains(unit));
+    }
+
+    let deps = Vec::from(build_runner.unit_deps(unit));
+    let mut dependency_closure_ready = true;
+    for dep in deps
+        .into_iter()
+        .filter(|dep| !dep.unit.target.is_bin() || dep.unit.artifact.is_true())
+    {
+        if !artifact_cache_freshness_preflight_unit(
+            build_runner,
+            exec,
+            &dep.unit,
+            visited,
+            restored,
+        )? {
+            dependency_closure_ready = false;
+        }
+    }
+    let force_rebuild = if !unit.mode.is_run_custom_build() && !unit.mode.is_doc_test() {
+        *build_runner
+            .preflight_force_rebuilds
+            .entry(unit.clone())
+            .or_insert_with(|| exec.force_rebuild(unit))
+    } else {
         false
+    };
+    if force_rebuild {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_bypassed();
+        }
+        build_runner
+            .preflight_artifact_cache_states
+            .insert(unit.clone(), PreflightArtifactCacheState::Bypassed);
+        return Ok(false);
+    }
+    if !dependency_closure_ready {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_blocked_by_dependency();
+        }
+        return Ok(false);
+    }
+    if !unit.mode.is_doc_test() && fingerprint::restored_target_is_fresh(build_runner, unit)? {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_already_fresh();
+        }
+        restored.insert(unit.clone());
+        return Ok(true);
+    }
+    if !artifact_cache_freshness_preflight_candidate(build_runner, unit)? {
+        return Ok(false);
+    }
+    fingerprint::clear_calculated_target(build_runner, unit);
+    if let Some(stats) = &build_runner.artifact_cache_stats {
+        stats.preflight_attempted();
+    }
+
+    if artifact_cache_freshness_preflight_restore(build_runner, unit)? {
+        restored.insert(unit.clone());
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn artifact_cache_freshness_preflight_candidate(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<bool> {
+    let has_runtime_build_script_inputs = build_runner
+        .build_scripts
+        .get(unit)
+        .is_some_and(|scripts| !scripts.to_link.is_empty() || !scripts.plugins.is_empty());
+    Ok(!unit.skip_non_compile_time_dep
+        && !unit.artifact.is_true()
+        && matches!(unit.mode, CompileMode::Build)
+        && unit.target.is_lib()
+        && !unit.target.proc_macro()
+        && !unit.pkg.has_custom_build()
+        && !has_runtime_build_script_inputs
+        && build_runner.sbom_output_files(unit)?.is_empty())
+}
+
+fn artifact_cache_freshness_preflight_restore(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<bool> {
+    fingerprint::prepare_init(build_runner, unit)?;
+    fingerprint::verify_source(build_runner, unit)?;
+    fingerprint::invalidate_restored_target(build_runner, unit)?;
+
+    let mut rustc = prepare_rustc(build_runner, unit)?;
+    let outputs = build_runner.outputs(unit)?;
+    let output_root = build_runner.files().output_dir(unit);
+    let rustc_dep_info_loc = rustc_dep_info_loc(build_runner, unit, &output_root);
+    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let message_cache_path = build_runner.files().message_cache_path(unit);
+    let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    let pkg_root = unit.pkg.root().to_path_buf();
+    let cwd = rustc
+        .get_cwd()
+        .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
+        .to_path_buf();
+    let sbom_files = build_runner.sbom_output_files(unit)?;
+    let builder = ArtifactCacheActionBuilder::new(
+        build_runner,
+        unit,
+        &rustc,
+        &sbom_files,
+        &build_dir,
+        &output_root,
+        &cwd,
+    )?;
+    builder.record_static_rejection(build_runner.artifact_cache_stats.as_deref());
+
+    // Capture the consumer-side build boundary before verifying any cached
+    // source or action input.
+    let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+    let action = builder.describe(
+        &mut rustc,
+        true,
+        build_runner.artifact_cache_stats.as_deref(),
+    )?;
+    let Some(action) = action else {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_bypassed();
+        }
+        build_runner
+            .preflight_artifact_cache_states
+            .insert(unit.clone(), PreflightArtifactCacheState::Bypassed);
+        return Ok(false);
+    };
+    let cache_hit = restore_artifact_cache_action(
+        Some(&action),
+        outputs.as_slice(),
+        &rustc_dep_info_loc,
+        &message_cache_path,
+        &rustc,
+        &cwd,
+        &pkg_root,
+        &output_root,
+        unit.mode,
+        build_runner.artifact_cache_stats.as_deref(),
+    );
+    if !cache_hit {
+        build_runner
+            .preflight_artifact_cache_states
+            .insert(unit.clone(), PreflightArtifactCacheState::Miss(action));
+        return Ok(false);
+    }
+
+    let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
+    finish_rustc_target_state(
+        &rustc_dep_info_loc,
+        &dep_info_loc,
+        &cwd,
+        &pkg_root,
+        &build_dir,
+        &rustc,
+        unit.is_local(),
+        &env_config,
+        timestamp,
+        unit.mode,
+        outputs.as_slice(),
+        &fingerprint_dir,
+        false,
+        true,
+    )?;
+    if fingerprint::commit_restored_target(build_runner, unit)? {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_finalized();
+        }
+        debug!(
+            "artifact cache preflight made {} Cargo-fresh",
+            unit.target.crate_name()
+        );
+        Ok(true)
+    } else {
+        if let Some(stats) = &build_runner.artifact_cache_stats {
+            stats.preflight_bypassed();
+        }
+        debug!(
+            "artifact cache preflight could not make {} Cargo-fresh",
+            unit.target.crate_name()
+        );
+        build_runner
+            .preflight_artifact_cache_states
+            .insert(unit.clone(), PreflightArtifactCacheState::Miss(action));
+        Ok(false)
     }
 }
 
@@ -524,13 +813,16 @@ fn compile<'gctx>(
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
         } else {
-            let force = exec.force_rebuild(unit);
+            let force = build_runner
+                .preflight_force_rebuilds
+                .remove(unit)
+                .unwrap_or_else(|| exec.force_rebuild(unit));
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
-                    rustc(build_runner, unit, exec)?
+                    rustc(build_runner, unit, exec, force)?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
@@ -716,6 +1008,7 @@ impl ArtifactCacheActionBuilder {
     fn describe(
         self,
         rustc: &mut ProcessBuilder,
+        require_materialized_inputs: bool,
         stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
     ) -> CargoResult<Option<PreparedArtifactCacheAction>> {
         let Self::Candidate {
@@ -749,6 +1042,14 @@ impl ArtifactCacheActionBuilder {
             }
             debug!(
                 "artifact cache admission rejected for {crate_name}: rustc action is not safely modeled"
+            );
+            return Ok(None);
+        }
+        if require_materialized_inputs
+            && !artifact_cache_action_inputs_are_materialized(rustc, &cwd)
+        {
+            debug!(
+                "artifact cache preflight deferred for {crate_name}: action inputs are not materialized"
             );
             return Ok(None);
         }
@@ -811,14 +1112,135 @@ impl ArtifactCacheActionBuilder {
         if let Some(stats) = stats {
             stats.eligible();
         }
+        let command_digest = artifact_cache_command_digest(rustc);
         Ok(Some(PreparedArtifactCacheAction {
             crate_name,
             config,
             key,
             identity_witness,
             loader_input_paths,
+            command_digest,
         }))
     }
+}
+
+fn restore_artifact_cache_action(
+    action: Option<&PreparedArtifactCacheAction>,
+    outputs: &[build_runner::OutputFile],
+    rustc_dep_info_loc: &Path,
+    message_cache_path: &Path,
+    rustc: &ProcessBuilder,
+    cwd: &Path,
+    pkg_root: &Path,
+    output_root: &Path,
+    mode: CompileMode,
+    stats: Option<&artifact_cache_stats::ArtifactCacheStats>,
+) -> bool {
+    let restore_started = (action.is_some() && stats.is_some()).then(Instant::now);
+    let mut restore_failed = false;
+    let cache_hit = match action {
+        Some(action) => match restore_rlib_cache(
+            &action.key.entry_root,
+            outputs,
+            rustc_dep_info_loc,
+            message_cache_path,
+            rustc,
+            cwd,
+            pkg_root,
+            output_root,
+            &action.identity_witness,
+            &action.loader_input_paths,
+            &action.key.loader_inputs_digest,
+            &action.key.action_inputs_digest,
+            if mode.is_check() {
+                ArtifactCacheMaterialization::Copy
+            } else {
+                action.config.materialization
+            },
+            action.config.max_size,
+            stats,
+        ) {
+            Ok(cache_hit) => cache_hit,
+            Err(error) => {
+                restore_failed = true;
+                debug!(
+                    "ignoring artifact cache restore failure for {}: {error:#}",
+                    action.crate_name
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    if let Some(started) = restore_started
+        && let Some(stats) = stats
+    {
+        stats.restore_finished(cache_hit, restore_failed, started.elapsed());
+    }
+    cache_hit
+}
+
+#[expect(clippy::too_many_arguments)]
+fn finish_rustc_target_state(
+    rustc_dep_info_loc: &Path,
+    dep_info_loc: &Path,
+    cwd: &Path,
+    pkg_root: &Path,
+    build_dir: &Path,
+    rustc: &ProcessBuilder,
+    is_local: bool,
+    env_config: &Arc<HashMap<String, OsString>>,
+    timestamp: filetime::FileTime,
+    mode: CompileMode,
+    outputs: &[build_runner::OutputFile],
+    fingerprint_dir: &Path,
+    preserve_sld_root_output: bool,
+    artifact_cache_freshness_stamp: bool,
+) -> CargoResult<()> {
+    if rustc_dep_info_loc.exists() {
+        fingerprint::translate_dep_info(
+            rustc_dep_info_loc,
+            dep_info_loc,
+            cwd,
+            pkg_root,
+            build_dir,
+            rustc,
+            // Do not track source files in the fingerprint for registry dependencies.
+            is_local,
+            env_config,
+        )
+        .with_context(|| {
+            internal(format!(
+                "could not parse/generate dep info at: {}",
+                rustc_dep_info_loc.display()
+            ))
+        })?;
+        // This mtime shift allows Cargo to detect if a source file was
+        // modified in the middle of the build.
+        paths::set_file_time_no_err(dep_info_loc, timestamp);
+    }
+
+    // This mtime shift for .rmeta is a workaround as rustc incremental build
+    // since rust-lang/rust#114669 (1.90.0) skips unnecessary rmeta generation.
+    if mode.is_check() {
+        for output in outputs {
+            paths::set_file_time_no_err(&output.path, timestamp);
+        }
+    }
+    // SLD owns the retained private output's identity, including its mtime.
+    // Record Cargo's successful completion without mutating that output.
+    if preserve_sld_root_output {
+        let stamp = fingerprint_dir.join(SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP);
+        drop(paths::create(&stamp)?);
+        paths::set_file_time_no_err(stamp, timestamp);
+    }
+
+    if artifact_cache_freshness_stamp {
+        let stamp = fingerprint_dir.join(ARTIFACT_CACHE_FRESHNESS_STAMP);
+        drop(paths::create(&stamp)?);
+        paths::set_file_time_no_err(stamp, timestamp);
+    }
+    Ok(())
 }
 
 /// Generates the warning message used when fallible doc-scrape units fail,
@@ -842,11 +1264,26 @@ fn make_failed_scrape_diagnostic(
     )
 }
 
+fn rustc_dep_info_loc(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    output_root: &Path,
+) -> PathBuf {
+    let dep_info_name =
+        if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+            format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
+        } else {
+            format!("{}.d", unit.target.crate_name())
+        };
+    output_root.join(dep_info_name)
+}
+
 /// Creates a unit of work invoking `rustc` for building the `unit`.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
+    force_rebuild: bool,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
     let artifact_cache_stats = build_runner.artifact_cache_stats.clone();
@@ -866,13 +1303,7 @@ fn rustc(
     // don't pass the `-l` flags.
     let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
 
-    let dep_info_name =
-        if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
-            format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
-        } else {
-            format!("{}.d", unit.target.crate_name())
-        };
-    let rustc_dep_info_loc = root.join(dep_info_name);
+    let rustc_dep_info_loc = rustc_dep_info_loc(build_runner, unit, &root);
     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
@@ -921,15 +1352,26 @@ fn rustc(
         && artifact_cache_compile_mode_is_supported(unit.mode)
         && !unit.pkg.has_custom_build()
         && sbom_files.is_empty();
-    let artifact_cache_builder = ArtifactCacheActionBuilder::new(
-        build_runner,
-        unit,
-        &rustc,
-        &sbom_files,
-        &build_dir,
-        &root,
-        &cwd,
-    )?;
+    let preflight_artifact_cache_state = if force_rebuild {
+        build_runner.preflight_artifact_cache_states.remove(unit);
+        Some(PreflightArtifactCacheState::Bypassed)
+    } else {
+        build_runner.preflight_artifact_cache_states.remove(unit)
+    };
+    let artifact_cache_builder = preflight_artifact_cache_state
+        .is_none()
+        .then(|| {
+            ArtifactCacheActionBuilder::new(
+                build_runner,
+                unit,
+                &rustc,
+                &sbom_files,
+                &build_dir,
+                &root,
+                &cwd,
+            )
+        })
+        .transpose()?;
 
     let hide_diagnostics_for_scrape_unit = build_runner.bcx.unit_can_fail_for_docscraping(unit)
         && !matches!(
@@ -955,7 +1397,9 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        artifact_cache_builder.record_static_rejection(artifact_cache_stats.as_deref());
+        if let Some(builder) = &artifact_cache_builder {
+            builder.record_static_rejection(artifact_cache_stats.as_deref());
+        }
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
@@ -1005,15 +1449,42 @@ fn rustc(
         // Record the invocation before reading cache-discovered inputs so edits
         // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        let artifact_cache_action =
-            artifact_cache_builder.describe(&mut rustc, artifact_cache_stats.as_deref())?;
-        let restore_started =
-            (artifact_cache_action.is_some() && artifact_cache_stats.is_some()).then(Instant::now);
-        let mut restore_failed = false;
-        let cache_hit = match artifact_cache_action.as_ref() {
-            Some(action) => {
-                match restore_rlib_cache(
-                    &action.key.entry_root,
+        let (artifact_cache_action, cache_hit) = match preflight_artifact_cache_state {
+            Some(PreflightArtifactCacheState::Miss(action)) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test-only hook is intentionally outside user configuration"
+                )]
+                if std::env::var_os(ARTIFACT_CACHE_RUNTIME_COMMAND_MUTATION_FOR_TESTS).is_some() {
+                    rustc
+                        .arg("--cfg")
+                        .arg("artifact_cache_runtime_command_mutation_for_test");
+                }
+                let mut cache_rustc = rustc.clone();
+                remove_cargo_injected_loader_path(&mut cache_rustc, &root)?;
+                if artifact_cache_command_digest(&cache_rustc) == action.command_digest {
+                    rustc = cache_rustc;
+                    (Some(action), false)
+                } else {
+                    if let Some(stats) = &artifact_cache_stats {
+                        stats.preflight_bypassed();
+                    }
+                    debug!(
+                        "artifact cache preflight command changed for {}; compiling without cache publication",
+                        action.crate_name
+                    );
+                    (None, false)
+                }
+            }
+            Some(PreflightArtifactCacheState::Bypassed) => (None, false),
+            None => {
+                let action = artifact_cache_builder.unwrap().describe(
+                    &mut rustc,
+                    false,
+                    artifact_cache_stats.as_deref(),
+                )?;
+                let hit = restore_artifact_cache_action(
+                    action.as_ref(),
                     outputs.as_slice(),
                     &rustc_dep_info_loc,
                     &message_cache_path,
@@ -1021,36 +1492,12 @@ fn rustc(
                     &cwd,
                     &pkg_root,
                     &root,
-                    &action.identity_witness,
-                    &action.loader_input_paths,
-                    &action.key.loader_inputs_digest,
-                    &action.key.action_inputs_digest,
-                    if mode.is_check() {
-                        ArtifactCacheMaterialization::Copy
-                    } else {
-                        action.config.materialization
-                    },
-                    action.config.max_size,
+                    mode,
                     artifact_cache_stats.as_deref(),
-                ) {
-                    Ok(cache_hit) => cache_hit,
-                    Err(error) => {
-                        restore_failed = true;
-                        debug!(
-                            "ignoring artifact cache restore failure for {}: {error:#}",
-                            action.crate_name
-                        );
-                        false
-                    }
-                }
+                );
+                (action, hit)
             }
-            None => false,
         };
-        if let Some(started) = restore_started
-            && let Some(stats) = &artifact_cache_stats
-        {
-            stats.restore_finished(cache_hit, restore_failed, started.elapsed());
-        }
 
         if cache_hit {
             debug!(
@@ -1186,60 +1633,22 @@ fn rustc(
             debug_assert_eq!(output_options.errors_seen, 0);
         }
 
-        if rustc_dep_info_loc.exists() {
-            fingerprint::translate_dep_info(
-                &rustc_dep_info_loc,
-                &dep_info_loc,
-                &cwd,
-                &pkg_root,
-                &build_dir,
-                &rustc,
-                // Do not track source files in the fingerprint for registry dependencies.
-                is_local,
-                &env_config,
-            )
-            .with_context(|| {
-                internal(format!(
-                    "could not parse/generate dep info at: {}",
-                    rustc_dep_info_loc.display()
-                ))
-            })?;
-            // This mtime shift allows Cargo to detect if a source file was
-            // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
-        }
-
-        // This mtime shift for .rmeta is a workaround as rustc incremental build
-        // since rust-lang/rust#114669 (1.90.0) skips unnecessary rmeta generation.
-        //
-        // The situation is like this:
-        //
-        // 1. When build script execution's external dependendies
-        //    (rerun-if-changed, rerun-if-env-changed) got updated,
-        //    the execution unit reran and got a newer mtime.
-        // 2. rustc type-checked the associated crate, though with incremental
-        //    compilation, no rmeta regeneration. Its `.rmeta` stays old.
-        // 3. Run `cargo check` again. Cargo found build script execution had
-        //    a new mtime than existing crate rmeta, so re-checking the crate.
-        //    However the check is a no-op (input has no change), so stuck.
-        if mode.is_check() {
-            for output in outputs.iter() {
-                paths::set_file_time_no_err(&output.path, timestamp);
-            }
-        }
-        // SLD owns the retained private output's identity, including its mtime.
-        // Record Cargo's successful completion without mutating that output.
-        if preserve_sld_root_output {
-            let stamp = fingerprint_dir.join(SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP);
-            drop(paths::create(&stamp)?);
-            paths::set_file_time_no_err(stamp, timestamp);
-        }
-
-        if artifact_cache_freshness_stamp {
-            let stamp = fingerprint_dir.join(ARTIFACT_CACHE_FRESHNESS_STAMP);
-            drop(paths::create(&stamp)?);
-            paths::set_file_time_no_err(stamp, timestamp);
-        }
+        finish_rustc_target_state(
+            &rustc_dep_info_loc,
+            &dep_info_loc,
+            &cwd,
+            &pkg_root,
+            &build_dir,
+            &rustc,
+            is_local,
+            &env_config,
+            timestamp,
+            mode,
+            outputs.as_slice(),
+            &fingerprint_dir,
+            preserve_sld_root_output,
+            artifact_cache_freshness_stamp,
+        )?;
 
         if !cache_hit && let Some(action) = artifact_cache_action.as_ref() {
             if let Some(stats) = &artifact_cache_stats {
@@ -2625,6 +3034,56 @@ fn resolve_rustc_input_path(path: &Path, rustc_cwd: &Path) -> PathBuf {
     } else {
         rustc_cwd.join(path)
     }
+}
+
+fn artifact_cache_action_inputs_are_materialized(rustc: &ProcessBuilder, rustc_cwd: &Path) -> bool {
+    let args = rustc.get_args().collect::<Vec<_>>();
+    let externs_exist = args.windows(2).all(|pair| {
+        if pair[0] != OsStr::new("--extern") {
+            return true;
+        }
+        let value = pair[1].to_string_lossy();
+        let Some((_, path)) = value.split_once('=') else {
+            return false;
+        };
+        resolve_rustc_input_path(Path::new(path), rustc_cwd).is_file()
+    });
+    let generated_inputs_exist = rustc.get_envs().iter().all(|(key, value)| {
+        if key != "OUT_DIR" && !key.ends_with("_OUT_DIR") {
+            return true;
+        }
+        value
+            .as_ref()
+            .is_none_or(|value| resolve_rustc_input_path(Path::new(value), rustc_cwd).is_dir())
+    });
+    externs_exist && generated_inputs_exist
+}
+
+fn artifact_cache_command_digest(rustc: &ProcessBuilder) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-command-v1\0");
+    hasher.update(rustc.get_program().as_encoded_bytes());
+    hasher.update(b"\0cwd\0");
+    if let Some(cwd) = rustc.get_cwd() {
+        hasher.update(cwd.as_os_str().as_encoded_bytes());
+    }
+    hasher.update(b"\0args\0");
+    for arg in rustc.get_args() {
+        hasher.update(arg.as_encoded_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"env\0");
+    let mut envs = rustc.get_envs().iter().collect::<Vec<_>>();
+    envs.sort_by_key(|(key, _)| *key);
+    for (key, value) in envs {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = value {
+            hasher.update(value.as_encoded_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    hasher.finalize()
 }
 
 fn artifact_cache_action_inputs_digest(
