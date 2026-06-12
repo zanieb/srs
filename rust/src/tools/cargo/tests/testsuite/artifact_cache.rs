@@ -2655,7 +2655,7 @@ fn checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
-fn cache_hit_is_fresh_after_rebuilding_non_cacheable_dependency() {
+fn cache_hit_is_fresh_after_restoring_dependency_with_build_script() {
     use std::os::unix::fs::MetadataExt;
 
     let cache = paths::root().join("shared-cache");
@@ -2707,7 +2707,15 @@ fn cache_hit_is_fresh_after_rebuilding_non_cacheable_dependency() {
     sleep_ms(1100);
     build_in_target(&project, &consumer_target);
 
-    let stored = cached_rlib(&cache);
+    let stored = cached_rlibs(&cache)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libproject-")
+        })
+        .unwrap();
     let restored = cached_rlibs(&consumer_target.join("debug").join("deps"))
         .into_iter()
         .find(|path| {
