@@ -2389,6 +2389,7 @@ enum ChangedInputPatchResult {
 const MACHO_TEXT_RELOCATION_RECORDS_REQUIRED: &str =
     "changed input needs Mach-O text relocation records";
 const MACHO_SYMBOL_RESOLUTIONS_REQUIRED: &str = "missing Mach-O symbol resolution";
+const DIRECT_MACHO_CGU_MIGRATION_REQUIRED: &str = "missing direct Mach-O CGU catalog target";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangedInputRecordCoverage {
@@ -2764,6 +2765,24 @@ fn matching_macho_symbol_resolution_move<'a>(
             && moved.previous_target == *previous_target
             && moved.previous_value == previous_target_value
             && moved.current_target.section_offset == current_section_offset
+    });
+    let matching_move = matching_moves.next();
+    if matching_moves.next().is_some() {
+        return Err(());
+    }
+    Ok(matching_move)
+}
+
+fn matching_macho_symbol_resolution_move_for_previous<'a>(
+    resolution_moves: &'a [MachOSymbolResolutionMove],
+    target_name: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_target_value: u64,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, ()> {
+    let mut matching_moves = resolution_moves.iter().filter(|moved| {
+        moved.name.as_str() == target_name
+            && moved.previous_target == *previous_target
+            && moved.previous_value == previous_target_value
     });
     let matching_move = matching_moves.next();
     if matching_moves.next().is_some() {
@@ -3320,6 +3339,13 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
                 if allow_added_archive_retirement && resolution.direct_value.is_some() {
                     retiring_names.push(resolution.name.clone());
                     continue;
+                }
+                if previous_input == input.path {
+                    return Ok(Err(format!(
+                        "{DIRECT_MACHO_CGU_MIGRATION_REQUIRED}: missing Mach-O symbol catalog target `{}` in {}",
+                        display_hex_text(resolution.name.as_str()),
+                        display_hex_path(&input.path),
+                    )));
                 }
                 return Ok(Err(format!(
                     "missing Mach-O symbol catalog target `{}` in {} (selected input `{}`)",
@@ -4426,6 +4452,579 @@ struct IndexedMachOSymbolCatalogInput<'data> {
     positions: HashMap<SharedText, IndexedSymbolPosition>,
 }
 
+struct DirectMachOCguMigrationInput {
+    input_file: String,
+    previous_bytes: Vec<u8>,
+    current_bytes: Vec<u8>,
+    current_hash: String,
+}
+
+#[derive(Default)]
+struct DirectMachOCguMigrationPlan {
+    moves: Vec<MachOSymbolResolutionMove>,
+    output_patches: Vec<SectionPatch>,
+    chained_fixup_patches: Vec<SectionPatch>,
+    output_symbols: Vec<RelocationTargetSymbolPatch>,
+    reusable_branch_targets: Vec<MachOReusableBranchTarget>,
+    migrated_names_by_input: HashMap<String, HashSet<Vec<u8>>>,
+    current_hashes: HashMap<String, String>,
+    relocation_record_owners: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct DirectMachOCguDefinition {
+    position: SymbolPosition,
+    size: u64,
+    kind: Option<u8>,
+    scope: u8,
+    n_desc: u16,
+    eligible: bool,
+}
+
+impl DirectMachOCguDefinition {
+    fn signature_matches(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.kind == other.kind
+            && self.scope == other.scope
+            && self.n_desc == other.n_desc
+    }
+}
+
+fn direct_macho_cgu_definitions(
+    file: &object::File<'_>,
+    requested_names: &HashMap<Vec<u8>, SharedText>,
+) -> Result<HashMap<SharedText, Vec<DirectMachOCguDefinition>>> {
+    let mut definitions = HashMap::<SharedText, Vec<DirectMachOCguDefinition>>::new();
+    for symbol in file.symbols() {
+        if symbol.is_undefined() {
+            continue;
+        }
+        let Some(encoded_name) = requested_names.get(symbol.name_bytes()?) else {
+            continue;
+        };
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let section_address = file.section_by_index(section_index)?.address();
+        let section_size = file.section_by_index(section_index)?.size();
+        let section_offset = symbol
+            .address()
+            .checked_sub(section_address)
+            .context("Mach-O CGU symbol address precedes its section")?;
+        if section_offset >= section_size {
+            continue;
+        }
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            continue;
+        };
+        definitions
+            .entry(encoded_name.clone())
+            .or_default()
+            .push(DirectMachOCguDefinition {
+                position: SymbolPosition {
+                    section_index,
+                    section_offset,
+                    value_range: None,
+                },
+                size: symbol.size(),
+                kind: macho_symbol_kind_tag(symbol.kind()),
+                scope: macho_symbol_scope_tag(symbol.scope()),
+                n_desc,
+                eligible: symbol.is_global() && !symbol.is_weak(),
+            });
+    }
+    Ok(definitions)
+}
+
+fn direct_macho_cgu_sections_are_compatible(
+    source_file: &object::File<'_>,
+    source_index: object::SectionIndex,
+    destination_file: &object::File<'_>,
+    destination_index: object::SectionIndex,
+) -> Result<bool> {
+    let source = source_file.section_by_index(source_index)?;
+    let destination = destination_file.section_by_index(destination_index)?;
+    Ok(source.segment_name_bytes().ok().flatten()
+        == destination.segment_name_bytes().ok().flatten()
+        && source.name_bytes().ok() == destination.name_bytes().ok()
+        && source.flags() == destination.flags()
+        && source.align() == destination.align())
+}
+
+fn unique_direct_macho_section_record<'a>(
+    records: &'a [SectionRecord],
+    input_file: &str,
+    section_index: u32,
+) -> std::result::Result<Option<&'a SectionRecord>, String> {
+    let mut matches = records.iter().filter(|record| {
+        record.input_file == input_file
+            && record.input == input_file
+            && record.section_index == section_index
+    });
+    let record = matches.next();
+    if matches.next().is_some() {
+        return Err("direct Mach-O CGU section has ambiguous output ownership".to_owned());
+    }
+    Ok(record)
+}
+
+fn direct_macho_cgu_section_is_retained(
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    section_index: object::SectionIndex,
+    record: &SectionRecord,
+) -> Result<bool> {
+    let record_index = patch_section_record_index(current_file, section_index)?;
+    if record_index != record.section_index {
+        return Ok(false);
+    }
+    let previous_index = patch_section_object_index(previous_file, record.section_index)?;
+    let Ok(previous_section) = previous_file.section_by_index(previous_index) else {
+        return Ok(false);
+    };
+    let current_section = current_file.section_by_index(section_index)?;
+    if previous_section.segment_name_bytes().ok().flatten()
+        != current_section.segment_name_bytes().ok().flatten()
+        || previous_section.name_bytes().ok() != current_section.name_bytes().ok()
+        || previous_section.flags() != current_section.flags()
+        || previous_section.align() != current_section.align()
+        || previous_section.size() > record.size
+        || current_section.size() > record.size
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn plan_direct_macho_cgu_migrations(
+    inputs: &[DirectMachOCguMigrationInput],
+    sections: &[SectionRecord],
+    resolutions: &[MachOSymbolResolutionRecord],
+    previous_output: &[u8],
+) -> Result<std::result::Result<DirectMachOCguMigrationPlan, String>> {
+    let output_file = object::File::parse(previous_output)
+        .context("Failed to parse previous output for direct Mach-O CGU migration")?;
+    let input_indices = inputs
+        .iter()
+        .enumerate()
+        .map(|(cohort_index, input)| (input.input_file.as_str(), cohort_index))
+        .collect::<HashMap<_, _>>();
+    let mut requested_names = HashMap::<Vec<u8>, SharedText>::new();
+    for resolution in resolutions {
+        let Some(target) = resolution.target.as_ref() else {
+            continue;
+        };
+        if !input_indices.contains_key(target.input_file.as_str())
+            || target.input != target.input_file
+            || resolution.direct_value.is_none()
+        {
+            continue;
+        }
+        let decoded = hex::decode(resolution.name.as_str())
+            .context("Malformed direct Mach-O CGU catalog symbol name")?;
+        requested_names.insert(decoded, resolution.name.clone());
+    }
+    if requested_names.is_empty() {
+        return Ok(Ok(DirectMachOCguMigrationPlan::default()));
+    }
+
+    let mut previous_definitions =
+        HashMap::<SharedText, Vec<(usize, DirectMachOCguDefinition)>>::new();
+    let mut current_definitions =
+        HashMap::<SharedText, Vec<(usize, DirectMachOCguDefinition)>>::new();
+    let mut previous_files = Vec::with_capacity(inputs.len());
+    let mut current_files = Vec::with_capacity(inputs.len());
+    for (cohort_index, input) in inputs.iter().enumerate() {
+        let previous_file = object::File::parse(input.previous_bytes.as_slice())
+            .context("Failed to parse previous direct Mach-O CGU")?;
+        let current_file = object::File::parse(input.current_bytes.as_slice())
+            .context("Failed to parse current direct Mach-O CGU")?;
+        if !is_supported_incremental_macho_object(&previous_file)
+            || !is_supported_incremental_macho_object(&current_file)
+        {
+            return Ok(Err(
+                "direct Mach-O CGU migration cohort contains an unsupported object".to_owned(),
+            ));
+        }
+        for (name, definitions) in direct_macho_cgu_definitions(&previous_file, &requested_names)? {
+            previous_definitions.entry(name).or_default().extend(
+                definitions
+                    .into_iter()
+                    .map(|definition| (cohort_index, definition)),
+            );
+        }
+        for (name, definitions) in direct_macho_cgu_definitions(&current_file, &requested_names)? {
+            current_definitions.entry(name).or_default().extend(
+                definitions
+                    .into_iter()
+                    .map(|definition| (cohort_index, definition)),
+            );
+        }
+        previous_files.push(previous_file);
+        current_files.push(current_file);
+    }
+
+    let mut plan = DirectMachOCguMigrationPlan::default();
+    for resolution in resolutions {
+        let Some(previous_target) = resolution.target.as_ref() else {
+            continue;
+        };
+        let Some(&source_index) = input_indices.get(previous_target.input_file.as_str()) else {
+            continue;
+        };
+        if previous_target.input != previous_target.input_file {
+            continue;
+        }
+        let Some(previous_value) = resolution.direct_value else {
+            continue;
+        };
+        let previous = previous_definitions
+            .get(&resolution.name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let current = current_definitions
+            .get(&resolution.name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if previous.len() != 1
+            || previous[0].0 != source_index
+            || !previous[0].1.eligible
+            || previous[0].1.position.section_index.0 as u32 != previous_target.section_index
+            || previous[0].1.position.section_offset != previous_target.section_offset
+        {
+            continue;
+        }
+        if current.iter().any(|(index, _)| *index == source_index) {
+            continue;
+        }
+        let [(destination_index, current_definition)] = current else {
+            continue;
+        };
+        if *destination_index == source_index
+            || !current_definition.eligible
+            || !previous[0].1.signature_matches(current_definition)
+            || !direct_macho_cgu_sections_are_compatible(
+                &previous_files[source_index],
+                previous[0].1.position.section_index,
+                &current_files[*destination_index],
+                current_definition.position.section_index,
+            )?
+        {
+            continue;
+        }
+        let source = &inputs[source_index];
+        let destination = &inputs[*destination_index];
+        let source_record_index = patch_section_record_index(
+            &previous_files[source_index],
+            previous[0].1.position.section_index,
+        )?;
+        let Some(source_record) = unique_direct_macho_section_record(
+            sections,
+            source.input_file.as_str(),
+            source_record_index,
+        )?
+        else {
+            continue;
+        };
+        if previous[0].1.position.section_offset >= source_record.size {
+            continue;
+        }
+        let Some(source_output_offset) = source_record
+            .output_offset
+            .checked_add(previous[0].1.position.section_offset)
+        else {
+            return Ok(Err(
+                "direct Mach-O CGU source output offset overflowed".to_owned()
+            ));
+        };
+        if macho_output_address_for_file_offset(&output_file, source_output_offset)
+            != Some(previous_value)
+        {
+            continue;
+        }
+
+        let destination_record_index = patch_section_record_index(
+            &current_files[*destination_index],
+            current_definition.position.section_index,
+        )?;
+        let Some(destination_record) = unique_direct_macho_section_record(
+            sections,
+            destination.input_file.as_str(),
+            destination_record_index,
+        )?
+        else {
+            continue;
+        };
+        if current_definition.position.section_offset >= destination_record.size {
+            continue;
+        }
+        if !direct_macho_cgu_section_is_retained(
+            &previous_files[*destination_index],
+            &current_files[*destination_index],
+            current_definition.position.section_index,
+            destination_record,
+        )? {
+            continue;
+        }
+        let Some(destination_output_offset) = destination_record
+            .output_offset
+            .checked_add(current_definition.position.section_offset)
+        else {
+            return Ok(Err(
+                "direct Mach-O CGU destination output offset overflowed".to_owned(),
+            ));
+        };
+        let Some(current_value) =
+            macho_output_address_for_file_offset(&output_file, destination_output_offset)
+        else {
+            continue;
+        };
+        let current_target = RelocationTargetRecord {
+            input_file: destination.input_file.clone().into(),
+            input: destination.input_file.clone().into(),
+            section_index: current_definition.position.section_index.0 as u32,
+            section_offset: current_definition.position.section_offset,
+        };
+        let moved = MachOSymbolResolutionMove {
+            name: resolution.name.clone(),
+            previous_value,
+            current_value,
+            previous_target: previous_target.clone(),
+            current_target,
+        };
+        let decoded_name = hex::decode(resolution.name.as_str())
+            .context("Malformed direct Mach-O CGU migration name")?;
+        plan.migrated_names_by_input
+            .entry(source.input_file.clone())
+            .or_default()
+            .insert(decoded_name.clone());
+        plan.migrated_names_by_input
+            .entry(destination.input_file.clone())
+            .or_default()
+            .insert(decoded_name);
+        plan.output_symbols.push(RelocationTargetSymbolPatch {
+            target_name: resolution.name.to_string(),
+            previous_target_value: previous_value,
+            target_value: current_value,
+            allow_missing: true,
+            source: "direct Mach-O CGU symbol migration",
+        });
+        plan.moves.push(moved);
+    }
+    plan.moves.sort_by(|left, right| left.name.cmp(&right.name));
+    if plan
+        .moves
+        .windows(2)
+        .any(|moves| moves[0].name == moves[1].name)
+    {
+        return Ok(Err(
+            "direct Mach-O CGU migration has an ambiguous symbol name".to_owned(),
+        ));
+    }
+    for input in inputs {
+        plan.current_hashes
+            .insert(input.input_file.clone(), input.current_hash.clone());
+    }
+    Ok(Ok(plan))
+}
+
+fn apply_direct_macho_cgu_resolution_migrations(
+    resolutions: &mut [MachOSymbolResolutionRecord],
+    plan: &mut DirectMachOCguMigrationPlan,
+    previous_output: &[u8],
+) -> std::result::Result<(), String> {
+    let output_file = object::File::parse(previous_output)
+        .map_err(|error| format!("failed to parse output for direct CGU migration: {error}"))?;
+    for moved in &plan.moves {
+        let Some(index) = macho_symbol_resolution_index_for_name(resolutions, moved.name.as_str())?
+        else {
+            return Err("direct Mach-O CGU migration lost its catalog entry".to_owned());
+        };
+        let resolution = &mut resolutions[index];
+        if resolution.direct_value != Some(moved.previous_value)
+            || resolution.target.as_ref() != Some(&moved.previous_target)
+        {
+            return Err("direct Mach-O CGU migration catalog changed during planning".to_owned());
+        }
+        if resolution.stub_address.is_some() && resolution.got_address.is_none() {
+            return Err("migrated direct Mach-O CGU stub has no stable GOT target".to_owned());
+        }
+        if let Some(got_address) = resolution.got_address {
+            if moved.previous_value != moved.current_value {
+                plan.chained_fixup_patches
+                    .push(migrated_macho_got_retarget_patch(
+                        previous_output,
+                        got_address,
+                        moved.previous_value,
+                        moved.current_value,
+                    )?);
+            }
+            plan.reusable_branch_targets
+                .push(MachOReusableBranchTarget {
+                    moved: moved.clone(),
+                    applied_target_value: got_address,
+                });
+        }
+        if let Some(stub_address) = resolution.stub_address {
+            validate_migrated_macho_stub(
+                previous_output,
+                stub_address,
+                resolution
+                    .got_address
+                    .expect("migrated stub requires GOT address"),
+            )?;
+            plan.reusable_branch_targets
+                .push(MachOReusableBranchTarget {
+                    moved: moved.clone(),
+                    applied_target_value: stub_address,
+                });
+        }
+        let previous_thunk_target = resolution.stub_address.unwrap_or(moved.previous_value);
+        let current_thunk_target = resolution.stub_address.unwrap_or(moved.current_value);
+        if !resolution.thunk_addresses.is_empty() && previous_thunk_target != current_thunk_target {
+            let retargets = recorded_macho_thunk_retargets(
+                moved.name.as_str(),
+                &resolution.thunk_addresses,
+                previous_thunk_target,
+                current_thunk_target,
+                &output_file,
+                previous_output,
+            )?;
+            resolution
+                .thunk_addresses
+                .retain(|address| !retargets.retired_addresses.contains(address));
+            plan.output_patches.extend(retargets.patches);
+            plan.reusable_branch_targets
+                .extend(retargets.reusable_branch_targets.into_iter().map(
+                    |applied_target_value| MachOReusableBranchTarget {
+                        moved: moved.clone(),
+                        applied_target_value,
+                    },
+                ));
+        } else {
+            plan.reusable_branch_targets
+                .extend(
+                    resolution
+                        .thunk_addresses
+                        .iter()
+                        .map(|&applied_target_value| MachOReusableBranchTarget {
+                            moved: moved.clone(),
+                            applied_target_value,
+                        }),
+                );
+        }
+        resolution.direct_value = Some(moved.current_value);
+        resolution.target = Some(moved.current_target.clone());
+    }
+    Ok(())
+}
+
+fn apply_direct_macho_cgu_relocation_migrations(
+    relocations: &mut [RelocationRecord],
+    plan: &mut DirectMachOCguMigrationPlan,
+    previous_output: &[u8],
+) -> std::result::Result<(), String> {
+    for relocation in relocations {
+        let Some(target_name) = relocation.target_name.as_deref() else {
+            continue;
+        };
+        let mut matching = plan.moves.iter().filter(|moved| {
+            moved.name == target_name
+                && relocation.target.as_ref() == Some(&moved.previous_target)
+                && relocation.target_value == moved.previous_value
+        });
+        let moved = matching.next();
+        if matching.next().is_some() {
+            return Err("direct Mach-O CGU relocation migration is ambiguous".to_owned());
+        }
+        let Some(moved) = moved else {
+            continue;
+        };
+        let previous_applied_target = relocation
+            .applied_target_value
+            .unwrap_or(relocation.target_value);
+        if plan.reusable_branch_targets.iter().any(|reusable| {
+            reusable.moved == *moved && reusable.applied_target_value == previous_applied_target
+        }) {
+            relocation.target_value = moved.current_value;
+            relocation.target = Some(moved.current_target.clone());
+            plan.relocation_record_owners
+                .insert(relocation.input_file.to_string());
+            continue;
+        }
+        if previous_applied_target != moved.previous_value {
+            return Err("direct Mach-O CGU migration used an unknown indirect target".to_owned());
+        }
+        let Some(previous_written_value) = relocation.written_value else {
+            return Err("direct Mach-O CGU migration has no written relocation value".to_owned());
+        };
+        let Some(raw_relocation) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+            return Err("direct Mach-O CGU migration has an unsupported relocation".to_owned());
+        };
+        if !macho_aarch64_cross_input_relocation_is_supported(raw_relocation, relocation.size) {
+            return Err("direct Mach-O CGU migration has an unsupported relocation".to_owned());
+        }
+        let absolute_patch = macho_aarch64_cross_input_absolute_patch(
+            raw_relocation,
+            relocation.size,
+            relocation.output_offset,
+            previous_output,
+            previous_written_value,
+            moved.previous_value,
+            moved.current_value,
+        )?;
+        let size = usize::try_from(relocation.size)
+            .map_err(|_| "direct Mach-O CGU relocation size is too large".to_owned())?;
+        let (written_value, data, deferred_relocation) = if let Some((written_value, data)) =
+            absolute_patch
+        {
+            (written_value, data, None)
+        } else {
+            let written_value = macho_aarch64_relocated_value_after_target_move(
+                raw_relocation.r_type,
+                previous_written_value,
+                moved.previous_value,
+                moved.current_value,
+                relocation.addend,
+            )
+            .ok_or_else(|| {
+                "direct Mach-O CGU relocation cannot encode its migrated target".to_owned()
+            })?;
+            let rel_info =
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw_relocation,
+                )
+                .map_err(|error| {
+                    format!("failed to decode direct Mach-O CGU relocation: {error:#?}")
+                })?;
+            let deferred_relocation = deferred_instruction_relocation_patch(
+                rel_info,
+                previous_written_value,
+                written_value,
+            )
+            .ok_or_else(|| {
+                "direct Mach-O CGU migration has an unsupported instruction relocation".to_owned()
+            })?;
+            (written_value, vec![0; size], Some(deferred_relocation))
+        };
+        plan.output_patches.push(SectionPatch {
+            output_offset: relocation.output_offset,
+            size: relocation.size,
+            data,
+            deferred_relocation,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        relocation.written_value = Some(written_value);
+        relocation.target_value = moved.current_value;
+        relocation.applied_target_value = Some(moved.current_value);
+        relocation.target = Some(moved.current_target.clone());
+        plan.relocation_record_owners
+            .insert(relocation.input_file.to_string());
+    }
+    Ok(())
+}
+
 fn indexed_unique_symbol_positions(
     bytes: &[u8],
     file_offset: usize,
@@ -4718,6 +5317,43 @@ fn patch_changed_inputs(
     )
 }
 
+fn direct_macho_cgu_migration_inputs(
+    state_dir: &Path,
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+) -> Result<Vec<DirectMachOCguMigrationInput>> {
+    let mut inputs = Vec::new();
+    for (input_index, path) in changed_inputs {
+        let Some(input) = previous.input_files.get(*input_index) else {
+            continue;
+        };
+        let Some(previous_bytes) = read_verified_input_snapshot(state_dir, input)? else {
+            continue;
+        };
+        let Some((current_bytes, _)) = read_file_with_stable_identity(path)? else {
+            continue;
+        };
+        let Ok(previous_file) = object::File::parse(previous_bytes.as_slice()) else {
+            continue;
+        };
+        let Ok(current_file) = object::File::parse(current_bytes.as_slice()) else {
+            continue;
+        };
+        if !is_supported_incremental_macho_object(&previous_file)
+            || !is_supported_incremental_macho_object(&current_file)
+        {
+            continue;
+        }
+        inputs.push(DirectMachOCguMigrationInput {
+            input_file: input.path.clone(),
+            current_hash: hash_bytes(&current_bytes),
+            previous_bytes,
+            current_bytes,
+        });
+    }
+    Ok(inputs)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     args: &impl platform::Args,
@@ -4763,6 +5399,71 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         .collect::<Vec<_>>();
     let mut indexed_changed_input_macho_definitions = None;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
+    let mut direct_macho_cgu_migration_plan = DirectMachOCguMigrationPlan::default();
+    if records_complete && record_coverage.has_complete_macho_symbol_resolutions() {
+        let migration_inputs =
+            direct_macho_cgu_migration_inputs(state_dir, &previous, changed_inputs)?;
+        if migration_inputs.len() >= 2 {
+            let migration_input_files = migration_inputs
+                .iter()
+                .map(|input| input.input_file.as_str())
+                .collect::<HashSet<_>>();
+            for (input_index, _) in changed_inputs {
+                let input = &previous.input_files[*input_index];
+                if !migration_input_files.contains(input.path.as_str())
+                    || input.patch.as_ref().is_some_and(|patch| {
+                        !patch.sections.is_empty()
+                            || patch
+                                .raw_sections
+                                .as_deref()
+                                .is_some_and(|raw| !raw.is_empty())
+                    })
+                    || !previous
+                        .sections
+                        .iter()
+                        .any(|section| section.input_file == input.path)
+                {
+                    continue;
+                }
+                let patch = current_patch_state_from_snapshot_with_rustc_work_product_provenance(
+                    state_dir,
+                    input,
+                    previous_output.get()?,
+                    &previous.sections,
+                    &previous.relocations,
+                    &previous.macho_symbol_resolutions,
+                    &previous.fdes,
+                    &previous.dynamic_relocations,
+                    args.should_normalize_rust_archive_patch_inputs(),
+                    trust_rustc_link_content_digests,
+                )?;
+                previous.input_files[*input_index].patch = patch;
+            }
+            direct_macho_cgu_migration_plan = match plan_direct_macho_cgu_migrations(
+                &migration_inputs,
+                &previous.sections,
+                &previous.macho_symbol_resolutions,
+                previous_output.get()?,
+            )? {
+                Ok(plan) => plan,
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            };
+            if !direct_macho_cgu_migration_plan.moves.is_empty() {
+                if let Err(reason) = apply_direct_macho_cgu_resolution_migrations(
+                    &mut previous.macho_symbol_resolutions,
+                    &mut direct_macho_cgu_migration_plan,
+                    previous_output.get()?,
+                ) {
+                    return Ok(ChangedInputPatchResult::Unsupported(reason));
+                }
+                previous.macho_symbol_resolutions_file = None;
+                previous.sections_file = None;
+                patches.append(&mut direct_macho_cgu_migration_plan.output_patches);
+                patches.append(&mut direct_macho_cgu_migration_plan.chained_fixup_patches);
+                output_symbol_patches.append(&mut direct_macho_cgu_migration_plan.output_symbols);
+            }
+        }
+    }
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
         let normalize_rust_archive_patch_inputs = args.should_normalize_rust_archive_patch_inputs();
@@ -4874,6 +5575,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             };
             loaded_input
         };
+        if let Some(expected_hash) = direct_macho_cgu_migration_plan
+            .current_hashes
+            .get(previous.input_files[*input_index].path.as_str())
+            && hash_bytes(&bytes) != *expected_hash
+        {
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "changed direct Mach-O CGU changed after migration planning: {}",
+                path.display()
+            )));
+        }
         let rustc_provenance = (can_reuse_rustc_link_content_digest
             && trust_rustc_link_content_digests)
             .then(|| rustc_rlib_provenance(&bytes))
@@ -5449,6 +6160,26 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     previous_bytes.map(|bytes| (bytes, previous.sections.as_slice())),
                 )? {
                     Ok(updates) => updates,
+                    Err(reason)
+                        if changed_inputs.len() > 1
+                            && reason.starts_with(DIRECT_MACHO_CGU_MIGRATION_REQUIRED)
+                            && !records_complete =>
+                    {
+                        return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
+                            "direct Mach-O CGU migration needs complete ownership and relocation records"
+                                .to_owned(),
+                        ));
+                    }
+                    Err(reason)
+                        if changed_inputs.len() > 1
+                            && reason.starts_with(DIRECT_MACHO_CGU_MIGRATION_REQUIRED)
+                            && !record_coverage.has_complete_macho_symbol_resolutions() =>
+                    {
+                        return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                            "direct Mach-O CGU migration needs the complete resolution catalog"
+                                .to_owned(),
+                        ));
+                    }
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
             };
@@ -5768,6 +6499,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .moves
                 .iter()
                 .chain(&migrated_macho_resolution_updates.moves)
+                .chain(&direct_macho_cgu_migration_plan.moves)
                 .cloned()
                 .collect::<Vec<_>>();
             let macho_text_relocation_retiring_names =
@@ -6400,6 +7132,23 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     timing_phase!("Read previous incremental input snapshot");
                     previous_snapshot_bytes.get()?
                 };
+                let allows_direct_macho_cgu_migration =
+                    if let (Some(previous_bytes), Some(migrated_names)) = (
+                        previous_snapshot_bytes,
+                        direct_macho_cgu_migration_plan
+                            .migrated_names_by_input
+                            .get(input.path.as_str()),
+                    ) {
+                        direct_macho_cgu_migration_fingerprint_matches(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            migrated_names,
+                        )?
+                    } else {
+                        false
+                    };
                 let allows_unowned_macho_text_changes = if normalize_rust_archive_patch_inputs {
                     if let Some(previous_bytes) = previous_snapshot_bytes {
                         archive_diff_allows_unowned_macho_text_changes(
@@ -6573,6 +7322,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     && !metadata_only_fingerprint_matches
                     && !allows_owned_macho_member_removal
                     && !allows_unowned_macho_text_changes
+                    && !allows_direct_macho_cgu_migration
                     && macho_text_section_activation.is_none()
                     && !activated_archive_base_diff_is_changed_definitions
                     && added_macho_archive_text_activation.is_none()
@@ -7424,6 +8174,23 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 bytes,
             ));
         }
+    }
+
+    if !direct_macho_cgu_migration_plan.moves.is_empty() {
+        if let Err(reason) = apply_direct_macho_cgu_relocation_migrations(
+            &mut previous.relocations,
+            &mut direct_macho_cgu_migration_plan,
+            previous_output.get()?,
+        ) {
+            return Ok(ChangedInputPatchResult::Unsupported(reason));
+        }
+        record_override_input_files.extend(
+            direct_macho_cgu_migration_plan
+                .relocation_record_owners
+                .iter()
+                .cloned(),
+        );
+        patches.append(&mut direct_macho_cgu_migration_plan.output_patches);
     }
 
     if patched_input_count == 0 {
@@ -16494,7 +17261,31 @@ fn macho_text_relocation_replays_for_input(
                     consumed_target_moves.insert(relocation_index);
                 }
                 let target_move = recorded_target_move.cloned().or(same_object_target_move);
-                let resolution_move = target_resolution_moves.get(&relocation_index);
+                let planned_resolution_move = if let (Some(target_name), Some(previous_target)) = (
+                    relocation.target_name.as_deref(),
+                    relocation.target.as_ref(),
+                ) {
+                    match matching_macho_symbol_resolution_move_for_previous(
+                        resolution_moves,
+                        target_name,
+                        previous_target,
+                        relocation.target_value,
+                    ) {
+                        Ok(moved) => moved,
+                        Err(()) => {
+                            return Ok(Err(format!(
+                                "ambiguous moved Mach-O symbol for text relocation in {}",
+                                display_hex_path(&input.path)
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let resolution_move = target_resolution_moves
+                    .get(&relocation_index)
+                    .or(planned_resolution_move);
+                section_has_moved_target |= resolution_move.is_some();
                 let (current_target_value, current_target) = resolved_macho_relocation_target(
                     relocation.target_value,
                     replay_target,
@@ -16943,7 +17734,30 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                if let Some(target_move) = target_moves_by_index.get(&relocation_index) {
+                let planned_resolution_move = if let (Some(target_name), Some(previous_target)) = (
+                    relocation.target_name.as_deref(),
+                    relocation.target.as_ref(),
+                ) {
+                    match matching_macho_symbol_resolution_move_for_previous(
+                        resolution_moves,
+                        target_name,
+                        previous_target,
+                        relocation.target_value,
+                    ) {
+                        Ok(moved) => moved,
+                        Err(()) => {
+                            return Ok(Err(format!(
+                                "ambiguous moved Mach-O symbol for data relocation in {}",
+                                display_hex_path(&input.path)
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                if target_moves_by_index.contains_key(&relocation_index)
+                    || planned_resolution_move.is_some()
+                {
                     let Some(target_name) = relocation.target_name.as_deref() else {
                         return Ok(Err(format!(
                             "missing Mach-O data relocation target name in {}",
@@ -16956,24 +17770,40 @@ fn validate_macho_data_relocations_are_stable(
                             display_hex_path(&input.path)
                         )));
                     };
-                    let resolution_move = match matching_macho_symbol_resolution_move(
-                        resolution_moves,
-                        target_name,
-                        previous_target,
-                        relocation.target_value,
-                        target_move.current_section_offset,
-                    ) {
-                        Ok(moved) => moved,
-                        Err(()) => {
-                            return Ok(Err(format!(
-                                "ambiguous moved Mach-O symbol for data relocation in {}",
-                                display_hex_path(&input.path)
-                            )));
+                    let target_move = target_moves_by_index
+                        .get(&relocation_index)
+                        .map(|target_move| (*target_move).clone())
+                        .or_else(|| {
+                            planned_resolution_move.map(|moved| MachORelocationTargetMove {
+                                relocation_index,
+                                current_section_offset: moved.current_target.section_offset,
+                                current_target_value: moved.current_value,
+                                current_input: Some(moved.current_target.input.clone()),
+                            })
+                        })
+                        .expect("checked target or resolution move");
+                    let resolution_move = if let Some(moved) = planned_resolution_move {
+                        Some(moved)
+                    } else {
+                        match matching_macho_symbol_resolution_move(
+                            resolution_moves,
+                            target_name,
+                            previous_target,
+                            relocation.target_value,
+                            target_move.current_section_offset,
+                        ) {
+                            Ok(moved) => moved,
+                            Err(()) => {
+                                return Ok(Err(format!(
+                                    "ambiguous moved Mach-O symbol for data relocation in {}",
+                                    display_hex_path(&input.path)
+                                )));
+                            }
                         }
                     };
                     let (patch, symbol_patch) = match moved_macho_data_relocation_patch(
                         relocation,
-                        (*target_move).clone(),
+                        target_move,
                         resolution_move,
                     ) {
                         Ok(patches) => patches,
@@ -16981,7 +17811,9 @@ fn validate_macho_data_relocations_are_stable(
                     };
                     target_patches.output_patches.push(patch);
                     target_patches.output_symbols.push(symbol_patch);
-                    handled_target_moves.insert(relocation_index);
+                    if target_moves_by_index.contains_key(&relocation_index) {
+                        handled_target_moves.insert(relocation_index);
+                    }
                     changed = true;
                     continue;
                 }
@@ -20733,6 +21565,58 @@ fn macho_object_semantic_patch_fingerprint(
 
     (retirement_proof || (has_masked_section && (!require_masked_text || has_masked_text)))
         .then(|| hasher.finalize())
+}
+
+fn direct_macho_cgu_migration_fingerprint_matches(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    migrated_names: &HashSet<Vec<u8>>,
+) -> Result<bool> {
+    if migrated_names.is_empty() {
+        return Ok(false);
+    }
+    let previous_ranges = patch_ranges_with_lookup(
+        previous_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.previous.clone()),
+        PatchInputLookup::MatchArchiveMember,
+    )?;
+    let current_ranges = patch_ranges_with_lookup(
+        current_bytes,
+        input_file_path,
+        matched_sections
+            .iter()
+            .map(|section| section.current.clone()),
+        PatchInputLookup::MatchArchiveMember,
+    )?;
+    let (Some(previous_ranges), Some(current_ranges)) = (previous_ranges, current_ranges) else {
+        return Ok(false);
+    };
+    let previous = macho_object_semantic_patch_fingerprint(
+        previous_bytes,
+        0,
+        &previous_ranges,
+        &HashSet::new(),
+        &HashSet::new(),
+        migrated_names,
+        true,
+        true,
+    );
+    let current = macho_object_semantic_patch_fingerprint(
+        current_bytes,
+        0,
+        &current_ranges,
+        &HashSet::new(),
+        &HashSet::new(),
+        migrated_names,
+        true,
+        true,
+    );
+    Ok(previous.is_some() && previous == current)
 }
 
 fn macho_section_symbols_fingerprint(
@@ -47534,6 +48418,226 @@ mod tests {
         push_macho_symbol(&mut bytes, 7, 2, text.len() as u64 + data_symbol_offset);
         bytes.extend_from_slice(strings);
         bytes
+    }
+
+    fn retire_test_macho_symbol(mut bytes: Vec<u8>, symbol_index: usize) -> Vec<u8> {
+        let value_range =
+            macho_symbol_value_field_range(&bytes, object::SymbolIndex(symbol_index)).unwrap();
+        let entry = value_range.start - 8;
+        bytes[entry + 4] = object::macho::N_STAB;
+        bytes[entry + 5] = 0;
+        bytes[value_range].fill(0);
+        bytes
+    }
+
+    fn direct_macho_cgu_migration_fixture() -> (
+        Vec<DirectMachOCguMigrationInput>,
+        Vec<SectionRecord>,
+        Vec<MachOSymbolResolutionRecord>,
+        Vec<u8>,
+    ) {
+        let source_previous = test_macho_object(b"\x01\x02\x03\x04", b"\x11\x12\x13\x14", 0);
+        let source_current = retire_test_macho_symbol(source_previous.clone(), 0);
+        let destination_current = test_macho_object(b"\x05\x06\x07\x08", b"\x21\x22\x23\x24", 0);
+        let destination_previous = retire_test_macho_symbol(destination_current.clone(), 0);
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let source_value =
+            macho_output_address_for_file_offset(&output_file, output.text_offset).unwrap();
+        let inputs = vec![
+            DirectMachOCguMigrationInput {
+                input_file: "source.o".to_owned(),
+                previous_bytes: source_previous,
+                current_hash: hash_bytes(&source_current),
+                current_bytes: source_current,
+            },
+            DirectMachOCguMigrationInput {
+                input_file: "destination.o".to_owned(),
+                previous_bytes: destination_previous,
+                current_hash: hash_bytes(&destination_current),
+                current_bytes: destination_current,
+            },
+        ];
+        let sections = vec![
+            SectionRecord {
+                input_file: "source.o".into(),
+                input: "source.o".into(),
+                section_index: 0,
+                output_offset: output.text_offset,
+                size: 4,
+            },
+            SectionRecord {
+                input_file: "destination.o".into(),
+                input: "destination.o".into(),
+                section_index: 0,
+                output_offset: output.text_offset + 0x100,
+                size: 4,
+            },
+        ];
+        let resolutions = vec![MachOSymbolResolutionRecord {
+            name: hex::encode("_text").into(),
+            direct_value: Some(source_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "source.o".into(),
+                input: "source.o".into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+        }];
+        (inputs, sections, resolutions, output.bytes)
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_is_order_independent() {
+        let (mut inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        let forward = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
+            .unwrap()
+            .unwrap();
+        inputs.reverse();
+        let reversed = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(forward.moves, reversed.moves);
+        assert_eq!(forward.moves.len(), 1);
+        assert_eq!(forward.moves[0].current_target.input_file, "destination.o");
+        assert_eq!(
+            forward.migrated_names_by_input,
+            reversed.migrated_names_by_input
+        );
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_rejects_ambiguous_destination() {
+        let (mut inputs, mut sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        let duplicate = DirectMachOCguMigrationInput {
+            input_file: "duplicate.o".to_owned(),
+            previous_bytes: retire_test_macho_symbol(inputs[1].current_bytes.clone(), 0),
+            current_hash: hash_bytes(&inputs[1].current_bytes),
+            current_bytes: inputs[1].current_bytes.clone(),
+        };
+        inputs.push(duplicate);
+        sections.push(SectionRecord {
+            input_file: "duplicate.o".into(),
+            input: "duplicate.o".into(),
+            section_index: 0,
+            output_offset: sections[1].output_offset + 0x100,
+            size: 4,
+        });
+
+        let plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
+            .unwrap()
+            .unwrap();
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_rejects_changed_symbol_signature() {
+        let (mut inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        let value_range =
+            macho_symbol_value_field_range(&inputs[1].current_bytes, object::SymbolIndex(0))
+                .unwrap();
+        let entry = value_range.start - 8;
+        inputs[1].current_bytes[entry + 6..entry + 8]
+            .copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
+
+        let plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
+            .unwrap()
+            .unwrap();
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_fingerprint_ignores_only_paired_name() {
+        let input_file = hex::encode("source.o");
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x11\x12\x13\x14", 0);
+        let current = retire_test_macho_symbol(previous.clone(), 0);
+        let current_unrelated_change = retire_test_macho_symbol(
+            test_macho_object(b"\x01\x02\x03\x04", b"\x91\x12\x13\x14", 0),
+            0,
+        );
+        let file = object::File::parse(previous.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let section = PatchSection {
+            input: input_file.clone(),
+            section_index: patch_section_record_index(&file, text.index()).unwrap(),
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: text.size(),
+            output_offset: 0,
+            output_size: text.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        };
+        let matched = vec![MatchedPatchSection::same(section)];
+        let migrated_names = HashSet::from([b"_text".to_vec()]);
+
+        assert!(
+            direct_macho_cgu_migration_fingerprint_matches(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &migrated_names,
+            )
+            .unwrap()
+        );
+        assert!(
+            !direct_macho_cgu_migration_fingerprint_matches(
+                &previous,
+                &current_unrelated_change,
+                &input_file,
+                &matched,
+                &migrated_names,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_retargets_absolute_relocation() {
+        let (inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        let mut plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
+            .unwrap()
+            .unwrap();
+        let moved = plan.moves[0].clone();
+        let output_offset = sections[0].output_offset + 0x200;
+        let mut relocations = vec![RelocationRecord {
+            target_symbol_id: 1,
+            written_value: Some(moved.previous_value),
+            target_value: moved.previous_value,
+            applied_target_value: Some(moved.previous_value),
+            target_name: Some(moved.name.clone()),
+            target: Some(moved.previous_target.clone()),
+            input_file: "caller.o".into(),
+            input: "caller.o".into(),
+            section_index: 1,
+            relocation_offset: 0,
+            output_offset,
+            size: 8,
+            kind: encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 3,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            }),
+            addend: 0,
+        }];
+
+        apply_direct_macho_cgu_relocation_migrations(&mut relocations, &mut plan, &output).unwrap();
+        assert_eq!(relocations[0].target_value, moved.current_value);
+        assert_eq!(relocations[0].target, Some(moved.current_target));
+        assert_eq!(plan.output_patches.len(), 1);
+        assert_eq!(
+            plan.output_patches[0].data,
+            moved.current_value.to_le_bytes()
+        );
+        assert!(plan.relocation_record_owners.contains("caller.o"));
     }
 
     fn test_macho_data_object(
