@@ -8476,6 +8476,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     }
 
     deduplicate_identical_plain_section_patches(&mut patches);
+    merge_compatible_overlapping_plain_section_patches(&mut patches);
     if let Some(reason) = patch_output_range_rejection_reason(&patches) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -8555,6 +8556,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         Ok(header_patches) => patches.extend(header_patches),
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
+    merge_compatible_overlapping_plain_section_patches(&mut patches);
     if let Some(reason) = patch_output_range_rejection_reason(&patches) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -9526,6 +9528,87 @@ fn deduplicate_identical_plain_section_patches(patches: &mut Vec<SectionPatch>) 
         unique.push(patch);
     }
     *patches = unique;
+}
+
+fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionPatch>) {
+    loop {
+        let mut merged = None;
+        'pairs: for left_index in 0..patches.len() {
+            let left = &patches[left_index];
+            if left.deferred_relocation.is_some()
+                || !left.preserve_ranges.is_empty()
+                || !left.adjustments.is_empty()
+                || left.size as usize != left.data.len()
+            {
+                continue;
+            }
+            let left_start = left.output_offset;
+            let Some(left_end) = left_start.checked_add(left.size) else {
+                continue;
+            };
+            for right_index in left_index + 1..patches.len() {
+                let right = &patches[right_index];
+                if right.deferred_relocation.is_some()
+                    || !right.preserve_ranges.is_empty()
+                    || !right.adjustments.is_empty()
+                    || right.size as usize != right.data.len()
+                {
+                    continue;
+                }
+                let right_start = right.output_offset;
+                let Some(right_end) = right_start.checked_add(right.size) else {
+                    continue;
+                };
+                let overlap_start = left_start.max(right_start);
+                let overlap_end = left_end.min(right_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                let (Ok(left_overlap_start), Ok(right_overlap_start), Ok(overlap_len)) = (
+                    usize::try_from(overlap_start - left_start),
+                    usize::try_from(overlap_start - right_start),
+                    usize::try_from(overlap_end - overlap_start),
+                ) else {
+                    continue;
+                };
+                if left.data[left_overlap_start..left_overlap_start + overlap_len]
+                    != right.data[right_overlap_start..right_overlap_start + overlap_len]
+                {
+                    continue;
+                }
+                let output_offset = left_start.min(right_start);
+                let end = left_end.max(right_end);
+                let (Ok(data_len), Ok(left_offset), Ok(right_offset)) = (
+                    usize::try_from(end - output_offset),
+                    usize::try_from(left_start - output_offset),
+                    usize::try_from(right_start - output_offset),
+                ) else {
+                    continue;
+                };
+                let mut data = vec![0; data_len];
+                data[left_offset..left_offset + left.data.len()].copy_from_slice(&left.data);
+                data[right_offset..right_offset + right.data.len()].copy_from_slice(&right.data);
+                merged = Some((
+                    left_index,
+                    right_index,
+                    SectionPatch {
+                        output_offset,
+                        size: end - output_offset,
+                        data,
+                        deferred_relocation: None,
+                        preserve_ranges: Vec::new(),
+                        adjustments: Vec::new(),
+                    },
+                ));
+                break 'pairs;
+            }
+        }
+        let Some((left_index, right_index, patch)) = merged else {
+            break;
+        };
+        patches[left_index] = patch;
+        patches.remove(right_index);
+    }
 }
 
 fn remove_plain_patches_shadowed_by_exact_current_ranges(
@@ -61572,6 +61655,32 @@ mod tests {
         deduplicate_identical_plain_section_patches(&mut patches);
         assert_eq!(patches.len(), 2);
         assert!(patch_output_range_rejection_reason(&patches).is_some());
+    }
+
+    #[test]
+    fn compatible_plain_patch_overlaps_are_merged() {
+        let patch = |output_offset, data: Vec<u8>| SectionPatch {
+            output_offset,
+            size: data.len() as u64,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut patches = vec![patch(16, vec![1, 2, 3, 0]), patch(19, vec![0, 4, 5, 6])];
+
+        merge_compatible_overlapping_plain_section_patches(&mut patches);
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].output_offset, 16);
+        assert_eq!(patches[0].size, 7);
+        assert_eq!(patches[0].data, vec![1, 2, 3, 0, 4, 5, 6]);
+        assert!(patch_output_range_rejection_reason(&patches).is_none());
+
+        let mut conflicting = vec![patch(16, vec![1, 2]), patch(17, vec![3, 4])];
+        merge_compatible_overlapping_plain_section_patches(&mut conflicting);
+        assert_eq!(conflicting.len(), 2);
+        assert!(patch_output_range_rejection_reason(&conflicting).is_some());
     }
 
     #[test]
