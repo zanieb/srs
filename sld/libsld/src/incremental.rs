@@ -628,6 +628,29 @@ struct FileContentState {
     identity: Option<FileIdentity>,
 }
 
+enum PreviousOutputSource {
+    Live(PathBuf),
+    Retained(PathBuf),
+}
+
+impl PreviousOutputSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Live(path) | Self::Retained(path) => path,
+        }
+    }
+
+    fn is_retained(&self) -> bool {
+        matches!(self, Self::Retained(_))
+    }
+}
+
+enum PreviousOutputSourceSelection {
+    Available(PreviousOutputSource),
+    OutputChanged,
+    RetainedOutputChanged,
+}
+
 #[derive(Debug, Clone)]
 struct FileIdentity {
     len: u64,
@@ -1055,46 +1078,44 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
         )?;
         return Ok(false);
     }
-    let retained_output_to_restore = if args.should_retain_output_snapshot()
-        && !args.output().try_exists().unwrap_or(false)
-    {
-        match retained_output_snapshot_matches_previous(&state_dir, &previous.output, args.output())
-        {
-            Ok(true) => Some(previous.output.clone()),
-            Ok(false) => {
-                append_log(
-                    &state_dir,
-                    "incremental fast path unavailable before loading inputs: retained output snapshot changed",
-                )?;
-                return Ok(false);
-            }
-            Err(error) => {
-                append_log(
-                    &state_dir,
-                    &format!("retained output restoration unavailable: {error:?}"),
-                )?;
-                return Ok(false);
-            }
-        }
-    } else {
-        None
+    let output_match = {
+        timing_phase!("Validate incremental fast-path output content");
+        output_content_match(
+            &previous.output,
+            args.output(),
+            args.should_trust_persistent_output_data_identity(),
+        )?
     };
-    if retained_output_to_restore.is_none()
-        && !{
-            timing_phase!("Validate incremental fast-path output content");
-            output_content_matches_previous(
-                &previous.output,
-                args.output(),
-                args.should_trust_persistent_output_data_identity(),
-            )?
+    let previous_output_source = match select_previous_output_source(
+        &state_dir,
+        &previous.output,
+        args.output(),
+        args.should_retain_output_snapshot(),
+        output_match,
+    ) {
+        Ok(PreviousOutputSourceSelection::Available(source)) => source,
+        Ok(PreviousOutputSourceSelection::OutputChanged) => {
+            append_log(
+                &state_dir,
+                "incremental fast path unavailable before loading inputs: output content changed",
+            )?;
+            return Ok(false);
         }
-    {
-        append_log(
-            &state_dir,
-            "incremental fast path unavailable before loading inputs: output content changed",
-        )?;
-        return Ok(false);
-    }
+        Ok(PreviousOutputSourceSelection::RetainedOutputChanged) => {
+            append_log(
+                &state_dir,
+                "incremental fast path unavailable before loading inputs: retained output snapshot changed",
+            )?;
+            return Ok(false);
+        }
+        Err(error) => {
+            append_log(
+                &state_dir,
+                &format!("retained output restoration unavailable: {error:?}"),
+            )?;
+            return Ok(false);
+        }
+    };
 
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
@@ -1167,7 +1188,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
     }
 
     if !changed_inputs.is_empty() {
-        if retained_output_to_restore.is_none()
+        if !previous_output_source.is_retained()
             && !args.should_patch_changed_inputs_before_loading()
         {
             append_log(
@@ -1267,6 +1288,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             patch_changed_inputs(
                 args,
                 &state_dir,
+                previous_output_source.path(),
                 full_previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::Complete,
@@ -1292,6 +1314,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             patch_changed_inputs(
                 args,
                 &state_dir,
+                previous_output_source.path(),
                 previous,
                 current_link_start.clone(),
                 if complete_macho_symbol_resolutions {
@@ -1306,6 +1329,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             let result = patch_changed_inputs(
                 args,
                 &state_dir,
+                previous_output_source.path(),
                 previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::MetadataOnly,
@@ -1356,6 +1380,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 patch_changed_inputs(
                     args,
                     &state_dir,
+                    previous_output_source.path(),
                     previous,
                     current_link_start.clone(),
                     if complete_macho_symbol_resolutions {
@@ -1385,6 +1410,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             patch_changed_inputs(
                 args,
                 &state_dir,
+                previous_output_source.path(),
                 previous,
                 current_link_start.clone(),
                 record_coverage,
@@ -1421,6 +1447,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 patch_changed_inputs(
                     args,
                     &state_dir,
+                    previous_output_source.path(),
                     previous,
                     current_link_start.clone(),
                     ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions,
@@ -1457,6 +1484,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     patch_changed_inputs(
                         args,
                         &state_dir,
+                        previous_output_source.path(),
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
@@ -1492,6 +1520,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     patch_changed_inputs(
                         args,
                         &state_dir,
+                        previous_output_source.path(),
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
@@ -1552,8 +1581,12 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             ),
         )?;
     }
-    if let Some(previous_output) = retained_output_to_restore.as_ref()
-        && !restore_missing_output_snapshot(&state_dir, previous_output, args.output())?
+    if previous_output_source.is_retained()
+        && !restore_selected_output_source(
+            &state_dir,
+            previous_output_source.path(),
+            args.output(),
+        )?
     {
         return Ok(false);
     }
@@ -5462,6 +5495,7 @@ fn output_symbol_value_patches(
 fn patch_changed_inputs(
     args: &impl platform::Args,
     state_dir: &Path,
+    previous_output_source: &Path,
     previous: PersistedState,
     current_link_start: Option<FileIdentity>,
     record_coverage: ChangedInputRecordCoverage,
@@ -5473,6 +5507,7 @@ fn patch_changed_inputs(
     patch_changed_inputs_with_rustc_link_content_digest_trust(
         args,
         state_dir,
+        previous_output_source,
         previous,
         current_link_start,
         record_coverage,
@@ -5523,6 +5558,7 @@ fn direct_macho_cgu_migration_inputs(
 fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     args: &impl platform::Args,
     state_dir: &Path,
+    previous_output_source: &Path,
     previous: PersistedState,
     current_link_start: Option<FileIdentity>,
     record_coverage: ChangedInputRecordCoverage,
@@ -5563,7 +5599,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         .map(|(_, path)| path.clone())
         .collect::<Vec<_>>();
     let mut indexed_changed_input_macho_definitions = None;
-    let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
+    let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(previous_output_source));
     let mut direct_macho_cgu_migration_plan = DirectMachOCguMigrationPlan::default();
     if records_complete && record_coverage.has_complete_macho_symbol_resolutions() {
         let migration_inputs =
@@ -8490,13 +8526,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 ),
             )?;
         }
-        if !args.output().try_exists().unwrap_or(false)
-            && retained_output_snapshot_matches_previous(
-                state_dir,
-                &previous.output,
-                args.output(),
-            )?
-            && !restore_missing_output_snapshot(state_dir, &previous.output, args.output())?
+        if previous_output_source != args.output().as_ref()
+            && !restore_selected_output_source(state_dir, previous_output_source, args.output())?
         {
             return Ok(ChangedInputPatchResult::Unsupported(
                 "missing retained output could not be restored".to_owned(),
@@ -8519,14 +8550,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
-    let retained_output_snapshot = if args.should_retain_output_snapshot()
-        && !args.output().try_exists().unwrap_or(false)
-        && retained_output_snapshot_matches_previous(state_dir, &previous.output, args.output())?
-    {
-        Some(output_snapshot_path(state_dir))
-    } else {
-        None
-    };
+    let retained_output_snapshot =
+        (previous_output_source != args.output().as_ref()).then_some(previous_output_source);
     let Some(mut directly_patched_output) = DirectlyPatchedOutput::new(
         args.output(),
         state_dir,
@@ -9846,8 +9871,7 @@ impl DirectlyPatchedOutput {
         should_replace: bool,
         retained_output_snapshot: Option<&Path>,
     ) -> Option<Self> {
-        if !output.try_exists().unwrap_or(false) {
-            let snapshot = retained_output_snapshot?;
+        if let Some(snapshot) = retained_output_snapshot {
             let generation = directly_patched_output_standby_path(state_dir);
             let _ = std::fs::remove_file(&generation);
             let _ = std::fs::remove_file(directly_patched_output_standby_state_path(state_dir));
@@ -9863,6 +9887,9 @@ impl DirectlyPatchedOutput {
                 standby_state_path: None,
                 install_if_missing: true,
             });
+        }
+        if !output.try_exists().unwrap_or(false) {
+            return None;
         }
         if !should_replace {
             return Some(Self {
@@ -35639,6 +35666,26 @@ fn content_state_matches_previous(previous: &FileContentState, current: &FileCon
     !previous.hash.is_empty() && previous.len == current.len && previous.hash == current.hash
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputContentMatch {
+    Matches,
+    Changed,
+    Missing,
+}
+
+fn output_content_match(
+    previous: &FileContentState,
+    path: &Path,
+    trust_persistent_output_data_identity: bool,
+) -> Result<OutputContentMatch> {
+    match output_content_matches_previous(previous, path, trust_persistent_output_data_identity) {
+        Ok(true) => Ok(OutputContentMatch::Matches),
+        Ok(false) => Ok(OutputContentMatch::Changed),
+        Err(_) if matches!(path.try_exists(), Ok(false)) => Ok(OutputContentMatch::Missing),
+        Err(error) => Err(error),
+    }
+}
+
 fn output_content_matches_previous(
     previous: &FileContentState,
     path: &Path,
@@ -35655,6 +35702,31 @@ fn output_content_matches_previous(
         };
     }
     Ok(FileContentState::from_path(path)? == *previous)
+}
+
+fn select_previous_output_source(
+    state_dir: &Path,
+    previous: &FileContentState,
+    output: &Path,
+    should_retain_output_snapshot: bool,
+    output_match: OutputContentMatch,
+) -> Result<PreviousOutputSourceSelection> {
+    match output_match {
+        OutputContentMatch::Matches => Ok(PreviousOutputSourceSelection::Available(
+            PreviousOutputSource::Live(output.to_path_buf()),
+        )),
+        OutputContentMatch::Changed => Ok(PreviousOutputSourceSelection::OutputChanged),
+        OutputContentMatch::Missing if should_retain_output_snapshot => {
+            if retained_output_snapshot_matches_previous(state_dir, previous, output)? {
+                Ok(PreviousOutputSourceSelection::Available(
+                    PreviousOutputSource::Retained(output_snapshot_path(state_dir)),
+                ))
+            } else {
+                Ok(PreviousOutputSourceSelection::RetainedOutputChanged)
+            }
+        }
+        OutputContentMatch::Missing => Ok(PreviousOutputSourceSelection::OutputChanged),
+    }
 }
 
 fn install_output_snapshot(state_dir: &Path, output: &Path) -> Result {
@@ -35714,7 +35786,14 @@ fn restore_missing_output_snapshot(
         return Ok(false);
     }
     let snapshot = output_snapshot_path(state_dir);
-    install_isolated_output_copy(&snapshot, output).with_context(|| {
+    restore_selected_output_source(state_dir, &snapshot, output)
+}
+
+fn restore_selected_output_source(state_dir: &Path, source: &Path, output: &Path) -> Result<bool> {
+    if output.try_exists().unwrap_or(false) {
+        return Ok(false);
+    }
+    install_isolated_output_copy(source, output).with_context(|| {
         format!(
             "Failed to restore incremental output snapshot to `{}`",
             output.display()
@@ -52323,9 +52402,11 @@ mod tests {
         std::fs::write(&replacement, &current_bytes).unwrap();
         std::fs::rename(&replacement, &input).unwrap();
 
+        let args = crate::args::macho::MachOArgs::default();
         let result = patch_changed_inputs_with_rustc_link_content_digest_trust(
-            &crate::args::macho::MachOArgs::default(),
+            &args,
             &state_dir,
+            args.output.as_ref(),
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -52541,9 +52622,11 @@ mod tests {
         previous.write(&state_dir).unwrap();
         std::fs::write(&input, &current_bytes).unwrap();
 
+        let args = crate::args::macho::MachOArgs::default();
         let result = patch_changed_inputs_with_rustc_link_content_digest_trust(
-            &crate::args::macho::MachOArgs::default(),
+            &args,
             &state_dir,
+            args.output.as_ref(),
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -57173,6 +57256,7 @@ mod tests {
         let result = patch_changed_inputs(
             &crate::args::elf::ElfArgs::default(),
             dir.path(),
+            Path::new("unused-output"),
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -57213,9 +57297,12 @@ mod tests {
         std::fs::write(&replacement, b"object").unwrap();
         std::fs::rename(&replacement, &input).unwrap();
 
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.output = Arc::from(output.as_path());
         let result = patch_changed_inputs(
-            &crate::args::elf::ElfArgs::default(),
+            &args,
             &state_dir,
+            &output,
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -57329,6 +57416,44 @@ mod tests {
         assert!(log.contains("patched 1 changed input file before loading inputs"));
         assert!(!log.contains("metadata-only changed-input patch unavailable"));
         assert!(!log.contains("filtered-record changed-input patch unavailable"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_patches_missing_output_from_retained_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let input = dir.path().join("input.o");
+        let previous_bytes = growable_data_elf();
+        let mut current_bytes = previous_bytes.clone();
+        current_bytes[0x40..0x44].copy_from_slice(&[5, 6, 7, 8]);
+        std::fs::write(&output, &previous_bytes).unwrap();
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut previous = publishing_metadata_state(&args, &output, &input);
+        previous.output = FileContentState::from_path(&output).unwrap();
+        previous
+            .sections
+            .push(section_record(input.to_str().unwrap(), 1, 0x40, 8));
+        previous.write(&state_dir).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        install_output_snapshot(&state_dir, &output).unwrap();
+
+        let replacement = dir.path().join("input.replacement.o");
+        std::fs::write(&replacement, &current_bytes).unwrap();
+        std::fs::rename(replacement, &input).unwrap();
+        std::fs::remove_file(&output).unwrap();
+
+        let reused = maybe_reuse_output_before_loading(&args).unwrap();
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(reused, "{log}");
+        assert_eq!(&std::fs::read(&output).unwrap()[0x40..0x44], &[5, 6, 7, 8]);
+        assert!(log.contains("loaded records for 1 changed input file before loading inputs"));
+        assert!(log.contains("patched 1 changed input file before loading inputs"));
     }
 
     #[test]
@@ -59238,6 +59363,32 @@ mod tests {
             std::fs::read(output_snapshot_path(&state_dir)).unwrap(),
             b"after!"
         );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn disappeared_output_selects_retained_source_without_restoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let state_dir = dir.path().join("out.incr");
+        std::fs::write(&output, b"output").unwrap();
+        let previous = FileContentState::from_path(&output).unwrap();
+        install_output_snapshot(&state_dir, &output).unwrap();
+
+        assert!(output.try_exists().unwrap());
+        std::fs::remove_file(&output).unwrap();
+        let output_match = output_content_match(&previous, &output, false).unwrap();
+
+        assert_eq!(output_match, OutputContentMatch::Missing);
+        let PreviousOutputSourceSelection::Available(source) =
+            select_previous_output_source(&state_dir, &previous, &output, true, output_match)
+                .unwrap()
+        else {
+            panic!("retained output snapshot was not selected");
+        };
+        assert_eq!(source.path(), output_snapshot_path(&state_dir));
+        assert!(source.is_retained());
+        assert!(!output.exists());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
