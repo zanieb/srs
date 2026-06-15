@@ -2661,10 +2661,20 @@ fn current_relocation_target_input_bytes<'data>(
     }
 }
 
+#[cfg(test)]
 fn relocation_target_patches_for_input(
     relocations: &mut [RelocationRecord],
     input: &FileState,
     bytes: &[u8],
+) -> Result<std::result::Result<RelocationTargetPatches, String>> {
+    relocation_target_patches_for_input_with_normalization(relocations, input, bytes, false)
+}
+
+fn relocation_target_patches_for_input_with_normalization(
+    relocations: &mut [RelocationRecord],
+    input: &FileState,
+    bytes: &[u8],
+    normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<RelocationTargetPatches, String>> {
     let macho_archive_symbol_inputs = MachOArchiveSymbolInputLookup::new(bytes)?;
     let mut input_ranges = Vec::new();
@@ -2683,7 +2693,17 @@ fn relocation_target_patches_for_input(
         let Some(target_name) = relocation.target_name.as_deref() else {
             continue;
         };
-        let input_bytes = if let Some(lookup) = macho_archive_symbol_inputs.as_ref() {
+        let same_macho_archive_owner = macho_archive_symbol_inputs.is_some()
+            && relocation.input_file == input.path
+            && patch_input_refs_match(
+                input.path.as_str(),
+                relocation.input.as_str(),
+                target.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?;
+        let input_bytes = if same_macho_archive_owner {
+            current_relocation_target_input_bytes(bytes, input.path.as_str(), &target.input)?
+        } else if let Some(lookup) = macho_archive_symbol_inputs.as_ref() {
             if let Some(input_bytes) = lookup.get(target_name) {
                 Some(input_bytes)
             } else if !lookup.contains(target_name)
@@ -2731,7 +2751,7 @@ fn relocation_target_patches_for_input(
             && file.architecture() == object::Architecture::Aarch64
             && decode_macho_aarch64_relocation_kind(relocation.kind).is_some();
         if relocation.input_file == input.path
-            && relocation.input == target.input
+            && (relocation.input == target.input || same_macho_archive_owner)
             && file.format() == object::BinaryFormat::MachO
             && file.architecture() == object::Architecture::Aarch64
             && decode_macho_aarch64_relocation_kind(relocation.kind).is_some()
@@ -6268,8 +6288,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 };
             let mut relocation_target_patches = {
                 timing_phase!("Resolve changed relocation targets");
-                match relocation_target_patches_for_input(&mut previous.relocations, input, &bytes)?
-                {
+                match relocation_target_patches_for_input_with_normalization(
+                    &mut previous.relocations,
+                    input,
+                    &bytes,
+                    normalize_rust_archive_patch_inputs,
+                )? {
                     Ok(patches) => patches,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
@@ -63144,6 +63168,81 @@ mod tests {
         assert!(target_input.contains(String::from_utf8_lossy(current_identifier).as_ref()));
         assert_eq!(patches.changed_relocation_indices, vec![0]);
         assert!(patches.macho_cross_input_target_moves.is_empty());
+    }
+
+    #[test]
+    fn macho_relocation_target_defers_normalized_same_owner_refs() {
+        let object = test_macho_object(&[0; 4], &[0; 8], 4);
+        let current_identifier = b"crate.cgu.current.rcgu.o";
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(current_identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let current = builder.into_inner().unwrap();
+        let mut state = state("args", b"output", &[("libcrate.rlib", &current)]);
+        let input = state.input_files.remove(0);
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 3,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        };
+        let mut relocation = relocation_record(
+            "libcrate.rlib",
+            1,
+            42,
+            Some(0x1000),
+            0x2000,
+            Some("_data"),
+            Some(("libcrate.rlib", 2, 0)),
+            0,
+            300,
+            8,
+            encode_macho_aarch64_relocation_kind(raw_relocation),
+            0,
+        );
+        relocation.input = hex::encode(b"libcrate.rlib\0crate.cgu.source.rcgu.o\08:16").into();
+        relocation.target.as_mut().unwrap().input =
+            hex::encode(b"libcrate.rlib\0crate.cgu.target.rcgu.o\016:24").into();
+
+        assert!(
+            patch_input_refs_match(
+                input.path.as_str(),
+                relocation.input.as_str(),
+                relocation.target.as_ref().unwrap().input.as_str(),
+                true,
+            )
+            .unwrap()
+        );
+
+        let mut unnormalized = [relocation.clone()];
+        let unnormalized_patches = relocation_target_patches_for_input_with_normalization(
+            &mut unnormalized,
+            &input,
+            &current,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unnormalized_patches.macho_target_moves.len(), 1);
+
+        let mut normalized = [relocation];
+        let normalized_patches = relocation_target_patches_for_input_with_normalization(
+            &mut normalized,
+            &input,
+            &current,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(normalized_patches.macho_target_moves.is_empty());
+        assert!(normalized_patches.input_ranges.is_empty());
+        assert!(normalized_patches.changed_relocation_indices.is_empty());
     }
 
     #[test]
