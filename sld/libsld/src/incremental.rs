@@ -6678,6 +6678,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .is_some_and(ChangedMachODefinitionActivation::owns_changed_unwind),
                     &retired_macho_archive_identifiers,
                     &reactivated_macho_archive_identifiers,
+                    &relocation_target_patches.validated_macho_local_retargets,
                 )? {
                     Ok(activation) => activation,
                     Err(reason) => {
@@ -7116,6 +7117,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 .chain(&ignored_archive_identifiers)
                                 .cloned()
                                 .collect::<Vec<_>>(),
+                            &relocation_target_patches.validated_macho_local_retargets,
                             &previous_unwind_input_ranges,
                             &current_unwind_input_ranges,
                             &definition_activation.added_names,
@@ -21118,23 +21120,6 @@ fn archive_macho_semantic_patch_proof_fingerprint(
     )
 }
 
-fn archive_macho_masked_local_semantic_fingerprint(
-    bytes: &[u8],
-    ranges: &[std::ops::Range<usize>],
-    ignored_identifiers: &[Vec<u8>],
-    ignored_defined_symbols: &HashSet<Vec<u8>>,
-) -> Result<Option<blake3::Hash>> {
-    archive_macho_semantic_patch_proof_fingerprint_with_options(
-        bytes,
-        ranges,
-        ignored_identifiers,
-        ignored_defined_symbols,
-        true,
-        true,
-        &[],
-    )
-}
-
 fn archive_macho_masked_local_semantic_fingerprint_with_retargets(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
@@ -21150,23 +21135,6 @@ fn archive_macho_masked_local_semantic_fingerprint_with_retargets(
         true,
         true,
         validated_local_retargets,
-    )
-}
-
-fn archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
-    bytes: &[u8],
-    ranges: &[std::ops::Range<usize>],
-    ignored_identifiers: &[Vec<u8>],
-    ignored_defined_symbols: &HashSet<Vec<u8>>,
-) -> Result<Option<blake3::Hash>> {
-    archive_macho_semantic_patch_proof_fingerprint_with_options(
-        bytes,
-        ranges,
-        ignored_identifiers,
-        ignored_defined_symbols,
-        true,
-        false,
-        &[],
     )
 }
 
@@ -21514,6 +21482,7 @@ fn archive_diff_allows_changed_macho_symbols(
     current_resolver: &PatchInputResolver<'_>,
     ignored_previous_identifiers: &[Vec<u8>],
     ignored_current_identifiers: &[Vec<u8>],
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
     added_names: &[SharedText],
@@ -21595,34 +21564,54 @@ fn archive_diff_allows_changed_macho_symbols(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
+    let previous_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.previous.clone())
+        .collect::<Vec<_>>();
+    let current_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.current.clone())
+        .collect::<Vec<_>>();
     let previous_fingerprint = if ignore_masked_unwind_sections {
-        archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
+        archive_macho_semantic_patch_proof_fingerprint_with_options(
             previous_bytes,
             &previous_ranges,
             ignored_previous_identifiers,
             &ignored_defined_symbols,
+            true,
+            false,
+            &previous_local_retargets,
         )?
     } else {
-        archive_macho_semantic_patch_proof_fingerprint(
+        archive_macho_semantic_patch_proof_fingerprint_with_options(
             previous_bytes,
             &previous_ranges,
             ignored_previous_identifiers,
             &ignored_defined_symbols,
+            false,
+            false,
+            &previous_local_retargets,
         )?
     };
     let current_fingerprint = if ignore_masked_unwind_sections {
-        archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_sections(
+        archive_macho_semantic_patch_proof_fingerprint_with_options(
             current_bytes,
             &current_ranges,
             ignored_current_identifiers,
             &ignored_defined_symbols,
+            true,
+            false,
+            &current_local_retargets,
         )?
     } else {
-        archive_macho_semantic_patch_proof_fingerprint(
+        archive_macho_semantic_patch_proof_fingerprint_with_options(
             current_bytes,
             &current_ranges,
             ignored_current_identifiers,
             &ignored_defined_symbols,
+            false,
+            false,
+            &current_local_retargets,
         )?
     };
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
@@ -23440,6 +23429,7 @@ fn archive_diff_allows_changed_macho_unwind(
     changed: &ChangedMachOArchiveUnwindMembers,
     ignored_previous_identifiers: &[Vec<u8>],
     ignored_current_identifiers: &[Vec<u8>],
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
 ) -> Result<bool> {
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let Some(mut previous_ranges) = patch_ranges_with_resolver(
@@ -23491,17 +23481,27 @@ fn archive_diff_allows_changed_macho_unwind(
     if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
         return Ok(true);
     }
-    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint(
+    let previous_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.previous.clone())
+        .collect::<Vec<_>>();
+    let current_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.current.clone())
+        .collect::<Vec<_>>();
+    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         previous_bytes,
         &previous_ranges,
         ignored_previous_identifiers,
         &HashSet::new(),
+        &previous_local_retargets,
     )?;
-    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint(
+    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         current_bytes,
         &current_ranges,
         ignored_current_identifiers,
         &HashSet::new(),
+        &current_local_retargets,
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
@@ -23523,6 +23523,7 @@ fn changed_macho_archive_unwind_activation(
     reuse_owned_output: bool,
     ignored_previous_identifiers: &[Vec<u8>],
     ignored_current_identifiers: &[Vec<u8>],
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
 ) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for changed unwind metadata")?;
@@ -23550,6 +23551,7 @@ fn changed_macho_archive_unwind_activation(
         &changed,
         ignored_previous_identifiers,
         ignored_current_identifiers,
+        validated_local_retargets,
     )?;
     let allows_unwind_and_definitions = !allows_unwind_only
         && archive_diff_allows_changed_macho_symbols(
@@ -23560,6 +23562,7 @@ fn changed_macho_archive_unwind_activation(
             current_resolver,
             ignored_previous_identifiers,
             ignored_current_identifiers,
+            validated_local_retargets,
             &changed.previous_input_ranges,
             &changed.current_input_ranges,
             added_definition_names,
@@ -45264,6 +45267,41 @@ mod tests {
             )
             .unwrap()
         );
+        let unchanged_unwind = ChangedMachOArchiveUnwindMembers {
+            members: Vec::new(),
+            retired_entries: Vec::new(),
+            current_sections: Vec::new(),
+            previous_input_ranges: Vec::new(),
+            current_input_ranges: Vec::new(),
+        };
+        assert!(
+            !archive_diff_allows_changed_macho_unwind(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &unchanged_unwind,
+                &removed,
+                &added,
+                &[],
+            )
+            .unwrap()
+        );
+        assert!(
+            archive_diff_allows_changed_macho_unwind(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &unchanged_unwind,
+                &removed,
+                &added,
+                std::slice::from_ref(&retarget),
+            )
+            .unwrap()
+        );
 
         let mut wrong_site = retarget.clone();
         wrong_site.current.target_symbol_index = 1;
@@ -47549,6 +47587,7 @@ mod tests {
                 &changed,
                 &[],
                 &[],
+                &[],
             )
             .unwrap(),
             "ordinary unwind replacement must not ignore removed members or local symbols",
@@ -47562,6 +47601,7 @@ mod tests {
                 &current_resolver,
                 &changed,
                 &retired_identifiers,
+                &[],
                 &[],
             )
             .unwrap(),
@@ -47597,6 +47637,7 @@ mod tests {
                 &reverse_changed,
                 &[],
                 &[],
+                &[],
             )
             .unwrap(),
             "ordinary unwind replacement must not ignore added members or local symbols",
@@ -47611,6 +47652,7 @@ mod tests {
                 &reverse_changed,
                 &[],
                 &retired_identifiers,
+                &[],
             )
             .unwrap(),
             "addition proof should ignore only the added member and masked local definition",
@@ -47863,6 +47905,7 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -47942,6 +47985,7 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
         )
         .unwrap()
         .unwrap()
@@ -48006,6 +48050,7 @@ mod tests {
             &[],
             &[],
             false,
+            &[],
             &[],
             &[],
         )
