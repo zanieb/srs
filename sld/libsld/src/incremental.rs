@@ -8479,9 +8479,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     if let Err(reason) = merge_compatible_overlapping_section_patches(&mut patches, None) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
-    if let Some(reason) = patch_output_range_rejection_reason(&patches) {
-        return Ok(ChangedInputPatchResult::Unsupported(reason));
-    }
 
     let retained_output_snapshot = if args.should_retain_output_snapshot()
         && !args.output().try_exists().unwrap_or(false)
