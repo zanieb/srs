@@ -25978,6 +25978,40 @@ fn macho_resolution_matches_archive_member(
         && archive_member_patch_identifier(&input.identifier) == member.normalized_identifier)
 }
 
+fn macho_symbol_entry_matches_resolution(
+    output: &[u8],
+    string_table_offset: u64,
+    entry: &[u8],
+    resolution: &MachOSymbolResolutionRecord,
+) -> bool {
+    if entry.len() != std::mem::size_of::<object::macho::Nlist64<object::Endianness>>()
+        || entry[4] & object::macho::N_STAB != 0
+        || entry[4] & object::macho::N_TYPE != object::macho::N_SECT
+        || entry[4] & object::macho::N_EXT == 0
+        || read_u64_le(&entry[8..]) != resolution.direct_value
+    {
+        return false;
+    }
+    let Some(string_index) = read_u32_le(&entry[..4]) else {
+        return false;
+    };
+    let Some(name_start) = string_table_offset
+        .checked_add(u64::from(string_index))
+        .and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return false;
+    };
+    let Some(name) = output.get(name_start..).and_then(|bytes| {
+        bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|end| &bytes[..end])
+    }) else {
+        return false;
+    };
+    hex::decode(resolution.name.as_str()).is_ok_and(|expected| expected == name)
+}
+
 fn returning_macho_definition_matches_rollback_entry(
     previous_output: &[u8],
     output_file: &object::File<'_>,
@@ -25998,37 +26032,73 @@ fn returning_macho_definition_matches_rollback_entry(
     let [state] = matching_states.as_slice() else {
         return Err("returning Mach-O definition has no unique rollback transaction".to_owned());
     };
-    let owned = state
-        .symbol_resolutions
-        .iter()
-        .filter(|resolution| resolution.name == rollback.name)
-        .collect::<Vec<_>>();
-    let [owned] = owned.as_slice() else {
-        return Err("returning Mach-O definition has no unique active symbol owner".to_owned());
-    };
     let name = hex::decode(rollback.name.as_str())
         .map_err(|_| "malformed returning Mach-O definition name".to_owned())?;
     if definition.name != name {
         return Ok(false);
     }
-    let owned_value = owned
-        .direct_value
-        .ok_or_else(|| "returning Mach-O definition owner has no direct value".to_owned())?;
-    let symbol_index = unique_macho_output_symbol_index(output_file, &name, owned_value)?;
+    if !macho_archive_transaction_patches_match(state) {
+        return Err(
+            "returning Mach-O definition has an incomplete rollback transaction".to_owned(),
+        );
+    }
     let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
-    let symbol_range =
-        macho_symbol_entry_range(previous_output, symbol_table_offset, symbol_index)?;
-    let rollback_patches = state
-        .rollback_patches
+    let string_table_offset = macho_string_table_offset(previous_output)
+        .ok_or_else(|| "returning Mach-O definition has no usable string table".to_owned())?;
+    let symbol_entry_size = std::mem::size_of::<object::macho::Nlist64<object::Endianness>>();
+    let matching_patches = state
+        .forward_patches
         .iter()
-        .filter(|patch| {
-            usize::try_from(patch.output_offset).ok() == Some(symbol_range.start)
-                && patch.data.len() == symbol_range.len()
+        .zip(&state.rollback_patches)
+        .filter(|(_, rollback_patch)| {
+            macho_symbol_entry_matches_resolution(
+                previous_output,
+                string_table_offset,
+                &rollback_patch.data,
+                rollback,
+            )
         })
         .collect::<Vec<_>>();
-    let [rollback_patch] = rollback_patches.as_slice() else {
+    let [(forward_patch, rollback_patch)] = matching_patches.as_slice() else {
         return Err("returning Mach-O definition has no unique rollback symbol entry".to_owned());
     };
+    let patch_offset = usize::try_from(rollback_patch.output_offset)
+        .map_err(|_| "returning Mach-O rollback symbol offset is too large".to_owned())?;
+    let symbol_table_start = usize::try_from(symbol_table_offset)
+        .map_err(|_| "returning Mach-O symbol table offset is too large".to_owned())?;
+    let Some(symbol_offset) = patch_offset.checked_sub(symbol_table_start) else {
+        return Err("returning Mach-O rollback entry is outside the symbol table".to_owned());
+    };
+    if symbol_offset % symbol_entry_size != 0 {
+        return Err("returning Mach-O rollback entry is not symbol-table aligned".to_owned());
+    }
+    let symbol_index = symbol_offset / symbol_entry_size;
+    let symbol_range =
+        macho_symbol_entry_range(previous_output, symbol_table_offset, symbol_index)?;
+    if !output_file
+        .symbols()
+        .any(|symbol| symbol.index().0 == symbol_index)
+        || previous_output.get(symbol_range) != Some(forward_patch.data.as_slice())
+    {
+        return Err(
+            "returning Mach-O rollback entry does not own the current symbol slot".to_owned(),
+        );
+    }
+    let active_owners = state
+        .symbol_resolutions
+        .iter()
+        .filter(|resolution| {
+            macho_symbol_entry_matches_resolution(
+                previous_output,
+                string_table_offset,
+                &forward_patch.data,
+                resolution,
+            )
+        })
+        .count();
+    if active_owners != 1 {
+        return Err("returning Mach-O definition has no unique active symbol owner".to_owned());
+    }
     let current_value = current
         .direct_value
         .ok_or_else(|| "returning Mach-O definition has no direct value".to_owned())?;
@@ -47731,23 +47801,51 @@ mod tests {
 
     #[test]
     fn returning_macho_definition_requires_exact_rollback_symbol_metadata() {
-        let output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
-        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let rollback_output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let rollback_file = object::File::parse(rollback_output.as_slice()).unwrap();
         let name = SharedText::from(hex::encode("_text"));
+        let active_name = SharedText::from(hex::encode("_data"));
         let active = MachOSymbolResolutionRecord {
-            name: name.clone(),
+            name: active_name,
             direct_value: Some(0),
             got_address: None,
             stub_address: None,
             thunk_addresses: Vec::new(),
             target: None,
         };
-        let rollback = active.clone();
-        let symbol_table_offset = macho_symbol_table_offset_for_recycling(&output).unwrap();
-        let symbol_index = unique_macho_output_symbol_index(&output_file, b"_text", 0).unwrap();
+        let rollback = MachOSymbolResolutionRecord {
+            name,
+            ..active.clone()
+        };
+        let symbol_table_offset =
+            macho_symbol_table_offset_for_recycling(&rollback_output).unwrap();
+        let symbol_index = unique_macho_output_symbol_index(&rollback_file, b"_text", 0).unwrap();
         let symbol_range =
-            macho_symbol_entry_range(&output, symbol_table_offset, symbol_index).unwrap();
-        let retired = [RetiredMachOArchiveActivation {
+            macho_symbol_entry_range(&rollback_output, symbol_table_offset, symbol_index).unwrap();
+        let data_symbol_index =
+            unique_macho_output_symbol_index(&rollback_file, b"_data", 4).unwrap();
+        let data_symbol_range =
+            macho_symbol_entry_range(&rollback_output, symbol_table_offset, data_symbol_index)
+                .unwrap();
+        let data_string_index =
+            read_u32_le(&rollback_output[data_symbol_range.start..][..4]).unwrap();
+        let active_definition = AddedMachOArchiveDefinition {
+            name: b"_data".to_vec(),
+            offset: 0,
+            desc: 0,
+            private_external: false,
+        };
+        let forward_entry = added_macho_symbol_entry(
+            &active_definition,
+            rollback_output[symbol_range.start + 5],
+            data_string_index,
+            0,
+        );
+        let rollback_entry = rollback_output[symbol_range.clone()].to_vec();
+        let mut output = rollback_output;
+        output[symbol_range.clone()].copy_from_slice(&forward_entry);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let mut retired = [RetiredMachOArchiveActivation {
             state: MachOArchiveActivationState {
                 kind: MachOArchiveActivationKind::AddedMembers,
                 members: Vec::new(),
@@ -47756,10 +47854,13 @@ mod tests {
                 relocations: Vec::new(),
                 symbol_resolutions: vec![active],
                 rollback_symbol_resolutions: vec![rollback.clone()],
-                forward_patches: Vec::new(),
+                forward_patches: vec![StoredOutputPatch {
+                    output_offset: symbol_range.start as u64,
+                    data: forward_entry,
+                }],
                 rollback_patches: vec![StoredOutputPatch {
                     output_offset: symbol_range.start as u64,
-                    data: output[symbol_range].to_vec(),
+                    data: rollback_entry,
                 }],
             },
             newly_tracked: false,
@@ -47812,6 +47913,28 @@ mod tests {
                 &rollback,
             )
             .unwrap()
+        );
+
+        let duplicate_forward = retired[0].forward_patches[0].clone();
+        let duplicate_rollback = retired[0].rollback_patches[0].clone();
+        retired[0].forward_patches.push(duplicate_forward);
+        retired[0].rollback_patches.push(duplicate_rollback);
+        assert!(
+            returning_macho_definition_matches_rollback_entry(
+                &output,
+                &output_file,
+                &retired,
+                &rollback,
+                &AddedMachOArchiveDefinition {
+                    name: b"_text".to_vec(),
+                    offset: 0,
+                    desc: 0,
+                    private_external: false,
+                },
+                &rollback,
+            )
+            .unwrap_err()
+            .contains("no unique rollback symbol entry")
         );
     }
 
