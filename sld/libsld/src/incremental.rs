@@ -5321,9 +5321,33 @@ fn output_symbol_value_patches(
     }
 
     let mut patches = Vec::with_capacity(values_by_previous_name_and_value.len());
-    for ((target_name, previous_target_value), (target_value, allow_missing, source)) in
-        values_by_previous_name_and_value
+    for (&(target_name, previous_target_value), &(target_value, allow_missing, source)) in
+        &values_by_previous_name_and_value
     {
+        let mut alternate_previous_value_matches = false;
+        if allow_missing {
+            for (&(other_name, other_previous_value), &(other_target_value, _, _)) in
+                &values_by_previous_name_and_value
+            {
+                if other_name == target_name
+                    && other_previous_value != previous_target_value
+                    && other_target_value == target_value
+                    && matches!(
+                        symbol_position_by_name_and_value(
+                            output,
+                            0,
+                            &file,
+                            target_name,
+                            other_previous_value,
+                        )?,
+                        Ok(Some(_))
+                    )
+                {
+                    alternate_previous_value_matches = true;
+                    break;
+                }
+            }
+        }
         let symbol = symbol_position_by_name_and_value(
             output,
             0,
@@ -5341,16 +5365,17 @@ fn output_symbol_value_patches(
             }
             Err(_)
                 if allow_missing
-                    && matches!(
-                        symbol_position_by_name_and_value(
-                            output,
-                            0,
-                            &file,
-                            target_name,
-                            target_value,
-                        )?,
-                        Ok(Some(_))
-                    ) =>
+                    && (alternate_previous_value_matches
+                        || matches!(
+                            symbol_position_by_name_and_value(
+                                output,
+                                0,
+                                &file,
+                                target_name,
+                                target_value,
+                            )?,
+                            Ok(Some(_))
+                        )) =>
             {
                 continue;
             }
@@ -37159,6 +37184,36 @@ mod tests {
                     == "output symbol value changed before incremental patch for `_data` at 0x8 \
                         from test"
         ));
+    }
+
+    #[test]
+    fn output_symbol_value_patches_compose_optional_predecessor_values() {
+        let output = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+
+        let patches = output_symbol_value_patches(
+            &output,
+            &[
+                RelocationTargetSymbolPatch {
+                    target_name: hex::encode(b"_data"),
+                    previous_target_value: 8,
+                    target_value: 12,
+                    allow_missing: true,
+                    source: "stale test producer",
+                },
+                RelocationTargetSymbolPatch {
+                    target_name: hex::encode(b"_data"),
+                    previous_target_value: 4,
+                    target_value: 12,
+                    allow_missing: true,
+                    source: "matching test producer",
+                },
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].data, 12_u64.to_le_bytes());
     }
 
     #[test]
