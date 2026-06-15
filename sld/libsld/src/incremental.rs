@@ -2811,7 +2811,6 @@ fn relocation_target_patches_for_input(
                     current_target_value: target_value,
                     current_input: target_input_changed
                         .then(|| current_target_input.clone().into()),
-                    provisional_input_range: current.value_range.clone(),
                 });
                 continue;
             }
@@ -2820,7 +2819,6 @@ fn relocation_target_patches_for_input(
                 current_section_offset: current.section_offset,
                 current_target_value: target_value,
                 current_input: target_input_changed.then(|| current_target_input.clone().into()),
-                provisional_input_range: current.value_range.clone(),
             });
             // A grown section may be rematerialized elsewhere. Defer the symbol patch until
             // text replay can reconcile this provisional offset with the final output mapping.
@@ -9543,7 +9541,6 @@ struct MachORelocationTargetMove {
     current_section_offset: u64,
     current_target_value: u64,
     current_input: Option<SharedText>,
-    provisional_input_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone)]
@@ -18126,7 +18123,6 @@ fn macho_text_relocation_replays_for_input(
                         current_section_offset: current_position.section_offset,
                         current_target_value,
                         current_input: None,
-                        provisional_input_range: None,
                     };
                     if current_target_value != relocation.target_value
                         || current_position.section_offset != target.section_offset
@@ -18680,8 +18676,14 @@ fn validate_macho_data_relocations_are_stable(
                             .map_or_else(|| "<unnamed>".to_owned(), display_hex_text),
                     )));
                 }
-                let defer_provisional_local_target_move = renamed_local_target_is_stable
-                    && target_moves_by_index.contains_key(&relocation_index);
+                if renamed_local_target_is_stable
+                    && target_moves_by_index.contains_key(&relocation_index)
+                {
+                    return Ok(Err(format!(
+                        "renamed and moved local Mach-O data relocation target in {}",
+                        display_hex_path(&input.path)
+                    )));
+                }
                 if renamed_local_target_name.is_some() {
                     let current_name = renamed_local_target_name
                         .as_ref()
@@ -18723,9 +18725,8 @@ fn validate_macho_data_relocations_are_stable(
                 } else {
                     None
                 };
-                if !defer_provisional_local_target_move
-                    && (target_moves_by_index.contains_key(&relocation_index)
-                        || planned_resolution_move.is_some())
+                if target_moves_by_index.contains_key(&relocation_index)
+                    || planned_resolution_move.is_some()
                 {
                     let Some(target_name) = relocation.target_name.as_deref() else {
                         return Ok(Err(format!(
@@ -18748,7 +18749,6 @@ fn validate_macho_data_relocations_are_stable(
                                 current_section_offset: moved.current_target.section_offset,
                                 current_target_value: moved.current_value,
                                 current_input: Some(moved.current_target.input.clone()),
-                                provisional_input_range: None,
                             })
                         })
                         .expect("checked target or resolution move");
@@ -18808,7 +18808,6 @@ fn validate_macho_data_relocations_are_stable(
                             current_section_offset: selected_target_record.section_offset,
                             current_target_value: selected_value,
                             current_input: Some(selected_target_record.input.clone()),
-                            provisional_input_range: None,
                         };
                         let (patch, symbol_patch) = match moved_macho_data_relocation_patch(
                             relocation,
@@ -18912,12 +18911,6 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                if defer_provisional_local_target_move && target_section.is_none() {
-                    return Ok(Err(format!(
-                        "renamed and moved local Mach-O data relocation target has no matched owner in {}",
-                        display_hex_path(&input.path)
-                    )));
-                }
                 if target_section.is_some_and(|target_section| {
                     target_section.previous.output_offset != target_section.current.output_offset
                 }) {
@@ -18965,19 +18958,6 @@ fn validate_macho_data_relocations_are_stable(
                 } else {
                     relocation.target_value
                 };
-                if defer_provisional_local_target_move {
-                    // A reused local name can resolve to an unrelated current symbol. The
-                    // contextual relocation proof supersedes both that move and its input mask.
-                    if let Some(range) = target_moves_by_index
-                        .get(&relocation_index)
-                        .and_then(|target_move| target_move.provisional_input_range.as_ref())
-                    {
-                        target_patches
-                            .input_ranges
-                            .retain(|candidate| candidate != range);
-                    }
-                    handled_target_moves.insert(relocation_index);
-                }
                 let validated_local_retarget = (renamed_local_target_is_stable
                     && target_section.is_some())
                 .then(|| {
@@ -19001,7 +18981,6 @@ fn validate_macho_data_relocations_are_stable(
                             current_section_offset: current_target.section_offset,
                             current_target_value: target_address,
                             current_input: Some(patch_section.current.input.clone().into()),
-                            provisional_input_range: None,
                         },
                         current_name,
                     ) {
@@ -46484,8 +46463,8 @@ mod tests {
                 .unwrap()
         }
 
-        let previous_kept = test_macho_local_data_retarget_object(b"l_anon.20", b"l_anon.21", 0x12);
-        let current_kept = test_macho_local_data_retarget_object(b"l_anon.21", b"l_anon.21", 0x26);
+        let previous_kept = test_macho_local_data_retarget_object(b"l_anon.20", 0x12);
+        let current_kept = test_macho_local_data_retarget_object(b"l_anon.21", 0x26);
         let exchanged = test_macho_object(b"text", b"data", 0);
         let kept_identifier = b"crate-hash.cgu.kept.session.rcgu.o";
         let removed_identifier = b"crate-hash.cgu.removed.session.rcgu.o";
@@ -47311,7 +47290,6 @@ mod tests {
                 current_section_offset: 0x24,
                 current_target_value: 0x1020,
                 current_input: Some(current_input.clone()),
-                provisional_input_range: None,
             },
             None,
         )
@@ -47354,7 +47332,6 @@ mod tests {
                 current_section_offset: 0x126,
                 current_target_value: 0x1014,
                 current_input: Some(current_input),
-                provisional_input_range: None,
             },
             b"l_anon.21",
         )
@@ -47376,7 +47353,6 @@ mod tests {
                 current_section_offset: 0x112,
                 current_target_value: 0x1000,
                 current_input: Some(SharedText::from(hex::encode("target.o"))),
-                provisional_input_range: None,
             },
             b"l_anon.20",
         )
@@ -47389,219 +47365,6 @@ mod tests {
         );
         assert_eq!(relocation.target_value, 0x1000);
         assert_eq!(relocation.target.as_ref().unwrap().section_offset, 0x112);
-    }
-
-    #[test]
-    fn macho_data_validation_composes_provisional_move_with_local_retarget() {
-        fn archive(identifier: &[u8], object: &[u8]) -> Vec<u8> {
-            let mut builder = ar::Builder::new(Vec::new());
-            builder
-                .append(
-                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
-                    object,
-                )
-                .unwrap();
-            builder.into_inner().unwrap()
-        }
-
-        fn section<'data>(
-            file: &'data object::File<'data>,
-            segment: &[u8],
-        ) -> object::Section<'data, 'data> {
-            file.sections()
-                .find(|section| {
-                    section.name_bytes().ok() == Some(b"__const".as_slice())
-                        && section.segment_name_bytes().ok().flatten() == Some(segment)
-                })
-                .unwrap()
-        }
-
-        let previous_object =
-            test_macho_local_data_retarget_object(b"l_anon.20", b"l_anon.30", 0x12);
-        let current_object =
-            test_macho_local_data_retarget_object(b"l_anon.21", b"l_anon.20", 0x26);
-        let identifier = b"crate-hash.cgu.session.rcgu.o";
-        let previous = {
-            let mut builder = ar::Builder::new(Vec::new());
-            builder
-                .append(
-                    &ar::Header::new(b"rust.metadata.bin".to_vec(), 7),
-                    b"padding".as_slice(),
-                )
-                .unwrap();
-            builder
-                .append(
-                    &ar::Header::new(identifier.to_vec(), previous_object.len() as u64),
-                    previous_object.as_slice(),
-                )
-                .unwrap();
-            builder.into_inner().unwrap()
-        };
-        let current = archive(identifier, &current_object);
-        let input_file = hex::encode("lib.rlib");
-        let ArchiveMemberMatch::Unique(previous_member) =
-            patch_archive_member_bytes(&previous, identifier).unwrap()
-        else {
-            panic!("expected unique previous archive member");
-        };
-        let ArchiveMemberMatch::Unique(current_member) =
-            patch_archive_member_bytes(&current, identifier).unwrap()
-        else {
-            panic!("expected unique current archive member");
-        };
-        let previous_input =
-            resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap();
-        let current_input =
-            resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap();
-        let previous_file = object::File::parse(previous_member.bytes).unwrap();
-        let current_file = object::File::parse(current_member.bytes).unwrap();
-        let previous_source = section(&previous_file, b"__DATA");
-        let current_source = section(&current_file, b"__DATA");
-        let previous_target = section(&previous_file, b"__TEXT");
-        let current_target = section(&current_file, b"__TEXT");
-        let source_output_offset = previous_source.file_range().unwrap().0;
-        let target_output_offset = previous_target.file_range().unwrap().0;
-        let patch_section = |input: String,
-                             section: &object::Section<'_, '_>,
-                             output_offset: u64,
-                             name: &str| PatchSection {
-            input,
-            section_index: patch_section_record_index(&previous_file, section.index()).unwrap(),
-            section_name: Some(name.to_owned()),
-            input_size: section.size(),
-            output_offset,
-            output_size: section.size(),
-            data_hash: None,
-            cstring_nul_boundaries_hash: None,
-        };
-        let matched = [
-            MatchedPatchSection {
-                previous: patch_section(
-                    previous_input.clone(),
-                    &previous_source,
-                    source_output_offset,
-                    "__DATA,__const",
-                ),
-                current: patch_section(
-                    current_input.clone(),
-                    &current_source,
-                    source_output_offset,
-                    "__DATA,__const",
-                ),
-            },
-            MatchedPatchSection {
-                previous: patch_section(
-                    previous_input.clone(),
-                    &previous_target,
-                    target_output_offset,
-                    "__TEXT,__const",
-                ),
-                current: patch_section(
-                    current_input.clone(),
-                    &current_target,
-                    target_output_offset,
-                    "__TEXT,__const",
-                ),
-            },
-        ];
-        let raw_relocation = object::macho::RelocationInfo {
-            r_address: 0,
-            r_symbolnum: 0,
-            r_pcrel: false,
-            r_length: 3,
-            r_extern: true,
-            r_type: object::macho::ARM64_RELOC_UNSIGNED,
-        };
-        let kind = encode_macho_aarch64_relocation_kind(raw_relocation);
-        let previous_primary_value = previous_target.address() + 0x12;
-        let current_primary_value = current_target.address() + 0x26;
-        let competing_value = previous_target.address() + 0x30;
-        let mut relocations = [
-            relocation_record(
-                "lib.rlib",
-                matched[0].previous.section_index,
-                0,
-                Some(previous_primary_value),
-                previous_primary_value,
-                Some("l_anon.20"),
-                Some(("lib.rlib", previous_target.index().0 as u32, 0x12)),
-                0,
-                source_output_offset,
-                8,
-                kind,
-                0,
-            ),
-            relocation_record(
-                "lib.rlib",
-                matched[0].previous.section_index,
-                1,
-                Some(competing_value),
-                competing_value,
-                Some("l_anon.30"),
-                Some(("lib.rlib", previous_target.index().0 as u32, 0x30)),
-                8,
-                source_output_offset + 8,
-                8,
-                kind,
-                0,
-            ),
-        ];
-        for relocation in &mut relocations {
-            relocation.input_file = input_file.clone().into();
-            relocation.input = previous_input.clone().into();
-            relocation.applied_target_value = Some(relocation.target_value);
-            let target = relocation.target.as_mut().unwrap();
-            target.input_file = input_file.clone().into();
-            target.input = current_input.clone().into();
-        }
-        let mut state = state("args", b"output", &[("lib.rlib", &current)]);
-        let input = state.input_files.remove(0);
-        let mut target_patches =
-            relocation_target_patches_for_input(&mut relocations, &input, &current)
-                .unwrap()
-                .unwrap();
-        assert_eq!(target_patches.macho_target_moves.len(), 1);
-        assert_eq!(
-            target_patches.macho_target_moves[0].current_section_offset,
-            0x30
-        );
-        assert_eq!(
-            target_patches.macho_target_moves[0].current_target_value,
-            competing_value
-        );
-        assert_eq!(target_patches.input_ranges.len(), 1);
-        let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
-        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
-
-        let changed = validate_macho_data_relocations_are_stable(
-            &mut relocations,
-            &[],
-            &input,
-            &matched,
-            &previous_resolver,
-            &current_resolver,
-            &previous_object,
-            &mut target_patches,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(changed);
-        assert_eq!(target_patches.output_patches.len(), 1);
-        assert_eq!(
-            target_patches.output_patches[0].data,
-            current_primary_value.to_le_bytes()
-        );
-        assert_eq!(relocations[0].target_value, current_primary_value);
-        assert_eq!(
-            relocations[0].target_name.as_deref(),
-            Some(hex::encode("l_anon.21").as_str())
-        );
-        assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
-        assert!(target_patches.macho_target_moves.is_empty());
-        assert!(target_patches.input_ranges.is_empty());
-        assert!(target_patches.output_symbols.is_empty());
     }
 
     #[test]
@@ -47629,7 +47392,6 @@ mod tests {
                 current_section_offset: 0x24,
                 current_target_value: 0x1020,
                 current_input: None,
-                provisional_input_range: None,
             },
             None,
         ) {
@@ -50845,11 +50607,7 @@ mod tests {
         );
     }
 
-    fn test_macho_local_data_retarget_object(
-        primary_name: &[u8],
-        competing_name: &[u8],
-        primary_offset: u64,
-    ) -> Vec<u8> {
+    fn test_macho_local_data_retarget_object(primary_name: &[u8], primary_offset: u64) -> Vec<u8> {
         const HEADER_SIZE: usize = 32;
         const SEGMENT_COMMAND_SIZE: usize = 72;
         const SECTION_SIZE: usize = 80;
@@ -50872,7 +50630,7 @@ mod tests {
             offset
         };
         let primary_name = add_string(primary_name);
-        let competing_name = add_string(competing_name);
+        let competing_name = add_string(b"l_anon.21");
         let source_name = add_string(b"_source");
 
         let mut bytes = Vec::new();
@@ -62159,7 +61917,6 @@ mod tests {
             current_section_offset: 124,
             current_target_value: provisional_value,
             current_input: None,
-            provisional_input_range: None,
         };
         let (resolved_value, resolved_target) = resolved_macho_relocation_target(
             previous_value,
