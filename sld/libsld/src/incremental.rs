@@ -18436,24 +18436,62 @@ fn validate_macho_data_relocations_are_stable(
                     changed = true;
                     continue;
                 }
-                if macho_relocation_target_is_global(&previous_file, previous_context.target)
-                    && macho_relocation_target_is_global(&current_file, current_context.target)
-                    && macho_catalog_data_relocation_target_is_stable_with_lookup(
+                let previous_target_is_global =
+                    macho_relocation_target_is_global(&previous_file, previous_context.target);
+                let current_target_is_global =
+                    macho_relocation_target_is_global(&current_file, current_context.target);
+                if previous_target_is_global && current_target_is_global {
+                    if let Some((selected_value, selected_target)) =
+                        resolved_macho_global_relocation_target(
+                            resolutions,
+                            &resolution_lookup,
+                            relocation.target_name.as_deref(),
+                            true,
+                        )?
+                        && selected_value != relocation.target_value
+                    {
+                        let Some(selected_target_record) = selected_target.as_ref() else {
+                            return Ok(Err(format!(
+                                "selected Mach-O data relocation target has no owner in {}",
+                                display_hex_path(&input.path)
+                            )));
+                        };
+                        let target_move = MachORelocationTargetMove {
+                            relocation_index,
+                            current_section_offset: selected_target_record.section_offset,
+                            current_target_value: selected_value,
+                            current_input: Some(selected_target_record.input.clone()),
+                        };
+                        let (patch, symbol_patch) = match moved_macho_data_relocation_patch(
+                            relocation,
+                            target_move,
+                            None,
+                        ) {
+                            Ok(patches) => patches,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                        relocation.target = selected_target;
+                        target_patches.output_patches.push(patch);
+                        target_patches.output_symbols.push(symbol_patch);
+                        changed = true;
+                        continue;
+                    }
+                    if macho_catalog_data_relocation_target_is_stable_with_lookup(
                         &previous_identity,
                         &current_identity,
                         relocation,
                         resolutions,
                         &resolution_lookup,
                         normalize_rust_archive_patch_inputs,
-                    )?
-                {
-                    let previous_record = relocation.clone();
-                    if relocation.input != patch_section.current.input {
-                        relocation.input = patch_section.current.input.clone().into();
+                    )? {
+                        let previous_record = relocation.clone();
+                        if relocation.input != patch_section.current.input {
+                            relocation.input = patch_section.current.input.clone().into();
+                        }
+                        relocation.section_index = patch_section.current.section_index;
+                        changed |= *relocation != previous_record;
+                        continue;
                     }
-                    relocation.section_index = patch_section.current.section_index;
-                    changed |= *relocation != previous_record;
-                    continue;
                 }
                 let previous_target =
                     macho_data_relocation_target_position(&previous_file, previous_context.target)?;
