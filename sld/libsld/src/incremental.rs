@@ -7873,7 +7873,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.unwind_patches))
                 .unwrap_or_default();
-            let reactivated_macho_archive_output_patches = added_macho_archive_text_activation
+            let mut reactivated_macho_archive_output_patches = added_macho_archive_text_activation
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.reactivated_output_patches))
                 .unwrap_or_default();
@@ -7948,6 +7948,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     adjustments: Vec::new(),
                 })
                 .collect::<Vec<_>>();
+            if let Err(reason) = compose_historical_plain_patches_with_current(
+                &mut reactivated_macho_archive_output_patches,
+                &mut changed_macho_archive_unwind_patches,
+            ) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
             if let Err(reason) = compose_historical_plain_patches_with_current(
                 &mut retired_macho_archive_output_patches,
                 &mut changed_macho_archive_unwind_patches,
