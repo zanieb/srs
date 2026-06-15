@@ -5544,6 +5544,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut output_symbol_patches = Vec::new();
     let mut eh_frame_hdr_changes = Vec::new();
     let mut fde_add_candidates = Vec::new();
+    let mut retired_macho_archive_rollback_patches = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut rewritten_input_count = 0;
     let mut normalized_unchanged_input_count = 0;
@@ -7936,7 +7937,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .as_mut()
                 .map(|activation| std::mem::take(&mut activation.patches))
                 .unwrap_or_default();
-            let mut retired_macho_archive_rollback_patches = retired_macho_archive_activations
+            let mut retired_macho_archive_output_patches = retired_macho_archive_activations
                 .iter()
                 .flat_map(|state| state.rollback_patches.iter())
                 .map(|patch| SectionPatch {
@@ -7949,7 +7950,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 })
                 .collect::<Vec<_>>();
             remove_plain_patches_shadowed_by_exact_current_ranges(
-                &mut retired_macho_archive_rollback_patches,
+                &mut retired_macho_archive_output_patches,
                 &changed_macho_archive_unwind_patches,
             );
             for current in [
@@ -7964,7 +7965,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 reactivated_macho_archive_output_patches.as_slice(),
             ] {
                 remove_plain_patches_shadowed_by_exact_current_ranges(
-                    &mut retired_macho_archive_rollback_patches,
+                    &mut retired_macho_archive_output_patches,
                     current,
                 );
             }
@@ -7983,7 +7984,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             patched_section_count += macho_text_auxiliary_patches.len();
             patched_section_count += changed_macho_archive_unwind_patches.len();
             patched_section_count += reactivated_macho_archive_output_patches.len();
-            patched_section_count += retired_macho_archive_rollback_patches.len();
+            patched_section_count += retired_macho_archive_output_patches.len();
             patched_section_count += dynamic_relocation_patches.len();
             patched_section_count += relocation_addend_patches.output_patches.len();
             patched_section_count += eh_frame_patches
@@ -8045,7 +8046,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(added_macho_archive_unwind_patches)
                     .chain(reactivated_macho_archive_output_patches)
                     .chain(changed_macho_archive_unwind_patches)
-                    .chain(retired_macho_archive_rollback_patches)
+                    .chain(retired_macho_archive_output_patches)
                     .collect::<Vec<_>>(),
                 eh_frame_hdr_changes,
                 input_fde_add_candidates,
@@ -8060,6 +8061,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 retired_macho_archive_activations,
             )
         };
+        retired_macho_archive_rollback_patches.extend(
+            retired_macho_archive_activations
+                .iter()
+                .flat_map(|state| state.rollback_patches.iter().cloned()),
+        );
         let mut macho_archive_members = previous.input_files[*input_index]
             .patch
             .as_ref()
@@ -8532,6 +8538,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
+    let mut fde_add_terminator_offsets = Vec::new();
     match fde_add_patches_for_output(&output, &fde_add_candidates, &previous.fdes)? {
         Ok(resolved_fdes) => {
             if !records_complete && !resolved_fdes.is_empty() {
@@ -8541,6 +8548,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             patched_section_count += resolved_fdes.len();
             for resolved in resolved_fdes {
+                if resolved.patch.data.ends_with(&0_u32.to_le_bytes())
+                    && resolved.patch.size == resolved.patch.data.len() as u64
+                    && let Some(terminator_offset) = resolved
+                        .patch
+                        .output_offset
+                        .checked_add(resolved.patch.size)
+                        .and_then(|end| end.checked_sub(4))
+                {
+                    fde_add_terminator_offsets.push(terminator_offset);
+                }
                 record_override_input_files.insert(resolved.record.input_file.to_string());
                 previous.fdes.push(resolved.record);
                 patches.push(resolved.patch);
@@ -8550,6 +8567,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
         }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+    }
+    if let Err(reason) = remove_zero_backed_retired_patches_after_fde_terminators(
+        &mut patches,
+        &retired_macho_archive_rollback_patches,
+        &fde_add_terminator_offsets,
+        &output,
+    ) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
     match eh_frame_hdr_patches_for_fde_changes(&output, &eh_frame_hdr_changes)? {
         Ok(header_patches) => patches.extend(header_patches),
@@ -9626,6 +9651,80 @@ fn merge_compatible_overlapping_section_patches(
         patches[left_index] = patch;
         patches.remove(right_index);
     }
+    Ok(())
+}
+
+fn remove_zero_backed_retired_patches_after_fde_terminators(
+    patches: &mut Vec<SectionPatch>,
+    retired: &[StoredOutputPatch],
+    terminator_offsets: &[u64],
+    previous_output: &[u8],
+) -> std::result::Result<(), String> {
+    if retired.is_empty() || terminator_offsets.is_empty() {
+        return Ok(());
+    }
+    let file = object::File::parse(previous_output)
+        .map_err(|_| "failed to parse output for retired FDE rollback composition".to_owned())?;
+    let Some(eh_frame) = file.section_by_name(".eh_frame") else {
+        return Err("output has no .eh_frame for retired FDE rollback composition".to_owned());
+    };
+    let Some((eh_frame_start, eh_frame_size)) = eh_frame.file_range() else {
+        return Err("output .eh_frame has no file range for rollback composition".to_owned());
+    };
+    let Some(eh_frame_end) = eh_frame_start.checked_add(eh_frame_size) else {
+        return Err("output .eh_frame range overflowed during rollback composition".to_owned());
+    };
+    remove_zero_backed_retired_patches_in_eh_frame(
+        patches,
+        retired,
+        terminator_offsets,
+        eh_frame_start..eh_frame_end,
+        previous_output,
+    )
+}
+
+fn remove_zero_backed_retired_patches_in_eh_frame(
+    patches: &mut Vec<SectionPatch>,
+    retired: &[StoredOutputPatch],
+    terminator_offsets: &[u64],
+    eh_frame_range: std::ops::Range<u64>,
+    previous_output: &[u8],
+) -> std::result::Result<(), String> {
+    let mut removable = Vec::new();
+    for rollback in retired {
+        if !terminator_offsets.contains(&rollback.output_offset) {
+            continue;
+        }
+        let rollback_size = u64::try_from(rollback.data.len())
+            .map_err(|_| "retired FDE rollback patch is too large".to_owned())?;
+        let rollback_end = rollback
+            .output_offset
+            .checked_add(rollback_size)
+            .ok_or_else(|| "retired FDE rollback patch range overflowed".to_owned())?;
+        if rollback.output_offset < eh_frame_range.start || rollback_end > eh_frame_range.end {
+            return Err("retired FDE rollback patch is outside .eh_frame".to_owned());
+        }
+        let start = usize::try_from(rollback.output_offset)
+            .map_err(|_| "retired FDE rollback patch offset is too large".to_owned())?;
+        let end = usize::try_from(rollback_end)
+            .map_err(|_| "retired FDE rollback patch end is too large".to_owned())?;
+        let bytes = previous_output
+            .get(start..end)
+            .ok_or_else(|| "retired FDE rollback patch is outside output".to_owned())?;
+        if bytes.iter().all(|byte| *byte == 0) {
+            removable.push(rollback);
+        }
+    }
+    patches.retain(|patch| {
+        !removable.iter().any(|rollback| {
+            patch.output_offset == rollback.output_offset
+                && usize::try_from(patch.size).is_ok_and(|size| size == rollback.data.len())
+                && patch.data == rollback.data
+                && patch.deferred_relocation.is_none()
+                && patch.preserve_ranges.is_empty()
+                && patch.adjustments.is_empty()
+        })
+    });
     Ok(())
 }
 
@@ -61712,6 +61811,55 @@ mod tests {
             .unwrap();
         assert_eq!(materialized.len(), 1);
         assert_eq!(materialized[0].data, vec![1, 2, 3, 0, 4, 5, 6]);
+    }
+
+    #[test]
+    fn current_fde_terminator_shadows_zero_backed_retired_rollback() {
+        let patch = |output_offset, data: Vec<u8>| SectionPatch {
+            output_offset,
+            size: data.len() as u64,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let rollback = StoredOutputPatch {
+            output_offset: 19,
+            data: vec![0x10, 1, 2, 3],
+        };
+        let mut patches = vec![
+            patch(16, vec![1, 2, 3, 0, 0, 0, 0]),
+            patch(rollback.output_offset, rollback.data.clone()),
+        ];
+        let output = vec![0; 32];
+
+        remove_zero_backed_retired_patches_in_eh_frame(
+            &mut patches,
+            std::slice::from_ref(&rollback),
+            &[19],
+            0..32,
+            &output,
+        )
+        .unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].output_offset, 16);
+
+        let mut nonzero_output = output;
+        nonzero_output[19] = 1;
+        let mut patches = vec![
+            patch(16, vec![1, 2, 3, 0, 0, 0, 0]),
+            patch(rollback.output_offset, rollback.data.clone()),
+        ];
+        remove_zero_backed_retired_patches_in_eh_frame(
+            &mut patches,
+            &[rollback],
+            &[19],
+            0..32,
+            &nonzero_output,
+        )
+        .unwrap();
+        assert_eq!(patches.len(), 2);
     }
 
     #[test]
