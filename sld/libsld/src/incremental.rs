@@ -631,18 +631,19 @@ struct FileContentState {
 }
 
 enum PreviousOutputSource {
-    Live(PathBuf),
-    Retained(RetainedOutputSource),
+    Live(PinnedOutputSource),
+    Retained(PinnedOutputSource),
 }
 
-struct RetainedOutputSource {
+struct PinnedOutputSource {
     path: PathBuf,
+    live_identity: Option<FileIdentity>,
 }
 
 impl PreviousOutputSource {
     fn path(&self) -> &Path {
         match self {
-            Self::Live(path) => path,
+            Self::Live(source) => &source.path,
             Self::Retained(source) => &source.path,
         }
     }
@@ -650,9 +651,16 @@ impl PreviousOutputSource {
     fn is_retained(&self) -> bool {
         matches!(self, Self::Retained(_))
     }
+
+    fn live_identity(&self) -> Option<&FileIdentity> {
+        match self {
+            Self::Live(source) => source.live_identity.as_ref(),
+            Self::Retained(_) => None,
+        }
+    }
 }
 
-impl Drop for RetainedOutputSource {
+impl Drop for PinnedOutputSource {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -1302,6 +1310,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 args,
                 &state_dir,
                 previous_output_source.path(),
+                previous_output_source.live_identity(),
                 full_previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::Complete,
@@ -1328,6 +1337,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 args,
                 &state_dir,
                 previous_output_source.path(),
+                previous_output_source.live_identity(),
                 previous,
                 current_link_start.clone(),
                 if complete_macho_symbol_resolutions {
@@ -1343,6 +1353,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 args,
                 &state_dir,
                 previous_output_source.path(),
+                previous_output_source.live_identity(),
                 previous,
                 current_link_start.clone(),
                 ChangedInputRecordCoverage::MetadataOnly,
@@ -1394,6 +1405,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     args,
                     &state_dir,
                     previous_output_source.path(),
+                    previous_output_source.live_identity(),
                     previous,
                     current_link_start.clone(),
                     if complete_macho_symbol_resolutions {
@@ -1424,6 +1436,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 args,
                 &state_dir,
                 previous_output_source.path(),
+                previous_output_source.live_identity(),
                 previous,
                 current_link_start.clone(),
                 record_coverage,
@@ -1461,6 +1474,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     args,
                     &state_dir,
                     previous_output_source.path(),
+                    previous_output_source.live_identity(),
                     previous,
                     current_link_start.clone(),
                     ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions,
@@ -1498,6 +1512,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                         args,
                         &state_dir,
                         previous_output_source.path(),
+                        previous_output_source.live_identity(),
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
@@ -1534,6 +1549,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                         args,
                         &state_dir,
                         previous_output_source.path(),
+                        previous_output_source.live_identity(),
                         full_previous,
                         current_link_start,
                         ChangedInputRecordCoverage::Complete,
@@ -1594,11 +1610,12 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             ),
         )?;
     }
-    if previous_output_source.is_retained()
-        && !restore_selected_output_source(
+    if previous_output_source.path() != args.output().as_ref()
+        && !publish_selected_output_source(
             &state_dir,
             previous_output_source.path(),
             args.output(),
+            previous_output_source.live_identity(),
         )?
     {
         return Ok(false);
@@ -5509,6 +5526,7 @@ fn patch_changed_inputs(
     args: &impl platform::Args,
     state_dir: &Path,
     previous_output_source: &Path,
+    live_output_identity: Option<&FileIdentity>,
     previous: PersistedState,
     current_link_start: Option<FileIdentity>,
     record_coverage: ChangedInputRecordCoverage,
@@ -5521,6 +5539,7 @@ fn patch_changed_inputs(
         args,
         state_dir,
         previous_output_source,
+        live_output_identity,
         previous,
         current_link_start,
         record_coverage,
@@ -5572,6 +5591,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     args: &impl platform::Args,
     state_dir: &Path,
     previous_output_source: &Path,
+    live_output_identity: Option<&FileIdentity>,
     previous: PersistedState,
     current_link_start: Option<FileIdentity>,
     record_coverage: ChangedInputRecordCoverage,
@@ -8540,7 +8560,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             )?;
         }
         if previous_output_source != args.output().as_ref()
-            && !restore_selected_output_source(state_dir, previous_output_source, args.output())?
+            && !publish_selected_output_source(
+                state_dir,
+                previous_output_source,
+                args.output(),
+                live_output_identity,
+            )?
         {
             return Ok(ChangedInputPatchResult::Unsupported(
                 "missing retained output could not be restored".to_owned(),
@@ -8570,6 +8595,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         state_dir,
         args.should_replace_directly_patched_output(),
         retained_output_snapshot.as_deref(),
+        live_output_identity,
     ) else {
         return Ok(ChangedInputPatchResult::Unsupported(
             "could not clone directly patched output generation".to_owned(),
@@ -9883,8 +9909,19 @@ impl DirectlyPatchedOutput {
         state_dir: &Path,
         should_replace: bool,
         retained_output_snapshot: Option<&Path>,
+        live_output_identity: Option<&FileIdentity>,
     ) -> Option<Self> {
         if let Some(snapshot) = retained_output_snapshot {
+            let published_identity = if output.try_exists().ok()? {
+                FileIdentity::from_path(output).ok().flatten()
+            } else {
+                None
+            };
+            match (live_output_identity, published_identity.as_ref()) {
+                (Some(expected), Some(actual)) if expected == actual => {}
+                (Some(_), None) | (None, None) => {}
+                _ => return None,
+            }
             let generation = directly_patched_output_standby_path(state_dir);
             let _ = std::fs::remove_file(&generation);
             let _ = std::fs::remove_file(directly_patched_output_standby_state_path(state_dir));
@@ -9893,12 +9930,13 @@ impl DirectlyPatchedOutput {
             {
                 return None;
             }
+            let install_if_missing = published_identity.is_none();
             return Some(Self {
                 path: generation,
                 published_path: Some(output.to_path_buf()),
-                published_identity: None,
+                published_identity,
                 standby_state_path: None,
-                install_if_missing: true,
+                install_if_missing,
             });
         }
         if !output.try_exists().unwrap_or(false) {
@@ -9986,6 +10024,33 @@ impl DirectlyPatchedOutput {
             self.published_path = None;
             return Ok(());
         }
+        if self.standby_state_path.is_none()
+            && let Some(expected) = self.published_identity.as_ref()
+        {
+            if !published_path.try_exists().unwrap_or(true) {
+                std::fs::hard_link(&self.path, published_path).with_context(|| {
+                    format!(
+                        "Failed to install directly patched output `{}` after the selected output disappeared",
+                        published_path.display()
+                    )
+                })?;
+                std::fs::remove_file(&self.path).with_context(|| {
+                    format!(
+                        "Failed to remove directly patched output generation `{}`",
+                        self.path.display()
+                    )
+                })?;
+                self.published_path = None;
+                return Ok(());
+            }
+            let actual = FileIdentity::from_path(published_path)?;
+            if actual.as_ref() != Some(expected) {
+                return Err(crate::error!(
+                    "Refusing to replace changed incremental output `{}`",
+                    published_path.display()
+                ));
+            }
+        }
         verbose_timing_phase!("Install directly patched output generation");
         install_directly_patched_output_generation(&self.path, published_path)?;
         let standby_is_predecessor = self
@@ -10027,6 +10092,25 @@ impl Drop for DirectlyPatchedOutput {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+fn publish_selected_output_source(
+    state_dir: &Path,
+    source: &Path,
+    output: &Path,
+    live_output_identity: Option<&FileIdentity>,
+) -> Result<bool> {
+    let Some(mut publication) =
+        DirectlyPatchedOutput::new(output, state_dir, false, Some(source), live_output_identity)
+    else {
+        return Ok(false);
+    };
+    let restored_missing_output = publication.install_if_missing;
+    publication.install(&[])?;
+    if restored_missing_output {
+        append_log(state_dir, "restored missing output from retained snapshot")?;
+    }
+    Ok(true)
 }
 
 fn directly_patched_output_standby_path(state_dir: &Path) -> PathBuf {
@@ -35835,9 +35919,15 @@ fn select_previous_output_source(
     output_match: OutputContentMatch,
 ) -> Result<PreviousOutputSourceSelection> {
     match output_match {
-        OutputContentMatch::Matches => Ok(PreviousOutputSourceSelection::Available(
-            PreviousOutputSource::Live(output.to_path_buf()),
-        )),
+        OutputContentMatch::Matches => {
+            if let Some(source) = pinned_output_source(state_dir, previous, output, true)? {
+                Ok(PreviousOutputSourceSelection::Available(
+                    PreviousOutputSource::Live(source),
+                ))
+            } else {
+                Ok(PreviousOutputSourceSelection::OutputChanged)
+            }
+        }
         OutputContentMatch::Changed => Ok(PreviousOutputSourceSelection::OutputChanged),
         OutputContentMatch::Missing if should_retain_output_snapshot => {
             if let Some(source) = retained_output_source(state_dir, previous, output)? {
@@ -35943,7 +36033,7 @@ fn retained_output_source(
     state_dir: &Path,
     previous: &FileContentState,
     output: &Path,
-) -> Result<Option<RetainedOutputSource>> {
+) -> Result<Option<PinnedOutputSource>> {
     if output.try_exists().unwrap_or(false) || previous.hash.is_empty() {
         return Ok(None);
     }
@@ -35951,20 +36041,49 @@ fn retained_output_source(
     if !snapshot.try_exists().unwrap_or(false) {
         return Ok(None);
     }
+    pinned_output_source(state_dir, previous, &snapshot, false)
+}
+
+fn pinned_output_source(
+    state_dir: &Path,
+    previous: &FileContentState,
+    source_path: &Path,
+    is_live: bool,
+) -> Result<Option<PinnedOutputSource>> {
+    let live_identity = if is_live {
+        FileIdentity::from_path(source_path)?
+    } else {
+        None
+    };
     let sequence = RETAINED_OUTPUT_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let source = RetainedOutputSource {
+    let source = PinnedOutputSource {
         path: state_dir.join(format!(
             "{RETAINED_OUTPUT_SOURCE_FILE_PREFIX}.{}.{sequence}",
             std::process::id()
         )),
+        live_identity,
     };
-    install_isolated_output_copy(&snapshot, &source.path).with_context(|| {
+    install_isolated_output_copy(source_path, &source.path).with_context(|| {
         format!(
-            "Failed to clone retained output snapshot `{}`",
-            snapshot.display()
+            "Failed to clone selected output source `{}`",
+            source_path.display()
         )
     })?;
-    if FileContentState::from_path(&source.path)? != *previous {
+    let pinned = FileContentState::from_path(&source.path)?;
+    let matches = if previous.hash.is_empty() {
+        pinned.len == previous.len
+    } else {
+        pinned.len == previous.len && pinned.hash == previous.hash
+    };
+    if !matches {
+        return Ok(None);
+    }
+    if is_live
+        && FileIdentity::from_path(source_path)?
+            .as_ref()
+            .zip(source.live_identity.as_ref())
+            .is_none_or(|(current, selected)| current != selected)
+    {
         return Ok(None);
     }
     Ok(Some(source))
@@ -38576,13 +38695,13 @@ mod tests {
         std::fs::write(&output, b"original").unwrap();
         let original_identity = FileIdentity::from_path(&output).unwrap().unwrap();
 
-        let in_place = DirectlyPatchedOutput::new(&output, &state_dir, false, None).unwrap();
+        let in_place = DirectlyPatchedOutput::new(&output, &state_dir, false, None, None).unwrap();
         assert_eq!(in_place.path(), output);
         assert!(!in_place.is_generation());
         assert!(in_place.should_invalidate_code_signature_cache());
         drop(in_place);
 
-        let aborted = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let aborted = DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         let aborted_path = aborted.path().to_path_buf();
         assert_ne!(aborted.path(), output);
         assert!(aborted.is_generation());
@@ -38592,7 +38711,8 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
         assert!(!aborted_path.exists());
 
-        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let mut installed =
+            DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         let installed_path = installed.path().to_path_buf();
         std::fs::write(installed.path(), b"changed!").unwrap();
         let installed_identity = FileIdentity::from_path(&installed_path).unwrap().unwrap();
@@ -38617,7 +38737,8 @@ mod tests {
                 vec![0..8],
             );
 
-            let mut reused = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+            let mut reused =
+                DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
             assert_eq!(reused.path(), installed_path);
             assert_eq!(std::fs::read(reused.path()).unwrap(), b"changed!");
             std::fs::write(reused.path(), b"second!!").unwrap();
@@ -38645,7 +38766,7 @@ mod tests {
         std::fs::write(&snapshot, b"original").unwrap();
 
         let mut patched =
-            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot)).unwrap();
+            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot), None).unwrap();
         assert!(patched.is_generation());
         assert!(!patched.should_invalidate_code_signature_cache());
         std::fs::write(patched.path(), b"changed!").unwrap();
@@ -38669,7 +38790,7 @@ mod tests {
         std::fs::write(&snapshot, b"original").unwrap();
 
         let mut patched =
-            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot)).unwrap();
+            DirectlyPatchedOutput::new(&output, &state_dir, false, Some(&snapshot), None).unwrap();
         std::fs::write(patched.path(), b"changed!").unwrap();
         let generation = patched.path().to_path_buf();
         std::fs::write(&output, b"appeared").unwrap();
@@ -38678,6 +38799,62 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"appeared");
         drop(patched);
         assert!(!generation.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directly_patched_live_snapshot_installs_after_output_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        let snapshot = state_dir.join("selected-output");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&output, b"original").unwrap();
+        std::fs::write(&snapshot, b"original").unwrap();
+        let selected_identity = FileIdentity::from_path(&output).unwrap().unwrap();
+        std::fs::remove_file(&output).unwrap();
+
+        let mut patched = DirectlyPatchedOutput::new(
+            &output,
+            &state_dir,
+            false,
+            Some(&snapshot),
+            Some(&selected_identity),
+        )
+        .unwrap();
+        std::fs::write(patched.path(), b"changed!").unwrap();
+        patched.install(&[0..8]).unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"changed!");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directly_patched_live_snapshot_rejects_replaced_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        let snapshot = state_dir.join("selected-output");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&output, b"original").unwrap();
+        std::fs::write(&snapshot, b"original").unwrap();
+        let selected_identity = FileIdentity::from_path(&output).unwrap().unwrap();
+
+        let mut patched = DirectlyPatchedOutput::new(
+            &output,
+            &state_dir,
+            false,
+            Some(&snapshot),
+            Some(&selected_identity),
+        )
+        .unwrap();
+        std::fs::write(patched.path(), b"changed!").unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"unrelated").unwrap();
+        std::fs::rename(&replacement, &output).unwrap();
+
+        assert!(patched.install(&[0..8]).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"unrelated");
     }
 
     #[cfg(target_os = "macos")]
@@ -38689,12 +38866,12 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         std::fs::write(&output, b"abcdefgh").unwrap();
 
-        let mut first = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let mut first = DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         std::fs::write(first.path(), b"Abcdefgh").unwrap();
         first.install(&[0..1]).unwrap();
         drop(first);
 
-        let mut raced = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let mut raced = DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         assert_eq!(std::fs::read(raced.path()).unwrap(), b"Abcdefgh");
         std::fs::write(raced.path(), b"ABcdefgh").unwrap();
         let replacement = dir.path().join("replacement");
@@ -38705,7 +38882,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&output).unwrap(), b"ABcdefgh");
         assert!(!directly_patched_output_standby_state_path(&state_dir).exists());
-        let recloned = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let recloned = DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         assert_eq!(std::fs::read(recloned.path()).unwrap(), b"ABcdefgh");
     }
 
@@ -38718,7 +38895,8 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         std::fs::write(&output, b"original").unwrap();
 
-        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let mut installed =
+            DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         std::fs::write(installed.path(), b"changed!").unwrap();
         installed.install(&[0..8]).unwrap();
         drop(installed);
@@ -38732,7 +38910,7 @@ mod tests {
             .join("\n");
         std::fs::write(&state_path, format!("{truncated}\n")).unwrap();
 
-        let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true, None).unwrap();
+        let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true, None, None).unwrap();
         assert_eq!(std::fs::read(fallback.path()).unwrap(), b"changed!");
     }
 
@@ -52561,6 +52739,7 @@ mod tests {
             &args,
             &state_dir,
             args.output.as_ref(),
+            None,
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -52781,6 +52960,7 @@ mod tests {
             &args,
             &state_dir,
             args.output.as_ref(),
+            None,
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -57411,6 +57591,7 @@ mod tests {
             &crate::args::elf::ElfArgs::default(),
             dir.path(),
             Path::new("unused-output"),
+            None,
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -57457,6 +57638,7 @@ mod tests {
             &args,
             &state_dir,
             &output,
+            None,
             previous,
             None,
             ChangedInputRecordCoverage::Complete,
@@ -59546,6 +59728,36 @@ mod tests {
         std::fs::write(output_snapshot_path(&state_dir), b"changed").unwrap();
         assert_eq!(std::fs::read(source.path()).unwrap(), b"output");
         assert!(!output.exists());
+        drop(source);
+        assert!(!source_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_live_output_is_pinned_before_the_public_path_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let state_dir = dir.path().join("out.incr");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&output, b"selected").unwrap();
+        let previous = FileContentState::from_path(&output).unwrap();
+
+        let PreviousOutputSourceSelection::Available(source) = select_previous_output_source(
+            &state_dir,
+            &previous,
+            &output,
+            true,
+            OutputContentMatch::Matches,
+        )
+        .unwrap() else {
+            panic!("live output was not selected");
+        };
+        let source_path = source.path().to_path_buf();
+        assert!(!source.is_retained());
+        assert_ne!(source.path(), output);
+
+        std::fs::write(&output, b"replaced").unwrap();
+        assert_eq!(std::fs::read(source.path()).unwrap(), b"selected");
         drop(source);
         assert!(!source_path.exists());
     }
