@@ -19,6 +19,6 @@
 extern int incremental_text_value(void);
 
 void main(void) {
-    int value = incremental_text_value();
-    exit_syscall(value == 42 || value == 50 ? 42 : 1);
+  int value = incremental_text_value();
+  exit_syscall(value == 42 || value == 50 ? 42 : 1);
 }

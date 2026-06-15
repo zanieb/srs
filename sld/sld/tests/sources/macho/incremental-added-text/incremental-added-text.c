@@ -19,6 +19,4 @@
 
 extern int incremental_added_text_anchor;
 
-void main(void) {
-    exit_syscall(incremental_added_text_anchor == 42 ? 42 : 1);
-}
+void main(void) { exit_syscall(incremental_added_text_anchor == 42 ? 42 : 1); }

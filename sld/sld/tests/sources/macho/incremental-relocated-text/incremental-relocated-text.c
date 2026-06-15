@@ -110,8 +110,11 @@ extern int incremental_cross_input_page_value(void);
 int incremental_relocated_text_helper(void) { return 0; }
 
 void main(void) {
-    int value = incremental_relocated_text_value();
-    int branch_value = incremental_cross_input_branch_value();
-    int page_value = incremental_cross_input_page_value();
-    exit_syscall((value == 42 || value == 50) && branch_value == 42 && page_value == 42 ? 42 : 1);
+  int value = incremental_relocated_text_value();
+  int branch_value = incremental_cross_input_branch_value();
+  int page_value = incremental_cross_input_page_value();
+  exit_syscall((value == 42 || value == 50) && branch_value == 42 &&
+                       page_value == 42
+                   ? 42
+                   : 1);
 }

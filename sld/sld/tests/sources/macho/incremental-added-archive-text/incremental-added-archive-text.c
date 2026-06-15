@@ -31,13 +31,12 @@
 
 extern int incremental_added_archive_reserve(void);
 extern int incremental_added_archive_runtime(void);
-extern int incremental_added_archive_verify_unwind(void *expected_ip);
+extern int incremental_added_archive_verify_unwind(void* expected_ip);
 
 void main(void) {
-    exit_syscall(
-        incremental_added_archive_verify_unwind(0) &&
-                incremental_added_archive_runtime() == 42 &&
-                incremental_added_archive_reserve() == 0
-            ? 42
-            : 1);
+  exit_syscall(incremental_added_archive_verify_unwind(0) &&
+                       incremental_added_archive_runtime() == 42 &&
+                       incremental_added_archive_reserve() == 0
+                   ? 42
+                   : 1);
 }
