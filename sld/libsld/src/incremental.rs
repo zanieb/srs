@@ -17998,6 +17998,14 @@ fn macho_text_relocation_replays_for_input(
     let mut rematerialized_sections = Vec::new();
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for text relocation replay")?;
+    if output_file.format() != object::BinaryFormat::MachO {
+        return Ok(Ok(MachOTextRelocationReplays {
+            replays,
+            rematerialized_sections,
+            normalize_rust_archive_patch_inputs: false,
+            symbol_resolutions_changed: false,
+        }));
+    }
     let target_moves = target_patches
         .macho_target_moves
         .iter()
@@ -18860,6 +18868,9 @@ fn validate_macho_data_relocations_are_stable(
 ) -> Result<std::result::Result<bool, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for data relocation validation")?;
+    if output_file.format() != object::BinaryFormat::MachO {
+        return Ok(Ok(false));
+    }
     let target_moves = std::mem::take(&mut target_patches.macho_target_moves);
     let target_moves_by_index = target_moves
         .iter()
@@ -57022,6 +57033,94 @@ mod tests {
                 &[],
             ),
             Some(b"_new_target".as_slice())
+        );
+    }
+
+    #[test]
+    fn macho_relocation_validators_ignore_elf_outputs() {
+        let mut elf = vec![0; 193];
+        elf[..4].copy_from_slice(&object::elf::ELFMAG);
+        elf[4] = object::elf::ELFCLASS64;
+        elf[5] = object::elf::ELFDATA2LSB;
+        elf[6] = object::elf::EV_CURRENT;
+        elf[16..18].copy_from_slice(&object::elf::ET_REL.to_le_bytes());
+        elf[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes());
+        elf[20..24].copy_from_slice(&u32::from(object::elf::EV_CURRENT).to_le_bytes());
+        elf[40..48].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&2_u16.to_le_bytes());
+        elf[62..64].copy_from_slice(&1_u16.to_le_bytes());
+        elf[132..136].copy_from_slice(&object::elf::SHT_STRTAB.to_le_bytes());
+        elf[152..160].copy_from_slice(&192_u64.to_le_bytes());
+        elf[160..168].copy_from_slice(&1_u64.to_le_bytes());
+        elf[176..184].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            object::File::parse(elf.as_slice()).unwrap().format(),
+            object::BinaryFormat::Elf
+        );
+
+        let input = state("args", &elf, &[("changed.o", &elf)])
+            .input_files
+            .remove(0);
+        let missing_section = MatchedPatchSection::same(PatchSection {
+            input: input.path.clone(),
+            section_index: 1,
+            section_name: Some(".eh_frame".to_owned()),
+            input_size: 0,
+            output_offset: 0,
+            output_size: 0,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        });
+        let previous_resolver = PatchInputResolver::new(&elf, false).unwrap();
+        let current_resolver = PatchInputResolver::new(&elf, false).unwrap();
+        let mut resolutions = Vec::new();
+        let mut target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
+            validated_macho_local_text_retargets: Vec::new(),
+            changed_relocation_indices: Vec::new(),
+        };
+
+        let replays = macho_text_relocation_replays_for_input(
+            &[],
+            &mut resolutions,
+            &[],
+            &input,
+            Some(&HashSet::new()),
+            std::slice::from_ref(&missing_section),
+            &previous_resolver,
+            &current_resolver,
+            &elf,
+            &mut target_patches,
+            &[],
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(replays.replays.is_empty());
+        assert!(replays.rematerialized_sections.is_empty());
+
+        assert!(
+            !validate_macho_data_relocations_are_stable(
+                &mut [],
+                &resolutions,
+                &input,
+                &[missing_section],
+                &previous_resolver,
+                &current_resolver,
+                &elf,
+                &mut target_patches,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
         );
     }
 

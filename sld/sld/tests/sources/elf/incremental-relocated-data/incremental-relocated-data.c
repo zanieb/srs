@@ -7,7 +7,7 @@
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedInput:incremental-relocated-data.c.o
 //#TestIncrementalChangedSection:.data.rel.local.incremental_relocated
-//#TestIncrementalStateContains:reloc2\t
+//#TestIncrementalStateContains:reloc3\t
 //#TestIncrementalStateContains:72656c6f63617465645f746172676574
 //#SkipArch:riscv64
 //#Config:incremental-relocated-data-riscv64-fallback:incremental-relocated-data
