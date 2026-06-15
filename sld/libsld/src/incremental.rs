@@ -15421,7 +15421,8 @@ fn renamed_local_macho_relocation_target_name(
     if previous_identity.name.is_empty()
         || current_identity.name.is_empty()
         || previous_identity.name == current_identity.name
-        || previous_identity.section != current_identity.section
+        || previous_identity.section.map(|(section, _)| section)
+            != current_identity.section.map(|(section, _)| section)
         || previous_identity.kind != current_identity.kind
         || previous_identity.scope != current_identity.scope
         || previous_identity.weak != current_identity.weak
@@ -17987,6 +17988,30 @@ fn validate_macho_data_relocations_are_stable(
                 } else {
                     relocation.target_value
                 };
+                if let Some(current_name) = matched_local_target_name.as_ref()
+                    && target_address != relocation.target_value
+                {
+                    let patch = match moved_local_macho_data_relocation_patch(
+                        relocation,
+                        MachORelocationTargetMove {
+                            relocation_index,
+                            current_section_offset: current_target.section_offset,
+                            current_target_value: target_address,
+                            current_input: Some(patch_section.current.input.clone().into()),
+                        },
+                        current_name,
+                    ) {
+                        Ok(patch) => patch,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    if relocation.input != patch_section.current.input {
+                        relocation.input = patch_section.current.input.clone().into();
+                    }
+                    relocation.section_index = patch_section.current.section_index;
+                    target_patches.output_patches.push(patch);
+                    changed = true;
+                    continue;
+                }
                 if target_address != relocation.target_value
                     || relocation.applied_target_value != Some(relocation.target_value)
                 {
@@ -18075,6 +18100,16 @@ fn moved_macho_data_relocation_patch(
         source: "resolved Mach-O data relocation target movement",
     };
     Ok((patch, symbol_patch))
+}
+
+fn moved_local_macho_data_relocation_patch(
+    relocation: &mut RelocationRecord,
+    target_move: MachORelocationTargetMove,
+    current_name: &[u8],
+) -> std::result::Result<SectionPatch, String> {
+    let (patch, _) = moved_macho_data_relocation_patch(relocation, target_move, None)?;
+    relocation.target_name = Some(SharedText::from(hex::encode(current_name)));
+    Ok(patch)
 }
 
 fn macho_data_relocation_semantics_are_stable(
@@ -45100,6 +45135,66 @@ mod tests {
     }
 
     #[test]
+    fn moved_local_macho_data_relocation_rewrites_without_a_symbol_patch() {
+        let mut relocation = relocation_record(
+            "source.o",
+            2,
+            7,
+            Some(0x1008),
+            0x1000,
+            Some("l_anon.20"),
+            Some(("target.o", 1, 0x112)),
+            0x90,
+            0x200,
+            8,
+            0,
+            0,
+        );
+        relocation.applied_target_value = Some(0x1000);
+        let current_input = SharedText::from(hex::encode("current-target.o"));
+        let patch = moved_local_macho_data_relocation_patch(
+            &mut relocation,
+            MachORelocationTargetMove {
+                relocation_index: 0,
+                current_section_offset: 0x126,
+                current_target_value: 0x1014,
+                current_input: Some(current_input),
+            },
+            b"l_anon.21",
+        )
+        .unwrap();
+
+        assert_eq!(patch.data, 0x101c_u64.to_le_bytes());
+        let current_name = hex::encode("l_anon.21");
+        assert_eq!(
+            relocation.target_name.as_deref(),
+            Some(current_name.as_str())
+        );
+        assert_eq!(relocation.target_value, 0x1014);
+        assert_eq!(relocation.target.as_ref().unwrap().section_offset, 0x126);
+
+        let reverse = moved_local_macho_data_relocation_patch(
+            &mut relocation,
+            MachORelocationTargetMove {
+                relocation_index: 0,
+                current_section_offset: 0x112,
+                current_target_value: 0x1000,
+                current_input: Some(SharedText::from(hex::encode("target.o"))),
+            },
+            b"l_anon.20",
+        )
+        .unwrap();
+        assert_eq!(reverse.data, 0x1008_u64.to_le_bytes());
+        let previous_name = hex::encode("l_anon.20");
+        assert_eq!(
+            relocation.target_name.as_deref(),
+            Some(previous_name.as_str())
+        );
+        assert_eq!(relocation.target_value, 0x1000);
+        assert_eq!(relocation.target.as_ref().unwrap().section_offset, 0x112);
+    }
+
+    #[test]
     fn moved_macho_data_relocation_rejects_indirect_target() {
         let mut relocation = relocation_record(
             "source.o",
@@ -45620,6 +45715,37 @@ mod tests {
             .unwrap(),
             Some(b"_dota".to_vec()),
             "a changed target needs the caller's matched-section ownership proof",
+        );
+
+        let mut moved = changed.clone();
+        let value_range = macho_symbol_value_field_range(&moved, changed_symbol.index()).unwrap();
+        let value = u64::from_le_bytes(moved[value_range.clone()].try_into().unwrap());
+        moved[value_range].copy_from_slice(&(value + 4).to_le_bytes());
+        let moved_file = object::File::parse(moved.as_slice()).unwrap();
+        let moved_symbol = moved_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(b"_dota".as_slice()))
+            .unwrap();
+        assert!(
+            renamed_local_macho_relocation_target_is_stable(
+                &previous_file,
+                &moved_file,
+                object::RelocationTarget::Symbol(previous_symbol.index()),
+                object::RelocationTarget::Symbol(moved_symbol.index()),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            renamed_local_macho_relocation_target_name(
+                &previous_file,
+                &moved_file,
+                object::RelocationTarget::Symbol(previous_symbol.index()),
+                object::RelocationTarget::Symbol(moved_symbol.index()),
+            )
+            .unwrap(),
+            Some(b"_dota".to_vec()),
+            "the caller must prove a renamed local target's moved matched owner",
         );
 
         let global_previous = test_macho_object(b"\x1f\x20\x03\xd5", b"old!same", 4);
