@@ -15653,6 +15653,7 @@ fn macho_relocation_symbol_position(
     }))
 }
 
+#[derive(Debug)]
 struct MachODataRelocationTargetPosition {
     section_index: object::SectionIndex,
     section_offset: u64,
@@ -18618,8 +18619,16 @@ fn validate_macho_data_relocations_are_stable(
                     || relocation.applied_target_value != Some(relocation.target_value)
                 {
                     return Ok(Err(format!(
-                        "Mach-O data relocation target value changed in {}",
-                        display_hex_path(&input.path)
+                        "Mach-O data relocation target value changed in {} input {} section {} offset {:#x}: target={target_address:#x}, recorded={:#x}, applied={:?}, previous={previous_identity:?} at {:?}, current={current_identity:?} at {:?}, matched-local={:?}",
+                        display_hex_path(&input.path),
+                        display_hex_text(&patch_section.previous.input),
+                        patch_section.previous.section_index,
+                        relocation.relocation_offset,
+                        relocation.target_value,
+                        relocation.applied_target_value,
+                        previous_target,
+                        current_target,
+                        matched_local_target_name.as_deref().map(hex::encode),
                     )));
                 }
                 if let Some(current_name) = matched_local_target_name {
