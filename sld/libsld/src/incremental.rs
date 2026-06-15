@@ -6655,10 +6655,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &previous.macho_symbol_resolutions,
                     &retained_macho_archive_members,
                     &macho_resolution_updates.retiring_names,
-                    &retired_macho_archive_activations
-                        .iter()
-                        .flat_map(|state| state.rollback_symbol_resolutions.iter().cloned())
-                        .collect::<Vec<_>>(),
+                    &retired_macho_archive_activations,
                     text_activation_reserved_ranges,
                 )? {
                     Ok(activation) => activation,
@@ -25730,6 +25727,90 @@ fn macho_resolution_matches_archive_member(
         && archive_member_patch_identifier(&input.identifier) == member.normalized_identifier)
 }
 
+fn returning_macho_definition_matches_rollback_entry(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    retired: &[RetiredMachOArchiveActivation],
+    rollback: &MachOSymbolResolutionRecord,
+    definition: &AddedMachOArchiveDefinition,
+    current: &MachOSymbolResolutionRecord,
+) -> std::result::Result<bool, String> {
+    let matching_states = retired
+        .iter()
+        .filter(|state| {
+            state
+                .rollback_symbol_resolutions
+                .iter()
+                .any(|candidate| candidate == rollback)
+        })
+        .collect::<Vec<_>>();
+    let [state] = matching_states.as_slice() else {
+        return Err("returning Mach-O definition has no unique rollback transaction".to_owned());
+    };
+    let owned = state
+        .symbol_resolutions
+        .iter()
+        .filter(|resolution| resolution.name == rollback.name)
+        .collect::<Vec<_>>();
+    let [owned] = owned.as_slice() else {
+        return Err("returning Mach-O definition has no unique active symbol owner".to_owned());
+    };
+    let name = hex::decode(rollback.name.as_str())
+        .map_err(|_| "malformed returning Mach-O definition name".to_owned())?;
+    if definition.name != name {
+        return Ok(false);
+    }
+    let owned_value = owned
+        .direct_value
+        .ok_or_else(|| "returning Mach-O definition owner has no direct value".to_owned())?;
+    let symbol_index = unique_macho_output_symbol_index(output_file, &name, owned_value)?;
+    let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
+    let symbol_range =
+        macho_symbol_entry_range(previous_output, symbol_table_offset, symbol_index)?;
+    let rollback_patches = state
+        .rollback_patches
+        .iter()
+        .filter(|patch| {
+            usize::try_from(patch.output_offset).ok() == Some(symbol_range.start)
+                && patch.data.len() == symbol_range.len()
+        })
+        .collect::<Vec<_>>();
+    let [rollback_patch] = rollback_patches.as_slice() else {
+        return Err("returning Mach-O definition has no unique rollback symbol entry".to_owned());
+    };
+    let current_value = current
+        .direct_value
+        .ok_or_else(|| "returning Mach-O definition has no direct value".to_owned())?;
+    let output_sections = output_file
+        .sections()
+        .filter(|section| {
+            section
+                .address()
+                .checked_add(section.size())
+                .is_some_and(|end| current_value >= section.address() && current_value < end)
+        })
+        .collect::<Vec<_>>();
+    let [output_section] = output_sections.as_slice() else {
+        return Err("returning Mach-O definition has no unique output section".to_owned());
+    };
+    let output_section_index = u8::try_from(output_section.index().0)
+        .map_err(|_| "returning Mach-O definition output section exceeds u8".to_owned())?;
+    let string_index = read_u32_le(
+        rollback_patch
+            .data
+            .get(..std::mem::size_of::<u32>())
+            .ok_or_else(|| "returning Mach-O rollback symbol entry is truncated".to_owned())?,
+    )
+    .ok_or_else(|| "returning Mach-O rollback symbol entry is truncated".to_owned())?;
+    let expected = added_macho_symbol_entry(
+        definition,
+        output_section_index,
+        string_index,
+        current_value,
+    );
+    Ok(rollback_patch.data == expected)
+}
+
 fn section_patches_from_stored(patches: &[StoredOutputPatch]) -> Vec<SectionPatch> {
     patches
         .iter()
@@ -25755,7 +25836,7 @@ fn changed_macho_definition_activation(
     resolutions: &[MachOSymbolResolutionRecord],
     states: &[MachOArchiveActivationState],
     retiring_names: &[SharedText],
-    returning_resolutions: &[MachOSymbolResolutionRecord],
+    retired: &[RetiredMachOArchiveActivation],
     reserved_ranges: &[ReservedRangeRecord],
 ) -> Result<std::result::Result<Option<ChangedMachODefinitionActivation>, String>> {
     let output_file = object::File::parse(previous_output)
@@ -25773,7 +25854,10 @@ fn changed_macho_definition_activation(
         Err(reason) => return Ok(Err(reason)),
     };
     let retiring_names = retiring_names.iter().cloned().collect::<HashSet<_>>();
-    let mut returning_resolutions = returning_resolutions.to_vec();
+    let mut returning_resolutions = retired
+        .iter()
+        .flat_map(|state| state.rollback_symbol_resolutions.iter().cloned())
+        .collect::<Vec<_>>();
     returning_resolutions.sort_unstable();
     if returning_resolutions
         .windows(2)
@@ -25856,9 +25940,34 @@ fn changed_macho_definition_activation(
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .all(std::convert::identity);
+            let returning_metadata_matches =
+                match returning
+                    .iter()
+                    .zip(&current_resolutions)
+                    .map(|(rollback, current)| {
+                        let Some(definition) = member.definitions.iter().find(|definition| {
+                            hex::encode(&definition.name) == current.name.as_str()
+                        }) else {
+                            return Ok(false);
+                        };
+                        returning_macho_definition_matches_rollback_entry(
+                            previous_output,
+                            &output_file,
+                            retired,
+                            rollback,
+                            definition,
+                            current,
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()
+                {
+                    Ok(matches) => matches.into_iter().all(std::convert::identity),
+                    Err(reason) => return Ok(Err(reason)),
+                };
             if !returning_owner_matches
                 || returning.len() != current_resolutions.len()
                 || !macho_definition_resolutions_match(&returning, &current_resolutions)
+                || !returning_metadata_matches
             {
                 return Ok(Err(
                     "returning Mach-O definitions split or changed a rollback transaction"
@@ -47043,6 +47152,92 @@ mod tests {
         stab[symoff + 4] |= object::macho::N_STAB;
         let stab_file = object::File::parse(stab.as_slice()).unwrap();
         assert!(unique_macho_output_symbol_index(&stab_file, b"_text", 0).is_err());
+    }
+
+    #[test]
+    fn returning_macho_definition_requires_exact_rollback_symbol_metadata() {
+        let output = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let name = SharedText::from(hex::encode("_text"));
+        let active = MachOSymbolResolutionRecord {
+            name: name.clone(),
+            direct_value: Some(0),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
+        let rollback = active.clone();
+        let symbol_table_offset = macho_symbol_table_offset_for_recycling(&output).unwrap();
+        let symbol_index = unique_macho_output_symbol_index(&output_file, b"_text", 0).unwrap();
+        let symbol_range =
+            macho_symbol_entry_range(&output, symbol_table_offset, symbol_index).unwrap();
+        let retired = [RetiredMachOArchiveActivation {
+            state: MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: Vec::new(),
+                active: false,
+                sections: Vec::new(),
+                relocations: Vec::new(),
+                symbol_resolutions: vec![active],
+                rollback_symbol_resolutions: vec![rollback.clone()],
+                forward_patches: Vec::new(),
+                rollback_patches: vec![StoredOutputPatch {
+                    output_offset: symbol_range.start as u64,
+                    data: output[symbol_range].to_vec(),
+                }],
+            },
+            newly_tracked: false,
+        }];
+        let definition = AddedMachOArchiveDefinition {
+            name: b"_text".to_vec(),
+            offset: 0,
+            desc: 0,
+            private_external: false,
+        };
+
+        assert!(
+            returning_macho_definition_matches_rollback_entry(
+                &output,
+                &output_file,
+                &retired,
+                &rollback,
+                &definition,
+                &rollback,
+            )
+            .unwrap()
+        );
+
+        let changed_desc = AddedMachOArchiveDefinition {
+            desc: 1,
+            ..definition.clone()
+        };
+        assert!(
+            !returning_macho_definition_matches_rollback_entry(
+                &output,
+                &output_file,
+                &retired,
+                &rollback,
+                &changed_desc,
+                &rollback,
+            )
+            .unwrap()
+        );
+        let changed_visibility = AddedMachOArchiveDefinition {
+            private_external: true,
+            ..definition
+        };
+        assert!(
+            !returning_macho_definition_matches_rollback_entry(
+                &output,
+                &output_file,
+                &retired,
+                &rollback,
+                &changed_visibility,
+                &rollback,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
