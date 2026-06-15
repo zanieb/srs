@@ -4178,10 +4178,7 @@ fn reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
                     rollback.name.as_str(),
                 )?
                 else {
-                    return Err(
-                        "reactivated Mach-O archive rollback symbol has no returning owner"
-                            .to_owned(),
-                    );
+                    continue;
                 };
                 let Some(target) = activation.symbol_resolutions[resolution_index]
                     .target
@@ -50664,9 +50661,18 @@ mod tests {
             target: None,
             ..rollback.clone()
         };
+        let unrelated_predecessor = MachOSymbolResolutionRecord {
+            name: hex::encode("_unrelated_retirement").into(),
+            direct_value: Some(0x7000),
+            ..rollback.clone()
+        };
         reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
             &mut multi_activation,
-            &[first_predecessor.clone(), second_predecessor.clone()],
+            &[
+                first_predecessor.clone(),
+                second_predecessor.clone(),
+                unrelated_predecessor.clone(),
+            ],
         )
         .unwrap();
         assert_eq!(
@@ -50684,7 +50690,11 @@ mod tests {
         assert!(
             reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
                 &mut multi_activation,
-                &[changed_predecessor, second_predecessor],
+                &[
+                    changed_predecessor,
+                    second_predecessor,
+                    unrelated_predecessor,
+                ],
             )
             .unwrap_err()
             .contains("changed while dormant")
