@@ -1724,7 +1724,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
 
     let (common, output, remap_renamed_codegen_units) = match args {
         crate::args::Args::Elf(args) if args.common.incremental => {
-            (&mut args.common, args.output.clone(), false)
+            (&mut args.common, args.output.clone(), true)
         }
         crate::args::Args::MachO(args)
             if args.common.incremental
@@ -2144,7 +2144,7 @@ fn remapped_rustc_codegen_input_targets(
             (
                 source.clone(),
                 natural_target.clone(),
-                macho_global_definition_names(source).unwrap_or_default(),
+                global_definition_names(source).unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>();
@@ -2153,7 +2153,7 @@ fn remapped_rustc_codegen_input_targets(
         .map(|target| {
             (
                 target.clone(),
-                macho_global_definition_names(target).unwrap_or_default(),
+                global_definition_names(target).unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>();
@@ -2295,10 +2295,13 @@ fn maximum_weight_bipartite_assignment(weights: &[Vec<Option<usize>>]) -> Vec<us
     assignment
 }
 
-fn macho_global_definition_names(path: &Path) -> Option<HashSet<Vec<u8>>> {
+fn global_definition_names(path: &Path) -> Option<HashSet<Vec<u8>>> {
     let bytes = std::fs::read(path).ok()?;
     let file = object::File::parse(bytes.as_slice()).ok()?;
-    if file.format() != object::BinaryFormat::MachO {
+    if !matches!(
+        file.format(),
+        object::BinaryFormat::Elf | object::BinaryFormat::MachO
+    ) {
         return None;
     }
     Some(
@@ -2327,7 +2330,7 @@ fn rustc_codegen_input_block_is_canonicalizable(
     output: &Path,
     stable_dir: &Path,
 ) -> bool {
-    let indices = common
+    let indices_and_targets = common
         .inputs
         .iter()
         .enumerate()
@@ -2336,11 +2339,22 @@ fn rustc_codegen_input_block_is_canonicalizable(
                 return None;
             };
             let stable_name = stable_rustc_input_name(path, output)?;
-            is_stable_rustc_codegen_input(&stable_dir.join(stable_name), output, stable_dir)
-                .then_some(index)
+            let target = stable_dir.join(stable_name);
+            is_stable_rustc_codegen_input(&target, output, stable_dir).then_some((index, target))
         })
         .collect::<Vec<_>>();
+    let targets_are_unique = indices_and_targets
+        .iter()
+        .map(|(_, target)| target)
+        .collect::<HashSet<_>>()
+        .len()
+        == indices_and_targets.len();
+    let indices = indices_and_targets
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     !indices.is_empty()
+        && targets_are_unique
         && indices.windows(2).all(|pair| pair[1] == pair[0] + 1)
         && indices.into_iter().all(|index| {
             common.inputs[index].search_first.is_none()
@@ -37309,6 +37323,55 @@ mod tests {
         assert_eq!(std::fs::read(stable_codegen_unit).unwrap(), b"next-codegen");
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn incremental_elf_canonicalizes_contiguous_codegen_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("deps").join("uv-abc123");
+        let output_dir = output.parent().unwrap();
+        let current_a = output_dir.join("uv-abc123.cgu-a.session.rcgu.o");
+        let current_b = output_dir.join("uv-abc123.cgu-b.session.rcgu.o");
+        let archive = output_dir.join("libuv-python.rlib");
+        std::fs::create_dir_all(output_dir).unwrap();
+        std::fs::write(&current_a, b"a").unwrap();
+        std::fs::write(&current_b, b"b").unwrap();
+        std::fs::write(&archive, b"archive").unwrap();
+
+        let mut elf_args = crate::args::elf::ElfArgs::default();
+        elf_args.common.incremental = true;
+        elf_args.output = Arc::from(output.as_path());
+        elf_args.common.inputs = [&current_b, &current_a, &archive]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        let mut args = crate::args::Args::Elf(elf_args);
+
+        stabilize_rustc_transient_inputs(&mut args).unwrap();
+
+        let stable_dir = state_dir_for_output(&output).join(STABLE_RUSTC_INPUT_DIR);
+        let stable_a = stable_dir.join("uv-abc123.cgu-a.rcgu.o");
+        let stable_b = stable_dir.join("uv-abc123.cgu-b.rcgu.o");
+        let crate::args::Args::Elf(elf_args) = args else {
+            panic!("expected ELF arguments");
+        };
+        assert_eq!(
+            elf_args.common.inputs[0].spec,
+            InputSpec::File(stable_a.into_boxed_path())
+        );
+        assert_eq!(
+            elf_args.common.inputs[1].spec,
+            InputSpec::File(stable_b.into_boxed_path())
+        );
+        assert_eq!(
+            elf_args.common.inputs[2].spec,
+            InputSpec::File(archive.into_boxed_path())
+        );
+    }
+
     #[test]
     fn stable_rustc_input_name_is_scoped_to_final_link_inputs() {
         let output = Path::new("/target/debug/deps/uv-abc123");
@@ -37533,6 +37596,41 @@ mod tests {
             Some(&PathBuf::from("previous-a"))
         );
 
+        let duplicate_invocation = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.new-a.other.rcgu.o");
+        let mut duplicate_targets = crate::args::CommonArgs::default();
+        duplicate_targets.inputs = [&current_a, &duplicate_invocation]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        assert!(!rustc_codegen_input_block_is_canonicalizable(
+            &duplicate_targets,
+            &output,
+            &stable_dir
+        ));
+
+        let mut non_default = crate::args::CommonArgs::default();
+        non_default.inputs = [&current_a, &current_b]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        non_default.inputs[0].modifiers.whole_archive = true;
+        assert!(!rustc_codegen_input_block_is_canonicalizable(
+            &non_default,
+            &output,
+            &stable_dir
+        ));
+
         let mut non_contiguous = crate::args::CommonArgs::default();
         non_contiguous.inputs = vec![
             crate::args::Input {
@@ -37556,6 +37654,106 @@ mod tests {
             &output,
             &stable_dir
         ));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn renamed_elf_codegen_inputs_preserve_exact_args_by_symbol_overlap() {
+        fn renamed_object(name: &[u8; 4]) -> Vec<u8> {
+            let mut object = eh_frame_relocation_elf(0, 0);
+            let symbol_offset = 0x70 + 24;
+            object[symbol_offset + 4] = (object::elf::STB_GLOBAL << 4) | object::elf::STT_FUNC;
+            object[0xa1..0xa5].copy_from_slice(name);
+            object
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("deps").join("uv-abc123");
+        let stable_dir = state_dir_for_output(&output).join(STABLE_RUSTC_INPUT_DIR);
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let previous_a = stable_dir.join("uv-abc123.old-a.rcgu.o");
+        let previous_b = stable_dir.join("uv-abc123.old-b.rcgu.o");
+        let current_a = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.new-a.session.rcgu.o");
+        let current_b = output
+            .parent()
+            .unwrap()
+            .join("uv-abc123.new-b.session.rcgu.o");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let a = renamed_object(b"aaaa");
+        let b = renamed_object(b"bbbb");
+        std::fs::write(&previous_a, &a).unwrap();
+        std::fs::write(&previous_b, &b).unwrap();
+        std::fs::write(&current_a, &a).unwrap();
+        std::fs::write(&current_b, &b).unwrap();
+        let previous = state(
+            "args",
+            b"output",
+            &[
+                (previous_a.to_str().unwrap(), a.as_slice()),
+                (previous_b.to_str().unwrap(), b.as_slice()),
+            ],
+        );
+        let mut current_common = crate::args::CommonArgs::default();
+        current_common.inputs = [&current_b, &current_a]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        assert!(rustc_codegen_input_block_is_canonicalizable(
+            &current_common,
+            &output,
+            &stable_dir
+        ));
+        assert_eq!(
+            global_definition_names(&current_a),
+            Some(HashSet::from([b"aaaa".to_vec()]))
+        );
+
+        let provenance = HashMap::from([
+            (current_a.clone(), hash_bytes(&a)),
+            (current_b.clone(), hash_bytes(&b)),
+        ]);
+        let remapped = remapped_rustc_codegen_input_targets(
+            &current_common,
+            &output,
+            &stable_dir,
+            Some(&previous),
+            Some(&provenance),
+        );
+        assert_eq!(remapped.get(&current_a), Some(&previous_a));
+        assert_eq!(remapped.get(&current_b), Some(&previous_b));
+        for input in &mut current_common.inputs {
+            let InputSpec::File(source) = &input.spec else {
+                panic!("expected a codegen-unit file");
+            };
+            let target = remapped.get(source.as_ref()).unwrap().clone();
+            input.spec = InputSpec::File(target.into_boxed_path());
+        }
+        canonicalize_stable_rustc_codegen_input_order(&mut current_common, &output, &stable_dir);
+
+        let mut previous_args = crate::args::elf::ElfArgs::default();
+        previous_args.common.incremental = true;
+        previous_args.output = Arc::from(output.as_path());
+        previous_args.common.inputs = [&previous_a, &previous_b]
+            .into_iter()
+            .map(|path| crate::args::Input {
+                spec: InputSpec::File(path.clone().into_boxed_path()),
+                search_first: None,
+                modifiers: crate::args::Modifiers::default(),
+            })
+            .collect();
+        let mut current_args = crate::args::elf::ElfArgs::default();
+        current_common.incremental = true;
+        current_args.common = current_common;
+        current_args.output = Arc::from(output.as_path());
+
+        assert_eq!(args_hash(&current_args), args_hash(&previous_args));
     }
 
     #[test]
