@@ -9578,10 +9578,20 @@ fn merge_compatible_overlapping_section_patches(
                 ) else {
                     continue;
                 };
-                if left_data[left_overlap_start..left_overlap_start + overlap_len]
-                    != right_data[right_overlap_start..right_overlap_start + overlap_len]
+                let left_overlap = &left_data[left_overlap_start..left_overlap_start + overlap_len];
+                let right_overlap =
+                    &right_data[right_overlap_start..right_overlap_start + overlap_len];
+                if let Some(difference) = left_overlap
+                    .iter()
+                    .zip(right_overlap)
+                    .position(|(left, right)| left != right)
                 {
-                    continue;
+                    return Err(format!(
+                        "materialized changed patches disagree at {:#x}: patch {left_index} writes {:#04x} and patch {right_index} writes {:#04x}",
+                        overlap_start + difference as u64,
+                        left_overlap[difference],
+                        right_overlap[difference],
+                    ));
                 }
                 let output_offset = left_start.min(right_start);
                 let end = left_end.max(right_end);
@@ -61686,7 +61696,10 @@ mod tests {
         assert!(patch_output_range_rejection_reason(&patches).is_none());
 
         let mut conflicting = vec![patch(16, vec![1, 2]), patch(17, vec![3, 4])];
-        merge_compatible_overlapping_section_patches(&mut conflicting, None).unwrap();
+        assert_eq!(
+            merge_compatible_overlapping_section_patches(&mut conflicting, None).unwrap_err(),
+            "materialized changed patches disagree at 0x11: patch 0 writes 0x02 and patch 1 writes 0x03"
+        );
         assert_eq!(conflicting.len(), 2);
         assert!(patch_output_range_rejection_reason(&conflicting).is_some());
 
