@@ -9545,6 +9545,7 @@ struct ValidatedMachOLocalRelocationSite {
     section_index: usize,
     relocation_offset: u64,
     target_symbol_index: usize,
+    hash_target_symbol: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16467,6 +16468,7 @@ fn matched_macho_local_text_target_ownership(
     current_caller_section: object::SectionIndex,
     previous_context: &MachOTextRelocationContext,
     current_context: &MachOTextRelocationContext,
+    output_symbols: &MachOLocalOutputSymbolLookup,
     output_file: &object::File<'_>,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MatchedMachOLocalTextTargetOwnership>, String>> {
@@ -16547,15 +16549,6 @@ fn matched_macho_local_text_target_ownership(
             "renamed local Mach-O text target has no current position".to_owned(),
         ));
     };
-    if output_file.symbols().any(|symbol| {
-        symbol.name_bytes().is_ok_and(|name| {
-            name == previous_position.name.as_slice() || name == current_name.as_slice()
-        })
-    }) {
-        return Ok(Err(
-            "renamed local Mach-O text target is present in the output symbol table".to_owned(),
-        ));
-    }
     let Some(recorded_target) = relocation.target.as_ref() else {
         return Ok(Err(
             "renamed local Mach-O text target has no recorded owner".to_owned(),
@@ -16665,7 +16658,44 @@ fn matched_macho_local_text_target_ownership(
             "renamed local Mach-O text target output ownership changed".to_owned(),
         ));
     }
-    let Some(validated_retarget) = validated_macho_local_relocation_retarget(
+    let Some(previous_output_section) =
+        macho_output_section_index_for_file_offset(output_file, previous_output_offset)
+    else {
+        return Ok(Err(
+            "renamed local Mach-O text target output ownership changed".to_owned(),
+        ));
+    };
+    let Some(current_output_section) =
+        macho_output_section_index_for_file_offset(output_file, current_output_offset)
+    else {
+        return Ok(Err(
+            "renamed local Mach-O text target output ownership changed".to_owned(),
+        ));
+    };
+    let published_symbols = renamed_local_macho_output_symbols_are_exact(
+        output_symbols,
+        &previous_position.name,
+        relocation.target_value,
+        previous_output_section,
+        &current_name,
+        current_target_value.expect("checked current target value"),
+        current_output_section,
+    );
+    if published_symbols == ExactLocalMachOOutputSymbol::Inexact
+        || (published_symbols == ExactLocalMachOOutputSymbol::Exact
+            && !published_local_macho_targets_remain_exact(
+                previous_file,
+                current_file,
+                &previous_position,
+                &current_position,
+                &current_name,
+            )?)
+    {
+        return Ok(Err(
+            "renamed local Mach-O text target is present in the output symbol table".to_owned(),
+        ));
+    }
+    let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
         previous_input,
         current_input,
         previous_caller_section,
@@ -16686,11 +16716,220 @@ fn matched_macho_local_text_target_ownership(
             "renamed local Mach-O text target fingerprint site is unavailable".to_owned(),
         ));
     };
+    if published_symbols == ExactLocalMachOOutputSymbol::Exact {
+        validated_retarget.previous.hash_target_symbol = true;
+        validated_retarget.current.hash_target_symbol = true;
+    }
     Ok(Ok(Some(MatchedMachOLocalTextTargetOwnership {
         current_name,
         current_target_value: current_target_value.expect("checked current target value"),
         validated_retarget,
     })))
+}
+
+fn macho_output_section_index_for_file_offset(
+    file: &object::File<'_>,
+    file_offset: u64,
+) -> Option<u8> {
+    let mut matched = None;
+    for section in file.sections() {
+        let Some((section_offset, section_size)) = section.file_range() else {
+            continue;
+        };
+        let section_end = section_offset.checked_add(section_size)?;
+        if file_offset < section_offset || file_offset >= section_end {
+            continue;
+        }
+        let index = u8::try_from(section.index().0).ok()?;
+        if matched.replace(index).is_some() {
+            return None;
+        }
+    }
+    matched
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExactLocalMachOOutputSymbol {
+    Absent,
+    Exact,
+    Inexact,
+}
+
+#[derive(Clone, Copy)]
+struct MachOLocalOutputSymbol {
+    n_type: u8,
+    section_index: u8,
+    value: u64,
+}
+
+struct MachOLocalOutputSymbolLookup {
+    symbols: Option<HashMap<Vec<u8>, Option<MachOLocalOutputSymbol>>>,
+}
+
+impl MachOLocalOutputSymbolLookup {
+    fn new(output: &[u8]) -> Result<Self> {
+        use object::read::macho::MachHeader as _;
+        use object::read::macho::Nlist as _;
+
+        let header = object::macho::MachHeader64::<object::Endianness>::parse(output, 0)
+            .context("Failed to parse Mach-O output for local symbol validation")?;
+        let endian = header
+            .endian()
+            .context("Failed to read Mach-O output endianness")?;
+        if endian != object::Endianness::Little {
+            return Ok(Self { symbols: None });
+        }
+        let mut commands = header
+            .load_commands(endian, output, 0)
+            .context("Failed to parse Mach-O output load commands")?;
+        let mut symbol_table = None;
+        while let Some(command) = commands
+            .next()
+            .context("Failed to parse Mach-O output load command")?
+        {
+            let Some(command) = command
+                .symtab()
+                .context("Failed to parse Mach-O output symbol table command")?
+            else {
+                continue;
+            };
+            if symbol_table.replace(command).is_some() {
+                return Ok(Self { symbols: None });
+            }
+        }
+        let Some(symbol_table) = symbol_table else {
+            return Ok(Self {
+                symbols: Some(HashMap::new()),
+            });
+        };
+        let table = symbol_table
+            .symbols::<object::macho::MachHeader64<_>, _>(endian, output)
+            .context("Failed to parse Mach-O output symbols")?;
+        let mut symbols = HashMap::new();
+        for symbol in table.iter() {
+            let name = symbol
+                .name(endian, table.strings())
+                .context("Failed to parse Mach-O output symbol name")?
+                .to_vec();
+            let metadata = MachOLocalOutputSymbol {
+                n_type: symbol.n_type(),
+                section_index: symbol.n_sect(),
+                value: symbol.n_value(endian),
+            };
+            match symbols.entry(name) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(metadata));
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+        Ok(Self {
+            symbols: Some(symbols),
+        })
+    }
+
+    fn exact_local_symbol(
+        &self,
+        name: &[u8],
+        value: u64,
+        section_index: u8,
+    ) -> ExactLocalMachOOutputSymbol {
+        let Some(symbols) = self.symbols.as_ref() else {
+            return ExactLocalMachOOutputSymbol::Inexact;
+        };
+        let Some(symbol) = symbols.get(name) else {
+            return ExactLocalMachOOutputSymbol::Absent;
+        };
+        let Some(symbol) = symbol else {
+            return ExactLocalMachOOutputSymbol::Inexact;
+        };
+        if symbol.n_type & object::macho::N_STAB == 0
+            && symbol.n_type & object::macho::N_TYPE == object::macho::N_SECT
+            && symbol.n_type & (object::macho::N_EXT | object::macho::N_PEXT) == 0
+            && symbol.section_index == section_index
+            && symbol.value == value
+        {
+            ExactLocalMachOOutputSymbol::Exact
+        } else {
+            ExactLocalMachOOutputSymbol::Inexact
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn renamed_local_macho_output_symbols_are_exact(
+    output_symbols: &MachOLocalOutputSymbolLookup,
+    previous_name: &[u8],
+    previous_value: u64,
+    previous_section: u8,
+    current_name: &[u8],
+    current_value: u64,
+    current_section: u8,
+) -> ExactLocalMachOOutputSymbol {
+    let previous =
+        output_symbols.exact_local_symbol(previous_name, previous_value, previous_section);
+    let current = output_symbols.exact_local_symbol(current_name, current_value, current_section);
+    match (previous, current) {
+        (ExactLocalMachOOutputSymbol::Absent, ExactLocalMachOOutputSymbol::Absent) => {
+            ExactLocalMachOOutputSymbol::Absent
+        }
+        (ExactLocalMachOOutputSymbol::Exact, ExactLocalMachOOutputSymbol::Exact) => {
+            ExactLocalMachOOutputSymbol::Exact
+        }
+        _ => ExactLocalMachOOutputSymbol::Inexact,
+    }
+}
+
+fn local_macho_symbol_has_exact_position(
+    file: &object::File<'_>,
+    name: &[u8],
+    section_index: object::SectionIndex,
+    section_offset: u64,
+) -> Result<bool> {
+    let matches = file
+        .symbols()
+        .filter(|symbol| symbol.name_bytes().is_ok_and(|candidate| candidate == name))
+        .collect::<Vec<_>>();
+    let [symbol] = matches.as_slice() else {
+        return Ok(false);
+    };
+    if symbol.is_global() || symbol.is_weak() || symbol.section_index() != Some(section_index) {
+        return Ok(false);
+    }
+    let section = file.section_by_index(section_index)?;
+    Ok(symbol.address().checked_sub(section.address()) == Some(section_offset))
+}
+
+fn published_local_macho_targets_remain_exact(
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    previous: &MachORelocationSymbolPosition,
+    current: &MachORelocationSymbolPosition,
+    current_name: &[u8],
+) -> Result<bool> {
+    Ok(local_macho_symbol_has_exact_position(
+        previous_file,
+        &previous.name,
+        previous.section_index,
+        previous.section_offset,
+    )? && local_macho_symbol_has_exact_position(
+        previous_file,
+        current_name,
+        previous.section_index,
+        current.section_offset,
+    )? && local_macho_symbol_has_exact_position(
+        current_file,
+        &previous.name,
+        current.section_index,
+        previous.section_offset,
+    )? && local_macho_symbol_has_exact_position(
+        current_file,
+        current_name,
+        current.section_index,
+        current.section_offset,
+    )?)
 }
 
 fn macho_data_relocation_target_position(
@@ -18003,6 +18242,7 @@ fn macho_text_relocation_replays_for_input(
             symbol_resolutions_changed: false,
         }));
     }
+    let output_symbols = MachOLocalOutputSymbolLookup::new(previous_output)?;
     let target_moves = target_patches
         .macho_target_moves
         .iter()
@@ -18403,6 +18643,7 @@ fn macho_text_relocation_replays_for_input(
                         current_index,
                         previous_context,
                         current_context,
+                        &output_symbols,
                         &output_file,
                         normalize_rust_archive_patch_inputs,
                     )? {
@@ -18551,17 +18792,19 @@ fn macho_text_relocation_replays_for_input(
                         || current_position.section_offset != target.section_offset
                     {
                         section_has_moved_target = true;
-                        target_output_symbols.push(RelocationTargetSymbolPatch {
-                            target_name: relocation
-                                .target_name
-                                .as_deref()
-                                .context("Missing recorded Mach-O relocation target name")?
-                                .to_owned(),
-                            previous_target_value: relocation.target_value,
-                            target_value: current_target_value,
-                            allow_missing: true,
-                            source: "same-object Mach-O text relocation replay",
-                        });
+                        if matched_local_target_ownership.is_none() {
+                            target_output_symbols.push(RelocationTargetSymbolPatch {
+                                target_name: relocation
+                                    .target_name
+                                    .as_deref()
+                                    .context("Missing recorded Mach-O relocation target name")?
+                                    .to_owned(),
+                                previous_target_value: relocation.target_value,
+                                target_value: current_target_value,
+                                allow_missing: true,
+                                source: "same-object Mach-O text relocation replay",
+                            });
+                        }
                         Some(target_move)
                     } else {
                         None
@@ -19581,12 +19824,14 @@ fn validated_macho_local_relocation_retarget(
             section_index: previous_section.0,
             relocation_offset: previous_context.range.start as u64,
             target_symbol_index: previous_target.0,
+            hash_target_symbol: false,
         },
         current: ValidatedMachOLocalRelocationSite {
             archive_identifier: current_identifier,
             section_index: current_section.0,
             relocation_offset: current_context.range.start as u64,
             target_symbol_index: current_target.0,
+            hash_target_symbol: false,
         },
     })
 }
@@ -23234,7 +23479,9 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                 if relocation.subtractor().is_some() || !consumed_local_retargets.insert(index) {
                     return None;
                 }
-                validated_local_target_symbols.insert(target_symbol);
+                if !validated_local_retargets[index].hash_target_symbol {
+                    validated_local_target_symbols.insert(target_symbol);
+                }
                 let object::RelocationFlags::MachO {
                     r_type,
                     r_pcrel,
@@ -23303,7 +23550,9 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                 let object::RelocationTarget::Symbol(symbol) = relocation.target() else {
                     return None;
                 };
-                validated_local_target_symbols.insert(symbol);
+                if !validated_local_retargets[index].hash_target_symbol {
+                    validated_local_target_symbols.insert(symbol);
+                }
                 hash_validated_macho_local_relocation_target(
                     &mut hasher,
                     &file,
@@ -47760,12 +48009,14 @@ mod tests {
                 section_index: previous_source.index().0,
                 relocation_offset: 0,
                 target_symbol_index: 0,
+                hash_target_symbol: false,
             },
             current: ValidatedMachOLocalRelocationSite {
                 archive_identifier: current_identifier,
                 section_index: current_source.index().0,
                 relocation_offset: 0,
                 target_symbol_index: 0,
+                hash_target_symbol: false,
             },
         };
         let removed = [archive_member_patch_identifier(removed_identifier)];
@@ -52292,6 +52543,128 @@ mod tests {
         bytes
     }
 
+    fn publish_local_transition_symbols(
+        fixture: &mut LocalTextTargetTransitionFixture,
+        targets: &[(&[u8], u64)],
+    ) {
+        let output_file = object::File::parse(fixture.previous_output.as_slice()).unwrap();
+        let output_section = output_file.section_by_name("__const").unwrap();
+        let section = u8::try_from(output_section.index().0).unwrap();
+        let section_address = output_section.address();
+        let mut targets = targets.to_vec();
+        targets.sort_unstable_by_key(|(name, _)| *name);
+        for (name, offset) in targets {
+            let value = section_address + offset;
+            fixture.previous_output =
+                add_test_macho_local_alias(fixture.previous_output.clone(), name, section, value);
+            fixture.expected_output =
+                add_test_macho_local_alias(fixture.expected_output.clone(), name, section, value);
+        }
+    }
+
+    fn publish_stable_local_transition_symbols(
+        fixture: &mut LocalTextTargetTransitionFixture,
+        previous_name: &[u8],
+        previous_offset: u64,
+        current_name: &[u8],
+        current_offset: u64,
+    ) {
+        publish_local_transition_symbols(
+            fixture,
+            &[
+                (previous_name, previous_offset),
+                (current_name, current_offset),
+            ],
+        );
+        let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let ArchiveMemberMatch::Unique(previous) =
+            patch_archive_member_bytes(&fixture.previous, previous_identifier).unwrap()
+        else {
+            panic!("expected previous local target member");
+        };
+        let ArchiveMemberMatch::Unique(current) =
+            patch_archive_member_bytes(&fixture.current, current_identifier).unwrap()
+        else {
+            panic!("expected current local target member");
+        };
+        let previous = add_test_macho_local_alias(
+            previous.bytes.to_vec(),
+            current_name,
+            2,
+            4 + current_offset,
+        );
+        let mut current = add_test_macho_local_alias(
+            current.bytes.to_vec(),
+            previous_name,
+            2,
+            4 + previous_offset,
+        );
+
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let current_target = current_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(current_name))
+            .unwrap();
+        let previous_target = current_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(previous_name))
+            .unwrap();
+        let current_entry = macho_symbol_value_field_range(&current, current_target.index())
+            .unwrap()
+            .start
+            - 8;
+        let previous_entry = macho_symbol_value_field_range(&current, previous_target.index())
+            .unwrap()
+            .start
+            - 8;
+        let current_symbol = current[current_entry..current_entry + 16].to_vec();
+        let previous_symbol = current[previous_entry..previous_entry + 16].to_vec();
+        current[current_entry..current_entry + 16].copy_from_slice(&previous_symbol);
+        current[previous_entry..previous_entry + 16].copy_from_slice(&current_symbol);
+        let old_relocation = 1_u32
+            | 1 << 24
+            | 2 << 25
+            | 1 << 27
+            | u32::from(object::macho::ARM64_RELOC_PAGE21) << 28;
+        let relocation = current
+            .windows(4)
+            .position(|bytes| bytes == old_relocation.to_le_bytes())
+            .unwrap();
+        current[relocation..relocation + 4].copy_from_slice(&(old_relocation + 1).to_le_bytes());
+
+        let archive = |identifier: &[u8], object: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        fixture.previous = archive(previous_identifier, &previous);
+        fixture.current = archive(current_identifier, &current);
+    }
+
+    fn test_macho_symbol_entry_offset(bytes: &[u8], name: &[u8]) -> usize {
+        let file = object::File::parse(bytes).unwrap();
+        let symbols = file
+            .symbols()
+            .filter(|symbol| symbol.name_bytes().ok() == Some(name))
+            .collect::<Vec<_>>();
+        let [symbol] = symbols.as_slice() else {
+            panic!(
+                "expected one output symbol named {}",
+                String::from_utf8_lossy(name)
+            );
+        };
+        macho_symbol_value_field_range(bytes, symbol.index())
+            .unwrap()
+            .start
+            - 8
+    }
+
     struct LocalTextTargetTransitionFixture {
         previous: Vec<u8>,
         current: Vec<u8>,
@@ -52591,6 +52964,7 @@ mod tests {
         )
         .unwrap()
         .map_err(|reason| reason.to_string())?;
+        assert!(target_patches.output_symbols.is_empty());
         if !matched_macho_local_retarget_fingerprint_matches(
             &fixture.previous,
             &fixture.current,
@@ -52718,6 +53092,198 @@ mod tests {
         assert_eq!(reapplied_b, output_b);
         assert_eq!(records_b2, expected_records_b);
         assert_eq!(retargets_b2, retargets_b);
+    }
+
+    #[test]
+    fn local_macho_text_target_ownership_reuses_exact_published_locals_across_cycles() {
+        let mut a_to_b = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_stable_local_transition_symbols(&mut a_to_b, b"l_a.1", 0, b"l_b.2", 4);
+        let (output_b, records_b, retargets_b) =
+            apply_local_text_target_transition(&a_to_b, vec![a_to_b.relocation.clone()], true)
+                .unwrap();
+        let records_b = round_trip_relocation_records(&records_b);
+        assert_eq!(output_b, a_to_b.expected_output);
+        assert_eq!(retargets_b.len(), 1);
+
+        let mut b_to_a = local_text_target_transition_fixture(
+            b"l_b.2",
+            b"l_a.1",
+            b"B-target",
+            b"A-target",
+            4,
+            0,
+        );
+        publish_stable_local_transition_symbols(&mut b_to_a, b"l_b.2", 4, b"l_a.1", 0);
+        b_to_a.previous_output = output_b.clone();
+        let (restored_a, records_a, retargets_a) =
+            apply_local_text_target_transition(&b_to_a, records_b, true).unwrap();
+        let records_a = round_trip_relocation_records(&records_a);
+        assert_eq!(restored_a, b_to_a.expected_output);
+        assert_eq!(retargets_a.len(), 1);
+
+        let mut reapply = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_stable_local_transition_symbols(&mut reapply, b"l_a.1", 0, b"l_b.2", 4);
+        reapply.previous_output = restored_a;
+        let (reapplied_b, _, retargets_b2) =
+            apply_local_text_target_transition(&reapply, records_a, true).unwrap();
+        assert_eq!(reapplied_b, output_b);
+        assert_eq!(retargets_b2, retargets_b);
+    }
+
+    #[test]
+    fn local_macho_text_target_ownership_rejects_inexact_published_locals() {
+        let expected = "renamed local Mach-O text target is present in the output symbol table";
+
+        let mut moved = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut moved, &[(b"l_a.1", 0), (b"l_b.2", 0)]);
+        assert_eq!(
+            apply_local_text_target_transition(&moved, vec![moved.relocation.clone()], true)
+                .unwrap_err(),
+            expected,
+        );
+
+        let mut disappearing = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut disappearing, &[(b"l_a.1", 0), (b"l_b.2", 4)]);
+        assert_eq!(
+            apply_local_text_target_transition(
+                &disappearing,
+                vec![disappearing.relocation.clone()],
+                true,
+            )
+            .unwrap_err(),
+            expected,
+        );
+
+        let mut one_sided = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut one_sided, &[(b"l_a.1", 0)]);
+        assert_eq!(
+            apply_local_text_target_transition(
+                &one_sided,
+                vec![one_sided.relocation.clone()],
+                true,
+            )
+            .unwrap_err(),
+            expected,
+        );
+
+        let mut external = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut external, &[(b"l_b.2", 4)]);
+        let external_name = external
+            .previous_output
+            .windows(6)
+            .rposition(|window| window == b"_data\0")
+            .unwrap();
+        external.previous_output[external_name..external_name + 5].copy_from_slice(b"l_a.1");
+        assert_eq!(
+            apply_local_text_target_transition(&external, vec![external.relocation.clone()], true,)
+                .unwrap_err(),
+            expected,
+        );
+
+        let mut ambiguous = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut ambiguous, &[(b"l_a.1", 0), (b"l_b.2", 4)]);
+        let file = object::File::parse(ambiguous.previous_output.as_slice()).unwrap();
+        let section = file.section_by_name("__const").unwrap();
+        let section_index = u8::try_from(section.index().0).unwrap();
+        let value = section.address();
+        ambiguous.previous_output =
+            add_test_macho_local_alias(ambiguous.previous_output, b"l_a.1", section_index, value);
+        assert_eq!(
+            apply_local_text_target_transition(
+                &ambiguous,
+                vec![ambiguous.relocation.clone()],
+                true,
+            )
+            .unwrap_err(),
+            expected,
+        );
+
+        let mut stab = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut stab, &[(b"l_a.1", 0), (b"l_b.2", 4)]);
+        let entry = test_macho_symbol_entry_offset(&stab.previous_output, b"l_a.1");
+        stab.previous_output[entry + 4] |= object::macho::N_STAB;
+        assert_eq!(
+            apply_local_text_target_transition(&stab, vec![stab.relocation.clone()], true)
+                .unwrap_err(),
+            expected,
+        );
+
+        let mut wrong_section = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut wrong_section, &[(b"l_a.1", 0), (b"l_b.2", 4)]);
+        let entry = test_macho_symbol_entry_offset(&wrong_section.previous_output, b"l_b.2");
+        wrong_section.previous_output[entry + 5] = 1;
+        assert_eq!(
+            apply_local_text_target_transition(
+                &wrong_section,
+                vec![wrong_section.relocation.clone()],
+                true,
+            )
+            .unwrap_err(),
+            expected,
+        );
     }
 
     #[test]
