@@ -118,6 +118,8 @@ const LOG_INCREMENTAL_LINK_OPTIONS_ENV: &str = "SLD_LOG_INCREMENTAL_LINK_OPTIONS
 const LOG_INCREMENTAL_EXACT_ARGS_ENV: &str = "SLD_LOG_INCREMENTAL_EXACT_ARGS";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const OUTPUT_SNAPSHOT_FILE: &str = "output";
+const RETAINED_OUTPUT_SOURCE_FILE_PREFIX: &str = "output-source";
+static RETAINED_OUTPUT_SOURCE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const DIRECT_PATCH_STANDBY_FILE: &str = "direct-patch-standby";
 const DIRECT_PATCH_STANDBY_STATE_FILE: &str = "direct-patch-standby-state";
 const DIRECT_PATCH_STANDBY_STATE_VERSION: &str = "sld-direct-patch-standby-v1";
@@ -630,18 +632,29 @@ struct FileContentState {
 
 enum PreviousOutputSource {
     Live(PathBuf),
-    Retained(PathBuf),
+    Retained(RetainedOutputSource),
+}
+
+struct RetainedOutputSource {
+    path: PathBuf,
 }
 
 impl PreviousOutputSource {
     fn path(&self) -> &Path {
         match self {
-            Self::Live(path) | Self::Retained(path) => path,
+            Self::Live(path) => path,
+            Self::Retained(source) => &source.path,
         }
     }
 
     fn is_retained(&self) -> bool {
         matches!(self, Self::Retained(_))
+    }
+}
+
+impl Drop for RetainedOutputSource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -14586,15 +14599,6 @@ impl FileContentState {
             return Ok(false);
         };
         Ok(FileIdentity::from_path(path)?.as_ref() == Some(previous))
-    }
-
-    fn data_identity_matches_path(&self, path: &Path) -> Result<bool> {
-        let Some(previous) = self.identity.as_ref() else {
-            return Ok(false);
-        };
-        Ok(FileIdentity::from_path(path)?
-            .as_ref()
-            .is_some_and(|current| previous.matches_same_data_ignoring_change_time(current)))
     }
 
     fn identity_is_ambiguous_since(&self, link_start: Option<&FileIdentity>) -> bool {
@@ -35678,10 +35682,23 @@ fn output_content_match(
     path: &Path,
     trust_persistent_output_data_identity: bool,
 ) -> Result<OutputContentMatch> {
-    match output_content_matches_previous(previous, path, trust_persistent_output_data_identity) {
+    classify_output_content_match(output_content_matches_previous_io(
+        previous,
+        path,
+        trust_persistent_output_data_identity,
+    ))
+    .with_context(|| format!("Failed to validate output content for `{}`", path.display()))
+}
+
+fn classify_output_content_match(
+    result: std::io::Result<bool>,
+) -> std::io::Result<OutputContentMatch> {
+    match result {
         Ok(true) => Ok(OutputContentMatch::Matches),
         Ok(false) => Ok(OutputContentMatch::Changed),
-        Err(_) if matches!(path.try_exists(), Ok(false)) => Ok(OutputContentMatch::Missing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(OutputContentMatch::Missing)
+        }
         Err(error) => Err(error),
     }
 }
@@ -35691,17 +35708,43 @@ fn output_content_matches_previous(
     path: &Path,
     trust_persistent_output_data_identity: bool,
 ) -> Result<bool> {
-    if previous.identity_matches_path(path)? {
+    output_content_matches_previous_io(previous, path, trust_persistent_output_data_identity)
+        .with_context(|| format!("Failed to validate output content for `{}`", path.display()))
+}
+
+fn output_content_matches_previous_io(
+    previous: &FileContentState,
+    path: &Path,
+    trust_persistent_output_data_identity: bool,
+) -> std::io::Result<bool> {
+    let current_identity = if previous.identity.is_some() {
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        {
+            Some(FileIdentity::from_metadata(&metadata))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    } else {
+        None
+    };
+    if previous.identity.is_some() && previous.identity.as_ref() == current_identity.as_ref() {
         return Ok(true);
     }
     if previous.hash.is_empty() {
-        return if trust_persistent_output_data_identity {
-            previous.data_identity_matches_path(path)
-        } else {
-            Ok(false)
-        };
+        return Ok(trust_persistent_output_data_identity
+            && previous
+                .identity
+                .as_ref()
+                .zip(current_identity.as_ref())
+                .is_some_and(|(previous, current)| {
+                    previous.matches_same_data_ignoring_change_time(current)
+                }));
     }
-    Ok(FileContentState::from_path(path)? == *previous)
+    Ok(FileContentState::from_bytes(&std::fs::read(path)?) == *previous)
 }
 
 fn select_previous_output_source(
@@ -35717,9 +35760,9 @@ fn select_previous_output_source(
         )),
         OutputContentMatch::Changed => Ok(PreviousOutputSourceSelection::OutputChanged),
         OutputContentMatch::Missing if should_retain_output_snapshot => {
-            if retained_output_snapshot_matches_previous(state_dir, previous, output)? {
+            if let Some(source) = retained_output_source(state_dir, previous, output)? {
                 Ok(PreviousOutputSourceSelection::Available(
-                    PreviousOutputSource::Retained(output_snapshot_path(state_dir)),
+                    PreviousOutputSource::Retained(source),
                 ))
             } else {
                 Ok(PreviousOutputSourceSelection::RetainedOutputChanged)
@@ -35814,6 +35857,37 @@ fn retained_output_snapshot_matches_previous(
     let snapshot = output_snapshot_path(state_dir);
     Ok(snapshot.try_exists().unwrap_or(false)
         && FileContentState::from_path(&snapshot)? == *previous)
+}
+
+fn retained_output_source(
+    state_dir: &Path,
+    previous: &FileContentState,
+    output: &Path,
+) -> Result<Option<RetainedOutputSource>> {
+    if output.try_exists().unwrap_or(false) || previous.hash.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = output_snapshot_path(state_dir);
+    if !snapshot.try_exists().unwrap_or(false) {
+        return Ok(None);
+    }
+    let sequence = RETAINED_OUTPUT_SOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let source = RetainedOutputSource {
+        path: state_dir.join(format!(
+            "{RETAINED_OUTPUT_SOURCE_FILE_PREFIX}.{}.{sequence}",
+            std::process::id()
+        )),
+    };
+    install_isolated_output_copy(&snapshot, &source.path).with_context(|| {
+        format!(
+            "Failed to clone retained output snapshot `{}`",
+            snapshot.display()
+        )
+    })?;
+    if FileContentState::from_path(&source.path)? != *previous {
+        return Ok(None);
+    }
+    Ok(Some(source))
 }
 
 fn install_isolated_output_copy(source: &Path, target: &Path) -> Result {
@@ -59367,7 +59441,7 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
-    fn disappeared_output_selects_retained_source_without_restoring() {
+    fn disappeared_output_pins_retained_source_without_restoring() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
         let state_dir = dir.path().join("out.incr");
@@ -59386,9 +59460,28 @@ mod tests {
         else {
             panic!("retained output snapshot was not selected");
         };
-        assert_eq!(source.path(), output_snapshot_path(&state_dir));
+        let source_path = source.path().to_path_buf();
+        assert_ne!(source.path(), output_snapshot_path(&state_dir));
         assert!(source.is_retained());
+        std::fs::write(output_snapshot_path(&state_dir), b"changed").unwrap();
+        assert_eq!(std::fs::read(source.path()).unwrap(), b"output");
         assert!(!output.exists());
+        drop(source);
+        assert!(!source_path.exists());
+    }
+
+    #[test]
+    fn output_content_match_only_treats_not_found_as_missing() {
+        assert_eq!(
+            classify_output_content_match(Err(std::io::Error::from(std::io::ErrorKind::NotFound,)))
+                .unwrap(),
+            OutputContentMatch::Missing
+        );
+        let error = classify_output_content_match(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
