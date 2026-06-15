@@ -2523,6 +2523,8 @@ const MACHO_TEXT_RELOCATION_RECORDS_REQUIRED: &str =
     "changed input needs Mach-O text relocation records";
 const MACHO_LOCAL_TEXT_TARGET_OWNERSHIP_RECORDS_REQUIRED: &str =
     "renamed local Mach-O text target needs complete relocation records";
+const MACHO_LOCAL_TEXT_TARGET_INDIRECT_RELOCATION_UNSUPPORTED: &str =
+    "renamed local Mach-O text target uses unsupported indirect relocation";
 const MACHO_SYMBOL_RESOLUTIONS_REQUIRED: &str = "missing Mach-O symbol resolution";
 const DIRECT_MACHO_CGU_MIGRATION_REQUIRED: &str = "missing direct Mach-O CGU catalog target";
 
@@ -16469,6 +16471,23 @@ fn matched_macho_local_text_target_ownership(
     else {
         return Ok(Ok(None));
     };
+    if matches!(
+        previous_context.r_type,
+        object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) || matches!(
+        current_context.r_type,
+        object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) {
+        return Ok(Err(
+            MACHO_LOCAL_TEXT_TARGET_INDIRECT_RELOCATION_UNSUPPORTED.to_owned()
+        ));
+    }
     if !records_complete {
         return Ok(Err(
             MACHO_LOCAL_TEXT_TARGET_OWNERSHIP_RECORDS_REQUIRED.to_owned()
@@ -51468,6 +51487,24 @@ mod tests {
         );
     }
 
+    fn set_test_macho_text_relocation_type(bytes: &mut [u8], relocation_type: u8) {
+        let previous = 1_u32
+            | 1 << 24
+            | 2 << 25
+            | 1 << 27
+            | u32::from(object::macho::ARM64_RELOC_PAGE21) << 28;
+        let current = previous & 0x0fff_ffff | u32::from(relocation_type) << 28;
+        let matches = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == previous.to_le_bytes()).then_some(offset))
+            .collect::<Vec<_>>();
+        let [offset] = matches.as_slice() else {
+            panic!("expected one test Mach-O text relocation, found {matches:?}");
+        };
+        bytes[*offset..*offset + 4].copy_from_slice(&current.to_le_bytes());
+    }
+
     fn test_macho_local_data_retarget_object(primary_name: &[u8], primary_offset: u64) -> Vec<u8> {
         const HEADER_SIZE: usize = 32;
         const SEGMENT_COMMAND_SIZE: usize = 72;
@@ -52291,6 +52328,44 @@ mod tests {
                 .unwrap_err(),
             MACHO_LOCAL_TEXT_TARGET_OWNERSHIP_RECORDS_REQUIRED,
         );
+    }
+
+    #[test]
+    fn local_macho_text_target_ownership_rejects_indirect_relocations() {
+        for relocation_type in [
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21,
+        ] {
+            let mut fixture = local_text_target_transition_fixture(
+                b"l_a.1",
+                b"l_b.2",
+                b"A-target",
+                b"B-target",
+                0,
+                4,
+            );
+            set_test_macho_text_relocation_type(&mut fixture.previous, relocation_type);
+            set_test_macho_text_relocation_type(&mut fixture.current, relocation_type);
+            fixture.relocation.kind =
+                encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                    r_address: 0,
+                    r_symbolnum: 1,
+                    r_pcrel: true,
+                    r_length: 2,
+                    r_extern: true,
+                    r_type: relocation_type,
+                });
+
+            assert_eq!(
+                apply_local_text_target_transition(
+                    &fixture,
+                    vec![fixture.relocation.clone()],
+                    true,
+                )
+                .unwrap_err(),
+                MACHO_LOCAL_TEXT_TARGET_INDIRECT_RELOCATION_UNSUPPORTED,
+            );
+        }
     }
 
     #[test]
