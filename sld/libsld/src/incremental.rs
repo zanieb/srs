@@ -8017,6 +8017,37 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .filter_map(|patch| patch.record_update.clone())
                 .collect::<Vec<_>>();
 
+            append_log(
+                state_dir,
+                &format!(
+                    "changed patch categories from index {}: sections={} dynamic={} relocation-addend={} relocation-target={} resolution-thunk={} forwarding-thunk={} migrated-resolution={} migrated-chained={} reserved-thunk={} text-auxiliary={} eh-frame={} changed-definition={} symbol-table={} chained-fixup={} added-unwind={} reactivated={} changed-unwind={} retired={}",
+                    patches.len(),
+                    resolved_patches.len(),
+                    dynamic_relocation_patches.len(),
+                    relocation_addend_patches.output_patches.len(),
+                    relocation_target_patches.output_patches.len(),
+                    macho_resolution_updates.thunk_patches.len(),
+                    macho_forwarding_thunk_patches.patches.len(),
+                    migrated_macho_resolution_updates.patches.len(),
+                    migrated_macho_resolution_updates
+                        .chained_fixup_patches
+                        .len(),
+                    macho_reserved_thunk_patches.len(),
+                    macho_text_auxiliary_patches.len(),
+                    eh_frame_patches
+                        .iter()
+                        .filter(|patch| patch.patch.is_some())
+                        .count(),
+                    changed_macho_definition_patches.len(),
+                    added_macho_archive_symbol_table_patches.len(),
+                    added_macho_archive_chained_fixup_patches.len(),
+                    added_macho_archive_unwind_patches.len(),
+                    reactivated_macho_archive_output_patches.len(),
+                    changed_macho_archive_unwind_patches.len(),
+                    retired_macho_archive_output_patches.len(),
+                ),
+            )?;
+
             (
                 fingerprint,
                 archive_member_patch_fingerprints,
