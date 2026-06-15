@@ -1671,11 +1671,11 @@ fn maybe_reuse_output_during_publication(
         || previous.patch_records_file.is_some()
         || previous.args_hash != args_hash(args)
         || sld_version_relink_reason(previous.sld_version.as_deref(), &sld_version(args)).is_some()
-        || !output_content_matches_previous(
+        || output_content_match(
             &previous.output,
             args.output(),
             args.should_trust_persistent_output_data_identity(),
-        )?
+        )? != OutputContentMatch::Matches
     {
         return Ok(false);
     }
@@ -60895,6 +60895,27 @@ mod tests {
         state.write_publishing_index(&state_dir).unwrap();
         mark_incremental_update_started(&state_dir, "publishing").unwrap();
         std::fs::write(&input, b"changed").unwrap();
+
+        assert!(!maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn publishing_metadata_rejects_missing_output_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("input.o");
+        let state_dir = state_dir_for_output(&output);
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state = publishing_metadata_state(&args, &output, &input);
+        state.write_publishing_index(&state_dir).unwrap();
+        mark_incremental_update_started(&state_dir, "publishing").unwrap();
+        std::fs::remove_file(&output).unwrap();
 
         assert!(!maybe_reuse_output_during_publication(&args, &state_dir).unwrap());
     }
