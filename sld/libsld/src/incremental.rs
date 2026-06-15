@@ -18552,7 +18552,7 @@ fn materialize_recorded_macho_text_thunk(
     let input_size = usize::try_from(patch.section.input_size)
         .map_err(|_| "Mach-O text patch input size does not fit usize".to_owned())?;
     if range.start < input_size {
-        return Err("recorded Mach-O text thunk overlaps the current input section".to_owned());
+        return Ok(None);
     }
     if thunk_address % 4 != 0 {
         return Err("recorded Mach-O text thunk is not instruction-aligned".to_owned());
@@ -54802,6 +54802,45 @@ mod tests {
         assert_eq!(&next_patches[0].patch.data[4..], expected_thunk);
         assert_eq!(relocations.len(), 1);
         assert_eq!(relocations[0].applied_target_value, Some(thunk_address));
+
+        let direct_target = place + 8;
+        let mut grown_replay = next_replays.replays[0].clone();
+        grown_replay.current_target_value = direct_target;
+        grown_replay.current_relocation_target_candidates = vec![direct_target];
+        let grown_replays = MachOTextRelocationReplays {
+            replays: vec![grown_replay],
+            rematerialized_sections: Vec::new(),
+            normalize_rust_archive_patch_inputs: false,
+            symbol_resolutions_changed: false,
+        };
+        let mut grown_patches = vec![ResolvedSectionPatch {
+            section: PatchSection {
+                input_size: 16,
+                ..patches[0].section.clone()
+            },
+            patch: SectionPatch {
+                output_offset: text_range.start as u64,
+                size: 16,
+                data: vec![0; 16],
+                deferred_relocation: None,
+                preserve_ranges: vec![0..4],
+                adjustments: Vec::new(),
+            },
+        }];
+
+        apply_macho_text_relocation_replays(
+            &mut grown_patches,
+            &grown_replays,
+            &next_previous_output,
+            &mut relocations,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(&grown_patches[0].patch.data[4..], &[0; 12]);
+        assert_eq!(relocations[0].applied_target_value, Some(direct_target));
     }
 
     #[test]
