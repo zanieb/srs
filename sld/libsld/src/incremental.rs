@@ -8199,6 +8199,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .iter()
                 .cloned(),
         );
+        if let Err(reason) = compose_nested_plain_patches(
+            &mut patches,
+            &mut direct_macho_cgu_migration_plan.output_patches,
+        ) {
+            return Ok(ChangedInputPatchResult::Unsupported(reason));
+        }
         patches.append(&mut direct_macho_cgu_migration_plan.output_patches);
     }
 
@@ -9008,6 +9014,57 @@ fn compose_relocation_target_patches_with_section_patches(
         section_patch.patch.preserve_ranges.remove(preserve_index);
     }
     *relocation_patches = remaining;
+    Ok(())
+}
+
+fn compose_nested_plain_patches(
+    containing_patches: &mut [SectionPatch],
+    nested_patches: &mut Vec<SectionPatch>,
+) -> std::result::Result<(), String> {
+    let mut remaining = Vec::new();
+    for nested in nested_patches.drain(..) {
+        let nested_start = nested.output_offset;
+        let nested_end = nested_start
+            .checked_add(nested.size)
+            .ok_or_else(|| "nested patch range overflowed".to_owned())?;
+        let containing = containing_patches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, patch)| {
+                let patch_end = patch.output_offset.checked_add(patch.size)?;
+                (nested_start >= patch.output_offset && nested_end <= patch_end).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let Some(&containing_index) = containing.first() else {
+            remaining.push(nested);
+            continue;
+        };
+        if containing.len() != 1 {
+            return Err("nested patch matched multiple containing patches".to_owned());
+        }
+        let containing = &mut containing_patches[containing_index];
+        let containing_is_plain = containing.deferred_relocation.is_none()
+            && containing.preserve_ranges.is_empty()
+            && containing.adjustments.is_empty()
+            && containing.data.len() as u64 == containing.size;
+        let nested_is_plain = nested.deferred_relocation.is_none()
+            && nested.preserve_ranges.is_empty()
+            && nested.adjustments.is_empty()
+            && nested.data.len() as u64 == nested.size;
+        if !containing_is_plain || !nested_is_plain {
+            return Err("nested patch cannot be composed with containing patch".to_owned());
+        }
+        let start = usize::try_from(nested_start - containing.output_offset)
+            .map_err(|_| "nested patch offset is too large".to_owned())?;
+        let end = start
+            .checked_add(nested.data.len())
+            .ok_or_else(|| "nested patch range overflowed".to_owned())?;
+        let Some(data) = containing.data.get_mut(start..end) else {
+            return Err("nested patch is outside containing patch data".to_owned());
+        };
+        data.copy_from_slice(&nested.data);
+    }
+    *nested_patches = remaining;
     Ok(())
 }
 
@@ -60758,6 +60815,38 @@ mod tests {
             )
             .unwrap_err(),
             "relocation target patch does not match a preserved relocation field",
+        );
+    }
+
+    #[test]
+    fn nested_plain_patch_updates_containing_patch() {
+        let patch = |output_offset, size, data| SectionPatch {
+            output_offset,
+            size,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut containing = [patch(0x100, 16, vec![0; 16])];
+        let mut nested = vec![
+            patch(0x108, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            patch(0x200, 4, vec![9; 4]),
+        ];
+
+        compose_nested_plain_patches(&mut containing, &mut nested).unwrap();
+
+        assert_eq!(containing[0].data[..8], [0; 8]);
+        assert_eq!(containing[0].data[8..], [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].output_offset, 0x200);
+
+        let mut containing = [patch(0x100, 16, vec![0; 16])];
+        containing[0].preserve_ranges.push(8..16);
+        let mut nested = vec![patch(0x108, 8, vec![1; 8])];
+        assert_eq!(
+            compose_nested_plain_patches(&mut containing, &mut nested).unwrap_err(),
+            "nested patch cannot be composed with containing patch",
         );
     }
 
