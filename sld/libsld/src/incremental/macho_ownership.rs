@@ -144,7 +144,7 @@ pub(super) enum MachOCoverageKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MachOCoverageClaim {
     pub(super) generation: MachOCoverageGeneration,
-    pub(super) object: MachOObjectSite,
+    pub(super) section: MachOSectionSite,
     /// Absolute byte range in the containing input file, including any archive member offset.
     pub(super) range: Range<usize>,
     pub(super) kind: MachOCoverageKind,
@@ -153,7 +153,7 @@ pub(super) struct MachOCoverageClaim {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MachOCoverageRequirement {
     pub(super) generation: MachOCoverageGeneration,
-    pub(super) object: MachOObjectSite,
+    pub(super) section: MachOSectionSite,
     /// Absolute byte range in the containing input file, including any archive member offset.
     pub(super) range: Range<usize>,
     pub(super) kind: MachOCoverageKind,
@@ -240,6 +240,10 @@ pub(super) enum MachOOwnershipDiagnostic {
     MissingCoverageDomain {
         transition_count: usize,
     },
+    MissingTransitionCoverage {
+        generation: MachOCoverageGeneration,
+        section: MachOSectionSite,
+    },
     EmptyCoverageRequirement {
         requirement: MachOCoverageRequirement,
     },
@@ -315,27 +319,35 @@ impl fmt::Display for MachOOwnershipDiagnostic {
                 formatter,
                 "missing Mach-O coverage domain for {transition_count} ownership transitions",
             ),
+            Self::MissingTransitionCoverage {
+                generation,
+                section,
+            } => write!(
+                formatter,
+                "missing {generation:?} Mach-O section-byte coverage for ownership transition {}",
+                DisplaySectionSite(section),
+            ),
             Self::EmptyCoverageRequirement { requirement } => write!(
                 formatter,
                 "empty {:?} Mach-O coverage requirement for {}",
                 requirement.generation,
-                DisplayObjectSite(&requirement.object),
+                DisplaySectionSite(&requirement.section),
             ),
             Self::EmptyCoverageRange { claim } => write!(
                 formatter,
                 "empty {:?} Mach-O coverage range for {}",
                 claim.generation,
-                DisplayObjectSite(&claim.object),
+                DisplaySectionSite(&claim.section),
             ),
             Self::OverlappingCoverageRequirements { first, second } => write!(
                 formatter,
                 "overlapping {:?} Mach-O coverage requirements in {} for {} at {:#x}..{:#x} and {} at {:#x}..{:#x}",
                 first.generation,
-                first.object.input_file,
-                DisplayObjectSite(&first.object),
+                first.section.object.input_file,
+                DisplaySectionSite(&first.section),
                 first.range.start,
                 first.range.end,
-                DisplayObjectSite(&second.object),
+                DisplaySectionSite(&second.section),
                 second.range.start,
                 second.range.end,
             ),
@@ -343,11 +355,11 @@ impl fmt::Display for MachOOwnershipDiagnostic {
                 formatter,
                 "overlapping {:?} Mach-O coverage in {} for {} at {:#x}..{:#x} and {} at {:#x}..{:#x}",
                 first.generation,
-                first.object.input_file,
-                DisplayObjectSite(&first.object),
+                first.section.object.input_file,
+                DisplaySectionSite(&first.section),
                 first.range.start,
                 first.range.end,
-                DisplayObjectSite(&second.object),
+                DisplaySectionSite(&second.section),
                 second.range.start,
                 second.range.end,
             ),
@@ -356,7 +368,7 @@ impl fmt::Display for MachOOwnershipDiagnostic {
                 "missing {:?} Mach-O {:?} coverage for {} at {:#x}..{:#x}",
                 requirement.generation,
                 requirement.kind,
-                DisplayObjectSite(&requirement.object),
+                DisplaySectionSite(&requirement.section),
                 requirement.range.start,
                 requirement.range.end,
             ),
@@ -365,7 +377,7 @@ impl fmt::Display for MachOOwnershipDiagnostic {
                 "unexpected {:?} Mach-O {:?} coverage for {} at {:#x}..{:#x}",
                 claim.generation,
                 claim.kind,
-                DisplayObjectSite(&claim.object),
+                DisplaySectionSite(&claim.section),
                 claim.range.start,
                 claim.range.end,
             ),
@@ -578,7 +590,7 @@ pub(super) fn plan_macho_ownership_transitions(
     let (coverage, coverage_diagnostics) = validate_coverage(
         &inventory.coverage_requirements,
         &inventory.coverage_claims,
-        transitions.len(),
+        &transitions,
     );
     diagnostics.extend(coverage_diagnostics);
 
@@ -628,31 +640,63 @@ fn output_owner_diagnostics(owners: &[MachOOutputOwner]) -> Vec<MachOOwnershipDi
 fn validate_coverage(
     requirements: &[MachOCoverageRequirement],
     claims: &[MachOCoverageClaim],
-    transition_count: usize,
+    transitions: &[MachOSectionOwnershipTransition],
 ) -> (MachOTransitionCoverage, Vec<MachOOwnershipDiagnostic>) {
     let mut requirements = requirements.to_vec();
     requirements.sort_by(|left, right| {
         left.generation
             .cmp(&right.generation)
-            .then_with(|| left.object.input_file.cmp(&right.object.input_file))
+            .then_with(|| {
+                left.section
+                    .object
+                    .input_file
+                    .cmp(&right.section.object.input_file)
+            })
             .then_with(|| left.range.start.cmp(&right.range.start))
             .then_with(|| left.range.end.cmp(&right.range.end))
-            .then_with(|| left.object.cmp(&right.object))
+            .then_with(|| left.section.cmp(&right.section))
             .then_with(|| left.kind.cmp(&right.kind))
     });
     let mut claims = claims.to_vec();
     claims.sort_by(|left, right| {
         left.generation
             .cmp(&right.generation)
-            .then_with(|| left.object.input_file.cmp(&right.object.input_file))
+            .then_with(|| {
+                left.section
+                    .object
+                    .input_file
+                    .cmp(&right.section.object.input_file)
+            })
             .then_with(|| left.range.start.cmp(&right.range.start))
             .then_with(|| left.range.end.cmp(&right.range.end))
-            .then_with(|| left.object.cmp(&right.object))
+            .then_with(|| left.section.cmp(&right.section))
             .then_with(|| left.kind.cmp(&right.kind))
     });
     let mut diagnostics = Vec::new();
-    if transition_count != 0 && requirements.is_empty() {
-        diagnostics.push(MachOOwnershipDiagnostic::MissingCoverageDomain { transition_count });
+    if !transitions.is_empty() && requirements.is_empty() {
+        diagnostics.push(MachOOwnershipDiagnostic::MissingCoverageDomain {
+            transition_count: transitions.len(),
+        });
+    }
+    for transition in transitions {
+        for (generation, section) in [
+            (
+                MachOCoverageGeneration::Previous,
+                &transition.owner.previous,
+            ),
+            (MachOCoverageGeneration::Current, &transition.current),
+        ] {
+            if !requirements.iter().any(|requirement| {
+                requirement.generation == generation
+                    && requirement.section == *section
+                    && requirement.kind == MachOCoverageKind::SectionBytes
+            }) {
+                diagnostics.push(MachOOwnershipDiagnostic::MissingTransitionCoverage {
+                    generation,
+                    section: section.clone(),
+                });
+            }
+        }
     }
     for requirement in &requirements {
         if requirement.range.is_empty() {
@@ -673,7 +717,7 @@ fn validate_coverage(
             continue;
         };
         if first.generation == second.generation
-            && first.object.input_file == second.object.input_file
+            && first.section.object.input_file == second.section.object.input_file
             && second.range.start < first.range.end
         {
             diagnostics.push(MachOOwnershipDiagnostic::OverlappingCoverageRequirements {
@@ -687,7 +731,7 @@ fn validate_coverage(
             continue;
         };
         if first.generation == second.generation
-            && first.object.input_file == second.object.input_file
+            && first.section.object.input_file == second.section.object.input_file
             && second.range.start < first.range.end
         {
             diagnostics.push(MachOOwnershipDiagnostic::OverlappingCoverage {
@@ -734,7 +778,7 @@ fn coverage_requirement_matches_claim(
     claim: &MachOCoverageClaim,
 ) -> bool {
     requirement.generation == claim.generation
-        && requirement.object == claim.object
+        && requirement.section == claim.section
         && requirement.range == claim.range
         && requirement.kind == claim.kind
 }
@@ -815,13 +859,13 @@ mod tests {
 
     fn coverage_requirement(
         generation: MachOCoverageGeneration,
-        object: MachOObjectSite,
+        section: MachOSectionSite,
         range: Range<usize>,
         kind: MachOCoverageKind,
     ) -> MachOCoverageRequirement {
         MachOCoverageRequirement {
             generation,
-            object,
+            section,
             range,
             kind,
         }
@@ -829,13 +873,13 @@ mod tests {
 
     fn coverage_claim(
         generation: MachOCoverageGeneration,
-        object: MachOObjectSite,
+        section: MachOSectionSite,
         range: Range<usize>,
         kind: MachOCoverageKind,
     ) -> MachOCoverageClaim {
         MachOCoverageClaim {
             generation,
-            object,
+            section,
             range,
             kind,
         }
@@ -860,19 +904,36 @@ mod tests {
         };
         let original_record = record.clone();
         let original_current_input = matched.current.input.clone();
-        let current_object = object(&input_file, &current_input);
-        let coverage_requirement = coverage_requirement(
-            MachOCoverageGeneration::Current,
-            current_object.clone(),
-            0x50..0x58,
-            MachOCoverageKind::SectionBytes,
-        );
-        let coverage_claim = coverage_claim(
-            MachOCoverageGeneration::Current,
-            current_object,
-            0x50..0x58,
-            MachOCoverageKind::SectionBytes,
-        );
+        let previous_section = section(&input_file, &persisted_input, 3);
+        let current_section = section(&input_file, &current_input, 7);
+        let coverage_requirements = vec![
+            coverage_requirement(
+                MachOCoverageGeneration::Previous,
+                previous_section.clone(),
+                0x10..0x18,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_requirement(
+                MachOCoverageGeneration::Current,
+                current_section.clone(),
+                0x50..0x58,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
+        let coverage_claims = vec![
+            coverage_claim(
+                MachOCoverageGeneration::Previous,
+                previous_section,
+                0x10..0x18,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_claim(
+                MachOCoverageGeneration::Current,
+                current_section,
+                0x50..0x58,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
 
         let inventory = inventory_macho_ownership_cohort(
             std::slice::from_ref(&record),
@@ -880,8 +941,8 @@ mod tests {
             Vec::new(),
             &[(input_file.as_str(), &matched)],
             true,
-            vec![coverage_requirement],
-            vec![coverage_claim],
+            coverage_requirements,
+            coverage_claims,
         )
         .unwrap();
         let plan = plan_macho_ownership_transitions(&inventory);
@@ -980,10 +1041,9 @@ mod tests {
     fn planner_rejects_missing_required_coverage() {
         let owner = owner("lib.rlib", "member.o", 1, 0x1000, 8);
         let current = section("lib.rlib", "member.o", 1);
-        let input = object("lib.rlib", "member.o");
         let required = coverage_requirement(
             MachOCoverageGeneration::Current,
-            input,
+            current.clone(),
             10..20,
             MachOCoverageKind::SectionBytes,
         );
@@ -1005,6 +1065,163 @@ mod tests {
             diagnostic,
             MachOOwnershipDiagnostic::MissingCoverage { requirement }
                 if requirement == &required
+        )));
+    }
+
+    #[test]
+    fn planner_rejects_coverage_for_an_unrelated_transition() {
+        let owner = owner("lib.rlib", "previous-a.o", 1, 0x1000, 8);
+        let current = section("lib.rlib", "current-a.o", 2);
+        let unrelated_previous = section("lib.rlib", "previous-b.o", 1);
+        let unrelated_current = section("lib.rlib", "current-b.o", 2);
+        let requirements = vec![
+            coverage_requirement(
+                MachOCoverageGeneration::Previous,
+                unrelated_previous.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_requirement(
+                MachOCoverageGeneration::Current,
+                unrelated_current.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
+        let claims = vec![
+            coverage_claim(
+                MachOCoverageGeneration::Previous,
+                unrelated_previous,
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_claim(
+                MachOCoverageGeneration::Current,
+                unrelated_current,
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
+        let inventory = MachOCohortInventory {
+            owners: vec![owner.clone()],
+            reserved_owners: Vec::new(),
+            unwind_terminators: Vec::new(),
+            candidates: vec![candidate(
+                owner.previous.clone(),
+                current.clone(),
+                0x1000,
+                8,
+            )],
+            coverage_requirements: requirements,
+            coverage_claims: claims,
+        };
+
+        let plan = plan_macho_ownership_transitions(&inventory);
+
+        assert!(!plan.is_complete());
+        assert_eq!(
+            plan.diagnostics()
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic,
+                    MachOOwnershipDiagnostic::MissingTransitionCoverage { .. }
+                ))
+                .count(),
+            2,
+        );
+        assert!(plan.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            MachOOwnershipDiagnostic::MissingTransitionCoverage {
+                generation: MachOCoverageGeneration::Previous,
+                section,
+            } if section == &owner.previous
+        )));
+        assert!(plan.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            MachOOwnershipDiagnostic::MissingTransitionCoverage {
+                generation: MachOCoverageGeneration::Current,
+                section,
+            } if section == &current
+        )));
+    }
+
+    #[test]
+    fn planner_rejects_partial_coverage_for_multiple_transitions() {
+        let first_owner = owner("lib.rlib", "previous-a.o", 1, 0x1000, 8);
+        let second_owner = owner("lib.rlib", "previous-b.o", 1, 0x2000, 8);
+        let first_current = section("lib.rlib", "current-a.o", 2);
+        let second_current = section("lib.rlib", "current-b.o", 2);
+        let requirements = vec![
+            coverage_requirement(
+                MachOCoverageGeneration::Previous,
+                first_owner.previous.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_requirement(
+                MachOCoverageGeneration::Current,
+                first_current.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
+        let claims = vec![
+            coverage_claim(
+                MachOCoverageGeneration::Previous,
+                first_owner.previous.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_claim(
+                MachOCoverageGeneration::Current,
+                first_current.clone(),
+                0..8,
+                MachOCoverageKind::SectionBytes,
+            ),
+        ];
+        let inventory = MachOCohortInventory {
+            owners: vec![first_owner.clone(), second_owner.clone()],
+            reserved_owners: Vec::new(),
+            unwind_terminators: Vec::new(),
+            candidates: vec![
+                candidate(first_owner.previous.clone(), first_current, 0x1000, 8),
+                candidate(
+                    second_owner.previous.clone(),
+                    second_current.clone(),
+                    0x2000,
+                    8,
+                ),
+            ],
+            coverage_requirements: requirements,
+            coverage_claims: claims,
+        };
+
+        let plan = plan_macho_ownership_transitions(&inventory);
+
+        assert!(!plan.is_complete());
+        assert_eq!(
+            plan.diagnostics()
+                .iter()
+                .filter(|diagnostic| matches!(
+                    diagnostic,
+                    MachOOwnershipDiagnostic::MissingTransitionCoverage { .. }
+                ))
+                .count(),
+            2,
+        );
+        assert!(plan.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            MachOOwnershipDiagnostic::MissingTransitionCoverage {
+                generation: MachOCoverageGeneration::Previous,
+                section,
+            } if section == &second_owner.previous
+        )));
+        assert!(plan.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            MachOOwnershipDiagnostic::MissingTransitionCoverage {
+                generation: MachOCoverageGeneration::Current,
+                section,
+            } if section == &second_current
         )));
     }
 
@@ -1079,18 +1296,18 @@ mod tests {
     fn planner_rejects_overlapping_coverage_claims() {
         let owner = owner("lib.rlib", "member.o", 1, 0x1000, 8);
         let current = section("lib.rlib", "member.o", 1);
-        let first_input = object("lib.rlib", "member.o");
-        let second_input = object("lib.rlib", "other.o");
+        let first_section = current.clone();
+        let second_section = section("lib.rlib", "other.o", 1);
         let coverage_requirements = vec![
             coverage_requirement(
                 MachOCoverageGeneration::Current,
-                first_input.clone(),
+                first_section.clone(),
                 10..20,
                 MachOCoverageKind::SectionBytes,
             ),
             coverage_requirement(
                 MachOCoverageGeneration::Current,
-                second_input.clone(),
+                second_section.clone(),
                 18..24,
                 MachOCoverageKind::RelocationField,
             ),
@@ -1104,13 +1321,13 @@ mod tests {
             coverage_claims: vec![
                 MachOCoverageClaim {
                     generation: MachOCoverageGeneration::Current,
-                    object: first_input,
+                    section: first_section,
                     range: 10..20,
                     kind: MachOCoverageKind::SectionBytes,
                 },
                 MachOCoverageClaim {
                     generation: MachOCoverageGeneration::Current,
-                    object: second_input,
+                    section: second_section,
                     range: 18..24,
                     kind: MachOCoverageKind::RelocationField,
                 },
@@ -1134,7 +1351,7 @@ mod tests {
             .expect("overlapping coverage should be diagnosed");
         assert_eq!(
             diagnostic.to_string(),
-            "overlapping Current Mach-O coverage in lib.rlib for lib.rlib(member.o) at 0xa..0x14 and lib.rlib(other.o) at 0x12..0x18",
+            "overlapping Current Mach-O coverage in lib.rlib for lib.rlib(member.o) section 1 at 0xa..0x14 and lib.rlib(other.o) section 1 at 0x12..0x18",
         );
     }
 
@@ -1142,18 +1359,30 @@ mod tests {
     fn planner_keeps_previous_and_current_coverage_separate() {
         let owner = owner("lib.rlib", "member.o", 1, 0x1000, 8);
         let current = section("lib.rlib", "member.o", 1);
-        let input = object("lib.rlib", "member.o");
+        let site = section("lib.rlib", "member.o", 1);
         let coverage_requirements = vec![
             coverage_requirement(
                 MachOCoverageGeneration::Previous,
-                input.clone(),
+                site.clone(),
                 10..20,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_requirement(
+                MachOCoverageGeneration::Previous,
+                site.clone(),
+                20..24,
                 MachOCoverageKind::SymbolMetadata,
             ),
             coverage_requirement(
                 MachOCoverageGeneration::Current,
-                input.clone(),
+                site.clone(),
                 10..20,
+                MachOCoverageKind::SectionBytes,
+            ),
+            coverage_requirement(
+                MachOCoverageGeneration::Current,
+                site.clone(),
+                20..24,
                 MachOCoverageKind::UnwindMetadata,
             ),
         ];
@@ -1166,14 +1395,26 @@ mod tests {
             coverage_claims: vec![
                 MachOCoverageClaim {
                     generation: MachOCoverageGeneration::Previous,
-                    object: input.clone(),
+                    section: site.clone(),
                     range: 10..20,
+                    kind: MachOCoverageKind::SectionBytes,
+                },
+                MachOCoverageClaim {
+                    generation: MachOCoverageGeneration::Previous,
+                    section: site.clone(),
+                    range: 20..24,
                     kind: MachOCoverageKind::SymbolMetadata,
                 },
                 MachOCoverageClaim {
                     generation: MachOCoverageGeneration::Current,
-                    object: input,
+                    section: site.clone(),
                     range: 10..20,
+                    kind: MachOCoverageKind::SectionBytes,
+                },
+                MachOCoverageClaim {
+                    generation: MachOCoverageGeneration::Current,
+                    section: site,
+                    range: 20..24,
                     kind: MachOCoverageKind::UnwindMetadata,
                 },
             ],
@@ -1187,7 +1428,7 @@ mod tests {
                 .expect("complete plan has validated coverage")
                 .claims()
                 .len(),
-            2,
+            4,
         );
         assert_eq!(plan.inventory().owners(), std::slice::from_ref(&owner));
         assert_eq!(plan.inventory().candidates().len(), 1);
