@@ -869,6 +869,42 @@ current aggregates cannot explain replay cost.
 `primary_link_rustc` includes frontend and code generation, so linker-only time
 still requires rustc or SLD timing data.
 
+### Warm-cache base comparison
+
+The fresh-target cache was compared with the `2026.06.11` base on one fixed
+16-vCPU AMD EPYC Linux host. Separate base and branch toolchains came from the
+same SRS CI workflow and used a byte-identical `rustc` executable, LLVM code
+generation, Clang 22.1.7, 16 Cargo jobs, and uv revision
+`f74311c1551000016f75ad203a0236e974726abe`. The benchmark varied the CI-built
+Cargo executable and wrapper. In the warm matrix, the cache feature was
+explicitly enabled for both versions so the base Clippy subprocess also
+participated.
+
+Each of seven warm base/branch pairs started with an empty consumer target and
+a fresh copy of that version's immutable producer cache. A separate matrix ran
+seven cache-disabled base/branch pairs per workload. Version order was
+randomized within every pair. Seed copying was outside the timed interval, and
+the measurements exclude remote cache transfer. Timed commands did not enable
+verbose output or structured statistics; those used separate untimed runs.
+
+| Workload | Base warm median (MAD) | This change warm median (MAD) | Paired change (MAD) | Base disabled median (MAD) | This change disabled median (MAD) | Paired disabled change (MAD) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cargo build --profile no-debug --bin uv --bin uvx --locked` | 83.732s (0.180s) | 82.663s (0.097s) | -1.5% (0.4pp) | 82.177s (0.026s) | 81.215s (0.293s) | -1.2% (0.3pp) |
+| `cargo clippy --workspace --all-targets --all-features --locked` | 109.283s (0.306s) | 108.699s (0.129s) | -0.4% (0.2pp) | 108.974s (0.190s) | 107.703s (0.022s) | -1.2% (0.2pp) |
+
+Paired change is the median of the seven within-pair `(branch - base) / base`
+values; its MAD is descriptive spread in percentage points, not a confidence
+interval. Negative changes are faster.
+
+In single untimed verbose runs, visible compiler command lines were 484 versus
+225 for Build and 693 versus 352 for Clippy. A separate branch-only statistics
+population and warm run reported 345 hits among 448 eligible Build actions and
+438 hits among 505 eligible Clippy actions. The cache-disabled branch-to-base
+change was -1.2% for both workloads, so the warm comparisons do not isolate a
+clear cache-specific speedup despite the additional reuse. The remaining
+performance gate is to profile whether replay, scheduling, or uncovered
+critical-path artifact classes explain the residual wall time.
+
 ## Integration Gate
 
 Do not use another broad uv CI experiment as the next diagnostic step. First
@@ -880,8 +916,9 @@ prove locally that:
 - target-path and generated-input portability tests stay green; and
 - replay time is materially below the avoided rustc time.
 
-The correctness gates have focused regression coverage, but the coverage and
-performance gates remain open until the final-HEAD matrix is complete.
+The correctness gates have focused regression coverage. Build and Clippy reuse
+are now measured, but test coverage and the cache-specific performance gate
+remain open.
 Metadata-only Check preflight was measured and not retained because it was
 neutral, and per-job target isolation avoids requiring fine-grained
 shared-target locking. Exact-path snapshots can cover nonportable build-script,
