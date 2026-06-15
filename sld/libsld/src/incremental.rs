@@ -17681,7 +17681,19 @@ fn macho_text_relocation_replays_for_input(
                     macho_relocation_target_identity(&previous_file, previous_context.target)?;
                 let current_target =
                     macho_relocation_target_identity(&current_file, current_context.target)?;
-                if previous_target.is_none() || previous_target != current_target {
+                let renamed_local_target_name = if previous_target != current_target {
+                    renamed_local_macho_relocation_target_is_stable(
+                        &previous_file,
+                        &current_file,
+                        previous_context.target,
+                        current_context.target,
+                    )?
+                } else {
+                    None
+                };
+                if previous_target.is_none()
+                    || (previous_target != current_target && renamed_local_target_name.is_none())
+                {
                     let previous_name = previous_target
                         .as_ref()
                         .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
@@ -17703,6 +17715,11 @@ fn macho_text_relocation_replays_for_input(
                 }
 
                 let mut replay_target = relocation.target.clone();
+                let replay_target_name = renamed_local_target_name
+                    .as_deref()
+                    .map(hex::encode)
+                    .map(SharedText::from)
+                    .or_else(|| relocation.target_name.clone());
                 let same_object_target = if let Some(target) = relocation.target.as_ref() {
                     (target.input_file == input.path
                         && patch_input_refs_match(
@@ -17931,7 +17948,7 @@ fn macho_text_relocation_replays_for_input(
                 let current_relocation_target_candidates = macho_text_relocation_target_candidates(
                     resolutions,
                     &resolution_lookup,
-                    relocation.target_name.as_deref(),
+                    replay_target_name.as_deref(),
                     raw_relocation.r_type,
                     current_target_value,
                     &previous_applied_target_values,
@@ -17957,7 +17974,7 @@ fn macho_text_relocation_replays_for_input(
                         .map(|target| target.section_offset)
                         .unwrap_or_default(),
                     target_symbol_id: relocation.target_symbol_id,
-                    target_name: relocation.target_name.clone(),
+                    target_name: replay_target_name,
                     target_is_global: current_target_is_global,
                     target: replay_target,
                     addend: relocation.addend,
