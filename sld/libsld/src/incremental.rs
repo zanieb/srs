@@ -54,6 +54,15 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the ownership planner is landed before it is connected to patch eligibility"
+    )
+)]
+mod macho_ownership;
+
 const STATE_VERSION: &str = "sld-incremental-state-v46";
 const STATE_VERSION_V45: &str = "sld-incremental-state-v45";
 const STATE_VERSION_V44: &str = "sld-incremental-state-v44";
