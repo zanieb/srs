@@ -5242,6 +5242,24 @@ fn unique_symbol_position_by_name(
     Ok(Ok(matched))
 }
 
+fn unique_macho_output_symbol_value_by_name(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    encoded_name: &str,
+) -> Result<std::result::Result<Option<u64>, String>> {
+    let Some(position) = (match unique_symbol_position_by_name(bytes, 0, file, encoded_name)? {
+        Ok(position) => position,
+        Err(reason) => return Ok(Err(reason)),
+    }) else {
+        return Ok(Ok(None));
+    };
+    let section_address = file.section_by_index(position.section_index)?.address();
+    let value = section_address
+        .checked_add(position.section_offset)
+        .context("Mach-O output symbol value overflowed")?;
+    Ok(Ok(Some(value)))
+}
+
 fn symbol_position_by_name_and_value(
     bytes: &[u8],
     file_offset: usize,
@@ -17602,13 +17620,26 @@ fn macho_text_relocation_replays_for_input(
                     });
                 replay_target = current_target;
                 if recorded_target_move.is_some() {
+                    let target_name = relocation
+                        .target_name
+                        .as_deref()
+                        .context("Missing recorded Mach-O relocation target name")?;
+                    let previous_target_value = if current_target_is_global {
+                        match unique_macho_output_symbol_value_by_name(
+                            previous_output,
+                            &output_file,
+                            target_name,
+                        )? {
+                            Ok(Some(value)) => value,
+                            Ok(None) => relocation.target_value,
+                            Err(reason) => return Ok(Err(reason)),
+                        }
+                    } else {
+                        relocation.target_value
+                    };
                     target_output_symbols.push(RelocationTargetSymbolPatch {
-                        target_name: relocation
-                            .target_name
-                            .as_deref()
-                            .context("Missing recorded Mach-O relocation target name")?
-                            .to_owned(),
-                        previous_target_value: relocation.target_value,
+                        target_name: target_name.to_owned(),
+                        previous_target_value,
                         target_value: current_target_value,
                         allow_missing: true,
                         source: "resolved Mach-O relocation target movement",
@@ -45635,7 +45666,19 @@ mod tests {
     #[test]
     fn output_symbol_value_patches_macho_nlist64() {
         let output = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
         let value_range = macho_symbol_value_field_range(&output, object::SymbolIndex(1)).unwrap();
+
+        assert_eq!(
+            unique_macho_output_symbol_value_by_name(
+                &output,
+                &output_file,
+                &hex::encode(b"_data"),
+            )
+            .unwrap()
+            .unwrap(),
+            Some(4)
+        );
 
         let patches = output_symbol_value_patches(
             &output,
