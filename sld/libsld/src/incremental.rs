@@ -22954,7 +22954,7 @@ fn archive_diff_allows_changed_macho_unwind(
     current_ranges.extend(changed.current_input_ranges.iter().cloned());
     dedup_ranges(&mut previous_ranges);
     dedup_ranges(&mut current_ranges);
-    let Some((previous_fingerprint, _)) = archive_patch_fingerprint_with_previous(
+    let previous_fingerprint = archive_patch_fingerprint_with_previous(
         previous_bytes,
         &previous_ranges,
         None,
@@ -22962,10 +22962,8 @@ fn archive_diff_allows_changed_macho_unwind(
         ignored_previous_identifiers,
         &[],
     )?
-    else {
-        return Ok(false);
-    };
-    let Some((current_fingerprint, _)) = archive_patch_fingerprint_with_previous(
+    .map(|(fingerprint, _)| fingerprint);
+    let current_fingerprint = archive_patch_fingerprint_with_previous(
         current_bytes,
         &current_ranges,
         None,
@@ -22973,10 +22971,8 @@ fn archive_diff_allows_changed_macho_unwind(
         ignored_current_identifiers,
         &[],
     )?
-    else {
-        return Ok(false);
-    };
-    if previous_fingerprint == current_fingerprint {
+    .map(|(fingerprint, _)| fingerprint);
+    if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
         return Ok(true);
     }
     let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint(
