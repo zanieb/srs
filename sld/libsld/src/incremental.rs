@@ -8354,7 +8354,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         )
     })?;
     match output_symbol_value_patches(&output, &output_symbol_patches)? {
-        Ok(symbol_patches) => patches.extend(symbol_patches),
+        Ok(mut symbol_patches) => {
+            if let Err(reason) = compose_nested_plain_patches(&mut patches, &mut symbol_patches) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
+            patches.extend(symbol_patches);
+        }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
     match fde_add_patches_for_output(&output, &fde_add_candidates, &previous.fdes)? {
