@@ -26373,13 +26373,12 @@ fn allocate_added_macho_archive_eh_frame_range(
             (range.output_section_id == output_section_id
                 && range.alignment_exponent == alignment.exponent
                 && range.output_offset >= terminator_output_offset
-                && range.output_offset - terminator_output_offset < alignment.value()
                 && patch_end <= range_end
                 && next_output_offset <= range_end)
-                .then_some((index, range_end))
+                .then_some((index, range.output_offset, range_end))
         })
         .collect::<Vec<_>>();
-    let [(range_index, range_end)] = candidates.as_slice() else {
+    let [(range_index, range_start, range_end)] = candidates.as_slice() else {
         return Ok(Err(
             "added Mach-O __eh_frame reserve is not adjacent to the current terminator".to_owned(),
         ));
@@ -26388,6 +26387,7 @@ fn allocate_added_macho_archive_eh_frame_range(
     let zero_start = terminator_offset;
     let zero_end = usize::try_from(
         next_output_offset
+            .max(*range_start)
             .checked_sub(section_file_offset)
             .context("Added Mach-O __eh_frame allocation precedes its section")?,
     )
@@ -48398,8 +48398,8 @@ mod tests {
         let mut gapped_reserves = vec![ReservedRangeRecord {
             output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
             alignment_exponent: 3,
-            output_offset: gapped.eh_frame_offset + 16,
-            size: 144,
+            output_offset: gapped.eh_frame_offset + 88,
+            size: 72,
         }];
         sections[0].output_offset = gapped.text_offset + 0x100;
         let gapped_activation = {
