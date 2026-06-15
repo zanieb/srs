@@ -18277,6 +18277,10 @@ fn validate_macho_data_relocations_are_stable(
                     macho_relocation_target_identity(&previous_file, previous_context.target)?;
                 let current_identity =
                     macho_relocation_target_identity(&current_file, current_context.target)?;
+                let previous_target_is_global =
+                    macho_relocation_target_is_global(&previous_file, previous_context.target);
+                let current_target_is_global =
+                    macho_relocation_target_is_global(&current_file, current_context.target);
                 let renamed_local_target_name = if previous_identity != current_identity {
                     renamed_local_macho_relocation_target_is_stable(
                         &previous_file,
@@ -18296,6 +18300,13 @@ fn validate_macho_data_relocations_are_stable(
                         previous_context.target,
                         current_context.target,
                     )?
+                } else if previous_identity == current_identity
+                    && !previous_target_is_global
+                    && !current_target_is_global
+                {
+                    current_identity
+                        .as_ref()
+                        .and_then(|(name, _)| (!name.is_empty()).then(|| name.clone()))
                 } else {
                     None
                 };
@@ -18436,10 +18447,6 @@ fn validate_macho_data_relocations_are_stable(
                     changed = true;
                     continue;
                 }
-                let previous_target_is_global =
-                    macho_relocation_target_is_global(&previous_file, previous_context.target);
-                let current_target_is_global =
-                    macho_relocation_target_is_global(&current_file, current_context.target);
                 if previous_target_is_global && current_target_is_global {
                     if let Some((selected_value, selected_target)) =
                         resolved_macho_global_relocation_target(
