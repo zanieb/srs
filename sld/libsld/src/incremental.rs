@@ -26384,8 +26384,7 @@ fn allocate_added_macho_archive_eh_frame_range(
         ));
     };
 
-    let zero_start = terminator_offset;
-    let zero_end = usize::try_from(
+    let allocation_end = usize::try_from(
         next_output_offset
             .max(*range_start)
             .checked_sub(section_file_offset)
@@ -26393,11 +26392,11 @@ fn allocate_added_macho_archive_eh_frame_range(
     )
     .context("Added Mach-O __eh_frame allocation exceeds usize")?;
     if section_data
-        .get(zero_start..zero_end)
-        .is_none_or(|data| data.iter().any(|byte| *byte != 0))
+        .get(terminator_offset..allocation_end)
+        .is_none()
     {
         return Ok(Err(
-            "added Mach-O __eh_frame reserve or alignment gap is not zero-filled".to_owned(),
+            "added Mach-O __eh_frame reserve or alignment gap is outside the section".to_owned(),
         ));
     }
 
@@ -26509,6 +26508,7 @@ fn added_macho_archive_unwind_activation(
             || allocation
                 .output_offset
                 .checked_add(allocation.size)
+                .and_then(|end| end.checked_add(4))
                 .is_none_or(|end| end > section_file_end)
         {
             return Ok(Err(
@@ -26526,9 +26526,10 @@ fn added_macho_archive_unwind_activation(
                     .context("Added Mach-O __eh_frame block has no output address")?;
         }
         eh_frame_section_file_offset = Some(section_file_offset);
+        eh_frame_data.extend_from_slice(&[0; 4]);
         patches.push(SectionPatch {
             output_offset: allocation.output_offset,
-            size: allocation.size,
+            size: eh_frame_data.len() as u64,
             data: eh_frame_data,
             deferred_relocation: None,
             preserve_ranges: Vec::new(),
@@ -48194,10 +48195,10 @@ mod tests {
             .patches
             .iter()
             .find(|patch| {
-                patch.output_offset == reserve_after_initial.output_offset + 72 && patch.size == 72
+                patch.output_offset == reserve_after_initial.output_offset + 72 && patch.size == 76
             })
             .unwrap();
-        assert_eq!(next_eh_frame.data.len(), 72);
+        assert_eq!(next_eh_frame.data.len(), 76);
         let next_unwind_info = next_activation
             .patches
             .iter()
@@ -48298,7 +48299,7 @@ mod tests {
             .iter()
             .find(|patch| patch.output_offset == output.eh_frame_offset)
             .unwrap();
-        assert_eq!(first_eh_frame.size, 72);
+        assert_eq!(first_eh_frame.size, 76);
         let first_unwind_info = first
             .patches
             .iter()
@@ -48381,7 +48382,7 @@ mod tests {
             .iter()
             .find(|patch| patch.output_offset == output.eh_frame_offset + 72)
             .unwrap();
-        assert_eq!(second_eh_frame.size, 72);
+        assert_eq!(second_eh_frame.size, 76);
         assert!(reserves.is_empty());
         apply_test_section_patches(&mut output.bytes, &second.patches);
         assert_eq!(
@@ -48421,7 +48422,7 @@ mod tests {
             gapped_activation
                 .patches
                 .iter()
-                .any(|patch| patch.output_offset == gapped.eh_frame_offset + 12 && patch.size == 72)
+                .any(|patch| patch.output_offset == gapped.eh_frame_offset + 12 && patch.size == 76)
         );
         assert_eq!(
             gapped_reserves,
@@ -48518,7 +48519,7 @@ mod tests {
             .iter()
             .find(|patch| patch.output_offset == output.eh_frame_offset)
             .unwrap();
-        assert_eq!(eh_frame_patch.size, 168);
+        assert_eq!(eh_frame_patch.size, 172);
         let unwind_info_patch = activation
             .patches
             .iter()
