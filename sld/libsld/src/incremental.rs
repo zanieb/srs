@@ -2749,6 +2749,7 @@ fn relocation_target_patches_for_input(
         output_symbols,
         macho_target_moves,
         macho_cross_input_target_moves,
+        validated_macho_local_retargets: Vec::new(),
         changed_relocation_indices,
     }))
 }
@@ -7100,6 +7101,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &removed_identifiers,
                         &ignored_archive_identifiers,
                         &restored_names,
+                        &relocation_target_patches.validated_macho_local_retargets,
                         &previous_unwind_input_ranges,
                         &current_unwind_input_ranges,
                     )?
@@ -7309,6 +7311,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &removed_identifiers,
                             added_identifiers,
                             &restored_names,
+                            &relocation_target_patches.validated_macho_local_retargets,
                             &previous_unwind_input_ranges,
                             &current_unwind_input_ranges,
                         )?
@@ -8960,7 +8963,22 @@ struct RelocationTargetPatches {
     output_symbols: Vec<RelocationTargetSymbolPatch>,
     macho_target_moves: Vec<MachORelocationTargetMove>,
     macho_cross_input_target_moves: Vec<MachORelocationTargetMove>,
+    validated_macho_local_retargets: Vec<ValidatedMachOLocalRelocationRetarget>,
     changed_relocation_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ValidatedMachOLocalRelocationSite {
+    archive_identifier: Vec<u8>,
+    section_index: usize,
+    relocation_offset: u64,
+    target_symbol_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedMachOLocalRelocationRetarget {
+    previous: ValidatedMachOLocalRelocationSite,
+    current: ValidatedMachOLocalRelocationSite,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17988,6 +18006,19 @@ fn validate_macho_data_relocations_are_stable(
                 } else {
                     relocation.target_value
                 };
+                let validated_local_retarget = (renamed_local_target_is_stable
+                    && target_section.is_some())
+                .then(|| {
+                    validated_macho_local_relocation_retarget(
+                        previous_input_bytes,
+                        current_input_bytes,
+                        previous_index,
+                        current_index,
+                        previous_context,
+                        current_context,
+                    )
+                })
+                .flatten();
                 if let Some(current_name) = matched_local_target_name.as_ref()
                     && target_address != relocation.target_value
                 {
@@ -18009,6 +18040,11 @@ fn validate_macho_data_relocations_are_stable(
                     }
                     relocation.section_index = patch_section.current.section_index;
                     target_patches.output_patches.push(patch);
+                    if let Some(retarget) = validated_local_retarget {
+                        target_patches
+                            .validated_macho_local_retargets
+                            .push(retarget);
+                    }
                     changed = true;
                     continue;
                 }
@@ -18039,6 +18075,11 @@ fn validate_macho_data_relocations_are_stable(
                 target.section_index =
                     relocation_target_record_index(current_target.section_index)?;
                 target.section_offset = current_target.section_offset;
+                if let Some(retarget) = validated_local_retarget {
+                    target_patches
+                        .validated_macho_local_retargets
+                        .push(retarget);
+                }
                 changed |= *relocation != previous_record;
             }
         }
@@ -18110,6 +18151,39 @@ fn moved_local_macho_data_relocation_patch(
     let (patch, _) = moved_macho_data_relocation_patch(relocation, target_move, None)?;
     relocation.target_name = Some(SharedText::from(hex::encode(current_name)));
     Ok(patch)
+}
+
+fn validated_macho_local_relocation_retarget(
+    previous_input: PatchInputBytes<'_>,
+    current_input: PatchInputBytes<'_>,
+    previous_section: object::SectionIndex,
+    current_section: object::SectionIndex,
+    previous_context: &MachODataRelocationContext,
+    current_context: &MachODataRelocationContext,
+) -> Option<ValidatedMachOLocalRelocationRetarget> {
+    let previous_identifier = archive_member_patch_identifier(previous_input.archive_identifier?);
+    let current_identifier = archive_member_patch_identifier(current_input.archive_identifier?);
+    let (
+        object::RelocationTarget::Symbol(previous_target),
+        object::RelocationTarget::Symbol(current_target),
+    ) = (previous_context.target, current_context.target)
+    else {
+        return None;
+    };
+    Some(ValidatedMachOLocalRelocationRetarget {
+        previous: ValidatedMachOLocalRelocationSite {
+            archive_identifier: previous_identifier,
+            section_index: previous_section.0,
+            relocation_offset: previous_context.range.start as u64,
+            target_symbol_index: previous_target.0,
+        },
+        current: ValidatedMachOLocalRelocationSite {
+            archive_identifier: current_identifier,
+            section_index: current_section.0,
+            relocation_offset: current_context.range.start as u64,
+            target_symbol_index: current_target.0,
+        },
+    })
 }
 
 fn macho_data_relocation_semantics_are_stable(
@@ -20756,6 +20830,7 @@ fn archive_macho_semantic_patch_proof_fingerprint(
         ignored_defined_symbols,
         false,
         false,
+        &[],
     )
 }
 
@@ -20772,6 +20847,25 @@ fn archive_macho_masked_local_semantic_fingerprint(
         ignored_defined_symbols,
         true,
         true,
+        &[],
+    )
+}
+
+fn archive_macho_masked_local_semantic_fingerprint_with_retargets(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+) -> Result<Option<blake3::Hash>> {
+    archive_macho_semantic_patch_proof_fingerprint_with_options(
+        bytes,
+        ranges,
+        ignored_identifiers,
+        ignored_defined_symbols,
+        true,
+        true,
+        validated_local_retargets,
     )
 }
 
@@ -20788,6 +20882,7 @@ fn archive_macho_semantic_patch_proof_fingerprint_ignoring_masked_unwind_section
         ignored_defined_symbols,
         true,
         false,
+        &[],
     )
 }
 
@@ -20798,6 +20893,7 @@ fn archive_macho_semantic_patch_proof_fingerprint_with_options(
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     ignore_masked_unwind_sections: bool,
     force_retirement_proof: bool,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
 ) -> Result<Option<blake3::Hash>> {
     let Some(members) = archive_macho_semantic_patch_proof_members(
         bytes,
@@ -20806,6 +20902,7 @@ fn archive_macho_semantic_patch_proof_fingerprint_with_options(
         ignored_defined_symbols,
         ignore_masked_unwind_sections,
         force_retirement_proof,
+        validated_local_retargets,
     )?
     else {
         return Ok(None);
@@ -20828,11 +20925,13 @@ fn archive_macho_semantic_patch_proof_members(
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     ignore_masked_unwind_sections: bool,
     force_retirement_proof: bool,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
 ) -> Result<Option<Vec<(Vec<u8>, blake3::Hash)>>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
     };
     let mut members = Vec::new();
+    let mut consumed_local_retargets = 0;
     for entry in archive {
         let ArchiveEntry::Regular(content) = entry? else {
             return Ok(None);
@@ -20852,24 +20951,35 @@ fn archive_macho_semantic_patch_proof_members(
         if file.format() != object::BinaryFormat::MachO {
             return Ok(None);
         }
+        let member_local_retargets = validated_local_retargets
+            .iter()
+            .filter(|site| site.archive_identifier == identifier)
+            .collect::<Vec<_>>();
         let mut ignored_sections = HashSet::new();
         if ignore_masked_unwind_sections {
             ignored_sections =
                 fully_masked_macho_unwind_sections(&file, content.data_offset, ranges)?;
         }
-        let Some(member_hash) = macho_object_semantic_patch_fingerprint(
-            content.entry_data,
-            content.data_offset,
-            ranges,
-            &ignored_sections,
-            &HashSet::new(),
-            ignored_defined_symbols,
-            force_retirement_proof,
-            true,
-        ) else {
+        let Some((member_hash, member_consumed_local_retargets)) =
+            macho_object_semantic_patch_fingerprint_with_retargets(
+                content.entry_data,
+                content.data_offset,
+                ranges,
+                &ignored_sections,
+                &HashSet::new(),
+                ignored_defined_symbols,
+                force_retirement_proof,
+                true,
+                &member_local_retargets,
+            )
+        else {
             return Ok(None);
         };
+        consumed_local_retargets += member_consumed_local_retargets;
         members.push((identifier, member_hash));
+    }
+    if consumed_local_retargets != validated_local_retargets.len() {
+        return Ok(None);
     }
     Ok(Some(members))
 }
@@ -20948,6 +21058,26 @@ fn archive_macho_unowned_text_fingerprint(
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     force_retirement_proof: bool,
 ) -> Result<Option<blake3::Hash>> {
+    archive_macho_unowned_text_fingerprint_with_retargets(
+        bytes,
+        ranges,
+        owned_sections,
+        ignored_identifiers,
+        ignored_defined_symbols,
+        force_retirement_proof,
+        &[],
+    )
+}
+
+fn archive_macho_unowned_text_fingerprint_with_retargets(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    owned_sections: &HashMap<Vec<u8>, HashSet<object::SectionIndex>>,
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+    force_retirement_proof: bool,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+) -> Result<Option<blake3::Hash>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
     };
@@ -20955,6 +21085,7 @@ fn archive_macho_unowned_text_fingerprint(
     hasher.update(b"sld-archive-unowned-macho-text-proof-v1");
     let mut member_count = 0_u64;
     let mut has_unowned_section = false;
+    let mut consumed_local_retargets = 0;
     for entry in archive {
         let ArchiveEntry::Regular(content) = entry? else {
             return Ok(None);
@@ -20997,23 +21128,34 @@ fn archive_macho_unowned_text_fingerprint(
         } else {
             HashSet::new()
         };
-        let Some(member_hash) = macho_object_semantic_patch_fingerprint(
-            content.entry_data,
-            content.data_offset,
-            ranges,
-            &ignored_sections,
-            &unowned,
-            ignored_defined_symbols,
-            force_retirement_proof,
-            true,
-        ) else {
+        let member_local_retargets = validated_local_retargets
+            .iter()
+            .filter(|site| site.archive_identifier == identifier)
+            .collect::<Vec<_>>();
+        let Some((member_hash, member_consumed_local_retargets)) =
+            macho_object_semantic_patch_fingerprint_with_retargets(
+                content.entry_data,
+                content.data_offset,
+                ranges,
+                &ignored_sections,
+                &unowned,
+                ignored_defined_symbols,
+                force_retirement_proof,
+                true,
+                &member_local_retargets,
+            )
+        else {
             return Ok(None);
         };
+        consumed_local_retargets += member_consumed_local_retargets;
         hash_length_prefixed(&mut hasher, &identifier);
         hasher.update(member_hash.as_bytes());
         member_count += 1;
     }
     hasher.update(&member_count.to_le_bytes());
+    if consumed_local_retargets != validated_local_retargets.len() {
+        return Ok(None);
+    }
     Ok(has_unowned_section.then(|| hasher.finalize()))
 }
 
@@ -21223,6 +21365,7 @@ fn archive_diff_allows_owned_macho_member_removal(
         removed_identifiers,
         &[],
         restored_names,
+        &[],
         previous_extra_ranges,
         current_extra_ranges,
     )
@@ -21238,6 +21381,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
     removed_identifiers: &[Vec<u8>],
     added_identifiers: &[Vec<u8>],
     restored_names: &[SharedText],
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
 ) -> Result<bool> {
@@ -21295,17 +21439,27 @@ fn archive_diff_allows_owned_macho_member_exchange(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint(
+    let previous_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.previous.clone())
+        .collect::<Vec<_>>();
+    let current_local_retargets = validated_local_retargets
+        .iter()
+        .map(|retarget| retarget.current.clone())
+        .collect::<Vec<_>>();
+    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         previous_bytes,
         &previous_ranges,
         removed_identifiers,
         &restored_names,
+        &previous_local_retargets,
     )?;
-    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint(
+    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         current_bytes,
         &current_ranges,
         added_identifiers,
         &restored_names,
+        &current_local_retargets,
     )?;
     if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
         return Ok(true);
@@ -21329,21 +21483,23 @@ fn archive_diff_allows_owned_macho_member_exchange(
     else {
         return Ok(false);
     };
-    let previous_fingerprint = archive_macho_unowned_text_fingerprint(
+    let previous_fingerprint = archive_macho_unowned_text_fingerprint_with_retargets(
         previous_bytes,
         &previous_ranges,
         &previous_owned,
         removed_identifiers,
         &restored_names,
         true,
+        &previous_local_retargets,
     )?;
-    let current_fingerprint = archive_macho_unowned_text_fingerprint(
+    let current_fingerprint = archive_macho_unowned_text_fingerprint_with_retargets(
         current_bytes,
         &current_ranges,
         &current_owned,
         added_identifiers,
         &restored_names,
         true,
+        &current_local_retargets,
     )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
@@ -21366,6 +21522,7 @@ fn archive_diff_allows_owned_macho_member_addition(
         &PatchInputResolver::new(current_bytes, true)?,
         &[],
         added_identifiers,
+        &[],
         &[],
         previous_extra_ranges,
         current_extra_ranges,
@@ -21399,6 +21556,40 @@ fn macho_object_semantic_patch_fingerprint(
     force_retirement_proof: bool,
     require_masked_text: bool,
 ) -> Option<blake3::Hash> {
+    macho_object_semantic_patch_fingerprint_with_retargets(
+        bytes,
+        file_offset,
+        ranges,
+        ignored_sections,
+        unowned_sections,
+        ignored_defined_symbols,
+        force_retirement_proof,
+        require_masked_text,
+        &[],
+    )
+    .map(|(fingerprint, _)| fingerprint)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn macho_object_semantic_patch_fingerprint_with_retargets(
+    bytes: &[u8],
+    file_offset: usize,
+    ranges: &[std::ops::Range<usize>],
+    ignored_sections: &HashSet<object::SectionIndex>,
+    unowned_sections: &HashSet<object::SectionIndex>,
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+    force_retirement_proof: bool,
+    require_masked_text: bool,
+    validated_local_retargets: &[&ValidatedMachOLocalRelocationSite],
+) -> Option<(blake3::Hash, usize)> {
+    if validated_local_retargets
+        .iter()
+        .collect::<HashSet<_>>()
+        .len()
+        != validated_local_retargets.len()
+    {
+        return None;
+    }
     let file = object::File::parse(bytes).ok()?;
     if file.format() != object::BinaryFormat::MachO
         || file.kind() != object::ObjectKind::Relocatable
@@ -21450,6 +21641,7 @@ fn macho_object_semantic_patch_fingerprint(
     let mut unowned_undefined_symbols = HashSet::new();
     let mut unmasked_relocation_symbols = HashSet::new();
     let mut hashed_relocation_symbols = HashSet::new();
+    let mut consumed_local_retargets = HashSet::new();
     for section in sections {
         let segment_name = section.segment_name_bytes().ok().flatten()?;
         let section_name = section.name_bytes().ok()?;
@@ -21543,15 +21735,52 @@ fn macho_object_semantic_patch_fingerprint(
             hasher.update(&[r_type, u8::from(r_pcrel), r_length]);
             hasher.update(&relocation.addend().to_le_bytes());
             hasher.update(&[u8::from(relocation.has_implicit_addend())]);
-            if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
-                unmasked_relocation_symbols.insert(symbol);
-            }
-            if retirement_proof {
+            let validated_local_retarget = if fully_masked && retirement_proof {
+                if let object::RelocationTarget::Symbol(target_symbol) = relocation.target() {
+                    let mut matching =
+                        validated_local_retargets
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, site)| {
+                                site.section_index == section.index().0
+                                    && site.relocation_offset == offset
+                                    && site.target_symbol_index == target_symbol.0
+                            });
+                    let matched = matching.next().map(|(index, _)| index);
+                    if matching.next().is_some() {
+                        return None;
+                    }
+                    matched
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(index) = validated_local_retarget {
+                if relocation.subtractor().is_some() || !consumed_local_retargets.insert(index) {
+                    return None;
+                }
+                let object::RelocationTarget::Symbol(symbol) = relocation.target() else {
+                    return None;
+                };
+                hash_validated_macho_local_relocation_target(
+                    &mut hasher,
+                    &file,
+                    symbol,
+                    file_offset,
+                    ranges,
+                )?;
+            } else if retirement_proof {
                 if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
+                    unmasked_relocation_symbols.insert(symbol);
                     hashed_relocation_symbols.insert(symbol);
                 }
                 hash_macho_semantic_relocation_target(&mut hasher, &file, relocation.target())?;
             } else {
+                if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
+                    unmasked_relocation_symbols.insert(symbol);
+                }
                 hash_macho_relocation_target(&mut hasher, relocation.target())?;
             }
             match relocation.subtractor() {
@@ -21638,8 +21867,11 @@ fn macho_object_semantic_patch_fingerprint(
         hasher.update(&n_desc.to_le_bytes());
     }
 
+    if consumed_local_retargets.len() != validated_local_retargets.len() {
+        return None;
+    }
     (retirement_proof || (has_masked_section && (!require_masked_text || has_masked_text)))
-        .then(|| hasher.finalize())
+        .then(|| (hasher.finalize(), consumed_local_retargets.len()))
 }
 
 fn direct_macho_cgu_migration_fingerprint_matches(
@@ -28176,6 +28408,48 @@ fn hash_macho_semantic_relocation_target(
         }
         _ => return None,
     }
+    Some(())
+}
+
+fn hash_validated_macho_local_relocation_target(
+    hasher: &mut blake3::Hasher,
+    file: &object::File<'_>,
+    symbol_index: object::SymbolIndex,
+    file_offset: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> Option<()> {
+    let symbol = file.symbol_by_index(symbol_index).ok()?;
+    if symbol.is_undefined()
+        || symbol.is_global()
+        || symbol.is_weak()
+        || symbol.scope() != object::SymbolScope::Compilation
+    {
+        return None;
+    }
+    let section = file.section_by_index(symbol.section_index()?).ok()?;
+    let (section_offset, section_size) = section.file_range()?;
+    let section_start = file_offset.checked_add(usize::try_from(section_offset).ok()?)?;
+    let section_end = section_start.checked_add(usize::try_from(section_size).ok()?)?;
+    if section_size == 0
+        || !ranges
+            .iter()
+            .any(|range| range.start <= section_start && range.end >= section_end)
+    {
+        return None;
+    }
+
+    hasher.update(b"sld-validated-macho-local-relocation-retarget-v1");
+    hash_macho_symbol_section(hasher, symbol.section())?;
+    hasher.update(&symbol.size().to_le_bytes());
+    hasher.update(&[
+        macho_symbol_kind_tag(symbol.kind())?,
+        macho_symbol_scope_tag(symbol.scope()),
+        u8::from(symbol.is_weak()),
+    ]);
+    let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+        return None;
+    };
+    hasher.update(&n_desc.to_le_bytes());
     Some(())
 }
 
@@ -44524,8 +44798,232 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn owned_macho_member_exchange_composes_with_validated_local_retarget() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        fn section<'data>(
+            file: &'data object::File<'data>,
+            segment: &[u8],
+        ) -> object::Section<'data, 'data> {
+            file.sections()
+                .find(|section| {
+                    section.name_bytes().ok() == Some(b"__const".as_slice())
+                        && section.segment_name_bytes().ok().flatten() == Some(segment)
+                })
+                .unwrap()
+        }
+
+        let previous_kept = test_macho_local_data_retarget_object(b"l_anon.20", 0x12);
+        let current_kept = test_macho_local_data_retarget_object(b"l_anon.21", 0x26);
+        let exchanged = test_macho_object(b"text", b"data", 0);
+        let kept_identifier = b"crate-hash.cgu.kept.session.rcgu.o";
+        let removed_identifier = b"crate-hash.cgu.removed.session.rcgu.o";
+        let added_identifier = b"crate-hash.cgu.added.session.rcgu.o";
+        let previous = archive(&[
+            (kept_identifier, previous_kept.as_slice()),
+            (removed_identifier, exchanged.as_slice()),
+        ]);
+        let current = archive(&[
+            (kept_identifier, current_kept.as_slice()),
+            (added_identifier, exchanged.as_slice()),
+        ]);
+        let input_file = hex::encode("lib.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, kept_identifier).unwrap()
+        else {
+            panic!("expected unique previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, kept_identifier).unwrap()
+        else {
+            panic!("expected unique current archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap();
+        let current_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap();
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_source = section(&previous_file, b"__DATA");
+        let current_source = section(&current_file, b"__DATA");
+        let previous_target = section(&previous_file, b"__TEXT");
+        let current_target = section(&current_file, b"__TEXT");
+        let matched = [
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_source.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: previous_source.size(),
+                    output_offset: 0,
+                    output_size: previous_source.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input.clone(),
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_source.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: current_source.size(),
+                    output_offset: 0,
+                    output_size: current_source.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+            },
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input,
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_target.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__TEXT,__const".to_owned()),
+                    input_size: previous_target.size(),
+                    output_offset: 0x100,
+                    output_size: previous_target.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input,
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_target.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__TEXT,__const".to_owned()),
+                    input_size: current_target.size(),
+                    output_offset: 0x100,
+                    output_size: current_target.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+            },
+        ];
+        let previous_identifier = archive_member_patch_identifier(kept_identifier);
+        let current_identifier = previous_identifier.clone();
+        let retarget = ValidatedMachOLocalRelocationRetarget {
+            previous: ValidatedMachOLocalRelocationSite {
+                archive_identifier: previous_identifier,
+                section_index: previous_source.index().0,
+                relocation_offset: 0,
+                target_symbol_index: 0,
+            },
+            current: ValidatedMachOLocalRelocationSite {
+                archive_identifier: current_identifier,
+                section_index: current_source.index().0,
+                relocation_offset: 0,
+                target_symbol_index: 0,
+            },
+        };
+        let removed = [archive_member_patch_identifier(removed_identifier)];
+        let added = [archive_member_patch_identifier(added_identifier)];
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed,
+                &added,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap()
+        );
+        assert!(
+            archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed,
+                &added,
+                &[],
+                std::slice::from_ref(&retarget),
+                &[],
+                &[],
+            )
+            .unwrap()
+        );
+
+        let mut wrong_site = retarget.clone();
+        wrong_site.current.target_symbol_index = 1;
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed,
+                &added,
+                &[],
+                &[wrong_site],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "a colliding local name at a different symbol index must not consume the proof",
+        );
+
+        let mut unrelated_kept = current_kept;
+        unrelated_kept[24] ^= 0x20;
+        let unrelated = archive(&[
+            (kept_identifier, unrelated_kept.as_slice()),
+            (added_identifier, exchanged.as_slice()),
+        ]);
+        let unrelated_resolver = PatchInputResolver::new(&unrelated, true).unwrap();
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &unrelated,
+                &input_file,
+                &matched,
+                &unrelated_resolver,
+                &removed,
+                &added,
+                &[],
+                &[retarget],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "validated local retargets must not mask unrelated object changes",
         );
     }
 
@@ -48420,6 +48918,120 @@ mod tests {
                 | u32::from(relocation.external) << 27
                 | u32::from(relocation.r_type) << 28,
         );
+    }
+
+    fn test_macho_local_data_retarget_object(primary_name: &[u8], primary_offset: u64) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let commands_size = SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let source = [0; 16];
+        let target = [0; 64];
+        let source_offset = HEADER_SIZE + commands_size;
+        let target_offset = source_offset + source.len();
+        let relocation_offset = target_offset + target.len();
+        let symoff = relocation_offset + 2 * 8;
+        let stroff = symoff + 3 * NLIST_64_SIZE;
+        let mut strings = vec![0];
+        let mut add_string = |name: &[u8]| {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(name);
+            strings.push(0);
+            offset
+        };
+        let primary_name = add_string(primary_name);
+        let competing_name = add_string(b"l_anon.21");
+        let source_name = add_string(b"_source");
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_OBJECT);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, object::macho::MH_SUBSECTIONS_VIA_SYMBOLS);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(&mut bytes, (SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE) as u32);
+        push_fixed_name(&mut bytes, b"");
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, (source.len() + target.len()) as u64);
+        push_u64(&mut bytes, source_offset as u64);
+        push_u64(&mut bytes, (source.len() + target.len()) as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, 0);
+
+        push_macho_section_with_relocations(
+            &mut bytes,
+            b"__const",
+            b"__DATA",
+            0,
+            source.len(),
+            source_offset,
+            relocation_offset,
+            2,
+            object::macho::S_REGULAR,
+        );
+        push_macho_section(
+            &mut bytes,
+            b"__const",
+            b"__TEXT",
+            source.len() as u64,
+            target.len(),
+            target_offset,
+            object::macho::S_REGULAR,
+        );
+
+        push_u32(&mut bytes, object::macho::LC_SYMTAB);
+        push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
+        push_u32(&mut bytes, symoff as u32);
+        push_u32(&mut bytes, 3);
+        push_u32(&mut bytes, stroff as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+
+        assert_eq!(bytes.len(), source_offset);
+        bytes.extend_from_slice(&source);
+        bytes.extend_from_slice(&target);
+        push_test_macho_relocation(
+            &mut bytes,
+            TestMachORelocation {
+                offset: 8,
+                symbol: 1,
+                pcrel: false,
+                length: 3,
+                external: true,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            },
+        );
+        push_test_macho_relocation(
+            &mut bytes,
+            TestMachORelocation {
+                offset: 0,
+                symbol: 0,
+                pcrel: false,
+                length: 3,
+                external: true,
+                r_type: object::macho::ARM64_RELOC_UNSIGNED,
+            },
+        );
+        assert_eq!(bytes.len(), symoff);
+        push_macho_local_symbol(
+            &mut bytes,
+            primary_name,
+            2,
+            source.len() as u64 + primary_offset,
+        );
+        push_macho_local_symbol(&mut bytes, competing_name, 2, source.len() as u64 + 0x30);
+        push_macho_symbol(&mut bytes, source_name, 1, 0);
+        bytes.extend_from_slice(&strings);
+        bytes
     }
 
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
@@ -52619,6 +53231,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: Vec::new(),
         };
 
@@ -52662,6 +53275,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: Vec::new(),
         };
 
@@ -52771,6 +53385,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: Vec::new(),
         };
 
@@ -52817,6 +53432,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: Vec::new(),
         };
         let changed_definition_paths = [changed_definition.path().to_owned()];
@@ -56487,6 +57103,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: vec![0, 1],
         };
         let changed_input_files = [hex::encode("a.o"), hex::encode("b.o")]
@@ -56526,6 +57143,7 @@ mod tests {
             output_symbols: Vec::new(),
             macho_target_moves: Vec::new(),
             macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
             changed_relocation_indices: vec![0],
         };
         let changed_input_files = [hex::encode("target.o")].into_iter().collect();
