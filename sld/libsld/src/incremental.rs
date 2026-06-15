@@ -2505,6 +2505,27 @@ fn changed_inputs_need_records_to_derive_patch_metadata(
     })
 }
 
+fn current_relocation_target_input_bytes<'data>(
+    bytes: &'data [u8],
+    input_file_path: &str,
+    input_ref: &str,
+) -> Result<Option<PatchInputBytes<'data>>> {
+    let Some(parsed) = parse_patch_input_ref(input_file_path, input_ref)? else {
+        return Ok(Some(PatchInputBytes {
+            bytes,
+            file_offset: 0,
+            archive_identifier: None,
+        }));
+    };
+    if parsed.identifier.is_empty() {
+        return Ok(None);
+    }
+    match patch_archive_member_bytes(bytes, &parsed.identifier)? {
+        ArchiveMemberMatch::Unique(member) => Ok(Some(member)),
+        ArchiveMemberMatch::Ambiguous | ArchiveMemberMatch::Unavailable => Ok(None),
+    }
+}
+
 fn relocation_target_patches_for_input(
     relocations: &mut [RelocationRecord],
     input: &FileState,
@@ -2545,7 +2566,7 @@ fn relocation_target_patches_for_input(
                 changed_relocation_indices.push(relocation_index);
                 continue;
             } else {
-                patch_input_bytes(bytes, input.path.as_str(), &target.input)?
+                current_relocation_target_input_bytes(bytes, input.path.as_str(), &target.input)?
             }
         } else {
             patch_input_bytes(bytes, input.path.as_str(), &target.input)?
@@ -41717,6 +41738,47 @@ mod tests {
 
         assert_eq!(member.bytes, b"member-data");
         assert_ne!(member.file_offset, 1);
+    }
+
+    #[test]
+    fn relocation_target_input_does_not_reuse_a_missing_members_recorded_range() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"current.o".to_vec(), 12),
+                b"current-data".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let ArchiveMemberMatch::Unique(current) =
+            patch_archive_member_bytes(&archive, b"current.o").unwrap()
+        else {
+            panic!("expected current archive member");
+        };
+        let input_file = hex::encode("libarchive.a");
+        let mut stale_ref = b"libarchive.a\0missing.o\0".to_vec();
+        stale_ref.extend_from_slice(
+            format!(
+                "{}:{}",
+                current.file_offset,
+                current.file_offset + current.bytes.len()
+            )
+            .as_bytes(),
+        );
+        let stale_ref = hex::encode(stale_ref);
+
+        assert_eq!(
+            patch_input_bytes(&archive, &input_file, &stale_ref)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"current-data"
+        );
+        assert!(
+            current_relocation_target_input_bytes(&archive, &input_file, &stale_ref)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
