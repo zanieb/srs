@@ -2817,6 +2817,26 @@ fn resolved_macho_relocation_target(
     )
 }
 
+fn resolved_macho_global_relocation_target(
+    resolutions: &[MachOSymbolResolutionRecord],
+    resolution_lookup: &MachOSymbolResolutionLookup<'_>,
+    target_name: Option<&str>,
+    target_is_global: bool,
+) -> std::result::Result<Option<(u64, Option<RelocationTargetRecord>)>, String> {
+    if !target_is_global {
+        return Ok(None);
+    }
+    let Some(target_name) = target_name else {
+        return Ok(None);
+    };
+    let Some(index) = resolution_lookup.unique_index_encoded(target_name)? else {
+        return Ok(None);
+    };
+    Ok(resolutions[index]
+        .direct_value
+        .map(|value| (value, resolutions[index].target.clone())))
+}
+
 fn finish_macho_cross_input_target_moves(
     relocations: &mut [RelocationRecord],
     target_patches: &mut RelocationTargetPatches,
@@ -17513,6 +17533,8 @@ fn macho_text_relocation_replays_for_input(
                     consumed_target_moves.insert(relocation_index);
                 }
                 let target_move = recorded_target_move.cloned().or(same_object_target_move);
+                let current_target_is_global =
+                    macho_relocation_target_is_global(&current_file, current_context.target);
                 let planned_resolution_move = if let (Some(target_name), Some(previous_target)) = (
                     relocation.target_name.as_deref(),
                     relocation.target.as_ref(),
@@ -17538,12 +17560,21 @@ fn macho_text_relocation_replays_for_input(
                     .get(&relocation_index)
                     .or(planned_resolution_move);
                 section_has_moved_target |= resolution_move.is_some();
-                let (current_target_value, current_target) = resolved_macho_relocation_target(
-                    relocation.target_value,
-                    replay_target,
-                    target_move.clone(),
-                    resolution_move,
-                );
+                let selected_global_resolution = resolved_macho_global_relocation_target(
+                    resolutions,
+                    &resolution_lookup,
+                    relocation.target_name.as_deref(),
+                    current_target_is_global,
+                )?;
+                let (current_target_value, current_target) = selected_global_resolution
+                    .unwrap_or_else(|| {
+                        resolved_macho_relocation_target(
+                            relocation.target_value,
+                            replay_target,
+                            target_move.clone(),
+                            resolution_move,
+                        )
+                    });
                 replay_target = current_target;
                 if recorded_target_move.is_some() {
                     target_output_symbols.push(RelocationTargetSymbolPatch {
@@ -17603,10 +17634,7 @@ fn macho_text_relocation_replays_for_input(
                         .unwrap_or_default(),
                     target_symbol_id: relocation.target_symbol_id,
                     target_name: relocation.target_name.clone(),
-                    target_is_global: macho_relocation_target_is_global(
-                        &current_file,
-                        current_context.target,
-                    ),
+                    target_is_global: current_target_is_global,
                     target: replay_target,
                     addend: relocation.addend,
                     chained_rebase_output_offset: None,
@@ -60367,6 +60395,35 @@ mod tests {
                 section_offset: 124,
                 ..previous_target.clone()
             })
+        );
+        let resolutions = vec![MachOSymbolResolutionRecord {
+            name: name.clone(),
+            direct_value: Some(moved_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(current_target.clone()),
+        }];
+        let resolution_lookup = MachOSymbolResolutionLookup::new(&resolutions);
+        assert_eq!(
+            resolved_macho_global_relocation_target(
+                &resolutions,
+                &resolution_lookup,
+                Some(name.as_str()),
+                true,
+            )
+            .unwrap(),
+            Some((moved_value, Some(current_target)))
+        );
+        assert_eq!(
+            resolved_macho_global_relocation_target(
+                &resolutions,
+                &resolution_lookup,
+                Some(name.as_str()),
+                false,
+            )
+            .unwrap(),
+            None
         );
         assert!(
             matching_macho_symbol_resolution_move(
