@@ -3337,7 +3337,7 @@ fn retained_macho_section_owner_mapping(
     })))
 }
 
-fn retained_macho_text_owner_mappings(
+fn retained_macho_output_owner_mappings(
     previous_bytes: &[u8],
     input_file_path: &str,
     current_resolver: &PatchInputResolver<'_>,
@@ -3367,30 +3367,41 @@ fn retained_macho_text_owner_mappings(
         if !is_supported_incremental_macho_object(&current_file) {
             continue;
         }
-        let Some(text) = current_file.section_by_name("__text") else {
-            continue;
-        };
-        let section_index = patch_section_record_index(&current_file, text.index())?;
-        if matched_sections.iter().chain(&mappings).any(|section| {
-            section.current.input == current_input && section.current.section_index == section_index
+        for section in current_file.sections().filter(|section| {
+            if section.segment_name_bytes().ok().flatten() != Some(b"__TEXT".as_slice()) {
+                return false;
+            }
+            let object::SectionFlags::MachO { flags } = section.flags() else {
+                return false;
+            };
+            match section.name_bytes().ok() {
+                Some(b"__text") => flags & object::macho::SECTION_TYPE == object::macho::S_REGULAR,
+                Some(b"__const") => flags == object::macho::S_REGULAR,
+                _ => false,
+            }
         }) {
-            continue;
-        }
-        let mapping = match retained_macho_section_owner_mapping(
-            previous_bytes,
-            input_file_path,
-            &current_input,
-            &current_file,
-            section_index,
-            section_records,
-            matched_sections,
-            &mappings,
-        )? {
-            Ok(mapping) => mapping,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        if let Some(mapping) = mapping {
-            mappings.push(mapping);
+            let is_text = section.name_bytes().ok() == Some(b"__text".as_slice());
+            let section_index = patch_section_record_index(&current_file, section.index())?;
+            let mapping = match retained_macho_section_owner_mapping(
+                previous_bytes,
+                input_file_path,
+                &current_input,
+                &current_file,
+                section_index,
+                section_records,
+                matched_sections,
+                &mappings,
+            )? {
+                Ok(mapping) => mapping,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if let Some(mapping) = mapping
+                && (is_text
+                    || mapping.previous.input_size != mapping.current.input_size
+                    || mapping.previous.data_hash != mapping.current.data_hash)
+            {
+                mappings.push(mapping);
+            }
         }
     }
     Ok(Ok(mappings))
@@ -6421,7 +6432,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         "retained Mach-O text owner needs the previous input snapshot".to_owned(),
                     ));
                 };
-                let mappings = match retained_macho_text_owner_mappings(
+                let mappings = match retained_macho_output_owner_mappings(
                     previous_bytes,
                     input.path.as_str(),
                     &current_resolver,
@@ -45525,7 +45536,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_macho_text_owner_is_recovered_from_auxiliary_match() {
+    fn retained_macho_output_owner_is_recovered_from_auxiliary_match() {
         let previous_object = test_macho_object(b"old!", b"same", 0);
         let current_object = test_macho_object(b"new!", b"same", 0);
         let input_file_path = hex::encode("input.rlib");
@@ -45623,7 +45634,7 @@ mod tests {
         }];
         let current_resolver = PatchInputResolver::new(&current, true).unwrap();
 
-        let mappings = retained_macho_text_owner_mappings(
+        let mappings = retained_macho_output_owner_mappings(
             &previous,
             &input_file_path,
             &current_resolver,
@@ -45641,6 +45652,154 @@ mod tests {
         assert_ne!(
             mappings[0].previous.data_hash,
             mappings[0].current.data_hash
+        );
+    }
+
+    #[test]
+    fn retained_macho_const_owner_requires_an_exact_record() {
+        fn archive(object: &[u8]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(b"unit.rcgu.o".to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        }
+
+        let previous_object = test_macho_object_with_text_const(b"old!", b"constant", true, false);
+        let current_object =
+            test_macho_object_with_text_const(b"newer!", b"constant-grown", true, false);
+        let previous = archive(&previous_object);
+        let current = archive(&current_object);
+        let input_file = hex::encode("input.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, b"unit.rcgu.o").unwrap()
+        else {
+            panic!("expected previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, b"unit.rcgu.o").unwrap()
+        else {
+            panic!("expected current archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap();
+        let current_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap();
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let previous_const = previous_file.section_by_name("__const").unwrap();
+        let current_const = current_file.section_by_name("__const").unwrap();
+        let text_index = patch_section_record_index(&previous_file, previous_text.index()).unwrap();
+        let const_index =
+            patch_section_record_index(&previous_file, previous_const.index()).unwrap();
+        assert_eq!(
+            text_index,
+            patch_section_record_index(&current_file, current_text.index()).unwrap()
+        );
+        assert_eq!(
+            const_index,
+            patch_section_record_index(&current_file, current_const.index()).unwrap()
+        );
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_input.clone(),
+                section_index: text_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: 0x100,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: current_input.clone(),
+                section_index: text_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: 0x100,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let text_record = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input.clone().into(),
+            section_index: text_index,
+            output_offset: 0x100,
+            size: current_text.size(),
+        };
+        let const_record = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input.into(),
+            section_index: const_index,
+            output_offset: 0x200,
+            size: current_const.size() + 8,
+        };
+        let resolver = PatchInputResolver::new(&current, true).unwrap();
+
+        let mappings = retained_macho_output_owner_mappings(
+            &previous,
+            &input_file,
+            &resolver,
+            &[text_record.clone(), const_record.clone()],
+            &matched,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].current.section_name.as_deref(),
+            Some("__TEXT,__const")
+        );
+        assert_eq!(mappings[0].current.output_offset, 0x200);
+        let resolved = resolved_patch_sections_for_input_with_resolver_detailed(
+            &input_file,
+            matched
+                .iter()
+                .map(|section| section.current.clone())
+                .chain(mappings.iter().map(|section| section.current.clone())),
+            std::iter::empty(),
+            std::iter::empty(),
+            &resolver,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+
+        assert!(
+            retained_macho_output_owner_mappings(
+                &previous,
+                &input_file,
+                &resolver,
+                std::slice::from_ref(&text_record),
+                &matched,
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+            "matched text ownership must not confer const ownership",
+        );
+
+        let mut short_const_record = const_record;
+        short_const_record.size = current_const.size() - 1;
+        assert!(
+            retained_macho_output_owner_mappings(
+                &previous,
+                &input_file,
+                &resolver,
+                &[text_record, short_const_record],
+                &matched,
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+            "const growth beyond its recorded capacity must not recover ownership",
         );
     }
 
@@ -51621,6 +51780,48 @@ mod tests {
 
     fn test_macho_object(text: &[u8], data: &[u8], data_symbol_offset: u64) -> Vec<u8> {
         test_macho_object_with_data_section_name(text, data, data_symbol_offset, b"__data")
+    }
+
+    fn test_macho_object_with_text_const(
+        text: &[u8],
+        constant: &[u8],
+        local_constant: bool,
+        text_relocation: bool,
+    ) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let mut bytes =
+            test_macho_object_with_options(text, constant, None, 0, b"__const", text_relocation);
+        let constant_section = HEADER_SIZE + SEGMENT_COMMAND_SIZE + SECTION_SIZE;
+        let segment_name = constant_section + 16..constant_section + 32;
+        bytes[segment_name.clone()].fill(0);
+        bytes[segment_name.start..segment_name.start + b"__TEXT".len()].copy_from_slice(b"__TEXT");
+
+        if local_constant {
+            let symbol_table_command = HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE;
+            let symbol_table_offset =
+                read_u32_le(&bytes[symbol_table_command + 8..symbol_table_command + 12]).unwrap()
+                    as usize;
+            let constant_symbol_type = symbol_table_offset + NLIST_64_SIZE + 4;
+            bytes[constant_symbol_type] &= !object::macho::N_EXT;
+        }
+        assert_eq!(
+            read_u32_le(&bytes[HEADER_SIZE + 4..HEADER_SIZE + 8]).unwrap() as usize,
+            SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE,
+        );
+        assert_eq!(
+            read_u32_le(
+                &bytes[HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE + 4
+                    ..HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE + 8],
+            )
+            .unwrap() as usize,
+            SYMTAB_COMMAND_SIZE,
+        );
+        bytes
     }
 
     fn test_macho_object_with_data_section_name(
