@@ -29115,10 +29115,14 @@ fn hash_validated_macho_local_relocation_target(
     ranges: &[std::ops::Range<usize>],
 ) -> Option<()> {
     let symbol = file.symbol_by_index(symbol_index).ok()?;
+    let scope = symbol.scope();
     if symbol.is_undefined()
         || symbol.is_global()
         || symbol.is_weak()
-        || symbol.scope() != object::SymbolScope::Compilation
+        || !matches!(
+            scope,
+            object::SymbolScope::Compilation | object::SymbolScope::Linkage
+        )
     {
         return None;
     }
@@ -29134,7 +29138,12 @@ fn hash_validated_macho_local_relocation_target(
         return None;
     }
 
-    hasher.update(b"sld-validated-macho-local-relocation-retarget-v1");
+    if scope == object::SymbolScope::Linkage {
+        hasher.update(b"sld-validated-macho-named-linkage-relocation-retarget-v1");
+        hash_length_prefixed(hasher, symbol.name_bytes().ok()?);
+    } else {
+        hasher.update(b"sld-validated-macho-local-relocation-retarget-v1");
+    }
     hash_macho_symbol_section(hasher, symbol.section())?;
     hasher.update(&symbol.size().to_le_bytes());
     hasher.update(&[
