@@ -4152,6 +4152,89 @@ fn finalize_retired_macho_archive_symbol_resolutions(
     Ok(())
 }
 
+fn reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
+    activation: &mut AddedMachOArchiveTextActivations,
+    rollback_symbol_resolutions: &[MachOSymbolResolutionRecord],
+) -> std::result::Result<(), String> {
+    let mut assigned = vec![Vec::new(); activation.member_states.len()];
+    for rollback in rollback_symbol_resolutions {
+        let stored_owners = activation
+            .member_states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| {
+                state
+                    .rollback_symbol_resolutions
+                    .iter()
+                    .any(|stored| stored.name == rollback.name)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let owner_index = match stored_owners.as_slice() {
+            [index] => *index,
+            [] => {
+                let Some(resolution_index) = macho_symbol_resolution_index_for_name(
+                    &activation.symbol_resolutions,
+                    rollback.name.as_str(),
+                )?
+                else {
+                    return Err(
+                        "reactivated Mach-O archive rollback symbol has no returning owner"
+                            .to_owned(),
+                    );
+                };
+                let Some(target) = activation.symbol_resolutions[resolution_index]
+                    .target
+                    .as_ref()
+                else {
+                    return Err(
+                        "reactivated Mach-O archive rollback symbol has no direct owner".to_owned(),
+                    );
+                };
+                let matching_states = activation
+                    .member_states
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, state)| {
+                        state
+                            .sections
+                            .iter()
+                            .any(|section| target.input == section.input)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let [index] = matching_states.as_slice() else {
+                    return Err(
+                        "reactivated Mach-O archive rollback symbol has no unique returning owner"
+                            .to_owned(),
+                    );
+                };
+                *index
+            }
+            _ => {
+                return Err(
+                    "reactivated Mach-O archive rollback symbol has ambiguous stored ownership"
+                        .to_owned(),
+                );
+            }
+        };
+        assigned[owner_index].push(rollback.clone());
+    }
+    for (state, mut assigned) in activation.member_states.iter_mut().zip(assigned) {
+        assigned.sort_unstable();
+        assigned.dedup();
+        if !state.rollback_symbol_resolutions.is_empty()
+            && state.rollback_symbol_resolutions != assigned
+        {
+            return Err(
+                "reactivated Mach-O archive rollback catalog changed while dormant".to_owned(),
+            );
+        }
+        state.rollback_symbol_resolutions = assigned;
+    }
+    Ok(())
+}
+
 fn combined_macho_text_relocation_retiring_names(
     retiring_names: &[SharedText],
     retired: &[RetiredMachOArchiveActivation],
@@ -6452,18 +6535,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 rollback_symbol_resolutions.sort_unstable();
                 rollback_symbol_resolutions.dedup();
                 if activation.reactivated {
-                    let mut stored_rollback_symbol_resolutions = activation
-                        .member_states
-                        .iter()
-                        .flat_map(|state| state.rollback_symbol_resolutions.iter().cloned())
-                        .collect::<Vec<_>>();
-                    stored_rollback_symbol_resolutions.sort_unstable();
-                    stored_rollback_symbol_resolutions.dedup();
-                    if stored_rollback_symbol_resolutions != rollback_symbol_resolutions {
-                        return Ok(ChangedInputPatchResult::Unsupported(
-                            "reactivated Mach-O archive rollback catalog changed while dormant"
-                                .to_owned(),
-                        ));
+                    if let Err(reason) =
+                        reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
+                            activation,
+                            &rollback_symbol_resolutions,
+                        )
+                    {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
                     }
                 } else {
                     let [state] = activation.member_states.as_mut_slice() else {
@@ -50531,7 +50609,7 @@ mod tests {
             macho_archive_members: vec![dormant, second_dormant],
             ..patch.clone()
         };
-        let multi_activation = reactivated_macho_archive_text_activation(
+        let mut multi_activation = reactivated_macho_archive_text_activation(
             &multi_current,
             &input_file,
             &[
@@ -50571,6 +50649,46 @@ mod tests {
                 .unwrap();
             assert_eq!(refreshed.identifier, expected_identifier);
         }
+        for state in &mut multi_activation.member_states {
+            state.rollback_symbol_resolutions.clear();
+        }
+        let first_predecessor = MachOSymbolResolutionRecord {
+            name: multi_activation.symbol_resolutions[0].name.clone(),
+            direct_value: Some(0x5000),
+            target: None,
+            ..rollback.clone()
+        };
+        let second_predecessor = MachOSymbolResolutionRecord {
+            name: multi_activation.symbol_resolutions[1].name.clone(),
+            direct_value: Some(0x6000),
+            target: None,
+            ..rollback.clone()
+        };
+        reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
+            &mut multi_activation,
+            &[first_predecessor.clone(), second_predecessor.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            multi_activation.member_states[0].rollback_symbol_resolutions,
+            vec![first_predecessor.clone()]
+        );
+        assert_eq!(
+            multi_activation.member_states[1].rollback_symbol_resolutions,
+            vec![second_predecessor.clone()]
+        );
+        let changed_predecessor = MachOSymbolResolutionRecord {
+            direct_value: Some(0x7000),
+            ..first_predecessor
+        };
+        assert!(
+            reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
+                &mut multi_activation,
+                &[changed_predecessor, second_predecessor],
+            )
+            .unwrap_err()
+            .contains("changed while dormant")
+        );
 
         let mut overlapping = multi_patch;
         overlapping.macho_archive_members[1].forward_patches[0].output_offset = 258;
