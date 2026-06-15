@@ -21103,6 +21103,7 @@ fn macho_definition_counts_prove_restoration(
         .all(|name| previous.get(name) == Some(&0) && current.get(name) == Some(&1))
 }
 
+#[cfg(test)]
 fn archive_macho_semantic_patch_proof_fingerprint(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
@@ -23570,9 +23571,11 @@ fn changed_macho_archive_unwind_activation(
             true,
         )?;
     if !allows_unwind_only && !allows_unwind_and_definitions {
-        return Ok(Err(
-            "changed Mach-O archive member differs outside text and unwind metadata".to_owned(),
-        ));
+        return Ok(Err(format!(
+            "changed Mach-O archive member differs outside text and unwind metadata: members={}, local-retargets={}",
+            changed.members.len(),
+            validated_local_retargets.len(),
+        )));
     }
     if reuse_owned_output {
         return Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
@@ -48057,9 +48060,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             unrelated,
-            Err(reason)
-                if reason
-                    == "changed Mach-O archive member differs outside text and unwind metadata"
+                Err(reason)
+                    if reason.starts_with(
+                        "changed Mach-O archive member differs outside text and unwind metadata"
+                    )
         ));
     }
 
