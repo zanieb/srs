@@ -5544,7 +5544,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut output_symbol_patches = Vec::new();
     let mut eh_frame_hdr_changes = Vec::new();
     let mut fde_add_candidates = Vec::new();
-    let mut retired_macho_archive_rollback_patches = Vec::new();
+    let mut historical_macho_archive_output_patches = Vec::new();
     let mut expected_changed_inputs = Vec::new();
     let mut rewritten_input_count = 0;
     let mut normalized_unchanged_input_count = 0;
@@ -8061,11 +8061,22 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 retired_macho_archive_activations,
             )
         };
-        retired_macho_archive_rollback_patches.extend(
+        historical_macho_archive_output_patches.extend(
             retired_macho_archive_activations
                 .iter()
                 .flat_map(|state| state.rollback_patches.iter().cloned()),
         );
+        if let Some(activation) = added_macho_archive_text_activation
+            .as_ref()
+            .filter(|activation| activation.reactivated)
+        {
+            historical_macho_archive_output_patches.extend(
+                activation
+                    .member_states
+                    .iter()
+                    .flat_map(|state| state.forward_patches.iter().cloned()),
+            );
+        }
         let mut macho_archive_members = previous.input_files[*input_index]
             .patch
             .as_ref()
@@ -8568,9 +8579,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         }
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
-    if let Err(reason) = remove_zero_backed_retired_patches_after_fde_terminators(
+    if let Err(reason) = remove_zero_backed_historical_patches_after_fde_terminators(
         &mut patches,
-        &retired_macho_archive_rollback_patches,
+        &historical_macho_archive_output_patches,
         &fde_add_terminator_offsets,
         &output,
     ) {
@@ -9654,19 +9665,19 @@ fn merge_compatible_overlapping_section_patches(
     Ok(())
 }
 
-fn remove_zero_backed_retired_patches_after_fde_terminators(
+fn remove_zero_backed_historical_patches_after_fde_terminators(
     patches: &mut Vec<SectionPatch>,
-    retired: &[StoredOutputPatch],
+    historical: &[StoredOutputPatch],
     terminator_offsets: &[u64],
     previous_output: &[u8],
 ) -> std::result::Result<(), String> {
-    if retired.is_empty() || terminator_offsets.is_empty() {
+    if historical.is_empty() || terminator_offsets.is_empty() {
         return Ok(());
     }
     let file = object::File::parse(previous_output)
-        .map_err(|_| "failed to parse output for retired FDE rollback composition".to_owned())?;
+        .map_err(|_| "failed to parse output for historical FDE composition".to_owned())?;
     let Some(eh_frame) = file.section_by_name(".eh_frame") else {
-        return Err("output has no .eh_frame for retired FDE rollback composition".to_owned());
+        return Err("output has no .eh_frame for historical FDE composition".to_owned());
     };
     let Some((eh_frame_start, eh_frame_size)) = eh_frame.file_range() else {
         return Err("output .eh_frame has no file range for rollback composition".to_owned());
@@ -9674,52 +9685,52 @@ fn remove_zero_backed_retired_patches_after_fde_terminators(
     let Some(eh_frame_end) = eh_frame_start.checked_add(eh_frame_size) else {
         return Err("output .eh_frame range overflowed during rollback composition".to_owned());
     };
-    remove_zero_backed_retired_patches_in_eh_frame(
+    remove_zero_backed_historical_patches_in_eh_frame(
         patches,
-        retired,
+        historical,
         terminator_offsets,
         eh_frame_start..eh_frame_end,
         previous_output,
     )
 }
 
-fn remove_zero_backed_retired_patches_in_eh_frame(
+fn remove_zero_backed_historical_patches_in_eh_frame(
     patches: &mut Vec<SectionPatch>,
-    retired: &[StoredOutputPatch],
+    historical: &[StoredOutputPatch],
     terminator_offsets: &[u64],
     eh_frame_range: std::ops::Range<u64>,
     previous_output: &[u8],
 ) -> std::result::Result<(), String> {
     let mut removable = Vec::new();
-    for rollback in retired {
-        if !terminator_offsets.contains(&rollback.output_offset) {
+    for historical_patch in historical {
+        if !terminator_offsets.contains(&historical_patch.output_offset) {
             continue;
         }
-        let rollback_size = u64::try_from(rollback.data.len())
-            .map_err(|_| "retired FDE rollback patch is too large".to_owned())?;
-        let rollback_end = rollback
+        let patch_size = u64::try_from(historical_patch.data.len())
+            .map_err(|_| "historical FDE transaction patch is too large".to_owned())?;
+        let patch_end = historical_patch
             .output_offset
-            .checked_add(rollback_size)
-            .ok_or_else(|| "retired FDE rollback patch range overflowed".to_owned())?;
-        if rollback.output_offset < eh_frame_range.start || rollback_end > eh_frame_range.end {
-            return Err("retired FDE rollback patch is outside .eh_frame".to_owned());
+            .checked_add(patch_size)
+            .ok_or_else(|| "historical FDE transaction patch range overflowed".to_owned())?;
+        if historical_patch.output_offset < eh_frame_range.start || patch_end > eh_frame_range.end {
+            return Err("historical FDE transaction patch is outside .eh_frame".to_owned());
         }
-        let start = usize::try_from(rollback.output_offset)
-            .map_err(|_| "retired FDE rollback patch offset is too large".to_owned())?;
-        let end = usize::try_from(rollback_end)
-            .map_err(|_| "retired FDE rollback patch end is too large".to_owned())?;
+        let start = usize::try_from(historical_patch.output_offset)
+            .map_err(|_| "historical FDE transaction patch offset is too large".to_owned())?;
+        let end = usize::try_from(patch_end)
+            .map_err(|_| "historical FDE transaction patch end is too large".to_owned())?;
         let bytes = previous_output
             .get(start..end)
-            .ok_or_else(|| "retired FDE rollback patch is outside output".to_owned())?;
+            .ok_or_else(|| "historical FDE transaction patch is outside output".to_owned())?;
         if bytes.iter().all(|byte| *byte == 0) {
-            removable.push(rollback);
+            removable.push(historical_patch);
         }
     }
     patches.retain(|patch| {
-        !removable.iter().any(|rollback| {
-            patch.output_offset == rollback.output_offset
-                && usize::try_from(patch.size).is_ok_and(|size| size == rollback.data.len())
-                && patch.data == rollback.data
+        !removable.iter().any(|historical_patch| {
+            patch.output_offset == historical_patch.output_offset
+                && usize::try_from(patch.size).is_ok_and(|size| size == historical_patch.data.len())
+                && patch.data == historical_patch.data
                 && patch.deferred_relocation.is_none()
                 && patch.preserve_ranges.is_empty()
                 && patch.adjustments.is_empty()
@@ -61814,7 +61825,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fde_terminator_shadows_zero_backed_retired_rollback() {
+    fn current_fde_terminator_shadows_zero_backed_historical_patch() {
         let patch = |output_offset, data: Vec<u8>| SectionPatch {
             output_offset,
             size: data.len() as u64,
@@ -61833,7 +61844,7 @@ mod tests {
         ];
         let output = vec![0; 32];
 
-        remove_zero_backed_retired_patches_in_eh_frame(
+        remove_zero_backed_historical_patches_in_eh_frame(
             &mut patches,
             std::slice::from_ref(&rollback),
             &[19],
@@ -61851,7 +61862,7 @@ mod tests {
             patch(16, vec![1, 2, 3, 0, 0, 0, 0]),
             patch(rollback.output_offset, rollback.data.clone()),
         ];
-        remove_zero_backed_retired_patches_in_eh_frame(
+        remove_zero_backed_historical_patches_in_eh_frame(
             &mut patches,
             &[rollback],
             &[19],
