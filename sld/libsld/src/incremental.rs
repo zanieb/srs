@@ -9989,12 +9989,7 @@ impl DirectlyPatchedOutput {
                 (Some(_), None) | (None, None) if !output_exists => {}
                 _ => return None,
             }
-            let generation = directly_patched_output_generation_path(state_dir);
-            if !clone_snapshot_bytes(snapshot, &generation)
-                && std::fs::copy(snapshot, &generation).is_err()
-            {
-                return None;
-            }
+            let generation = install_unique_output_generation_copy(state_dir, snapshot).ok()?;
             let install_if_missing = !output_exists;
             return Some(Self {
                 path: generation,
@@ -10130,6 +10125,12 @@ impl DirectlyPatchedOutput {
             verbose_timing_phase!("Exchange directly patched output generation");
             let generation_identity = FileIdentity::from_path(&self.path)?;
             pre_exchange_hook();
+            if FileIdentity::from_path(published_path)?.as_ref() != Some(expected) {
+                return Err(crate::error!(
+                    "Refusing to replace changed incremental output `{}`",
+                    published_path.display()
+                ));
+            }
             if let Err(error) =
                 exchange_directly_patched_output_generation(&self.path, published_path)
             {
@@ -10151,24 +10152,13 @@ impl DirectlyPatchedOutput {
             let predecessor_matches = FileIdentity::from_path(&self.path)?
                 .as_ref()
                 .is_some_and(|actual| actual.matches_same_data_ignoring_change_time(expected));
-            if !predecessor_matches {
-                let public_still_names_generation = FileIdentity::from_path(published_path)?
-                    .as_ref()
-                    .zip(generation_identity.as_ref())
-                    .is_some_and(|(actual, generation)| {
-                        actual.matches_same_data_ignoring_change_time(generation)
-                    });
-                if public_still_names_generation
-                    && exchange_directly_patched_output_generation(&self.path, published_path)
-                        .is_ok()
-                {
-                    self.remove_path_on_drop = FileIdentity::from_path(&self.path)?
-                        .as_ref()
-                        .zip(generation_identity.as_ref())
-                        .is_some_and(|(actual, generation)| {
-                            actual.matches_same_data_ignoring_change_time(generation)
-                        });
-                }
+            let public_matches_generation = FileIdentity::from_path(published_path)?
+                .as_ref()
+                .zip(generation_identity.as_ref())
+                .is_some_and(|(actual, generation)| {
+                    actual.matches_same_data_ignoring_change_time(generation)
+                });
+            if !predecessor_matches || !public_matches_generation {
                 return Err(crate::error!(
                     "Refusing to replace raced incremental output `{}`",
                     published_path.display()
@@ -10253,12 +10243,60 @@ fn directly_patched_output_standby_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DIRECT_PATCH_STANDBY_FILE)
 }
 
-fn directly_patched_output_generation_path(state_dir: &Path) -> PathBuf {
-    let sequence = DIRECT_PATCH_GENERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+fn directly_patched_output_generation_path(state_dir: &Path, sequence: &AtomicUsize) -> PathBuf {
+    let sequence = sequence.fetch_add(1, Ordering::Relaxed);
     state_dir.join(format!(
         "{DIRECT_PATCH_STANDBY_FILE}.{}.{sequence}",
         std::process::id()
     ))
+}
+
+fn install_unique_output_generation_copy(state_dir: &Path, source: &Path) -> Result<PathBuf> {
+    install_unique_output_generation_copy_with_sequence(
+        state_dir,
+        source,
+        &DIRECT_PATCH_GENERATION_SEQUENCE,
+    )
+}
+
+fn install_unique_output_generation_copy_with_sequence(
+    state_dir: &Path,
+    source: &Path,
+    sequence: &AtomicUsize,
+) -> Result<PathBuf> {
+    loop {
+        let generation = directly_patched_output_generation_path(state_dir, sequence);
+        if clone_snapshot_bytes(source, &generation) {
+            return Ok(generation);
+        }
+        let mut target = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&generation)
+        {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut source_file = std::fs::File::open(source)?;
+        if let Err(error) = std::io::copy(&mut source_file, &mut target) {
+            drop(target);
+            let _ = std::fs::remove_file(&generation);
+            return Err(error.into());
+        }
+        let permissions = match std::fs::metadata(source) {
+            Ok(metadata) => metadata.permissions(),
+            Err(error) => {
+                let _ = std::fs::remove_file(&generation);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = std::fs::set_permissions(&generation, permissions) {
+            let _ = std::fs::remove_file(&generation);
+            return Err(error.into());
+        }
+        return Ok(generation);
+    }
 }
 
 fn directly_patched_output_standby_state_path(state_dir: &Path) -> PathBuf {
@@ -39282,7 +39320,7 @@ mod tests {
 
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
-    fn directly_patched_live_snapshot_does_not_delete_second_raced_destination() {
+    fn directly_patched_live_snapshot_does_not_accept_post_exchange_destination() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("app");
         let state_dir = dir.path().join("app.incr");
@@ -39302,16 +39340,14 @@ mod tests {
         .unwrap();
         std::fs::write(patched.path(), b"changed!").unwrap();
         let private_path = patched.path().to_path_buf();
-        let first_replacement = dir.path().join("first-replacement");
         let second_replacement = dir.path().join("second-replacement");
-        std::fs::write(&first_replacement, b"first!!!").unwrap();
         std::fs::write(&second_replacement, b"second!!").unwrap();
 
         assert!(
             patched
                 .install_with_exchange_hooks(
                     &[0..8],
-                    || std::fs::rename(&first_replacement, &output).unwrap(),
+                    || {},
                     || std::fs::rename(&second_replacement, &output).unwrap(),
                 )
                 .is_err()
@@ -39319,8 +39355,30 @@ mod tests {
         drop(patched);
 
         assert_eq!(std::fs::read(&output).unwrap(), b"second!!");
-        assert_eq!(std::fs::read(&private_path).unwrap(), b"first!!!");
+        assert_eq!(std::fs::read(&private_path).unwrap(), b"original");
         std::fs::remove_file(private_path).unwrap();
+    }
+
+    #[test]
+    fn unique_output_generation_copy_preserves_colliding_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"source").unwrap();
+        let collision = dir.path().join(format!(
+            "{DIRECT_PATCH_STANDBY_FILE}.{}.0",
+            std::process::id()
+        ));
+        std::fs::write(&collision, b"preserve").unwrap();
+        let sequence = AtomicUsize::new(0);
+
+        let generation =
+            install_unique_output_generation_copy_with_sequence(dir.path(), &source, &sequence)
+                .unwrap();
+
+        assert_ne!(generation, collision);
+        assert_eq!(std::fs::read(&collision).unwrap(), b"preserve");
+        assert_eq!(std::fs::read(&generation).unwrap(), b"source");
+        std::fs::remove_file(generation).unwrap();
     }
 
     #[cfg(target_os = "macos")]
