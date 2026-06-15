@@ -8476,7 +8476,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     }
 
     deduplicate_identical_plain_section_patches(&mut patches);
-    merge_compatible_overlapping_plain_section_patches(&mut patches);
+    if let Err(reason) = merge_compatible_overlapping_section_patches(&mut patches, None) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
     if let Some(reason) = patch_output_range_rejection_reason(&patches) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -8556,7 +8558,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         Ok(header_patches) => patches.extend(header_patches),
         Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
     }
-    merge_compatible_overlapping_plain_section_patches(&mut patches);
+    if let Err(reason) = merge_compatible_overlapping_section_patches(&mut patches, Some(&output)) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
+    }
     if let Some(reason) = patch_output_range_rejection_reason(&patches) {
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
@@ -9530,31 +9534,20 @@ fn deduplicate_identical_plain_section_patches(patches: &mut Vec<SectionPatch>) 
     *patches = unique;
 }
 
-fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionPatch>) {
+fn merge_compatible_overlapping_section_patches(
+    patches: &mut Vec<SectionPatch>,
+    previous_output: Option<&[u8]>,
+) -> std::result::Result<(), String> {
     loop {
         let mut merged = None;
         'pairs: for left_index in 0..patches.len() {
             let left = &patches[left_index];
-            if left.deferred_relocation.is_some()
-                || !left.preserve_ranges.is_empty()
-                || !left.adjustments.is_empty()
-                || left.size as usize != left.data.len()
-            {
-                continue;
-            }
             let left_start = left.output_offset;
             let Some(left_end) = left_start.checked_add(left.size) else {
                 continue;
             };
             for right_index in left_index + 1..patches.len() {
                 let right = &patches[right_index];
-                if right.deferred_relocation.is_some()
-                    || !right.preserve_ranges.is_empty()
-                    || !right.adjustments.is_empty()
-                    || right.size as usize != right.data.len()
-                {
-                    continue;
-                }
                 let right_start = right.output_offset;
                 let Some(right_end) = right_start.checked_add(right.size) else {
                     continue;
@@ -9564,6 +9557,23 @@ fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionP
                 if overlap_start >= overlap_end {
                     continue;
                 }
+                let materialized_data = |patch: &SectionPatch| {
+                    if let Some(previous_output) = previous_output {
+                        return stored_output_patch(patch, previous_output)
+                            .map(|patch| Some(patch.data));
+                    }
+                    let is_complete_plain_patch = patch.deferred_relocation.is_none()
+                        && patch.preserve_ranges.is_empty()
+                        && patch.adjustments.is_empty()
+                        && usize::try_from(patch.size).is_ok_and(|size| size == patch.data.len());
+                    Ok(is_complete_plain_patch.then(|| patch.data.clone()))
+                };
+                let Some(left_data) = materialized_data(left)? else {
+                    continue;
+                };
+                let Some(right_data) = materialized_data(right)? else {
+                    continue;
+                };
                 let (Ok(left_overlap_start), Ok(right_overlap_start), Ok(overlap_len)) = (
                     usize::try_from(overlap_start - left_start),
                     usize::try_from(overlap_start - right_start),
@@ -9571,8 +9581,8 @@ fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionP
                 ) else {
                     continue;
                 };
-                if left.data[left_overlap_start..left_overlap_start + overlap_len]
-                    != right.data[right_overlap_start..right_overlap_start + overlap_len]
+                if left_data[left_overlap_start..left_overlap_start + overlap_len]
+                    != right_data[right_overlap_start..right_overlap_start + overlap_len]
                 {
                     continue;
                 }
@@ -9586,8 +9596,8 @@ fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionP
                     continue;
                 };
                 let mut data = vec![0; data_len];
-                data[left_offset..left_offset + left.data.len()].copy_from_slice(&left.data);
-                data[right_offset..right_offset + right.data.len()].copy_from_slice(&right.data);
+                data[left_offset..left_offset + left_data.len()].copy_from_slice(&left_data);
+                data[right_offset..right_offset + right_data.len()].copy_from_slice(&right_data);
                 merged = Some((
                     left_index,
                     right_index,
@@ -9609,6 +9619,7 @@ fn merge_compatible_overlapping_plain_section_patches(patches: &mut Vec<SectionP
         patches[left_index] = patch;
         patches.remove(right_index);
     }
+    Ok(())
 }
 
 fn remove_plain_patches_shadowed_by_exact_current_ranges(
@@ -61669,7 +61680,7 @@ mod tests {
         };
         let mut patches = vec![patch(16, vec![1, 2, 3, 0]), patch(19, vec![0, 4, 5, 6])];
 
-        merge_compatible_overlapping_plain_section_patches(&mut patches);
+        merge_compatible_overlapping_section_patches(&mut patches, None).unwrap();
 
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].output_offset, 16);
@@ -61678,9 +61689,19 @@ mod tests {
         assert!(patch_output_range_rejection_reason(&patches).is_none());
 
         let mut conflicting = vec![patch(16, vec![1, 2]), patch(17, vec![3, 4])];
-        merge_compatible_overlapping_plain_section_patches(&mut conflicting);
+        merge_compatible_overlapping_section_patches(&mut conflicting, None).unwrap();
         assert_eq!(conflicting.len(), 2);
         assert!(patch_output_range_rejection_reason(&conflicting).is_some());
+
+        let mut previous_output = vec![0; 32];
+        previous_output[19] = 0;
+        let mut preserved = patch(16, vec![1, 2, 3, 9]);
+        preserved.preserve_ranges.push(3..4);
+        let mut materialized = vec![preserved, patch(19, vec![0, 4, 5, 6])];
+        merge_compatible_overlapping_section_patches(&mut materialized, Some(&previous_output))
+            .unwrap();
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].data, vec![1, 2, 3, 0, 4, 5, 6]);
     }
 
     #[test]
