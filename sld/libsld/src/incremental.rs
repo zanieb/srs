@@ -7490,6 +7490,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 false
             };
+            if let Err(reason) = compose_relocation_target_patches_with_section_patches(
+                &mut resolved_patches,
+                &mut relocation_target_patches.output_patches,
+            ) {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
             if !macho_reserved_thunk_patches.is_empty() {
                 if !records_complete {
                     return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
@@ -8942,6 +8948,67 @@ struct PatchAdjustment {
 struct ResolvedSectionPatch {
     section: PatchSection,
     patch: SectionPatch,
+}
+
+fn compose_relocation_target_patches_with_section_patches(
+    section_patches: &mut [ResolvedSectionPatch],
+    relocation_patches: &mut Vec<SectionPatch>,
+) -> std::result::Result<(), String> {
+    let mut remaining = Vec::new();
+    for relocation_patch in relocation_patches.drain(..) {
+        let relocation_start = relocation_patch.output_offset;
+        let relocation_end = relocation_start
+            .checked_add(relocation_patch.size)
+            .ok_or_else(|| "relocation target patch range overflowed".to_owned())?;
+        let containing = section_patches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, section_patch)| {
+                let section_start = section_patch.patch.output_offset;
+                let section_end = section_start.checked_add(section_patch.patch.size)?;
+                (relocation_start >= section_start && relocation_end <= section_end)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let Some(&section_index) = containing.first() else {
+            remaining.push(relocation_patch);
+            continue;
+        };
+        if containing.len() != 1 {
+            return Err("relocation target patch matched multiple sections".to_owned());
+        }
+        let section_patch = &mut section_patches[section_index];
+        if relocation_patch.deferred_relocation.is_some()
+            || !relocation_patch.preserve_ranges.is_empty()
+            || !relocation_patch.adjustments.is_empty()
+            || relocation_patch.data.len() as u64 != relocation_patch.size
+        {
+            return Err("relocation target patch cannot be composed".to_owned());
+        }
+        let start = usize::try_from(relocation_start - section_patch.patch.output_offset)
+            .map_err(|_| "relocation target patch offset is too large".to_owned())?;
+        let end = start
+            .checked_add(relocation_patch.data.len())
+            .ok_or_else(|| "relocation target patch range overflowed".to_owned())?;
+        let range = start..end;
+        let Some(preserve_index) = section_patch
+            .patch
+            .preserve_ranges
+            .iter()
+            .position(|preserve| preserve == &range)
+        else {
+            return Err(
+                "relocation target patch does not match a preserved relocation field".to_owned(),
+            );
+        };
+        let Some(data) = section_patch.patch.data.get_mut(range) else {
+            return Err("relocation target patch is outside section data".to_owned());
+        };
+        data.copy_from_slice(&relocation_patch.data);
+        section_patch.patch.preserve_ranges.remove(preserve_index);
+    }
+    *relocation_patches = remaining;
+    Ok(())
 }
 
 struct DynamicRelocationPatch {
@@ -60638,6 +60705,59 @@ mod tests {
                 24,
                 None
             )]
+        );
+    }
+
+    #[test]
+    fn relocation_target_patch_replaces_exact_preserved_section_field() {
+        let section_patch = || ResolvedSectionPatch {
+            section: PatchSection {
+                input: "input.o".to_owned(),
+                section_index: 0,
+                section_name: Some("__DATA,__const".to_owned()),
+                input_size: 16,
+                output_offset: 0x100,
+                output_size: 16,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            patch: SectionPatch {
+                output_offset: 0x100,
+                size: 16,
+                data: vec![0; 16],
+                deferred_relocation: None,
+                preserve_ranges: vec![4..12],
+                adjustments: Vec::new(),
+            },
+        };
+        let relocation_patch = |output_offset| SectionPatch {
+            output_offset,
+            size: 8,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut sections = [section_patch()];
+        let mut relocations = vec![relocation_patch(0x104), relocation_patch(0x200)];
+
+        compose_relocation_target_patches_with_section_patches(&mut sections, &mut relocations)
+            .unwrap();
+
+        assert_eq!(sections[0].patch.data[4..12], [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(sections[0].patch.preserve_ranges.is_empty());
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].output_offset, 0x200);
+
+        let mut sections = [section_patch()];
+        let mut relocations = vec![relocation_patch(0x105)];
+        assert_eq!(
+            compose_relocation_target_patches_with_section_patches(
+                &mut sections,
+                &mut relocations,
+            )
+            .unwrap_err(),
+            "relocation target patch does not match a preserved relocation field",
         );
     }
 
