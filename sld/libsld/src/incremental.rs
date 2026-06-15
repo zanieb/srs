@@ -6644,50 +6644,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .into_iter()
                 .flat_map(|activation| activation.normalized_identifiers.iter().cloned())
                 .collect::<Vec<_>>();
-            let mut changed_macho_archive_unwind_activation = if args
-                .should_activate_macho_archive_members()
-                && added_macho_archive_text_activation
-                    .as_ref()
-                    .is_none_or(|activation| activation.reactivated)
-            {
-                let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
-                    return Ok(ChangedInputPatchResult::Unsupported(
-                        "changed Mach-O unwind metadata needs the previous input snapshot"
-                            .to_owned(),
-                    ));
-                };
-                match changed_macho_archive_unwind_activation(
-                    previous_bytes,
-                    &bytes,
-                    input.path.as_str(),
-                    &matched_sections,
-                    &previous.sections,
-                    &current_sections,
-                    &current_resolver,
-                    previous_output.get()?,
-                    &previous.macho_symbol_resolutions,
-                    activation_reserved_ranges,
-                    changed_macho_definition_activation
-                        .as_ref()
-                        .map_or(&[], |activation| activation.added_names.as_slice()),
-                    changed_macho_definition_activation
-                        .as_ref()
-                        .map_or(&[], |activation| activation.retired_names.as_slice()),
-                    changed_macho_definition_activation
-                        .as_ref()
-                        .is_some_and(ChangedMachODefinitionActivation::owns_changed_unwind),
-                    &retired_macho_archive_identifiers,
-                    &reactivated_macho_archive_identifiers,
-                    &relocation_target_patches.validated_macho_local_retargets,
-                )? {
-                    Ok(activation) => activation,
-                    Err(reason) => {
-                        return Ok(ChangedInputPatchResult::Unsupported(reason));
-                    }
-                }
-            } else {
-                None
-            };
             let stable_relocation_count = previous.relocations.len();
             if let Some(activation) = &mut added_macho_archive_text_activation {
                 if !records_complete {
@@ -6848,6 +6804,50 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         symbol_resolutions_changed: false,
                     }
                 }
+            };
+            let mut changed_macho_archive_unwind_activation = if args
+                .should_activate_macho_archive_members()
+                && added_macho_archive_text_activation
+                    .as_ref()
+                    .is_none_or(|activation| activation.reactivated)
+            {
+                let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "changed Mach-O unwind metadata needs the previous input snapshot"
+                            .to_owned(),
+                    ));
+                };
+                match changed_macho_archive_unwind_activation(
+                    previous_bytes,
+                    &bytes,
+                    input.path.as_str(),
+                    &matched_sections,
+                    &previous.sections,
+                    &current_sections,
+                    &current_resolver,
+                    previous_output.get()?,
+                    &previous.macho_symbol_resolutions,
+                    activation_reserved_ranges,
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .map_or(&[], |activation| activation.added_names.as_slice()),
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .map_or(&[], |activation| activation.retired_names.as_slice()),
+                    changed_macho_definition_activation
+                        .as_ref()
+                        .is_some_and(ChangedMachODefinitionActivation::owns_changed_unwind),
+                    &retired_macho_archive_identifiers,
+                    &reactivated_macho_archive_identifiers,
+                    &relocation_target_patches.validated_macho_local_retargets,
+                )? {
+                    Ok(activation) => activation,
+                    Err(reason) => {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
+                    }
+                }
+            } else {
+                None
             };
             if let Some(activation) = &added_macho_archive_text_activation {
                 macho_text_relocation_replays
