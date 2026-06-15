@@ -8893,7 +8893,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     }
     drop(output);
     drop(file);
-    directly_patched_output.install(&flush_ranges)?;
+    let installed_output_identity = directly_patched_output.install(&flush_ranges)?;
 
     let output = directly_patched_output_content_state(args, args.output()).with_context(|| {
         format!(
@@ -8901,6 +8901,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             args.output().display()
         )
     })?;
+    if installed_output_identity.as_ref().is_some_and(|installed| {
+        output
+            .identity
+            .as_ref()
+            .is_none_or(|current| !current.matches_same_data_ignoring_change_time(installed))
+    }) {
+        return Err(crate::error!(
+            "Incrementally patched output `{}` changed before state capture",
+            args.output().display()
+        ));
+    }
     if args.should_retain_output_snapshot() {
         timing_phase!("Update incremental output snapshot");
         update_output_snapshot_from_ranges(state_dir, args.output(), &flush_ranges)?;
@@ -10067,7 +10078,7 @@ impl DirectlyPatchedOutput {
         !self.is_generation()
     }
 
-    fn install(&mut self, ranges: &[std::ops::Range<usize>]) -> Result {
+    fn install(&mut self, ranges: &[std::ops::Range<usize>]) -> Result<Option<FileIdentity>> {
         self.install_with_exchange_hooks(ranges, || {}, || {})
     }
 
@@ -10076,9 +10087,9 @@ impl DirectlyPatchedOutput {
         ranges: &[std::ops::Range<usize>],
         pre_exchange_hook: impl FnOnce(),
         post_exchange_hook: impl FnOnce(),
-    ) -> Result {
+    ) -> Result<Option<FileIdentity>> {
         let Some(published_path) = self.published_path.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         if self.install_if_missing {
             std::fs::hard_link(&self.path, published_path).with_context(|| {
@@ -10087,6 +10098,7 @@ impl DirectlyPatchedOutput {
                     published_path.display()
                 )
             })?;
+            let installed_identity = FileIdentity::from_path(published_path)?;
             std::fs::remove_file(&self.path).with_context(|| {
                 format!(
                     "Failed to remove directly patched output generation `{}`",
@@ -10094,7 +10106,7 @@ impl DirectlyPatchedOutput {
                 )
             })?;
             self.published_path = None;
-            return Ok(());
+            return Ok(installed_identity);
         }
         if self.standby_state_path.is_none()
             && let Some(expected) = self.published_identity.as_ref()
@@ -10106,6 +10118,7 @@ impl DirectlyPatchedOutput {
                         published_path.display()
                     )
                 })?;
+                let installed_identity = FileIdentity::from_path(published_path)?;
                 std::fs::remove_file(&self.path).with_context(|| {
                     format!(
                         "Failed to remove directly patched output generation `{}`",
@@ -10113,7 +10126,7 @@ impl DirectlyPatchedOutput {
                     )
                 })?;
                 self.published_path = None;
-                return Ok(());
+                return Ok(installed_identity);
             }
             let actual = FileIdentity::from_path(published_path)?;
             if actual.as_ref() != Some(expected) {
@@ -10141,9 +10154,10 @@ impl DirectlyPatchedOutput {
                             published_path.display()
                         )
                     })?;
+                    let installed_identity = FileIdentity::from_path(published_path)?;
                     std::fs::remove_file(&self.path)?;
                     self.published_path = None;
-                    return Ok(());
+                    return Ok(installed_identity);
                 }
                 return Err(error);
             }
@@ -10166,8 +10180,9 @@ impl DirectlyPatchedOutput {
             }
             std::fs::remove_file(&self.path)?;
             self.published_path = None;
-            return Ok(());
+            return Ok(generation_identity);
         }
+        let generation_identity = FileIdentity::from_path(&self.path)?;
         verbose_timing_phase!("Install directly patched output generation");
         install_directly_patched_output_generation(&self.path, published_path)?;
         let standby_is_predecessor = self
@@ -10199,7 +10214,7 @@ impl DirectlyPatchedOutput {
             let _ = std::fs::remove_file(standby_state_path);
         }
         self.published_path = None;
-        Ok(())
+        Ok(generation_identity)
     }
 }
 
