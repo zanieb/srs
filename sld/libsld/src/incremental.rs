@@ -20724,7 +20724,7 @@ fn archive_macho_semantic_patch_proof_fingerprint(
     )
 }
 
-fn archive_macho_member_retirement_fingerprint(
+fn archive_macho_masked_local_semantic_fingerprint(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
     ignored_identifiers: &[Vec<u8>],
@@ -21260,13 +21260,13 @@ fn archive_diff_allows_owned_macho_member_exchange(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_fingerprint = archive_macho_member_retirement_fingerprint(
+    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint(
         previous_bytes,
         &previous_ranges,
         removed_identifiers,
         &restored_names,
     )?;
-    let current_fingerprint = archive_macho_member_retirement_fingerprint(
+    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint(
         current_bytes,
         &current_ranges,
         added_identifiers,
@@ -22944,16 +22944,13 @@ fn archive_diff_allows_changed_macho_unwind(
     if previous_fingerprint == current_fingerprint {
         return Ok(true);
     }
-    if ignored_previous_identifiers.is_empty() && ignored_current_identifiers.is_empty() {
-        return Ok(false);
-    }
-    let previous_fingerprint = archive_macho_member_retirement_fingerprint(
+    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint(
         previous_bytes,
         &previous_ranges,
         ignored_previous_identifiers,
         &HashSet::new(),
     )?;
-    let current_fingerprint = archive_macho_member_retirement_fingerprint(
+    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint(
         current_bytes,
         &current_ranges,
         ignored_current_identifiers,
@@ -46837,7 +46834,14 @@ mod tests {
                 object[text_offset] ^= 1;
                 object
             };
-        let current_object = replace_unwind_length(previous_object.clone(), 0x258_u32, 0x250_u32);
+        let mut current_object =
+            replace_unwind_length(previous_object.clone(), 0x258_u32, 0x250_u32);
+        let local_entry = macho_symbol_value_field_range(&current_object, object::SymbolIndex(1))
+            .unwrap()
+            .start
+            - 8;
+        assert_eq!(current_object[local_entry + 4] & object::macho::N_EXT, 0);
+        current_object[local_entry + 4] |= object::macho::N_STAB;
         let next_object = replace_unwind_length(current_object.clone(), 0x250_u32, 0x248_u32);
 
         let input_file_path = hex::encode("input.rlib");
