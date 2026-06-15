@@ -6642,6 +6642,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &previous.macho_symbol_resolutions,
                     &retained_macho_archive_members,
                     &macho_resolution_updates.retiring_names,
+                    &retired_macho_archive_activations
+                        .iter()
+                        .flat_map(|state| state.rollback_symbol_resolutions.iter().cloned())
+                        .collect::<Vec<_>>(),
                     text_activation_reserved_ranges,
                 )? {
                     Ok(activation) => activation,
@@ -7391,79 +7395,91 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 } else {
                     false
                 };
-            let activated_archive_base_diff_is_member_addition = if let Some(activation) =
-                added_macho_archive_text_activation.as_ref()
-                && !activated_archive_base_fingerprint_matches
-            {
-                let previous_bytes = {
-                    timing_phase!("Read previous incremental input snapshot");
-                    previous_snapshot_bytes.get()?
-                };
-                if let Some(previous_bytes) = previous_bytes {
-                    let previous_unwind_input_ranges = activation
-                        .previous_unwind_input_ranges
-                        .iter()
-                        .cloned()
-                        .chain(
-                            changed_macho_archive_unwind_activation
-                                .as_ref()
-                                .into_iter()
-                                .flat_map(|activation| {
-                                    activation.previous_input_ranges.iter().cloned()
-                                }),
-                        )
-                        .collect::<Vec<_>>();
-                    let current_unwind_input_ranges = activation
-                        .current_unwind_input_ranges
-                        .iter()
-                        .cloned()
-                        .chain(
-                            changed_macho_archive_unwind_activation
-                                .as_ref()
-                                .into_iter()
-                                .flat_map(|activation| {
-                                    activation.current_input_ranges.iter().cloned()
-                                }),
-                        )
-                        .collect::<Vec<_>>();
-                    let removed_identifiers = retired_macho_archive_activations
-                        .iter()
-                        .flat_map(|state| {
-                            state
-                                .members
-                                .iter()
-                                .map(|member| member.normalized_identifier.clone())
-                        })
-                        .collect::<Vec<_>>();
-                    let restored_names = restored_macho_archive_resolution_names(
-                        &retired_macho_archive_activations,
-                        &migrated_macho_resolution_updates.moves,
-                    );
-                    archive_diff_allows_owned_macho_member_exchange(
-                        previous_bytes,
-                        &bytes,
-                        input.path.as_str(),
-                        &matched_sections,
-                        &current_resolver,
-                        &removed_identifiers,
-                        &ignored_archive_identifiers,
-                        &restored_names,
-                        &relocation_target_patches.validated_macho_local_retargets,
-                        &previous_unwind_input_ranges,
-                        &current_unwind_input_ranges,
-                    )?
+            let activated_archive_base_diff_is_owned_exchange =
+                if (added_macho_archive_text_activation.is_some()
+                    || !retired_macho_archive_activations.is_empty())
+                    && !activated_archive_base_fingerprint_matches
+                {
+                    let previous_bytes = {
+                        timing_phase!("Read previous incremental input snapshot");
+                        previous_snapshot_bytes.get()?
+                    };
+                    if let Some(previous_bytes) = previous_bytes {
+                        let previous_unwind_input_ranges = added_macho_archive_text_activation
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|activation| {
+                                activation.previous_unwind_input_ranges.iter().cloned()
+                            })
+                            .chain(
+                                changed_macho_archive_unwind_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.previous_input_ranges.iter().cloned()
+                                    }),
+                            )
+                            .collect::<Vec<_>>();
+                        let current_unwind_input_ranges = added_macho_archive_text_activation
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|activation| {
+                                activation.current_unwind_input_ranges.iter().cloned()
+                            })
+                            .chain(
+                                changed_macho_archive_unwind_activation
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|activation| {
+                                        activation.current_input_ranges.iter().cloned()
+                                    }),
+                            )
+                            .collect::<Vec<_>>();
+                        let removed_identifiers = retired_macho_archive_activations
+                            .iter()
+                            .flat_map(|state| {
+                                state
+                                    .members
+                                    .iter()
+                                    .map(|member| member.normalized_identifier.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        let restored_names = restored_macho_archive_resolution_names(
+                            &retired_macho_archive_activations,
+                            &migrated_macho_resolution_updates.moves,
+                        );
+                        let retiring_names = added_macho_archive_text_activation
+                            .as_ref()
+                            .map(|activation| {
+                                activation.recycled_symbol_resolution_names.as_slice()
+                            })
+                            .unwrap_or_default();
+                        archive_diff_allows_owned_macho_member_exchange(
+                            previous_bytes,
+                            &bytes,
+                            input.path.as_str(),
+                            &matched_sections,
+                            &current_resolver,
+                            &removed_identifiers,
+                            &ignored_archive_identifiers,
+                            &restored_names,
+                            retiring_names,
+                            &relocation_target_patches.validated_macho_local_retargets,
+                            &previous_unwind_input_ranges,
+                            &current_unwind_input_ranges,
+                        )?
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
             if (added_macho_archive_text_activation.is_some()
                 || changed_macho_definition_activation.is_some()
                 || !replaced_archive_identifiers.is_empty())
                 && !activated_archive_base_fingerprint_matches
                 && !activated_archive_base_diff_is_changed_definitions
-                && !activated_archive_base_diff_is_member_addition
+                && !activated_archive_base_diff_is_owned_exchange
             {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed archive members outside activated Mach-O text members in `{}`: base={:?}, previous={}, added={}, changed-definitions={}, replaced={}, ignored={}",
@@ -7611,73 +7627,79 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     } else {
                         false
                     };
-                let allows_owned_macho_member_removal =
-                    if retired_macho_archive_activations.is_empty() {
-                        false
-                    } else if let Some(previous_bytes) = previous_snapshot_bytes {
-                        let removed_identifiers = retired_macho_archive_activations
-                            .iter()
-                            .flat_map(|state| {
-                                state
-                                    .members
-                                    .iter()
-                                    .map(|member| member.normalized_identifier.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        let restored_names = restored_macho_archive_resolution_names(
-                            &retired_macho_archive_activations,
-                            &migrated_macho_resolution_updates.moves,
-                        );
-                        let previous_unwind_input_ranges = added_macho_archive_text_activation
-                            .as_ref()
-                            .into_iter()
-                            .flat_map(|activation| {
-                                activation.previous_unwind_input_ranges.iter().cloned()
-                            })
-                            .chain(
-                                changed_macho_archive_unwind_activation
-                                    .as_ref()
-                                    .into_iter()
-                                    .flat_map(|activation| {
-                                        activation.previous_input_ranges.iter().cloned()
-                                    }),
-                            )
-                            .collect::<Vec<_>>();
-                        let current_unwind_input_ranges = added_macho_archive_text_activation
-                            .as_ref()
-                            .into_iter()
-                            .flat_map(|activation| {
-                                activation.current_unwind_input_ranges.iter().cloned()
-                            })
-                            .chain(
-                                changed_macho_archive_unwind_activation
-                                    .as_ref()
-                                    .into_iter()
-                                    .flat_map(|activation| {
-                                        activation.current_input_ranges.iter().cloned()
-                                    }),
-                            )
-                            .collect::<Vec<_>>();
-                        let added_identifiers = added_macho_archive_text_activation
-                            .as_ref()
-                            .map(|activation| activation.normalized_identifiers.as_slice())
-                            .unwrap_or_default();
-                        archive_diff_allows_owned_macho_member_exchange(
-                            previous_bytes,
-                            &bytes,
-                            input.path.as_str(),
-                            &matched_sections,
-                            &current_resolver,
-                            &removed_identifiers,
-                            added_identifiers,
-                            &restored_names,
-                            &relocation_target_patches.validated_macho_local_retargets,
-                            &previous_unwind_input_ranges,
-                            &current_unwind_input_ranges,
-                        )?
-                    } else {
-                        false
-                    };
+                let allows_owned_macho_member_removal = if retired_macho_archive_activations
+                    .is_empty()
+                {
+                    false
+                } else if let Some(previous_bytes) = previous_snapshot_bytes {
+                    let removed_identifiers = retired_macho_archive_activations
+                        .iter()
+                        .flat_map(|state| {
+                            state
+                                .members
+                                .iter()
+                                .map(|member| member.normalized_identifier.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    let restored_names = restored_macho_archive_resolution_names(
+                        &retired_macho_archive_activations,
+                        &migrated_macho_resolution_updates.moves,
+                    );
+                    let previous_unwind_input_ranges = added_macho_archive_text_activation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|activation| {
+                            activation.previous_unwind_input_ranges.iter().cloned()
+                        })
+                        .chain(
+                            changed_macho_archive_unwind_activation
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|activation| {
+                                    activation.previous_input_ranges.iter().cloned()
+                                }),
+                        )
+                        .collect::<Vec<_>>();
+                    let current_unwind_input_ranges = added_macho_archive_text_activation
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|activation| {
+                            activation.current_unwind_input_ranges.iter().cloned()
+                        })
+                        .chain(
+                            changed_macho_archive_unwind_activation
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|activation| {
+                                    activation.current_input_ranges.iter().cloned()
+                                }),
+                        )
+                        .collect::<Vec<_>>();
+                    let added_identifiers = added_macho_archive_text_activation
+                        .as_ref()
+                        .map(|activation| activation.normalized_identifiers.as_slice())
+                        .unwrap_or_default();
+                    let retiring_names = added_macho_archive_text_activation
+                        .as_ref()
+                        .map(|activation| activation.recycled_symbol_resolution_names.as_slice())
+                        .unwrap_or_default();
+                    archive_diff_allows_owned_macho_member_exchange(
+                        previous_bytes,
+                        &bytes,
+                        input.path.as_str(),
+                        &matched_sections,
+                        &current_resolver,
+                        &removed_identifiers,
+                        added_identifiers,
+                        &restored_names,
+                        retiring_names,
+                        &relocation_target_patches.validated_macho_local_retargets,
+                        &previous_unwind_input_ranges,
+                        &current_unwind_input_ranges,
+                    )?
+                } else {
+                    false
+                };
                 if !allows_dynamic_relocation_removal
                     && !allows_dynamic_relocation_addition
                     && !allows_fde_removal
@@ -22773,6 +22795,7 @@ fn archive_diff_allows_owned_macho_member_removal(
         &[],
         restored_names,
         &[],
+        &[],
         previous_extra_ranges,
         current_extra_ranges,
     )
@@ -22788,6 +22811,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
     removed_identifiers: &[Vec<u8>],
     added_identifiers: &[Vec<u8>],
     restored_names: &[SharedText],
+    retiring_names: &[SharedText],
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
@@ -22797,22 +22821,42 @@ fn archive_diff_allows_owned_macho_member_exchange(
         .map(|name| hex::decode(name.as_str()))
         .collect::<std::result::Result<HashSet<_>, _>>()
         .context("Malformed rollback Mach-O symbol resolution name")?;
-    if !restored_names.is_empty() {
+    let retiring_names = retiring_names
+        .iter()
+        .map(|name| hex::decode(name.as_str()))
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .context("Malformed retired Mach-O symbol resolution name")?;
+    if !restored_names.is_disjoint(&retiring_names) {
+        return Ok(false);
+    }
+    let ignored_defined_symbols = restored_names
+        .iter()
+        .chain(&retiring_names)
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !ignored_defined_symbols.is_empty() {
         let Some(previous_definition_counts) = archive_macho_defined_symbol_counts(
             previous_bytes,
             removed_identifiers,
-            &restored_names,
+            &ignored_defined_symbols,
         )?
         else {
             return Ok(false);
         };
-        let Some(current_definition_counts) =
-            archive_macho_defined_symbol_counts(current_bytes, added_identifiers, &restored_names)?
+        let Some(current_definition_counts) = archive_macho_defined_symbol_counts(
+            current_bytes,
+            added_identifiers,
+            &ignored_defined_symbols,
+        )?
         else {
             return Ok(false);
         };
         if !macho_definition_counts_prove_restoration(
             &restored_names,
+            &previous_definition_counts,
+            &current_definition_counts,
+        ) || !macho_definition_counts_prove_retirement(
+            &retiring_names,
             &previous_definition_counts,
             &current_definition_counts,
         ) {
@@ -22858,14 +22902,14 @@ fn archive_diff_allows_owned_macho_member_exchange(
         previous_bytes,
         &previous_ranges,
         removed_identifiers,
-        &restored_names,
+        &ignored_defined_symbols,
         &previous_local_retargets,
     )?;
     let current_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         current_bytes,
         &current_ranges,
         added_identifiers,
-        &restored_names,
+        &ignored_defined_symbols,
         &current_local_retargets,
     )?;
     if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
@@ -22895,7 +22939,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
         &previous_ranges,
         &previous_owned,
         removed_identifiers,
-        &restored_names,
+        &ignored_defined_symbols,
         true,
         &previous_local_retargets,
     )?;
@@ -22904,7 +22948,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
         &current_ranges,
         &current_owned,
         added_identifiers,
-        &restored_names,
+        &ignored_defined_symbols,
         true,
         &current_local_retargets,
     )?;
@@ -22929,6 +22973,7 @@ fn archive_diff_allows_owned_macho_member_addition(
         &PatchInputResolver::new(current_bytes, true)?,
         &[],
         added_identifiers,
+        &[],
         &[],
         &[],
         previous_extra_ranges,
@@ -25625,6 +25670,25 @@ fn macho_definition_resolutions_match(
         })
 }
 
+fn macho_resolution_matches_archive_member(
+    input_file_path: &str,
+    resolution: &MachOSymbolResolutionRecord,
+    member: &MachOArchiveMemberIdentity,
+) -> Result<bool> {
+    let Some(target) = resolution
+        .target
+        .as_ref()
+        .filter(|target| target.input_file == input_file_path)
+    else {
+        return Ok(false);
+    };
+    let Some(input) = parse_patch_input_ref(input_file_path, target.input.as_str())? else {
+        return Ok(false);
+    };
+    Ok(!input.identifier.is_empty()
+        && archive_member_patch_identifier(&input.identifier) == member.normalized_identifier)
+}
+
 fn section_patches_from_stored(patches: &[StoredOutputPatch]) -> Vec<SectionPatch> {
     patches
         .iter()
@@ -25650,6 +25714,7 @@ fn changed_macho_definition_activation(
     resolutions: &[MachOSymbolResolutionRecord],
     states: &[MachOArchiveActivationState],
     retiring_names: &[SharedText],
+    returning_resolutions: &[MachOSymbolResolutionRecord],
     reserved_ranges: &[ReservedRangeRecord],
 ) -> Result<std::result::Result<Option<ChangedMachODefinitionActivation>, String>> {
     let output_file = object::File::parse(previous_output)
@@ -25667,6 +25732,16 @@ fn changed_macho_definition_activation(
         Err(reason) => return Ok(Err(reason)),
     };
     let retiring_names = retiring_names.iter().cloned().collect::<HashSet<_>>();
+    let mut returning_resolutions = returning_resolutions.to_vec();
+    returning_resolutions.sort_unstable();
+    if returning_resolutions
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Ok(Err(
+            "returning Mach-O definition has ambiguous rollback ownership".to_owned(),
+        ));
+    }
     let mut state_updates = Vec::new();
     let mut symbol_resolutions = Vec::new();
     let mut output_patches = Vec::new();
@@ -25726,6 +25801,31 @@ fn changed_macho_definition_activation(
             .iter()
             .map(|resolution| resolution.name.clone())
             .collect::<Vec<_>>();
+        let returning = returning_resolutions
+            .iter()
+            .filter(|resolution| names.contains(&resolution.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !returning.is_empty() {
+            let returning_owner_matches = returning
+                .iter()
+                .map(|resolution| {
+                    macho_resolution_matches_archive_member(input_file_path, resolution, &identity)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(std::convert::identity);
+            if !returning_owner_matches
+                || returning.len() != current_resolutions.len()
+                || !macho_definition_resolutions_match(&returning, &current_resolutions)
+            {
+                return Ok(Err(
+                    "returning Mach-O definitions split or changed a rollback transaction"
+                        .to_owned(),
+                ));
+            }
+            continue;
+        }
         added_names.extend(names.iter().cloned());
         let mut dormant_index = None;
         for (index, state) in states.iter().enumerate() {
@@ -27545,8 +27645,11 @@ fn allocate_added_macho_archive_eh_frame_range(
     let patch_end = terminator_output_offset
         .checked_add(data_size)
         .context("Added Mach-O __eh_frame patch end overflow")?;
+    let terminator_end = patch_end
+        .checked_add(4)
+        .context("Added Mach-O __eh_frame terminator end overflow")?;
     let alignment = crate::alignment::Alignment { exponent: 3 };
-    let next_output_offset = alignment.align_up(patch_end);
+    let next_output_offset = alignment.align_up(terminator_end);
 
     let candidates = reserved_ranges
         .iter()
@@ -27557,6 +27660,7 @@ fn allocate_added_macho_archive_eh_frame_range(
                 && range.alignment_exponent == alignment.exponent
                 && range.output_offset >= terminator_output_offset
                 && patch_end <= range_end
+                && terminator_end <= range_end
                 && next_output_offset <= range_end)
                 .then_some((index, range.output_offset, range_end))
         })
@@ -27576,10 +27680,11 @@ fn allocate_added_macho_archive_eh_frame_range(
     .context("Added Mach-O __eh_frame allocation exceeds usize")?;
     if section_data
         .get(terminator_offset..allocation_end)
-        .is_none()
+        .is_none_or(|bytes| bytes.iter().any(|byte| *byte != 0))
     {
         return Ok(Err(
-            "added Mach-O __eh_frame reserve or alignment gap is outside the section".to_owned(),
+            "added Mach-O __eh_frame reserve or alignment gap is outside the section or nonzero"
+                .to_owned(),
         ));
     }
 
@@ -46974,8 +47079,168 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn owned_macho_member_addition_composes_with_symbol_retirement() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let previous_kept = test_macho_object(&[1; 4], &[2; 4], 0);
+        let mut current_kept = previous_kept.clone();
+        let retired_symbol = macho_symbol_value_field_range(&current_kept, object::SymbolIndex(0))
+            .unwrap()
+            .start
+            - 8;
+        current_kept[retired_symbol + 4] = object::macho::N_STAB;
+        let added = test_macho_object(&[3; 4], &[4; 4], 0);
+        let kept_identifier = b"crate-hash.cgu.kept.session.rcgu.o";
+        let added_identifier = b"crate-hash.cgu.added.session.rcgu.o";
+        let previous = archive(&[(kept_identifier, previous_kept.as_slice())]);
+        let current = archive(&[
+            (kept_identifier, current_kept.as_slice()),
+            (added_identifier, added.as_slice()),
+        ]);
+        let input_file = hex::encode("lib.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, kept_identifier).unwrap()
+        else {
+            panic!("expected unique previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, kept_identifier).unwrap()
+        else {
+            panic!("expected unique current archive member");
+        };
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap(),
+                section_index: patch_section_record_index(&previous_file, previous_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: 0,
+                output_size: previous_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap(),
+                section_index: patch_section_record_index(&current_file, current_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: 0,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let added_identifiers = [archive_member_patch_identifier(added_identifier)];
+        let retiring_names = [SharedText::from(hex::encode(b"_text"))];
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+
+        assert!(
+            archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &[],
+                &added_identifiers,
+                &[],
+                &retiring_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap()
+        );
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &[],
+                &added_identifiers,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "member ownership must not hide an unowned symbol retirement",
+        );
+
+        let duplicate = archive(&[
+            (kept_identifier, previous_kept.as_slice()),
+            (b"duplicate.o", previous_kept.as_slice()),
+        ]);
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &duplicate,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &[],
+                &added_identifiers,
+                &[],
+                &retiring_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "a duplicate previous definition must reject aggregate retirement",
+        );
+
+        let mut unrelated_kept = current_kept;
+        let data = test_macho_section_range(&unrelated_kept, "__data");
+        unrelated_kept[data.start] ^= 1;
+        let unrelated = archive(&[
+            (kept_identifier, unrelated_kept.as_slice()),
+            (added_identifier, added.as_slice()),
+        ]);
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &unrelated,
+                &input_file,
+                &matched,
+                &PatchInputResolver::new(&unrelated, true).unwrap(),
+                &[],
+                &added_identifiers,
+                &[],
+                &retiring_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "aggregate ownership must not mask unrelated member changes",
         );
     }
 
@@ -47136,6 +47401,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .unwrap()
         );
@@ -47148,6 +47414,7 @@ mod tests {
                 &current_resolver,
                 &removed,
                 &added,
+                &[],
                 &[],
                 std::slice::from_ref(&retarget),
                 &[],
@@ -47203,6 +47470,7 @@ mod tests {
                 &removed,
                 &added,
                 &[],
+                &[],
                 &[wrong_site],
                 &[],
                 &[],
@@ -47227,6 +47495,7 @@ mod tests {
                 &unrelated_resolver,
                 &removed,
                 &added,
+                &[],
                 &[],
                 &[retarget],
                 &[],
@@ -49903,7 +50172,7 @@ mod tests {
             .patches
             .iter()
             .find(|patch| {
-                patch.output_offset == reserve_after_initial.output_offset + 72 && patch.size == 76
+                patch.output_offset == reserve_after_initial.output_offset + 64 && patch.size == 76
             })
             .unwrap();
         assert_eq!(next_eh_frame.data.len(), 76);
@@ -49978,13 +50247,62 @@ mod tests {
             ADDED_MACHO_UNWIND_PERSONALITY_MASK | ADDED_MACHO_UNWIND_HAS_LSDA;
         let mut output = test_macho_unwind_output(0x1000);
         sections[0].output_offset = output.text_offset + 0x100;
+
+        let undersized_reserve = ReservedRangeRecord {
+            output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+            alignment_exponent: 3,
+            output_offset: output.eh_frame_offset,
+            size: 72,
+        };
+        let mut undersized_reserves = vec![undersized_reserve.clone()];
+        let undersized = {
+            let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+            added_macho_archive_unwind_activation(
+                std::slice::from_ref(&member),
+                &[0],
+                &sections,
+                &output_file,
+                &[],
+                &[],
+                &mut undersized_reserves,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            undersized,
+            Err(reason) if reason.contains("reserve is not adjacent to the current terminator")
+        ));
+        assert_eq!(undersized_reserves, [undersized_reserve]);
+
         let original_reserve = ReservedRangeRecord {
             output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
             alignment_exponent: 3,
             output_offset: output.eh_frame_offset,
-            size: 144,
+            size: 152,
         };
         let mut reserves = vec![original_reserve.clone()];
+
+        let mut nonzero_output = output.bytes.clone();
+        nonzero_output[output.eh_frame_offset as usize + 75] = 1;
+        let mut nonzero_reserves = reserves.clone();
+        let nonzero = {
+            let output_file = object::File::parse(nonzero_output.as_slice()).unwrap();
+            added_macho_archive_unwind_activation(
+                std::slice::from_ref(&member),
+                &[0],
+                &sections,
+                &output_file,
+                &[],
+                &[],
+                &mut nonzero_reserves,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            nonzero,
+            Err(reason) if reason.contains("outside the section or nonzero")
+        ));
+        assert_eq!(nonzero_reserves, reserves);
 
         let first = {
             let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
@@ -50035,7 +50353,7 @@ mod tests {
             vec![ReservedRangeRecord {
                 output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
                 alignment_exponent: 3,
-                output_offset: output.eh_frame_offset + 72,
+                output_offset: output.eh_frame_offset + 80,
                 size: 72,
             }]
         );
@@ -50155,7 +50473,7 @@ mod tests {
             output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
             alignment_exponent: 3,
             output_offset: too_small.eh_frame_offset,
-            size: 72,
+            size: 80,
         }];
         sections[0].output_offset = too_small.text_offset + 0x100;
         let before_failure = insufficient_capacity_reserves.clone();

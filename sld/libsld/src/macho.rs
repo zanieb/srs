@@ -111,8 +111,16 @@ fn incremental_reserve_sizes(
             }
             let alignment = incremental_reserve_alignment(part_id)
                 .context("Mach-O incremental reserve requires a supported output section")?;
-            *reserves.get_mut(part_id) =
+            let mut allocation =
                 incremental_reserve_allocation_size(current_size, padding_percent, alignment)?;
+            if part_id == part_id::EH_FRAME {
+                // An appended FDE stream replaces the old zero terminator and must leave a new
+                // aligned terminator inside the owned reserve.
+                allocation = allocation
+                    .checked_add(alignment.value())
+                    .context("Mach-O __eh_frame incremental reserve size overflowed u64")?;
+            }
+            *reserves.get_mut(part_id) = allocation;
         }
     }
     for part_id in [part_id::SYMTAB_GLOBAL, part_id::STRTAB] {
@@ -347,8 +355,9 @@ mod tests {
         assert_eq!(*reserves.get(rodata), 80);
         assert_eq!(*reserves.get(gcc_except), 7);
         assert_eq!(*reserves.get(data), 12);
-        // Four bytes align the reserve start, followed by eight usable bytes.
-        assert_eq!(*reserves.get(eh_frame), 12);
+        // Four bytes align the reserve start, followed by eight bytes of requested growth and
+        // another aligned slot that keeps the live terminator in owned space.
+        assert_eq!(*reserves.get(eh_frame), 20);
         assert_eq!(*reserves.get(part_id::SYMTAB_GLOBAL), 16);
         assert_eq!(*reserves.get(part_id::STRTAB), 10);
     }
