@@ -138,7 +138,7 @@ Those checks appear in `sld/tests/integration_tests.rs`, and the test fixtures u
 | Reversibility | fixtures using `TestIncrementalChangedRestore:true` |
 
 The tests do not merely check that the linker exits successfully. They pin symbol bytes, generated
-section bytes, sidecar contents such as `reloc2`, `dynrel`, and `fde` records, and repeated reuse of
+section bytes, sidecar contents such as `reloc3`, `dynrel`, and `fde` records, and repeated reuse of
 the refreshed state after a patch.
 
 ## Fallback tests
