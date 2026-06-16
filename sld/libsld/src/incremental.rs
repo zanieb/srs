@@ -5309,6 +5309,25 @@ struct DirectMachOCguLivenessProof {
 }
 
 #[derive(Clone)]
+struct RecordedMachOLocalCohortEdge {
+    relocation_index: usize,
+    previous_relocation_offset: u64,
+    previous_target_section_index: u32,
+    previous_target_section_offset: u64,
+    previous_target_name: Vec<u8>,
+    current_source_section_index: object::SectionIndex,
+    current_relocation_offset: u64,
+    current_target_section_index: object::SectionIndex,
+    current_target_section_offset: u64,
+    current_target_name: Vec<u8>,
+    current_target_value: u64,
+    r_type: u8,
+    r_pcrel: bool,
+    r_length: u8,
+    addend: i64,
+}
+
+#[derive(Clone)]
 struct DirectMachOCguDefinition {
     position: SymbolPosition,
     size: u64,
@@ -19057,6 +19076,7 @@ fn matched_macho_local_text_target_ownership(
                 previous_output,
                 output_file,
                 &[],
+                &[],
                 direct_macho_cgu_liveness_proof,
                 normalize_rust_archive_patch_inputs,
             )? {
@@ -19190,6 +19210,28 @@ fn matched_macho_local_text_target_ownership(
     } else {
         None
     };
+    let Some(record_kind) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+        return Ok(Err(
+            "renamed local Mach-O text target has an unsupported recorded relocation".to_owned(),
+        ));
+    };
+    let recorded_incoming_edge = RecordedMachOLocalCohortEdge {
+        relocation_index,
+        previous_relocation_offset: previous_context.range.start as u64,
+        previous_target_section_index: recorded_target.section_index,
+        previous_target_section_offset: recorded_target.section_offset,
+        previous_target_name: previous_position.name.clone(),
+        current_source_section_index: current_caller_section,
+        current_relocation_offset: current_context.range.start as u64,
+        current_target_section_index: current_position.section_index,
+        current_target_section_offset: current_position.section_offset,
+        current_target_name: current_name.clone(),
+        current_target_value: current_target_value.expect("checked current target value"),
+        r_type: record_kind.r_type,
+        r_pcrel: record_kind.r_pcrel,
+        r_length: record_kind.r_length,
+        addend: relocation.addend,
+    };
     let local_symbol_cohort = if published_symbols == ExactLocalMachOOutputSymbol::Absent
         || exact_published_symbol_indices.is_some()
     {
@@ -19210,6 +19252,7 @@ fn matched_macho_local_text_target_ownership(
             previous_output,
             output_file,
             &[],
+            std::slice::from_ref(&recorded_incoming_edge),
             direct_macho_cgu_liveness_proof,
             normalize_rust_archive_patch_inputs,
         )? {
@@ -20859,10 +20902,12 @@ fn verify_previous_macho_local_symbol_cohort(
     Ok(())
 }
 
+type MachOLocalCohortAtom = (object::SectionIndex, u64);
+
 fn reachable_macho_local_cohort_atoms(
-    roots: &HashSet<(object::SectionIndex, u64)>,
-    edges: &HashMap<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>,
-) -> HashSet<(object::SectionIndex, u64)> {
+    roots: &HashSet<MachOLocalCohortAtom>,
+    edges: &HashMap<MachOLocalCohortAtom, Vec<MachOLocalCohortAtom>>,
+) -> HashSet<MachOLocalCohortAtom> {
     let mut reachable = roots.clone();
     let mut queue = roots.iter().copied().collect::<Vec<_>>();
     let mut index = 0;
@@ -20878,8 +20923,8 @@ fn reachable_macho_local_cohort_atoms(
 }
 
 fn required_macho_local_cohort_atoms_are_reachable(
-    required: &[(object::SectionIndex, u64)],
-    reachable: &HashSet<(object::SectionIndex, u64)>,
+    required: &[MachOLocalCohortAtom],
+    reachable: &HashSet<MachOLocalCohortAtom>,
 ) -> bool {
     required.iter().all(|atom| reachable.contains(atom))
 }
@@ -21585,6 +21630,213 @@ fn carried_macho_data_local_target_roots(
     Ok(carried_roots)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn recorded_macho_local_cohort_edge_atoms(
+    edge: &RecordedMachOLocalCohortEdge,
+    relocations: &[RelocationRecord],
+    input_file_path: &str,
+    caller_section: &MatchedPatchSection,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    output_file: &object::File<'_>,
+    owned_sections: &HashMap<object::SectionIndex, &MatchedPatchSection>,
+    atom_for_offset: &impl Fn(object::SectionIndex, u64) -> Option<(object::SectionIndex, u64)>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<Option<(MachOLocalCohortAtom, MachOLocalCohortAtom)>> {
+    let Some(record) = relocations.get(edge.relocation_index) else {
+        return Ok(None);
+    };
+    let Some(record_kind) = decode_macho_aarch64_relocation_kind(record.kind) else {
+        return Ok(None);
+    };
+    if !macho_local_cohort_relocation_follows_target(record_kind.r_type) {
+        return Ok(None);
+    }
+    let Some(record_target) = record.target.as_ref() else {
+        return Ok(None);
+    };
+    let recorded_name = record
+        .target_name
+        .as_deref()
+        .map(hex::decode)
+        .transpose()
+        .context("Malformed recorded local Mach-O cohort edge target name")?;
+    if record.input_file != input_file_path
+        || record.section_index != caller_section.previous.section_index
+        || record.relocation_offset != edge.previous_relocation_offset
+        || record.addend != edge.addend
+        || record_kind.r_type != edge.r_type
+        || record_kind.r_pcrel != edge.r_pcrel
+        || record_kind.r_length != edge.r_length
+        || recorded_name.as_deref() != Some(edge.previous_target_name.as_slice())
+        || record_target.input_file != input_file_path
+        || record_target.section_index != edge.previous_target_section_index
+        || record_target.section_offset != edge.previous_target_section_offset
+        || !patch_input_refs_match(
+            input_file_path,
+            record.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+        || !patch_input_refs_match(
+            input_file_path,
+            record_target.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+    {
+        return Ok(None);
+    }
+    let matching_records = relocations
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.input_file == input_file_path
+                && candidate.section_index == caller_section.previous.section_index
+                && candidate.relocation_offset == edge.previous_relocation_offset
+                && patch_input_refs_match(
+                    input_file_path,
+                    candidate.input.as_str(),
+                    caller_section.previous.input.as_str(),
+                    normalize_rust_archive_patch_inputs,
+                )
+                .unwrap_or(false)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching_records.as_slice() != [edge.relocation_index] {
+        return Ok(None);
+    }
+
+    let Some(source_owner) = owned_sections.get(&edge.current_source_section_index) else {
+        return Ok(None);
+    };
+    let Some(target_owner) = owned_sections.get(&edge.current_target_section_index) else {
+        return Ok(None);
+    };
+    if source_owner.previous.section_index != caller_section.previous.section_index
+        || source_owner.current.section_index != caller_section.current.section_index
+        || relocation_target_record_index(patch_section_object_index(
+            previous_file,
+            target_owner.previous.section_index,
+        )?)? != edge.previous_target_section_index
+        || patch_section_object_index(current_file, target_owner.current.section_index)?
+            != edge.current_target_section_index
+        || edge.current_target_section_offset >= target_owner.current.input_size
+        || edge.current_target_section_offset >= target_owner.current.output_size
+        || !patch_input_refs_match(
+            input_file_path,
+            source_owner.previous.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+        || !patch_input_refs_match(
+            input_file_path,
+            source_owner.current.input.as_str(),
+            caller_section.current.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+        || !patch_input_refs_match(
+            input_file_path,
+            target_owner.previous.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+        || !patch_input_refs_match(
+            input_file_path,
+            target_owner.current.input.as_str(),
+            caller_section.current.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+    {
+        return Ok(None);
+    }
+
+    let source_section = current_file.section_by_index(edge.current_source_section_index)?;
+    let matching_relocations = source_section
+        .relocations()
+        .filter(|(offset, relocation)| {
+            *offset == edge.current_relocation_offset
+                && matches!(
+                    relocation.flags(),
+                    object::RelocationFlags::MachO {
+                        r_type,
+                        r_pcrel,
+                        r_length,
+                    } if r_type == edge.r_type
+                        && r_pcrel == edge.r_pcrel
+                        && r_length == edge.r_length
+                )
+        })
+        .collect::<Vec<_>>();
+    let [(_, current_relocation)] = matching_relocations.as_slice() else {
+        return Ok(None);
+    };
+    let object::RelocationTarget::Symbol(current_target_index) = current_relocation.target() else {
+        return Ok(None);
+    };
+    let current_target = current_file.symbol_by_index(current_target_index)?;
+    if current_target.is_global()
+        || current_target.is_undefined()
+        || current_target.is_weak()
+        || current_target.scope() != object::SymbolScope::Compilation
+        || current_target.name_bytes()? != edge.current_target_name
+        || current_target.section_index() != Some(edge.current_target_section_index)
+    {
+        return Ok(None);
+    }
+    let target_section = current_file.section_by_index(edge.current_target_section_index)?;
+    if current_target
+        .address()
+        .checked_sub(target_section.address())
+        != Some(edge.current_target_section_offset)
+    {
+        return Ok(None);
+    }
+    let exact_targets = current_file
+        .symbols()
+        .filter(|symbol| {
+            !symbol.is_global()
+                && !symbol.is_undefined()
+                && !symbol.is_weak()
+                && symbol.scope() == object::SymbolScope::Compilation
+                && symbol.name_bytes().ok() == Some(edge.current_target_name.as_slice())
+                && symbol.section_index() == Some(edge.current_target_section_index)
+                && symbol.address().checked_sub(target_section.address())
+                    == Some(edge.current_target_section_offset)
+        })
+        .map(|symbol| symbol.index())
+        .collect::<Vec<_>>();
+    if exact_targets.as_slice() != [current_target_index] {
+        return Ok(None);
+    }
+    let Some(target_output_offset) = target_owner
+        .current
+        .output_offset
+        .checked_add(edge.current_target_section_offset)
+    else {
+        return Ok(None);
+    };
+    if macho_output_address_for_file_offset(output_file, target_output_offset)
+        != Some(edge.current_target_value)
+    {
+        return Ok(None);
+    }
+    let Some(source_atom) = atom_for_offset(
+        edge.current_source_section_index,
+        edge.current_relocation_offset,
+    ) else {
+        return Ok(None);
+    };
+    let Some(target_atom) = atom_for_offset(
+        edge.current_target_section_index,
+        edge.current_target_section_offset,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((source_atom, target_atom)))
+}
+
 fn current_macho_local_cohort_atoms_are_live(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
@@ -21601,6 +21853,7 @@ fn current_macho_local_cohort_atoms_are_live(
     previous_output: &[u8],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     required_current_entries: &[MachOLocalSymbolCohortEntry],
+    recorded_incoming_edges: &[RecordedMachOLocalCohortEdge],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     retained_local_atom_names: &HashSet<Vec<u8>>,
     normalize_rust_archive_patch_inputs: bool,
@@ -22290,6 +22543,26 @@ fn current_macho_local_cohort_atoms_are_live(
     }
 
     let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
+    for edge in recorded_incoming_edges {
+        let validated = recorded_macho_local_cohort_edge_atoms(
+            edge,
+            relocations,
+            input_file_path,
+            caller_section,
+            previous_file,
+            current_file,
+            output_file,
+            &owned_sections,
+            &atom_for_offset,
+            normalize_rust_archive_patch_inputs,
+        )?;
+        let Some((source, target)) = validated else {
+            continue;
+        };
+        if reachable.contains(&source) {
+            roots.insert(target);
+        }
+    }
     roots.extend(carried_macho_data_local_target_roots(
         relocations,
         symbol_resolutions,
@@ -22907,6 +23180,7 @@ fn changed_macho_local_symbol_cohort_plan(
         previous_output,
         output_file,
         rematerialized_sections,
+        &[],
         direct_macho_cgu_liveness_proof,
         normalize_rust_archive_patch_inputs,
     )
@@ -22928,6 +23202,7 @@ fn plan_macho_local_symbol_cohort(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    recorded_incoming_edges: &[RecordedMachOLocalCohortEdge],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
@@ -23109,6 +23384,7 @@ fn plan_macho_local_symbol_cohort(
             previous_output,
             rematerialized_sections,
             &required_current_entries,
+            recorded_incoming_edges,
             direct_macho_cgu_liveness_proof,
             &retained_local_atom_names,
             normalize_rust_archive_patch_inputs,
@@ -26255,6 +26531,7 @@ fn validate_macho_data_relocations_are_stable(
                         &current_file,
                         previous_output,
                         &output_file,
+                        &[],
                         &[],
                         direct_macho_cgu_liveness_proof,
                         normalize_rust_archive_patch_inputs,
@@ -60252,6 +60529,7 @@ mod tests {
             &output,
             &output_file,
             &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             true,
         )
@@ -66573,6 +66851,89 @@ mod tests {
         bytes[address..address + 4].copy_from_slice(&relocation_offset.to_le_bytes());
     }
 
+    fn duplicate_test_macho_text_relocations(mut bytes: Vec<u8>, count: usize) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_RELOCATION_OFFSET: usize = 56;
+        const SECTION_RELOCATION_COUNT_OFFSET: usize = 60;
+
+        assert!(count > 0);
+        let command_count = read_u32_le(&bytes[16..20]).unwrap();
+        let mut command_offset = HEADER_SIZE;
+        let mut segment_command = None;
+        let mut symtab_command = None;
+        for _ in 0..command_count {
+            let command = read_u32_le(&bytes[command_offset..command_offset + 4]).unwrap();
+            let command_size =
+                read_u32_le(&bytes[command_offset + 4..command_offset + 8]).unwrap() as usize;
+            match command {
+                object::macho::LC_SEGMENT_64 => segment_command = Some(command_offset),
+                object::macho::LC_SYMTAB => symtab_command = Some(command_offset),
+                _ => {}
+            }
+            command_offset += command_size;
+        }
+        let text_section = segment_command.unwrap() + SEGMENT_COMMAND_SIZE;
+        let relocation_offset = read_u32_le(
+            &bytes[text_section + SECTION_RELOCATION_OFFSET
+                ..text_section + SECTION_RELOCATION_OFFSET + 4],
+        )
+        .unwrap() as usize;
+        assert_eq!(
+            read_u32_le(
+                &bytes[text_section + SECTION_RELOCATION_COUNT_OFFSET
+                    ..text_section + SECTION_RELOCATION_COUNT_OFFSET + 4],
+            )
+            .unwrap(),
+            1,
+        );
+        let relocation_flags =
+            read_u32_le(&bytes[relocation_offset + 4..relocation_offset + 8]).unwrap();
+        let mut extra = Vec::with_capacity((count - 1) * 8);
+        for index in 1..count {
+            push_u32(&mut extra, u32::try_from(index * 4).unwrap());
+            push_u32(&mut extra, relocation_flags);
+        }
+        let extra_len = extra.len();
+        bytes.splice(relocation_offset + 8..relocation_offset + 8, extra);
+        bytes[text_section + SECTION_RELOCATION_COUNT_OFFSET
+            ..text_section + SECTION_RELOCATION_COUNT_OFFSET + 4]
+            .copy_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+
+        let symtab_command = symtab_command.unwrap();
+        for field in [8, 16] {
+            let value =
+                read_u32_le(&bytes[symtab_command + field..symtab_command + field + 4]).unwrap();
+            bytes[symtab_command + field..symtab_command + field + 4].copy_from_slice(
+                &value
+                    .checked_add(u32::try_from(extra_len).unwrap())
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+        }
+        bytes
+    }
+
+    fn set_test_macho_symbol_desc(bytes: &mut [u8], name: &[u8], n_desc: u16) {
+        let entry = test_macho_symbol_entry_offset(bytes, name);
+        bytes[entry + 6..entry + 8].copy_from_slice(&n_desc.to_le_bytes());
+    }
+
+    fn set_first_test_macho_text_relocation_flags(
+        bytes: &mut [u8],
+        symbol: u32,
+        external: bool,
+        r_type: u8,
+    ) {
+        const TEXT_SECTION_RELOCATION_OFFSET: usize = 32 + 72 + 56;
+        let relocation_offset =
+            read_u32_le(&bytes[TEXT_SECTION_RELOCATION_OFFSET..TEXT_SECTION_RELOCATION_OFFSET + 4])
+                .unwrap() as usize;
+        let flags =
+            symbol | 1 << 24 | 2 << 25 | u32::from(external) << 27 | u32::from(r_type) << 28;
+        bytes[relocation_offset + 4..relocation_offset + 8].copy_from_slice(&flags.to_le_bytes());
+    }
+
     fn test_macho_local_data_retarget_object(primary_name: &[u8], primary_offset: u64) -> Vec<u8> {
         test_macho_local_data_retarget_object_with_source(primary_name, primary_offset, &[0; 16])
     }
@@ -67255,6 +67616,33 @@ mod tests {
         previous_source_offset: u32,
         current_source_offset: u32,
     ) -> LocalTextTargetTransitionFixture {
+        local_text_target_transition_fixture_with_alias_sources_and_text_size(
+            previous_name,
+            current_name,
+            previous_data,
+            current_data,
+            previous_target_offset,
+            current_target_offset,
+            alias_offsets,
+            previous_source_offset,
+            current_source_offset,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn local_text_target_transition_fixture_with_alias_sources_and_text_size(
+        previous_name: &[u8; 5],
+        current_name: &[u8; 5],
+        previous_data: &[u8; 8],
+        current_data: &[u8; 8],
+        previous_target_offset: u64,
+        current_target_offset: u64,
+        alias_offsets: Option<(u64, u64)>,
+        previous_source_offset: u32,
+        current_source_offset: u32,
+        minimum_text_size: usize,
+    ) -> LocalTextTargetTransitionFixture {
         let input_path = "libuv.rlib";
         let previous_member_identifier = b"uv-hash.cgu.old.rcgu.o";
         let current_member_identifier = b"uv-hash.cgu.new.rcgu.o";
@@ -67263,7 +67651,8 @@ mod tests {
             archive_member_patch_identifier(current_member_identifier),
         );
         let text_size =
-            usize::try_from(previous_source_offset.max(current_source_offset)).unwrap() + 4;
+            (usize::try_from(previous_source_offset.max(current_source_offset)).unwrap() + 4)
+                .max(minimum_text_size);
         let mut previous_object = test_macho_local_text_target_object_with_alias_and_source(
             previous_name,
             previous_data,
@@ -68214,6 +68603,282 @@ mod tests {
             .unwrap_err(),
             expected,
         );
+    }
+
+    #[test]
+    fn recorded_local_caller_edge_proves_only_its_exact_reachable_target() {
+        let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let relocation_count = 64;
+        let mut fixture = local_text_target_transition_fixture_with_alias_sources_and_text_size(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+            None,
+            0,
+            0,
+            relocation_count * 4,
+        );
+        publish_local_transition_symbols(&mut fixture, &[(b"l_a.1", 0)]);
+        let prepare = |mut object: Vec<u8>| {
+            object[24..28]
+                .copy_from_slice(&object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.to_le_bytes());
+            object = duplicate_test_macho_text_relocations(object, relocation_count);
+            set_test_macho_symbol_desc(&mut object, b"_text", object::macho::N_NO_DEAD_STRIP);
+            object
+        };
+        fixture.previous =
+            mutate_test_macho_archive_member(&fixture.previous, previous_identifier, prepare);
+        fixture.current =
+            mutate_test_macho_archive_member(&fixture.current, current_identifier, prepare);
+
+        let previous_resolver = PatchInputResolver::new(&fixture.previous, true).unwrap();
+        let current_resolver = PatchInputResolver::new(&fixture.current, true).unwrap();
+        let previous_input = previous_resolver
+            .resolve(
+                fixture.input.path.as_str(),
+                fixture.matched[0].previous.input.as_str(),
+                PatchInputLookup::MatchArchiveMember,
+            )
+            .unwrap()
+            .unwrap();
+        let current_input = current_resolver
+            .resolve(
+                fixture.input.path.as_str(),
+                fixture.matched[0].current.input.as_str(),
+                PatchInputLookup::MatchArchiveMember,
+            )
+            .unwrap()
+            .unwrap();
+        let previous_file = object::File::parse(previous_input.bytes).unwrap();
+        let current_file = object::File::parse(current_input.bytes).unwrap();
+        assert_eq!(
+            current_file
+                .section_by_name("__text")
+                .unwrap()
+                .relocations()
+                .count(),
+            relocation_count,
+        );
+        let output_file = object::File::parse(fixture.previous_output.as_slice()).unwrap();
+        let current_source_section_index = current_file.section_by_name("__text").unwrap().index();
+        let current_target = current_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(b"l_b.2"))
+            .unwrap();
+        let current_target_section_index = current_target.section_index().unwrap();
+        let current_target_section = current_file
+            .section_by_index(current_target_section_index)
+            .unwrap();
+        let current_target_section_offset =
+            current_target.address() - current_target_section.address();
+        let current_target_value = macho_output_address_for_file_offset(
+            &output_file,
+            fixture.matched[1].current.output_offset + current_target_section_offset,
+        )
+        .unwrap();
+        let record_kind = decode_macho_aarch64_relocation_kind(fixture.relocation.kind).unwrap();
+        let record_target = fixture.relocation.target.as_ref().unwrap();
+        let edge = RecordedMachOLocalCohortEdge {
+            relocation_index: 0,
+            previous_relocation_offset: fixture.relocation.relocation_offset,
+            previous_target_section_index: record_target.section_index,
+            previous_target_section_offset: record_target.section_offset,
+            previous_target_name: b"l_a.1".to_vec(),
+            current_source_section_index,
+            current_relocation_offset: 0,
+            current_target_section_index,
+            current_target_section_offset,
+            current_target_name: b"l_b.2".to_vec(),
+            current_target_value,
+            r_type: record_kind.r_type,
+            r_pcrel: record_kind.r_pcrel,
+            r_length: record_kind.r_length,
+            addend: fixture.relocation.addend,
+        };
+        let required_entry = MachOLocalSymbolCohortEntry {
+            name: b"l_b.2".to_vec(),
+            n_desc: 0,
+            output_section_index: macho_output_section_index_for_file_offset(
+                &output_file,
+                fixture.matched[1].current.output_offset,
+            )
+            .unwrap(),
+            output_value: current_target_value,
+            output_entry_offset: None,
+            string_index: None,
+        };
+        let proves = |relocations: &[RelocationRecord],
+                      current_resolver: &PatchInputResolver<'_>,
+                      current_file: &object::File<'_>,
+                      current_bytes: &[u8],
+                      edge: &RecordedMachOLocalCohortEdge| {
+            current_macho_local_cohort_atoms_are_live(
+                relocations,
+                &[],
+                fixture.input.path.as_str(),
+                &fixture.matched[0],
+                &fixture.matched,
+                &previous_resolver,
+                current_resolver,
+                &previous_file,
+                current_file,
+                current_bytes,
+                &output_file,
+                &fixture.previous_output,
+                &[],
+                std::slice::from_ref(&required_entry),
+                std::slice::from_ref(edge),
+                &DirectMachOCguLivenessProof::default(),
+                &HashSet::new(),
+                true,
+            )
+            .unwrap()
+        };
+        let records = [fixture.relocation.clone()];
+        assert!(
+            !current_macho_local_cohort_atoms_are_live(
+                &records,
+                &[],
+                fixture.input.path.as_str(),
+                &fixture.matched[0],
+                &fixture.matched,
+                &previous_resolver,
+                &current_resolver,
+                &previous_file,
+                &current_file,
+                current_input.bytes,
+                &output_file,
+                &fixture.previous_output,
+                &[],
+                std::slice::from_ref(&required_entry),
+                &[],
+                &DirectMachOCguLivenessProof::default(),
+                &HashSet::new(),
+                true,
+            )
+            .unwrap()
+        );
+        assert!(proves(
+            &records,
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &edge,
+        ));
+
+        let mut wrong_record = records[0].clone();
+        wrong_record.input_file = "other.rlib".into();
+        assert!(!proves(
+            &[wrong_record],
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &edge,
+        ));
+        let mut wrong_owner = records[0].clone();
+        wrong_owner.target.as_mut().unwrap().input_file = "other.rlib".into();
+        assert!(!proves(
+            &[wrong_owner],
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &edge,
+        ));
+        let mut wrong_offset = records[0].clone();
+        wrong_offset.relocation_offset += 4;
+        assert!(!proves(
+            &[wrong_offset],
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &edge,
+        ));
+        let mut wrong_target = edge.clone();
+        wrong_target.current_target_section_offset += 4;
+        assert!(!proves(
+            &records,
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &wrong_target,
+        ));
+
+        let unreachable_archive =
+            mutate_test_macho_archive_member(&fixture.current, current_identifier, |mut object| {
+                set_test_macho_symbol_desc(&mut object, b"_text", 0);
+                object
+            });
+        let unreachable_resolver = PatchInputResolver::new(&unreachable_archive, true).unwrap();
+        let unreachable_input = unreachable_resolver
+            .resolve(
+                fixture.input.path.as_str(),
+                fixture.matched[0].current.input.as_str(),
+                PatchInputLookup::MatchArchiveMember,
+            )
+            .unwrap()
+            .unwrap();
+        let unreachable_file = object::File::parse(unreachable_input.bytes).unwrap();
+        assert!(!proves(
+            &records,
+            &unreachable_resolver,
+            &unreachable_file,
+            unreachable_input.bytes,
+            &edge,
+        ));
+
+        for (external, r_type) in [
+            (false, object::macho::ARM64_RELOC_PAGE21),
+            (true, object::macho::ARM64_RELOC_SUBTRACTOR),
+        ] {
+            let hostile_archive = mutate_test_macho_archive_member(
+                &fixture.current,
+                current_identifier,
+                |mut object| {
+                    set_first_test_macho_text_relocation_flags(
+                        &mut object,
+                        if external { 1 } else { 2 },
+                        external,
+                        r_type,
+                    );
+                    object
+                },
+            );
+            let hostile_resolver = PatchInputResolver::new(&hostile_archive, true).unwrap();
+            let hostile_input = hostile_resolver
+                .resolve(
+                    fixture.input.path.as_str(),
+                    fixture.matched[0].current.input.as_str(),
+                    PatchInputLookup::MatchArchiveMember,
+                )
+                .unwrap()
+                .unwrap();
+            let hostile_file = object::File::parse(hostile_input.bytes).unwrap();
+            let mut hostile_edge = edge.clone();
+            let mut hostile_records = records.clone();
+            if r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
+                hostile_edge.r_type = r_type;
+                hostile_records[0].kind =
+                    encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                        r_address: 0,
+                        r_symbolnum: 1,
+                        r_pcrel: true,
+                        r_length: 2,
+                        r_extern: true,
+                        r_type,
+                    });
+            }
+            assert!(!proves(
+                &hostile_records,
+                &hostile_resolver,
+                &hostile_file,
+                hostile_input.bytes,
+                &hostile_edge,
+            ));
+        }
     }
 
     #[test]
@@ -69248,6 +69913,7 @@ mod tests {
                 &output,
                 &[],
                 std::slice::from_ref(&required_entry),
+                &[],
                 liveness_proof,
                 &HashSet::new(),
                 false,
