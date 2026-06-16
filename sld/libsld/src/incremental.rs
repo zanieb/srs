@@ -6700,6 +6700,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .map_or(text_activation_reserved_ranges, |activation| {
                     activation.remaining_reserved_ranges.as_slice()
                 });
+            let mut reactivation_retiring_names = macho_resolution_updates
+                .retiring_names
+                .iter()
+                .chain(
+                    changed_macho_definition_activation
+                        .iter()
+                        .flat_map(|activation| &activation.retired_names),
+                )
+                .cloned()
+                .collect::<Vec<_>>();
+            reactivation_retiring_names.sort_unstable();
+            reactivation_retiring_names.dedup();
             let mut added_macho_archive_text_activation =
                 if let Some(added_identifiers) = added_archive_member_identifiers.as_deref() {
                     let reactivated = if let Some(stored_patch) = input.patch.as_ref() {
@@ -6709,7 +6721,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             added_identifiers,
                             &current_resolver,
                             stored_patch,
+                            previous_output.get()?,
                             &previous.macho_symbol_resolutions,
+                            &reactivation_retiring_names,
                             activation_reserved_ranges,
                         )? {
                             Ok(activation) => activation,
@@ -22445,13 +22459,17 @@ fn tracked_symbol_only_macho_archive_transaction_is_current(
         && state.sections.is_empty()
         && !stored_resolutions.is_empty()
         && stored_resolutions == current_resolutions
-        && state.forward_patches.iter().all(|patch| {
-            usize::try_from(patch.output_offset).ok().and_then(|start| {
-                start
-                    .checked_add(patch.data.len())
-                    .and_then(|end| current_output.get(start..end))
-            }) == Some(patch.data.as_slice())
-        })
+        && stored_output_patches_match(&state.forward_patches, current_output)
+}
+
+fn stored_output_patches_match(patches: &[StoredOutputPatch], output: &[u8]) -> bool {
+    patches.iter().all(|patch| {
+        usize::try_from(patch.output_offset).ok().and_then(|start| {
+            start
+                .checked_add(patch.data.len())
+                .and_then(|end| output.get(start..end))
+        }) == Some(patch.data.as_slice())
+    })
 }
 
 fn initially_owned_macho_archive_removal_state(
@@ -22704,7 +22722,9 @@ fn reactivated_macho_archive_text_activation(
     added_identifiers: &[Vec<u8>],
     current_resolver: &PatchInputResolver<'_>,
     patch: &FilePatchState,
+    current_output: &[u8],
     resolutions: &[MachOSymbolResolutionRecord],
+    retiring_names: &[SharedText],
     reserved_ranges: &[ReservedRangeRecord],
 ) -> Result<std::result::Result<Option<AddedMachOArchiveTextActivations>, String>> {
     let mut indices = dormant_macho_archive_reactivation_indices(patch, added_identifiers)?;
@@ -22755,6 +22775,11 @@ fn reactivated_macho_archive_text_activation(
         .map(|index| patch.macho_archive_members[index].clone())
         .collect::<Vec<_>>();
     for state in &states {
+        if !stored_output_patches_match(&state.rollback_patches, current_output) {
+            return Ok(Err(
+                "reactivated Mach-O archive output changed while dormant".to_owned(),
+            ));
+        }
         for member in &state.members {
             let matched =
                 match patch_archive_member_bytes(current_bytes, &member.normalized_identifier)? {
@@ -22774,6 +22799,7 @@ fn reactivated_macho_archive_text_activation(
         }
     }
 
+    let retiring_names = retiring_names.iter().collect::<HashSet<_>>();
     let mut refreshed = HashMap::new();
     for state in &mut states {
         for section in &mut state.sections {
@@ -22828,6 +22854,16 @@ fn reactivated_macho_archive_text_activation(
                     Ok(input) => input.into(),
                     Err(reason) => return Ok(Err(reason)),
                 };
+            }
+            match macho_symbol_resolution_index_for_name(resolutions, resolution.name.as_str()) {
+                Ok(Some(_)) if !retiring_names.contains(&resolution.name) => {
+                    return Ok(Err(
+                        "reactivated Mach-O archive symbol conflicts with a live resolution"
+                            .to_owned(),
+                    ));
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(reason) => return Ok(Err(reason)),
             }
         }
         for rollback in &state.rollback_symbol_resolutions {
@@ -58286,12 +58322,82 @@ mod tests {
         let resolver = PatchInputResolver::new(&current, true).unwrap();
         let mut patch = patch;
         patch.macho_archive_members = parsed;
+        let mut dormant_output = object.clone();
+        for output_patch in &state.rollback_patches {
+            let start = output_patch.output_offset as usize;
+            dormant_output[start..start + output_patch.data.len()]
+                .copy_from_slice(&output_patch.data);
+        }
+        let live_conflict = MachOSymbolResolutionRecord {
+            target: Some(RelocationTargetRecord {
+                input_file: hex::encode("other.rlib").into(),
+                input: hex::encode("other.rlib").into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+            ..state.symbol_resolutions[0].clone()
+        };
+        assert!(
+            reactivated_macho_archive_text_activation(
+                &current,
+                &input_file,
+                &[current_identifier.to_vec()],
+                &resolver,
+                &patch,
+                &dormant_output,
+                std::slice::from_ref(&live_conflict),
+                &[],
+                &[],
+            )
+            .unwrap()
+            .err()
+            .unwrap()
+            .contains("conflicts with a live resolution")
+        );
+        assert!(
+            reactivated_macho_archive_text_activation(
+                &current,
+                &input_file,
+                &[current_identifier.to_vec()],
+                &resolver,
+                &patch,
+                &dormant_output,
+                std::slice::from_ref(&live_conflict),
+                std::slice::from_ref(&live_conflict.name),
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .is_some()
+        );
+        let mut tampered_dormant_output = dormant_output.clone();
+        let dormant_offset = state.rollback_patches[0].output_offset as usize;
+        tampered_dormant_output[dormant_offset] ^= 1;
+        assert!(
+            reactivated_macho_archive_text_activation(
+                &current,
+                &input_file,
+                &[current_identifier.to_vec()],
+                &resolver,
+                &patch,
+                &tampered_dormant_output,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap()
+            .err()
+            .unwrap()
+            .contains("output changed while dormant")
+        );
         let first_reactivation = reactivated_macho_archive_text_activation(
             &current,
             &input_file,
             &[current_identifier.to_vec()],
             &resolver,
             &patch,
+            &dormant_output,
+            &[],
             &[],
             &[],
         )
@@ -58367,6 +58473,8 @@ mod tests {
             &[current_identifier.to_vec()],
             &resolver,
             &patch,
+            &dormant_output,
+            &[],
             &[],
             &[],
         )
@@ -58488,6 +58596,7 @@ mod tests {
             sections: Vec::new(),
             raw_sections: None,
         };
+        let dormant_output = vec![0; 516];
 
         let activation = reactivated_macho_archive_text_activation(
             &current,
@@ -58495,7 +58604,9 @@ mod tests {
             &[current_identifier.to_vec()],
             &resolver,
             &patch,
+            &dormant_output,
             std::slice::from_ref(&rollback),
+            &[],
             &[],
         )
         .unwrap()
@@ -58609,7 +58720,9 @@ mod tests {
             ],
             &multi_resolver,
             &multi_patch,
+            &dormant_output,
             &[rollback.clone(), second_rollback.clone()],
+            &[],
             &[],
         )
         .unwrap()
@@ -58707,7 +58820,9 @@ mod tests {
                 ],
                 &multi_resolver,
                 &overlapping,
+                &dormant_output,
                 &[rollback.clone(), second_rollback],
+                &[],
                 &[],
             )
             .unwrap()
@@ -58726,7 +58841,9 @@ mod tests {
                 &[current_identifier.to_vec()],
                 &resolver,
                 &changed_hash,
+                &dormant_output,
                 std::slice::from_ref(&rollback),
+                &[],
                 &[],
             )
             .unwrap()
@@ -58744,7 +58861,9 @@ mod tests {
                 &[current_identifier.to_vec()],
                 &resolver,
                 &patch,
+                &dormant_output,
                 std::slice::from_ref(&conflicting_rollback),
+                &[],
                 &[],
             )
             .unwrap()
