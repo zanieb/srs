@@ -30457,6 +30457,22 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                     validated_retarget.hash_unmasked_target_offset
                         || validated_local_symbol_indices.contains(&symbol.0),
                 )?;
+            } else if fully_masked
+                && let object::RelocationTarget::Symbol(symbol) = relocation.target()
+                && validated_local_symbol_indices.contains(&symbol.0)
+            {
+                if relocation.subtractor().is_some() {
+                    return None;
+                }
+                hasher.update(b"sld-macho-validated-local-symbol-relocation-target-v1");
+                hash_validated_macho_local_relocation_target(
+                    &mut hasher,
+                    &file,
+                    symbol,
+                    file_offset,
+                    ranges,
+                    true,
+                )?;
             } else if retirement_proof {
                 if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
                     unmasked_relocation_symbols.insert(symbol);
@@ -59103,6 +59119,21 @@ mod tests {
             )
             .unwrap(),
         );
+        assert_eq!(
+            fingerprint(
+                &previous_archive,
+                &previous_ranges,
+                &[],
+                &validated_rename.previous,
+            ),
+            fingerprint(
+                &current_archive,
+                &current_ranges,
+                &[],
+                &validated_rename.current,
+            ),
+            "a proven supplemental rename must normalize its masked incoming relocations",
+        );
         let previous_fingerprint = fingerprint(
             &previous_archive,
             &previous_ranges,
@@ -59245,6 +59276,72 @@ mod tests {
                 &validated_rename.current,
             ),
             "a validated local rename must not hide unrelated atom bytes",
+        );
+        let mut partial_current_ranges = current_ranges.clone();
+        partial_current_ranges[0].end -= 1;
+        assert_ne!(
+            previous_fingerprint,
+            fingerprint(
+                &current_archive,
+                &partial_current_ranges,
+                &[],
+                &validated_rename.current,
+            ),
+            "a validated local rename requires full source-section masking",
+        );
+        assert!(
+            archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+                &current_archive,
+                &current_ranges,
+                &[],
+                &HashSet::new(),
+                &[],
+                &[
+                    validated_rename.current.clone(),
+                    validated_rename.current.clone(),
+                ],
+            )
+            .unwrap()
+            .is_none(),
+            "duplicate validated rename identities must be rejected",
+        );
+        let current_symbol_value = macho_symbol_value_field_range(
+            current_input_bytes.bytes,
+            object::SymbolIndex(validated_rename.current.symbol_index),
+        )
+        .unwrap();
+        let current_symbol_value = current_input_bytes.file_offset + current_symbol_value.start
+            ..current_input_bytes.file_offset + current_symbol_value.end;
+        let mut moved_current_archive = current_archive.clone();
+        let moved_value = read_u64_le(&moved_current_archive[current_symbol_value.clone()])
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        moved_current_archive[current_symbol_value.clone()]
+            .copy_from_slice(&moved_value.to_le_bytes());
+        assert_ne!(
+            previous_fingerprint,
+            fingerprint(
+                &moved_current_archive,
+                &current_ranges,
+                &[],
+                &validated_rename.current,
+            ),
+            "a validated local rename must bind the target section offset",
+        );
+        let mut changed_metadata_archive = current_archive.clone();
+        let n_desc = current_symbol_value.start - 2..current_symbol_value.start;
+        changed_metadata_archive[n_desc]
+            .copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
+        assert_ne!(
+            previous_fingerprint,
+            fingerprint(
+                &changed_metadata_archive,
+                &current_ranges,
+                &[],
+                &validated_rename.current,
+            ),
+            "a validated local rename must bind target metadata",
         );
 
         let patches =
