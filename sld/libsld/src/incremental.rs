@@ -28949,10 +28949,9 @@ fn stored_output_patches_match(patches: &[StoredOutputPatch], output: &[u8]) -> 
     })
 }
 
-fn macho_archive_transaction_touches_unwind_output(
-    state: &MachOArchiveActivationState,
+fn macho_unwind_output_ranges(
     output: &[u8],
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<Vec<std::ops::Range<u64>>, String> {
     let output_file = object::File::parse(output)
         .map_err(|_| "failed to parse Mach-O archive transaction output".to_owned())?;
     let mut unwind_ranges = Vec::new();
@@ -28975,15 +28974,29 @@ fn macho_archive_transaction_touches_unwind_output(
             .ok_or_else(|| "Mach-O archive transaction unwind section overflowed".to_owned())?;
         unwind_ranges.push(start..end);
     }
+    Ok(unwind_ranges)
+}
+
+fn stored_output_patch_overlaps_ranges(
+    patch: &StoredOutputPatch,
+    ranges: &[std::ops::Range<u64>],
+) -> std::result::Result<bool, String> {
+    let end = patch
+        .output_offset
+        .checked_add(patch.data.len() as u64)
+        .ok_or_else(|| "Mach-O archive transaction patch range overflowed".to_owned())?;
+    Ok(ranges
+        .iter()
+        .any(|range| patch.output_offset < range.end && range.start < end))
+}
+
+fn macho_archive_transaction_touches_unwind_output(
+    state: &MachOArchiveActivationState,
+    output: &[u8],
+) -> std::result::Result<bool, String> {
+    let unwind_ranges = macho_unwind_output_ranges(output)?;
     for patch in state.forward_patches.iter().chain(&state.rollback_patches) {
-        let end = patch
-            .output_offset
-            .checked_add(patch.data.len() as u64)
-            .ok_or_else(|| "Mach-O archive transaction patch range overflowed".to_owned())?;
-        if unwind_ranges
-            .iter()
-            .any(|range| patch.output_offset < range.end && range.start < end)
-        {
+        if stored_output_patch_overlaps_ranges(patch, &unwind_ranges)? {
             return Ok(true);
         }
     }
@@ -29648,9 +29661,20 @@ fn refresh_active_macho_archive_forward_patches(
                 .ok_or_else(|| "active Mach-O archive forward patch is outside output".to_owned())
         })
         .collect::<std::result::Result<Vec<_>, String>>()?;
+    let unwind_ranges = if state.unwind_transaction.is_some() {
+        macho_unwind_output_ranges(current_output)?
+    } else {
+        Vec::new()
+    };
     let mut updated = state.clone();
     for (patch, data) in updated.forward_patches.iter_mut().zip(refreshed) {
-        patch.data = data;
+        if stored_output_patch_overlaps_ranges(patch, &unwind_ranges)? {
+            if patch.data != data {
+                return Err("active Mach-O archive unwind transaction bytes changed".to_owned());
+            }
+        } else {
+            patch.data = data;
+        }
     }
     if let Some(transaction) = &updated.unwind_transaction
         && scratch_apply_macho_archive_unwind_transition(
@@ -68897,14 +68921,77 @@ mod tests {
         }
 
         let mut refreshed_proof = historical_state.clone();
-        refresh_active_macho_archive_forward_patches(&mut refreshed_proof, &current_version_output)
+        let unrelated_offset = output.text_offset as usize;
+        refreshed_proof.forward_patches.push(StoredOutputPatch {
+            output_offset: unrelated_offset as u64,
+            data: vec![current_version_output[unrelated_offset]],
+        });
+        refreshed_proof.rollback_patches.push(StoredOutputPatch {
+            output_offset: unrelated_offset as u64,
+            data: vec![previous_version_output[unrelated_offset]],
+        });
+        let mut refreshed_output = current_version_output.clone();
+        refreshed_output[unrelated_offset] ^= 1;
+        refresh_active_macho_archive_forward_patches(&mut refreshed_proof, &refreshed_output)
             .unwrap();
+        assert_eq!(
+            refreshed_proof.forward_patches.last().unwrap().data,
+            refreshed_output[unrelated_offset..unrelated_offset + 1],
+        );
         assert_eq!(
             refreshed_proof.unwind_transaction,
             Some(unwind_transaction.clone())
         );
 
-        let mut invalidated_output = current_version_output.clone();
+        let (unwind_info_offset, unwind_info_size, mut other_entries, text_end) = {
+            let file = object::File::parse(refreshed_output.as_slice()).unwrap();
+            let unwind_info = file.section_by_name("__unwind_info").unwrap();
+            let (offset, size) = unwind_info.file_range().unwrap();
+            let entries =
+                crate::macho_writer::parse_macho_unwind_info(unwind_info.data().unwrap()).unwrap();
+            let text = file.section_by_name("__text").unwrap();
+            let text_end = added_macho_archive_image_offset(text.address() + text.size()).unwrap();
+            (offset as usize, size as usize, entries, text_end)
+        };
+        other_entries
+            .iter_mut()
+            .find(|entry| entry.encoding != 0)
+            .unwrap()
+            .encoding ^= 1;
+        let mut other_unwind_info = vec![0; unwind_info_size];
+        crate::macho_writer::serialize_macho_unwind_info(
+            &mut other_unwind_info,
+            other_entries,
+            text_end,
+        )
+        .unwrap();
+        assert_ne!(
+            other_unwind_info,
+            refreshed_output[unwind_info_offset..unwind_info_offset + unwind_info_size],
+        );
+        assert!(crate::macho_writer::parse_macho_unwind_info(&other_unwind_info).is_ok());
+        let mut interleaved_output = refreshed_output.clone();
+        interleaved_output[unwind_info_offset..unwind_info_offset + unwind_info_size]
+            .copy_from_slice(&other_unwind_info);
+        let interleaved_file = object::File::parse(interleaved_output.as_slice()).unwrap();
+        assert_eq!(
+            macho_eh_frame_reserve_state(&interleaved_file, &activation.remaining_reserved_ranges,)
+                .unwrap()
+                .unwrap(),
+            unwind_transaction.forward.eh_frame_reserve,
+        );
+        let before_interleaved_refresh = refreshed_proof.clone();
+        assert!(
+            refresh_active_macho_archive_forward_patches(
+                &mut refreshed_proof,
+                &interleaved_output,
+            )
+            .unwrap_err()
+            .contains("unwind transaction bytes changed")
+        );
+        assert_eq!(refreshed_proof, before_interleaved_refresh);
+
+        let mut invalidated_output = refreshed_output.clone();
         let eh_frame = object::File::parse(invalidated_output.as_slice())
             .unwrap()
             .section_by_name("__eh_frame")
@@ -68928,7 +69015,7 @@ mod tests {
                 &invalidated_output,
             )
             .unwrap_err()
-            .contains("proof changed")
+            .contains("unwind transaction bytes changed")
         );
         assert_eq!(refreshed_proof, before_invalid_refresh);
 
