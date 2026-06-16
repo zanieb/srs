@@ -18061,6 +18061,16 @@ fn verify_previous_macho_local_symbol_cohort(
                 symbol
                     .name_bytes()
                     .is_ok_and(|candidate| candidate == entry.name)
+                    && !symbol.is_global()
+                    && !symbol.is_weak()
+                    && symbol.scope() == object::SymbolScope::Compilation
+                    && symbol.section_index().map(|index| index.0)
+                        == Some(usize::from(entry.output_section_index))
+                    && symbol.address() == entry.output_value
+                    && matches!(
+                        symbol.flags(),
+                        object::SymbolFlags::MachO { n_desc } if n_desc == entry.n_desc
+                    )
             })
             .collect::<Vec<_>>();
         let [symbol] = matches.as_slice() else {
@@ -52339,6 +52349,40 @@ mod tests {
             )
             .unwrap_err(),
             "published local Mach-O cohort string ownership is shared"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_scopes_duplicate_names_to_the_owned_site() {
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let text_entry = test_macho_symbol_entry_offset(&output, b"_text");
+        output[text_entry + 4] = object::macho::N_SECT;
+        let outside = add_test_macho_local_alias(output.clone(), b"_text", 2, 8);
+        let outside_file = object::File::parse(outside.as_slice()).unwrap();
+        let mut outside_entries = vec![test_macho_local_cohort_entry(&outside, b"_text")];
+        verify_previous_macho_local_symbol_cohort(
+            &outside,
+            &outside_file,
+            &[test_macho_patch_section(&outside, "__text")],
+            &mut outside_entries,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let duplicate_site = add_test_macho_local_alias(output, b"_text", 1, 0);
+        let duplicate_site_file = object::File::parse(duplicate_site.as_slice()).unwrap();
+        let mut duplicate_site_entries =
+            vec![test_macho_local_cohort_entry(&duplicate_site, b"_text")];
+        assert_eq!(
+            verify_previous_macho_local_symbol_cohort(
+                &duplicate_site,
+                &duplicate_site_file,
+                &[test_macho_patch_section(&duplicate_site, "__text")],
+                &mut duplicate_site_entries,
+                &HashSet::new(),
+            )
+            .unwrap_err(),
+            "published local Mach-O output contains duplicate cohort names",
         );
     }
 
