@@ -27,6 +27,15 @@ _main:
 
     cmp x10, x11
     b.ne 1f
+
+    adrp x13, _zero_fill_tail@PAGE
+    add x13, x13, _zero_fill_tail@PAGEOFF
+    ldrb w14, [x13]
+    cbnz w14, 1f
+    mov x14, #0x8000
+    ldrb w14, [x13, x14]
+    cbnz w14, 1f
+
     mov w0, #42
     b 2f
 1:
@@ -50,3 +59,8 @@ _tagged_pointer:
 _target:
     .quad 0x1111
     .quad 0x2222
+
+// Keep the final real chained pointer near a file/VM boundary followed by multiple zero-fill
+// pages. Post-link stripping may remove their file backing, so the fixup page table must stop at
+// the last page that actually contains a fixup.
+.zerofill __DATA,__bss,_zero_fill_tail,0x8001,14
