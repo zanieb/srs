@@ -29349,15 +29349,19 @@ fn archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
     )
 }
 
-fn direct_macho_masked_local_semantic_fingerprint_with_retargets(
+fn direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolSite],
 ) -> Result<Option<blake3::Hash>> {
     if validated_local_retargets
         .iter()
         .any(|site| !site.archive_identifier.is_empty())
+        || validated_local_symbol_renames
+            .iter()
+            .any(|site| !site.archive_identifier.is_empty())
     {
         return Ok(None);
     }
@@ -29378,9 +29382,9 @@ fn direct_macho_masked_local_semantic_fingerprint_with_retargets(
         ignored_defined_symbols,
         true,
         true,
-        !validated_local_retargets.is_empty(),
+        !validated_local_retargets.is_empty() || !validated_local_symbol_renames.is_empty(),
         &retargets,
-        &[],
+        &validated_local_symbol_renames.iter().collect::<Vec<_>>(),
     )
     .map(|(fingerprint, _, _)| fingerprint))
 }
@@ -32141,24 +32145,30 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
     {
         return Ok(true);
     }
-    if ignored_migrated_definitions.is_empty()
+    if (ignored_migrated_definitions.is_empty()
+        && validated_local_retargets.is_empty()
+        && validated_local_symbol_renames.is_empty())
         || !ignored_previous_identifiers.is_empty()
         || !ignored_current_identifiers.is_empty()
     {
         return Ok(false);
     }
-    let previous_fingerprint = direct_macho_masked_local_semantic_fingerprint_with_retargets(
-        previous_bytes,
-        &previous_ranges,
-        ignored_migrated_definitions,
-        &previous_local_retargets,
-    )?;
-    let current_fingerprint = direct_macho_masked_local_semantic_fingerprint_with_retargets(
-        current_bytes,
-        &current_ranges,
-        ignored_migrated_definitions,
-        &current_local_retargets,
-    )?;
+    let previous_fingerprint =
+        direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+            previous_bytes,
+            &previous_ranges,
+            ignored_migrated_definitions,
+            &previous_local_retargets,
+            &previous_local_symbol_renames,
+        )?;
+    let current_fingerprint =
+        direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+            current_bytes,
+            &current_ranges,
+            ignored_migrated_definitions,
+            &current_local_retargets,
+            &current_local_symbol_renames,
+        )?;
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
 }
 
@@ -57761,6 +57771,7 @@ mod tests {
                 &previous_output,
                 &mut target_patches,
                 &[],
+                &DirectMachOCguLivenessProof::default(),
                 true,
                 true,
             )
@@ -59108,6 +59119,100 @@ mod tests {
                 &validated_rename.current,
             ),
         );
+        assert!(
+            direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+                previous_input_bytes.bytes,
+                &previous_ranges
+                    .iter()
+                    .map(|range| {
+                        range.start - previous_input_bytes.file_offset
+                            ..range.end - previous_input_bytes.file_offset
+                    })
+                    .collect::<Vec<_>>(),
+                &HashSet::new(),
+                &previous_retarget,
+                std::slice::from_ref(&validated_rename.previous),
+            )
+            .unwrap()
+            .is_none(),
+            "direct-object proofs must reject archive-qualified sites",
+        );
+        let mut previous_direct_retarget = previous_retarget.clone();
+        let mut current_direct_retarget = current_retarget.clone();
+        for site in previous_direct_retarget
+            .iter_mut()
+            .chain(&mut current_direct_retarget)
+        {
+            site.archive_identifier.clear();
+        }
+        let mut previous_direct_rename = validated_rename.previous.clone();
+        previous_direct_rename.archive_identifier.clear();
+        let mut current_direct_rename = validated_rename.current.clone();
+        current_direct_rename.archive_identifier.clear();
+        let direct_ranges = |ranges: &[std::ops::Range<usize>], file_offset: usize| {
+            ranges
+                .iter()
+                .map(|range| range.start - file_offset..range.end - file_offset)
+                .collect::<Vec<_>>()
+        };
+        let previous_direct_fingerprint =
+            direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+                previous_input_bytes.bytes,
+                &direct_ranges(&previous_ranges, previous_input_bytes.file_offset),
+                &HashSet::new(),
+                &previous_direct_retarget,
+                std::slice::from_ref(&previous_direct_rename),
+            )
+            .unwrap();
+        assert!(previous_direct_fingerprint.is_some());
+        assert_eq!(
+            previous_direct_fingerprint,
+            direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+                current_input_bytes.bytes,
+                &direct_ranges(&current_ranges, current_input_bytes.file_offset),
+                &HashSet::new(),
+                &current_direct_retarget,
+                std::slice::from_ref(&current_direct_rename),
+            )
+            .unwrap(),
+            "direct unwind proofs must compose the exact retarget and local rename",
+        );
+        let direct_retargets = previous_direct_retarget
+            .iter()
+            .cloned()
+            .zip(current_direct_retarget.iter().cloned())
+            .map(|(previous, current)| ValidatedMachOLocalRelocationRetarget { previous, current })
+            .collect::<Vec<_>>();
+        let direct_rename = ValidatedMachOLocalSymbolRename {
+            previous: previous_direct_rename,
+            current: current_direct_rename,
+        };
+        assert!(
+            archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
+                &previous,
+                &current,
+                &direct_input,
+                &[MatchedPatchSection {
+                    previous: direct_previous_sections[0].clone(),
+                    current: direct_current_sections[0].clone(),
+                }],
+                &PatchInputResolver::new(&current, false).unwrap(),
+                &ChangedMachOArchiveUnwindMembers {
+                    members: Vec::new(),
+                    retired_entries: Vec::new(),
+                    current_sections: Vec::new(),
+                    previous_input_ranges: Vec::new(),
+                    current_input_ranges: Vec::new(),
+                },
+                &[],
+                &[],
+                &HashSet::new(),
+                &direct_retargets,
+                std::slice::from_ref(&direct_rename),
+            )
+            .unwrap(),
+            "direct unwind composition must not require an unrelated definition migration",
+        );
         let mut wrong_site = validated_rename.current.clone();
         wrong_site.section_index += 1;
         assert!(
@@ -60047,6 +60152,7 @@ mod tests {
                     string_index: None,
                     ..previous_text.clone()
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
             MachOLocalSymbolCohortPlan {
                 previous_input: "a2".to_owned(),
@@ -60060,6 +60166,7 @@ mod tests {
                     string_index: None,
                     ..previous_data.clone()
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
         ];
         let mut repeated_reserves = reserves.clone();
@@ -60967,6 +61074,7 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>();
             let mut target_patches = empty_target_patches();
+            let mut local_symbol_cohorts = Vec::new();
             let changed = validate_macho_data_relocations_are_stable(
                 &mut relocations,
                 &resolutions,
@@ -60977,6 +61085,8 @@ mod tests {
                 &previous_output,
                 &mut target_patches,
                 &resolution_moves,
+                &DirectMachOCguLivenessProof::default(),
+                &mut local_symbol_cohorts,
             )
             .unwrap()
             .unwrap();
@@ -61013,6 +61123,7 @@ mod tests {
         moved_field[0].current.output_offset += 8;
         let mut relocations = make_relocations();
         let mut target_patches = empty_target_patches();
+        let mut local_symbol_cohorts = Vec::new();
         let rejected = validate_macho_data_relocations_are_stable(
             &mut relocations,
             &[],
@@ -61023,6 +61134,8 @@ mod tests {
             &previous_output,
             &mut target_patches,
             std::slice::from_ref(&resolution_move),
+            &DirectMachOCguLivenessProof::default(),
+            &mut local_symbol_cohorts,
         )
         .unwrap();
         let Err(reason) = rejected else {
@@ -67648,6 +67761,9 @@ mod tests {
                 current_file,
                 current_bytes,
                 &output_file,
+                &output,
+                &[],
+                &[],
                 liveness_proof,
                 &HashSet::new(),
                 false,
@@ -75122,6 +75238,7 @@ mod tests {
                     local_symbol_cohorts: Vec::new(),
                     normalize_rust_archive_patch_inputs: false,
                     symbol_resolutions_changed: false,
+                    possible_removed_resolution_names: Vec::new(),
                 };
                 let mut patches = vec![ResolvedSectionPatch {
                     section: PatchSection {
