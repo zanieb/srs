@@ -17041,12 +17041,32 @@ fn published_local_macho_target_symbol_indices(
     )))
 }
 
-fn macho_local_symbol_is_default_strippable(name: &[u8]) -> bool {
-    name.starts_with(b"ltmp")
+fn macho_symbol_entry<'a>(bytes: &'a [u8], symbol: &object::Symbol<'_, '_>) -> Option<&'a [u8]> {
+    let value_range = macho_symbol_value_field_range(bytes, symbol.index())?;
+    let entry_start = value_range.start.checked_sub(8)?;
+    bytes.get(entry_start..value_range.end)
+}
+
+fn macho_local_symbol_is_default_strippable(
+    symbol: &object::Symbol<'_, '_>,
+    raw: &[u8],
+    name: &[u8],
+) -> bool {
+    let default_strippable_name = name.starts_with(b"ltmp")
         || name.starts_with(b".L")
         || name.starts_with(b"_.L")
         || name == b"l_.str"
-        || name.starts_with(b"l_.str.")
+        || name.starts_with(b"l_.str.");
+    default_strippable_name
+        && raw.len() == 16
+        && symbol.scope() == object::SymbolScope::Compilation
+        && !symbol.is_undefined()
+        && !symbol.is_weak()
+        && symbol
+            .section_index()
+            .is_some_and(|section| usize::from(raw[5]) == section.0)
+        && raw[4] == object::macho::N_SECT
+        && read_u16_le(&raw[6..8]) == Some(0)
 }
 
 fn macho_local_symbol_cohort_entries(
@@ -17074,10 +17094,6 @@ fn macho_local_symbol_cohort_entries(
         if symbol.is_global() {
             continue;
         }
-        let name = symbol.name_bytes()?;
-        if name.is_empty() || macho_local_symbol_is_default_strippable(name) {
-            continue;
-        }
         if symbol.is_undefined()
             || symbol.is_weak()
             || symbol.scope() != object::SymbolScope::Compilation
@@ -17091,22 +17107,7 @@ fn macho_local_symbol_cohort_entries(
                 "published local Mach-O cohort contains a symbol without a section".to_owned(),
             ));
         };
-        let Some((_, owner)) = owned_sections
-            .iter()
-            .find(|(index, _)| *index == section_index)
-        else {
-            return Ok(Err(
-                "published local Mach-O cohort is not completely section-owned".to_owned(),
-            ));
-        };
-        let value_range = macho_symbol_value_field_range(bytes, symbol.index())
-            .ok_or_else(|| crate::error!("Missing Mach-O local cohort symbol entry"))?;
-        let Some(entry_start) = value_range.start.checked_sub(8) else {
-            return Ok(Err(
-                "published local Mach-O cohort symbol entry is truncated".to_owned(),
-            ));
-        };
-        let Some(raw) = bytes.get(entry_start..value_range.end) else {
+        let Some(raw) = macho_symbol_entry(bytes, &symbol) else {
             return Ok(Err(
                 "published local Mach-O cohort symbol entry is truncated".to_owned(),
             ));
@@ -17128,6 +17129,18 @@ fn macho_local_symbol_cohort_entries(
                 "published local Mach-O cohort contains liveness-significant metadata".to_owned(),
             ));
         }
+        let name = symbol.name_bytes()?;
+        if name.is_empty() || macho_local_symbol_is_default_strippable(&symbol, raw, name) {
+            continue;
+        }
+        let Some((_, owner)) = owned_sections
+            .iter()
+            .find(|(index, _)| *index == section_index)
+        else {
+            return Ok(Err(
+                "published local Mach-O cohort is not completely section-owned".to_owned(),
+            ));
+        };
         let input_section = file.section_by_index(section_index)?;
         let Some(section_offset) = symbol.address().checked_sub(input_section.address()) else {
             return Ok(Err(
@@ -17225,7 +17238,10 @@ fn verify_previous_macho_local_symbol_cohort(
         let Ok(name) = symbol.name_bytes() else {
             return Err("published local Mach-O output has a malformed name".to_owned());
         };
-        if name.is_empty() || macho_local_symbol_is_default_strippable(name) {
+        let Some(raw) = macho_symbol_entry(previous_output, &symbol) else {
+            return Err("published local Mach-O output symbol entry is truncated".to_owned());
+        };
+        if name.is_empty() || macho_local_symbol_is_default_strippable(&symbol, raw, name) {
             continue;
         }
         let in_owned_range = symbol.section_index().is_some_and(|symbol_section| {
@@ -24775,16 +24791,17 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                         .section_index()
                         .is_some_and(|section| fully_masked_sections.contains(&section))
             }) {
+                let raw = macho_symbol_entry(bytes, &symbol)?;
                 symbols_by_position
                     .entry((symbol.section_index()?, symbol.address()))
                     .or_insert_with(Vec::new)
                     .push((
                         symbol.index(),
-                        symbol.scope() == object::SymbolScope::Compilation
-                            && symbol
-                                .name_bytes()
-                                .ok()
-                                .is_some_and(macho_local_symbol_is_default_strippable),
+                        !ignored_validated_local_target_symbols.contains(&symbol.index())
+                            && !exact_validated_local_target_symbols.contains(&symbol.index())
+                            && symbol.name_bytes().ok().is_some_and(|name| {
+                                macho_local_symbol_is_default_strippable(&symbol, raw, name)
+                            }),
                     ));
             }
             symbols_by_position
@@ -46483,9 +46500,77 @@ mod tests {
         let current_ltmp = add_test_macho_local_alias(current.clone(), b"ltmp3", 2, 9);
         assert_eq!(fingerprint(&previous_ltmp), fingerprint(&current_ltmp));
 
-        let previous_alias = add_test_macho_local_alias(previous, b"alias", 2, 4);
-        let current_alias = add_test_macho_local_alias(current, b"alias", 2, 9);
+        let previous_alias = add_test_macho_local_alias(previous.clone(), b"alias", 2, 4);
+        let current_alias = add_test_macho_local_alias(current.clone(), b"alias", 2, 9);
         assert_ne!(fingerprint(&previous_alias), fingerprint(&current_alias));
+
+        for n_desc in [
+            object::macho::N_WEAK_DEF,
+            object::macho::N_NO_DEAD_STRIP,
+            object::macho::N_ALT_ENTRY,
+        ] {
+            let mut previous_hostile = add_test_macho_local_alias(previous.clone(), b"ltmp3", 2, 4);
+            let previous_entry = test_macho_symbol_entry_offset(&previous_hostile, b"ltmp3");
+            previous_hostile[previous_entry + 6..previous_entry + 8]
+                .copy_from_slice(&n_desc.to_le_bytes());
+            let mut current_hostile = add_test_macho_local_alias(current.clone(), b"ltmp3", 2, 9);
+            let current_entry = test_macho_symbol_entry_offset(&current_hostile, b"ltmp3");
+            current_hostile[current_entry + 6..current_entry + 8]
+                .copy_from_slice(&n_desc.to_le_bytes());
+            assert_ne!(
+                fingerprint(&previous_hostile),
+                fingerprint(&current_hostile)
+            );
+        }
+    }
+
+    #[test]
+    fn masked_macho_alias_fingerprint_rejects_strippable_validated_target() {
+        let fingerprint = |bytes: &[u8], target_name: &[u8]| {
+            let file = object::File::parse(bytes).unwrap();
+            let section = file.section_by_name("__text").unwrap();
+            let target = file
+                .symbols()
+                .find(|symbol| symbol.name_bytes().ok() == Some(target_name))
+                .unwrap();
+            let site = ValidatedMachOLocalRelocationSite {
+                archive_identifier: Vec::new(),
+                section_index: section.index().0,
+                relocation_offset: 0,
+                target_symbol_index: target.index().0,
+                hash_target_symbol: false,
+                exact_symbol_indices: Vec::new(),
+            };
+            let ranges = [
+                test_macho_section_range(bytes, "__text"),
+                test_macho_section_range(bytes, "__const"),
+            ];
+            macho_object_semantic_patch_fingerprint_with_retargets(
+                bytes,
+                0,
+                &ranges,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                true,
+                true,
+                true,
+                &[&site],
+            )
+        };
+        let previous_unaliased =
+            test_macho_local_text_target_object_with_alias(b"ltmp0", b"A-target", 0, None);
+        let current_unaliased =
+            test_macho_local_text_target_object_with_alias(b"ltmp1", b"B-target", 4, None);
+        let previous =
+            test_macho_local_text_target_object_with_alias(b"ltmp0", b"A-target", 0, Some(0));
+        let current =
+            test_macho_local_text_target_object_with_alias(b"ltmp1", b"B-target", 4, Some(4));
+
+        assert!(fingerprint(&previous_unaliased, b"ltmp0").is_some());
+        assert!(fingerprint(&current_unaliased, b"ltmp1").is_some());
+        assert!(fingerprint(&previous, b"ltmp0").is_none());
+        assert!(fingerprint(&current, b"ltmp1").is_none());
     }
 
     #[test]
@@ -56001,32 +56086,60 @@ mod tests {
                 .unwrap();
         assert_eq!(output, fixture.expected_output);
 
-        let mut added = local_text_target_transition_fixture(
-            b"l_a.1",
-            b"l_b.2",
-            b"A-target",
-            b"B-target",
-            0,
-            4,
-        );
-        publish_stable_local_transition_symbols(&mut added, b"l_a.1", 0, b"l_b.2", 4);
-        added.previous = mutate_test_macho_archive_member(
-            &added.previous,
-            previous_identifier,
-            enable_subsections,
-        );
-        added.current =
-            mutate_test_macho_archive_member(&added.current, current_identifier, |mut object| {
-                object = enable_subsections(object);
-                let entry = test_macho_symbol_entry_offset(&object, b"l_a.1");
-                object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
-                add_test_macho_local_alias(object, b"new.dead", 2, 11)
-            });
+        let population_change = |name: &'static [u8], n_desc: u16| {
+            let mut added = local_text_target_transition_fixture(
+                b"l_a.1",
+                b"l_b.2",
+                b"A-target",
+                b"B-target",
+                0,
+                4,
+            );
+            publish_stable_local_transition_symbols(&mut added, b"l_a.1", 0, b"l_b.2", 4);
+            added.previous = mutate_test_macho_archive_member(
+                &added.previous,
+                previous_identifier,
+                enable_subsections,
+            );
+            added.current = mutate_test_macho_archive_member(
+                &added.current,
+                current_identifier,
+                |mut object| {
+                    object = enable_subsections(object);
+                    let entry = test_macho_symbol_entry_offset(&object, b"l_a.1");
+                    object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
+                    object = add_test_macho_local_alias(object, name, 2, 11);
+                    let entry = test_macho_symbol_entry_offset(&object, name);
+                    object[entry + 6..entry + 8].copy_from_slice(&n_desc.to_le_bytes());
+                    object
+                },
+            );
+            added
+        };
+        let expected = "renamed local Mach-O text target is present in the output symbol table";
+        let added = population_change(b"new.dead", 0);
         assert_eq!(
             apply_local_text_target_transition(&added, vec![added.relocation.clone()], true)
                 .unwrap_err(),
-            "renamed local Mach-O text target is present in the output symbol table",
+            expected,
         );
+
+        for n_desc in [
+            object::macho::N_WEAK_DEF,
+            object::macho::N_NO_DEAD_STRIP,
+            object::macho::N_ALT_ENTRY,
+        ] {
+            let hostile = population_change(b"ltmp7", n_desc);
+            assert_eq!(
+                apply_local_text_target_transition(
+                    &hostile,
+                    vec![hostile.relocation.clone()],
+                    true,
+                )
+                .unwrap_err(),
+                expected,
+            );
+        }
     }
 
     #[test]
