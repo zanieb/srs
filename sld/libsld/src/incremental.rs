@@ -7190,6 +7190,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     }
                 }
             };
+            // A historical member alias does not prove that a separate archive activation
+            // transaction preserves the same live output population.
+            if added_macho_archive_text_activation.is_some()
+                && !macho_text_relocation_replays.can_activate_macho_archive_members()
+            {
+                return Ok(ChangedInputPatchResult::Unsupported(
+                    "normalized Mach-O target aliases cannot activate archive members".to_owned(),
+                ));
+            }
             let mut changed_macho_archive_unwind_activation = if args
                 .should_activate_macho_archive_members()
                 && added_macho_archive_text_activation
@@ -16069,6 +16078,7 @@ struct MachOTextRelocationReplay {
     previous_written_value: Option<u64>,
     previous_applied_target_value: Option<u64>,
     current_target_value: u64,
+    used_normalized_target_alias: bool,
     current_relocation_target_candidates: Vec<u64>,
     current_target_section_offset: u64,
     target_symbol_id: u32,
@@ -16080,6 +16090,12 @@ struct MachOTextRelocationReplay {
     chained_rebase_value: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MachOCurrentTargetValue {
+    value: u64,
+    used_normalized_alias: bool,
+}
+
 struct MachOTextRelocationReplays {
     replays: Vec<MachOTextRelocationReplay>,
     rematerialized_sections: Vec<(SharedText, String, u32, String, u32)>,
@@ -16089,6 +16105,12 @@ struct MachOTextRelocationReplays {
 }
 
 impl MachOTextRelocationReplays {
+    fn can_activate_macho_archive_members(&self) -> bool {
+        self.replays
+            .iter()
+            .all(|replay| !replay.used_normalized_target_alias)
+    }
+
     fn uses_only_records_owned_by_input(
         &self,
         relocations: &[RelocationRecord],
@@ -19147,34 +19169,35 @@ fn macho_output_address_for_current_target(
         previous_target,
         normalize_rust_archive_patch_inputs,
     )
+    .map(|resolved| resolved.value)
 }
 
-fn macho_relocation_targets_match(
+fn macho_relocation_target_match_is_normalized(
     candidate: &RelocationTargetRecord,
     expected: &RelocationTargetRecord,
     previous_file: &object::File<'_>,
     current_file: &object::File<'_>,
     normalize_rust_archive_patch_inputs: bool,
-) -> bool {
+) -> Option<bool> {
     if candidate == expected {
-        return true;
+        return Some(false);
     }
     if !normalize_rust_archive_patch_inputs
         || candidate.input_file != expected.input_file
         || candidate.section_index != expected.section_index
         || candidate.section_offset != expected.section_offset
     {
-        return false;
+        return None;
     }
     let Ok(section_index) = usize::try_from(expected.section_index) else {
-        return false;
+        return None;
     };
     let section_index = object::SectionIndex(section_index);
     let Ok(previous_section) = previous_file.section_by_index(section_index) else {
-        return false;
+        return None;
     };
     let Ok(current_section) = current_file.section_by_index(section_index) else {
-        return false;
+        return None;
     };
     if previous_section.size() != current_section.size()
         || expected.section_offset >= previous_section.size()
@@ -19186,7 +19209,7 @@ fn macho_relocation_targets_match(
         )
         .is_ok_and(|compatible| compatible)
     {
-        return false;
+        return None;
     }
     normalized_archive_input_refs_match(
         expected.input_file.as_str(),
@@ -19194,6 +19217,25 @@ fn macho_relocation_targets_match(
         expected.input.as_str(),
     )
     .is_ok_and(|matches| matches)
+    .then_some(true)
+}
+
+#[cfg(test)]
+fn macho_relocation_targets_match(
+    candidate: &RelocationTargetRecord,
+    expected: &RelocationTargetRecord,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> bool {
+    macho_relocation_target_match_is_normalized(
+        candidate,
+        expected,
+        previous_file,
+        current_file,
+        normalize_rust_archive_patch_inputs,
+    )
+    .is_some()
 }
 
 fn macho_output_address_for_current_target_with_lookup(
@@ -19206,7 +19248,7 @@ fn macho_output_address_for_current_target_with_lookup(
     target: &RelocationTargetRecord,
     previous_target: &RelocationTargetRecord,
     normalize_rust_archive_patch_inputs: bool,
-) -> Option<u64> {
+) -> Option<MachOCurrentTargetValue> {
     if let Some(value) = macho_output_address_for_current_section_offset_with_lookup(
         output_file,
         matched_sections,
@@ -19215,27 +19257,36 @@ fn macho_output_address_for_current_target_with_lookup(
         object::SectionIndex(target.section_index as usize),
         target.section_offset,
     ) {
-        return Some(value);
+        return Some(MachOCurrentTargetValue {
+            value,
+            used_normalized_alias: false,
+        });
     }
-    let mut values = Vec::new();
-    for relocation in relocations {
-        let Some(candidate) = relocation.target.as_ref() else {
-            continue;
-        };
-        if macho_relocation_targets_match(
+    let target_match = |candidate: &RelocationTargetRecord| {
+        macho_relocation_target_match_is_normalized(
             candidate,
             target,
             previous_file,
             current_file,
             normalize_rust_archive_patch_inputs,
-        ) || macho_relocation_targets_match(
+        )
+        .into_iter()
+        .chain(macho_relocation_target_match_is_normalized(
             candidate,
             previous_target,
             previous_file,
             current_file,
             normalize_rust_archive_patch_inputs,
-        ) {
-            values.push(relocation.target_value);
+        ))
+        .min()
+    };
+    let mut values = Vec::new();
+    for relocation in relocations {
+        let Some(candidate) = relocation.target.as_ref() else {
+            continue;
+        };
+        if let Some(normalized) = target_match(candidate) {
+            values.push((relocation.target_value, normalized));
         }
     }
     for resolution in resolutions {
@@ -19243,23 +19294,15 @@ fn macho_output_address_for_current_target_with_lookup(
         else {
             continue;
         };
-        if macho_relocation_targets_match(
-            candidate,
-            target,
-            previous_file,
-            current_file,
-            normalize_rust_archive_patch_inputs,
-        ) || macho_relocation_targets_match(
-            candidate,
-            previous_target,
-            previous_file,
-            current_file,
-            normalize_rust_archive_patch_inputs,
-        ) {
-            values.push(value);
+        if let Some(normalized) = target_match(candidate) {
+            values.push((value, normalized));
         }
     }
-    unique_macho_target_value(values)
+    let value = unique_macho_target_value(values.iter().map(|(value, _)| *value))?;
+    Some(MachOCurrentTargetValue {
+        value,
+        used_normalized_alias: values.iter().all(|(_, normalized)| *normalized),
+    })
 }
 
 fn macho_symbol_resolution_for_name<'a>(
@@ -19693,6 +19736,7 @@ fn rematerialized_macho_text_relocation_replay(
 
     let mut target_name = None;
     let mut target_is_global = false;
+    let mut used_normalized_target_alias = false;
     let target;
     let mut resolution = None;
     let mut recorded_import_stub_candidates = Vec::new();
@@ -19727,7 +19771,7 @@ fn rematerialized_macho_text_relocation_replay(
                     section_index: current_target.section_index,
                     section_offset,
                 };
-                let Some(value) = macho_output_address_for_current_target_with_lookup(
+                let Some(resolved) = macho_output_address_for_current_target_with_lookup(
                     output_file,
                     previous_file,
                     current_file,
@@ -19747,7 +19791,8 @@ fn rematerialized_macho_text_relocation_replay(
                     )));
                 };
                 target = Some(current_target);
-                value
+                used_normalized_target_alias = resolved.used_normalized_alias;
+                resolved.value
             } else {
                 if let Some(value) = resolution.and_then(|resolution| resolution.direct_value) {
                     target = resolution.and_then(|resolution| resolution.target.clone());
@@ -19801,7 +19846,7 @@ fn rematerialized_macho_text_relocation_replay(
                 section_index: current_target.section_index,
                 section_offset: 0,
             };
-            let Some(value) = macho_output_address_for_current_target_with_lookup(
+            let Some(resolved) = macho_output_address_for_current_target_with_lookup(
                 output_file,
                 previous_file,
                 current_file,
@@ -19819,7 +19864,8 @@ fn rematerialized_macho_text_relocation_replay(
                 )));
             };
             target = Some(current_target);
-            value
+            used_normalized_target_alias = resolved.used_normalized_alias;
+            resolved.value
         }
         _ => {
             return Ok(Err(format!(
@@ -19866,6 +19912,7 @@ fn rematerialized_macho_text_relocation_replay(
         previous_written_value: None,
         previous_applied_target_value: None,
         current_target_value,
+        used_normalized_target_alias,
         current_relocation_target_candidates,
         current_target_section_offset: target.as_ref().map_or(0, |target| target.section_offset),
         target_symbol_id,
@@ -21033,6 +21080,7 @@ fn macho_text_relocation_replays_for_input(
                     previous_written_value: Some(previous_written_value),
                     previous_applied_target_value: Some(previous_applied_target_value),
                     current_target_value,
+                    used_normalized_target_alias: false,
                     current_relocation_target_candidates,
                     current_target_section_offset: replay_target
                         .as_ref()
@@ -33026,6 +33074,7 @@ fn added_macho_archive_text_relocation_replays(
                 previous_written_value: None,
                 previous_applied_target_value: None,
                 current_target_value,
+                used_normalized_target_alias: false,
                 current_relocation_target_candidates,
                 current_target_section_offset: target
                     .as_ref()
@@ -33203,6 +33252,7 @@ fn added_macho_archive_text_relocation_replays(
                     previous_written_value: None,
                     previous_applied_target_value: None,
                     current_target_value,
+                    used_normalized_target_alias: false,
                     current_relocation_target_candidates: vec![current_target_value],
                     current_target_section_offset: target
                         .as_ref()
@@ -64062,6 +64112,23 @@ mod tests {
             ),
             Some(0x1000_4020)
         );
+        assert_eq!(
+            macho_output_address_for_current_target_with_lookup(
+                &output_file,
+                &previous_file,
+                &current_file,
+                &MatchedCurrentSectionLookup::new(&[]),
+                std::slice::from_ref(&relocation),
+                &[],
+                &current_target,
+                &previous_target,
+                true,
+            ),
+            Some(MachOCurrentTargetValue {
+                value: 0x1000_4020,
+                used_normalized_alias: true,
+            })
+        );
 
         let persisted_target = relocation.target.as_ref().unwrap();
         assert!(!macho_relocation_targets_match(
@@ -64963,6 +65030,7 @@ mod tests {
             previous_written_value: None,
             previous_applied_target_value: None,
             current_target_value: target_value,
+            used_normalized_target_alias: false,
             current_relocation_target_candidates: vec![target_value],
             current_target_section_offset: target.section_offset,
             target_symbol_id: 1,
@@ -64973,6 +65041,29 @@ mod tests {
             chained_rebase_output_offset: None,
             chained_rebase_value: None,
         }
+    }
+
+    #[test]
+    fn normalized_macho_target_alias_cannot_activate_archive_members() {
+        let input = hex::encode("lib.rlib");
+        let target = RelocationTargetRecord {
+            input_file: input.clone().into(),
+            input: input.into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let replay = rematerialized_macho_replay("lib.rlib", "_target", 0x1000, target);
+        let mut replays = MachOTextRelocationReplays {
+            replays: vec![replay],
+            rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
+            normalize_rust_archive_patch_inputs: true,
+            symbol_resolutions_changed: false,
+        };
+        assert!(replays.can_activate_macho_archive_members());
+
+        replays.replays[0].used_normalized_target_alias = true;
+        assert!(!replays.can_activate_macho_archive_members());
     }
 
     #[test]
