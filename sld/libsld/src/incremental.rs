@@ -8919,6 +8919,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 match macho_local_symbol_cohort_owns_output_symbol_patch(
                     &macho_text_relocation_replays.local_symbol_cohorts,
                     patch,
+                    previous_output.get()?,
                 ) {
                     Ok(true) => {}
                     Ok(false) => output_symbol_patches.push(patch.clone()),
@@ -22944,6 +22945,7 @@ fn plan_macho_local_symbol_cohort(
 fn macho_local_symbol_cohort_owns_output_symbol_patch(
     cohorts: &[MachOLocalSymbolCohortPlan],
     patch: &RelocationTargetSymbolPatch,
+    previous_output: &[u8],
 ) -> std::result::Result<bool, String> {
     let name = hex::decode(&patch.target_name).map_err(|_| {
         "published local Mach-O output-symbol patch has a malformed name".to_owned()
@@ -22970,22 +22972,53 @@ fn macho_local_symbol_cohort_owns_output_symbol_patch(
     };
     let previous = cohort.previous.iter().find(|entry| entry.name == name);
     let current = cohort.current.iter().find(|entry| entry.name == name);
-    if let Some(previous) = previous {
-        if previous.output_value != patch.previous_target_value
-            || !cohort
-                .current
-                .iter()
-                .any(|entry| entry.output_value == patch.target_value)
+    let Some(previous) = previous else {
+        if !patch.allow_missing
+            || current.is_none_or(|entry| entry.output_value != patch.target_value)
         {
             return Err(
                 "published local Mach-O output-symbol patch conflicts with its cohort".to_owned(),
             );
         }
-    } else if !patch.allow_missing
-        || current.is_none_or(|entry| entry.output_value != patch.target_value)
+        // There is no prior local nlist for the cohort to own. Keep the optional patch; the
+        // generic symbol patcher will skip it if the output has no independently owned symbol.
+        return Ok(false);
+    };
+    if previous.output_value != patch.previous_target_value
+        || !cohort
+            .current
+            .iter()
+            .any(|entry| entry.output_value == patch.target_value)
     {
         return Err(
             "published local Mach-O output-symbol patch conflicts with its cohort".to_owned(),
+        );
+    }
+
+    let file = object::File::parse(previous_output).map_err(|_| {
+        "published local Mach-O output-symbol patch has an invalid output".to_owned()
+    })?;
+    let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
+    let mut exact_owner = None;
+    for symbol in file.symbols() {
+        let symbol_name = symbol.name_bytes().map_err(|_| {
+            "published local Mach-O output-symbol patch has a malformed output name".to_owned()
+        })?;
+        if symbol_name != name || symbol.address() != patch.previous_target_value {
+            continue;
+        }
+        let range =
+            macho_symbol_entry_range(previous_output, symbol_table_offset, symbol.index().0)?;
+        if exact_owner.replace(range.start as u64).is_some() {
+            return Err(
+                "published local Mach-O output-symbol patch has ambiguous exact nlist ownership"
+                    .to_owned(),
+            );
+        }
+    }
+    if exact_owner != previous.output_entry_offset {
+        return Err(
+            "published local Mach-O output-symbol patch has no exact cohort nlist owner".to_owned(),
         );
     }
     Ok(true)
@@ -60620,25 +60653,27 @@ mod tests {
 
     #[test]
     fn published_local_macho_cohort_validates_owned_output_symbol_patches() {
-        let entry = |name: &[u8], value| MachOLocalSymbolCohortEntry {
-            name: name.to_vec(),
-            n_desc: 0,
-            output_section_index: 1,
-            output_value: value,
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let output_entry = test_macho_symbol_entry_offset(&output, b"_text");
+        output[output_entry + 4] = object::macho::N_SECT;
+        let previous = test_macho_local_cohort_entry(&output, b"_text");
+        let current = MachOLocalSymbolCohortEntry {
+            output_value: previous.output_value + 4,
             output_entry_offset: None,
             string_index: None,
+            ..previous.clone()
         };
         let cohort = MachOLocalSymbolCohortPlan {
             previous_input: "a".to_owned(),
             current_input: "b".to_owned(),
-            previous: vec![entry(b"old", 10)],
-            current: vec![entry(b"new", 20)],
+            previous: vec![previous.clone()],
+            current: vec![current.clone()],
             validated_local_symbol_renames: Vec::new(),
         };
         let owned = RelocationTargetSymbolPatch {
-            target_name: hex::encode(b"old"),
-            previous_target_value: 10,
-            target_value: 20,
+            target_name: hex::encode(b"_text"),
+            previous_target_value: previous.output_value,
+            target_value: current.output_value,
             allow_missing: true,
             source: "test",
         };
@@ -60646,6 +60681,7 @@ mod tests {
             macho_local_symbol_cohort_owns_output_symbol_patch(
                 std::slice::from_ref(&cohort),
                 &owned,
+                &output,
             )
             .unwrap()
         );
@@ -60654,9 +60690,68 @@ mod tests {
             ..owned
         };
         assert_eq!(
-            macho_local_symbol_cohort_owns_output_symbol_patch(&[cohort], &conflicting)
+            macho_local_symbol_cohort_owns_output_symbol_patch(&[cohort], &conflicting, &output,)
                 .unwrap_err(),
             "published local Mach-O output-symbol patch conflicts with its cohort"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_does_not_own_same_name_global_symbol_patch() {
+        let output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let global = output_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(b"_text") && symbol.is_global())
+            .unwrap();
+        let section_index = u8::try_from(global.section_index().unwrap().0).unwrap();
+        let output_value = global.address();
+        drop(output_file);
+        let output = add_test_macho_local_alias(output, b"_text", section_index, output_value);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let local = output_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(b"_text") && !symbol.is_global())
+            .unwrap();
+        let local_range = macho_symbol_entry_range(
+            &output,
+            macho_symbol_table_offset_for_recycling(&output).unwrap(),
+            local.index().0,
+        )
+        .unwrap();
+        let previous = MachOLocalSymbolCohortEntry {
+            name: b"_text".to_vec(),
+            n_desc: 0,
+            output_section_index: section_index,
+            output_value,
+            output_entry_offset: Some(local_range.start as u64),
+            string_index: read_u32_le(&output[local_range.start..local_range.start + 4]),
+        };
+        let current = MachOLocalSymbolCohortEntry {
+            output_value: output_value + 4,
+            output_entry_offset: None,
+            string_index: None,
+            ..previous.clone()
+        };
+        let cohort = MachOLocalSymbolCohortPlan {
+            previous_input: "a".to_owned(),
+            current_input: "b".to_owned(),
+            previous: vec![previous],
+            current: vec![current],
+            validated_local_symbol_renames: Vec::new(),
+        };
+        let global_patch = RelocationTargetSymbolPatch {
+            target_name: hex::encode(b"_text"),
+            previous_target_value: output_value,
+            target_value: output_value + 4,
+            allow_missing: false,
+            source: "global test",
+        };
+
+        assert_eq!(
+            macho_local_symbol_cohort_owns_output_symbol_patch(&[cohort], &global_patch, &output,)
+                .unwrap_err(),
+            "published local Mach-O output-symbol patch has ambiguous exact nlist ownership",
         );
     }
 
