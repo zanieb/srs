@@ -6092,6 +6092,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 let ownership = match owned_macho_archive_removal_indices(
                     input.path.as_str(),
                     stored_patch,
+                    &previous.macho_symbol_resolutions,
                     &delta.removed,
                 ) {
                     Ok(ownership) => ownership,
@@ -6124,6 +6125,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         previous_bytes,
                         input.path.as_str(),
                         stored_patch,
+                        &previous.macho_symbol_resolutions,
                         &identifier,
                     )? {
                         Ok(state) => state,
@@ -6261,14 +6263,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             true
                         }
                     });
-                    for resolution in &previous.macho_symbol_resolutions {
-                        if resolution.target.as_ref().is_some_and(|target| {
-                            target.input_file == input.path
-                                && member_inputs.contains(target.input.as_str())
-                        }) {
-                            state.symbol_resolutions.push(resolution.clone());
-                        }
-                    }
+                    state
+                        .symbol_resolutions
+                        .extend(macho_archive_member_symbol_resolutions(
+                            &previous.macho_symbol_resolutions,
+                            input.path.as_str(),
+                            &member_inputs,
+                        ));
                     if retirement.newly_tracked {
                         if let Err(reason) = retain_initial_macho_archive_removal_transaction(
                             state,
@@ -22248,6 +22249,7 @@ fn archive_member_identifier_delta(
 fn owned_macho_archive_removal_indices(
     input_file_path: &str,
     patch: &FilePatchState,
+    resolutions: &[MachOSymbolResolutionRecord],
     removed_identifiers: &[Vec<u8>],
 ) -> std::result::Result<MachOArchiveRemovalOwnership, String> {
     let mut remaining = HashSet::with_capacity(removed_identifiers.len());
@@ -22302,6 +22304,28 @@ fn owned_macho_archive_removal_indices(
                 break;
             }
         }
+        if !represented {
+            for resolution in resolutions {
+                let Some(target) = resolution
+                    .target
+                    .as_ref()
+                    .filter(|target| target.input_file == input_file_path)
+                else {
+                    continue;
+                };
+                if normalized_archive_input_ref_matches_identifiers(
+                    input_file_path,
+                    target.input.as_str(),
+                    &identifiers,
+                )
+                .map_err(|error| {
+                    format!("failed to classify removed archive member resolution: {error:?}")
+                })? {
+                    represented = true;
+                    break;
+                }
+            }
+        }
         if represented {
             initially_owned_identifiers.push(identifier);
         }
@@ -22329,6 +22353,7 @@ fn initially_owned_macho_archive_removal_state(
     previous_bytes: &[u8],
     input_file_path: &str,
     patch: &FilePatchState,
+    resolutions: &[MachOSymbolResolutionRecord],
     normalized_identifier: &[u8],
 ) -> Result<std::result::Result<MachOArchiveActivationState, String>> {
     let member = match patch_archive_member_bytes(previous_bytes, normalized_identifier)? {
@@ -22350,7 +22375,25 @@ fn initially_owned_macho_archive_removal_state(
             sections.push(section.clone());
         }
     }
-    if sections.is_empty() {
+    let mut owns_resolution = false;
+    for resolution in resolutions {
+        let Some(target) = resolution
+            .target
+            .as_ref()
+            .filter(|target| target.input_file == input_file_path)
+        else {
+            continue;
+        };
+        if normalized_archive_input_ref_matches_identifiers(
+            input_file_path,
+            target.input.as_str(),
+            &normalized_identifiers,
+        )? {
+            owns_resolution = true;
+            break;
+        }
+    }
+    if sections.is_empty() && !owns_resolution {
         return Ok(Err(
             "removed Mach-O archive member has no active ownership record".to_owned(),
         ));
@@ -22369,6 +22412,23 @@ fn initially_owned_macho_archive_removal_state(
         forward_patches: Vec::new(),
         rollback_patches: Vec::new(),
     }))
+}
+
+fn macho_archive_member_symbol_resolutions(
+    resolutions: &[MachOSymbolResolutionRecord],
+    input_file_path: &str,
+    member_inputs: &HashSet<String>,
+) -> Vec<MachOSymbolResolutionRecord> {
+    resolutions
+        .iter()
+        .filter(|resolution| {
+            resolution.target.as_ref().is_some_and(|target| {
+                target.input_file == input_file_path
+                    && member_inputs.contains(target.input.as_str())
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn retain_initial_macho_archive_removal_transaction(
@@ -57768,6 +57828,7 @@ mod tests {
         let ownership = owned_macho_archive_removal_indices(
             "libcrate.rlib",
             &patch,
+            &[],
             &[
                 b"crate.cgu.1.session.rcgu.o".to_vec(),
                 b"crate.cgu.2.session.rcgu.o".to_vec(),
@@ -57780,6 +57841,7 @@ mod tests {
             owned_macho_archive_removal_indices(
                 "libcrate.rlib",
                 &patch,
+                &[],
                 &[b"crate.cgu.1.session.rcgu.o".to_vec()],
             )
             .unwrap_err()
@@ -57788,6 +57850,7 @@ mod tests {
         let ownership = owned_macho_archive_removal_indices(
             "libcrate.rlib",
             &patch,
+            &[],
             &[b"crate.cgu.3.session.rcgu.o".to_vec()],
         )
         .unwrap();
@@ -57893,6 +57956,7 @@ mod tests {
         let ownership = owned_macho_archive_removal_indices(
             &input_file,
             &patch,
+            &[],
             &[previous_identifier.to_vec()],
         )
         .unwrap();
@@ -57904,6 +57968,7 @@ mod tests {
             &previous,
             &input_file,
             &patch,
+            &[],
             &archive_member_patch_identifier(previous_identifier),
         )
         .unwrap()
@@ -57943,6 +58008,94 @@ mod tests {
                 .unwrap(),
             vec![0]
         );
+    }
+
+    #[test]
+    fn initially_owned_macho_archive_symbol_only_member_is_retained() {
+        let input_file = hex::encode("libcrate.rlib");
+        let previous_identifier = b"crate-hash.cgu.4.old.rcgu.o";
+        let object = test_macho_object(&[1; 4], &[2; 4], 0);
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(previous_identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let previous = builder.into_inner().unwrap();
+        let member = match patch_archive_member_bytes(&previous, previous_identifier).unwrap() {
+            ArchiveMemberMatch::Unique(member) => member,
+            _ => panic!("expected unique archive member"),
+        };
+        let input = resolved_patch_input_ref(&input_file, &input_file, member).unwrap();
+        let file = object::File::parse(member.bytes).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_text").into(),
+            direct_value: Some(0),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_file.clone().into(),
+                input: input.clone().into(),
+                section_index: text.index().0 as u32,
+                section_offset: 0,
+            }),
+        };
+        let patch = FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: Vec::new(),
+            raw_sections: None,
+        };
+
+        let ownership = owned_macho_archive_removal_indices(
+            &input_file,
+            &patch,
+            std::slice::from_ref(&resolution),
+            &[previous_identifier.to_vec()],
+        )
+        .unwrap();
+        assert_eq!(
+            ownership.initially_owned_identifiers,
+            vec![archive_member_patch_identifier(previous_identifier)]
+        );
+        assert!(
+            owned_macho_archive_removal_indices(
+                &input_file,
+                &patch,
+                &[],
+                &[previous_identifier.to_vec()],
+            )
+            .unwrap()
+            .initially_owned_identifiers
+            .is_empty()
+        );
+
+        let mut state = initially_owned_macho_archive_removal_state(
+            &previous,
+            &input_file,
+            &patch,
+            std::slice::from_ref(&resolution),
+            &archive_member_patch_identifier(previous_identifier),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(state.sections.is_empty());
+        state.symbol_resolutions = macho_archive_member_symbol_resolutions(
+            std::slice::from_ref(&resolution),
+            &input_file,
+            &HashSet::from([input]),
+        );
+        assert_eq!(state.symbol_resolutions, vec![resolution]);
+        retain_initial_macho_archive_removal_transaction(&mut state, &object).unwrap();
+        assert!(macho_archive_transaction_patches_match(&state));
+        assert_eq!(state.forward_patches.len(), 1);
+        assert_eq!(state.rollback_patches.len(), 1);
+        assert_eq!(&state.rollback_patches[0].data[..4], &[0; 4]);
     }
 
     #[test]
