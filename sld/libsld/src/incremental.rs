@@ -19178,7 +19178,7 @@ fn renamed_local_macho_relocation_target_name(
     Ok(Some(current_identity.name))
 }
 
-fn renamed_local_macho_relocation_target_candidate_name(
+fn changed_local_macho_relocation_target_candidate_name(
     previous_file: &object::File<'_>,
     current_file: &object::File<'_>,
     previous_target: object::RelocationTarget,
@@ -19204,9 +19204,18 @@ fn renamed_local_macho_relocation_target_candidate_name(
     let current_identity = macho_relocation_symbol_identity(current_file, current_symbol_index)?;
     if previous_identity.name.is_empty()
         || current_identity.name.is_empty()
-        || previous_identity.name == current_identity.name
+        || previous_identity == current_identity
         || previous_identity.kind != current_identity.kind
         || previous_identity.scope != current_identity.scope
+    {
+        return Ok(None);
+    }
+    if previous_identity.name == current_identity.name
+        && !matches!(
+            (previous_identity.section, current_identity.section),
+            (Some((previous_section, previous_offset)), Some((current_section, current_offset)))
+                if previous_section == current_section && previous_offset != current_offset
+        )
     {
         return Ok(None);
     }
@@ -19240,7 +19249,7 @@ fn matched_macho_local_text_target_ownership(
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MatchedMachOLocalTextTargetOwnership>, String>> {
-    let Some(current_name) = renamed_local_macho_relocation_target_candidate_name(
+    let Some(current_name) = changed_local_macho_relocation_target_candidate_name(
         previous_file,
         current_file,
         previous_context.target,
@@ -25845,7 +25854,7 @@ fn macho_text_relocation_replays_for_input(
                     macho_relocation_target_identity(&previous_file, previous_context.target)?;
                 let current_target =
                     macho_relocation_target_identity(&current_file, current_context.target)?;
-                let matched_local_target_ownership = if previous_target != current_target {
+                let matched_local_target_ownership =
                     match matched_macho_local_text_target_ownership(
                         relocations,
                         resolutions,
@@ -25874,10 +25883,7 @@ fn macho_text_relocation_replays_for_input(
                     )? {
                         Ok(ownership) => ownership,
                         Err(reason) => return Ok(Err(reason)),
-                    }
-                } else {
-                    None
-                };
+                    };
                 let renamed_local_target_name = if previous_target != current_target
                     && matched_local_target_ownership.is_none()
                 {
@@ -70944,6 +70950,146 @@ mod tests {
                 "unexpected rejection reason: {reason}",
             );
         }
+    }
+
+    #[test]
+    fn same_named_moved_local_text_target_carries_its_exact_recorded_edge() {
+        let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let prepare = |mut object: Vec<u8>| {
+            object[24..28]
+                .copy_from_slice(&object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.to_le_bytes());
+            set_test_macho_symbol_desc(&mut object, b"_text", object::macho::N_NO_DEAD_STRIP);
+            object
+        };
+        let mut fixture = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_a.1",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_local_transition_symbols(&mut fixture, &[(b"l_a.1", 0)]);
+        let output_file = object::File::parse(fixture.expected_output.as_slice()).unwrap();
+        let current_value = output_file.section_by_name("__const").unwrap().address() + 4;
+        let output_entry = test_macho_symbol_entry_offset(&fixture.expected_output, b"l_a.1");
+        fixture.expected_output[output_entry + 8..output_entry + 16]
+            .copy_from_slice(&current_value.to_le_bytes());
+        fixture.previous =
+            mutate_test_macho_archive_member(&fixture.previous, previous_identifier, prepare);
+        fixture.current =
+            mutate_test_macho_archive_member(&fixture.current, current_identifier, prepare);
+
+        let (output, _, retargets) =
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
+                .unwrap();
+        assert_eq!(output, fixture.expected_output);
+        assert_eq!(retargets.len(), 1);
+    }
+
+    #[test]
+    fn changed_local_text_target_candidate_rejects_inexact_same_name_cases() {
+        let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let candidate = |fixture: &LocalTextTargetTransitionFixture| {
+            let previous_resolver = PatchInputResolver::new(&fixture.previous, true).unwrap();
+            let current_resolver = PatchInputResolver::new(&fixture.current, true).unwrap();
+            let previous_input = previous_resolver
+                .resolve(
+                    fixture.input.path.as_str(),
+                    fixture.matched[0].previous.input.as_str(),
+                    PatchInputLookup::MatchArchiveMember,
+                )
+                .unwrap()
+                .unwrap();
+            let current_input = current_resolver
+                .resolve(
+                    fixture.input.path.as_str(),
+                    fixture.matched[0].current.input.as_str(),
+                    PatchInputLookup::MatchArchiveMember,
+                )
+                .unwrap()
+                .unwrap();
+            let previous_file = object::File::parse(previous_input.bytes).unwrap();
+            let current_file = object::File::parse(current_input.bytes).unwrap();
+            let previous_target = previous_file
+                .section_by_name("__text")
+                .unwrap()
+                .relocations()
+                .next()
+                .unwrap()
+                .1
+                .target();
+            let current_target = current_file
+                .section_by_name("__text")
+                .unwrap()
+                .relocations()
+                .next()
+                .unwrap()
+                .1
+                .target();
+            changed_local_macho_relocation_target_candidate_name(
+                &previous_file,
+                &current_file,
+                previous_target,
+                current_target,
+            )
+            .unwrap()
+        };
+
+        let same_offset = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_a.1",
+            b"A-target",
+            b"A-target",
+            0,
+            0,
+        );
+        assert_eq!(candidate(&same_offset), None);
+
+        let moved = || {
+            local_text_target_transition_fixture(b"l_a.1", b"l_a.1", b"A-target", b"B-target", 0, 4)
+        };
+        let mut weak = moved();
+        weak.previous =
+            mutate_test_macho_archive_member(&weak.previous, previous_identifier, |mut object| {
+                set_test_macho_symbol_desc(&mut object, b"l_a.1", object::macho::N_WEAK_DEF);
+                object
+            });
+        weak.current =
+            mutate_test_macho_archive_member(&weak.current, current_identifier, |mut object| {
+                set_test_macho_symbol_desc(&mut object, b"l_a.1", object::macho::N_WEAK_DEF);
+                object
+            });
+        assert_eq!(candidate(&weak), None);
+
+        let mut global = moved();
+        let make_global = |mut object: Vec<u8>| {
+            let entry = test_macho_symbol_entry_offset(&object, b"l_a.1");
+            object[entry + 4] |= object::macho::N_EXT;
+            object
+        };
+        global.previous =
+            mutate_test_macho_archive_member(&global.previous, previous_identifier, make_global);
+        global.current =
+            mutate_test_macho_archive_member(&global.current, current_identifier, make_global);
+        assert_eq!(candidate(&global), None);
+
+        let mut ambiguous = moved();
+        publish_local_transition_symbols(&mut ambiguous, &[(b"l_a.1", 0)]);
+        ambiguous.current =
+            mutate_test_macho_archive_member(&ambiguous.current, current_identifier, |object| {
+                add_test_macho_local_alias(object, b"l_a.1", 2, 8)
+            });
+        assert!(
+            apply_local_text_target_transition(
+                &ambiguous,
+                vec![ambiguous.relocation.clone()],
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[test]
