@@ -38667,26 +38667,53 @@ fn output_macho_archive_fde_address(
         .map_err(|_| "retired Mach-O FDE PC-begin encoding is unsupported".to_owned())?;
     let raw = read_added_macho_unwind_pointer(data, field_offset, width)
         .ok_or_else(|| "retired Mach-O FDE PC-begin is truncated".to_owned())?;
-    let signed = matches!(encoding & 0x0f, DW_EH_PE_SDATA4 | DW_EH_PE_SDATA8)
-        || encoding & DW_EH_PE_APPLICATION_MASK == DW_EH_PE_PCREL;
-    let value = match (width, signed) {
-        (4, true) => i128::from(i32::from_le_bytes((raw as u32).to_le_bytes())),
-        (8, true) => i128::from(i64::from_le_bytes(raw.to_le_bytes())),
-        (4 | 8, false) => i128::from(raw),
-        _ => unreachable!("validated DWARF pointer width"),
+    let signed_value = match encoding & 0x0f {
+        DW_EH_PE_SDATA4 => Some(i64::from(i32::from_le_bytes((raw as u32).to_le_bytes()))),
+        DW_EH_PE_SDATA8 => Some(i64::from_le_bytes(raw.to_le_bytes())),
+        _ => None,
     };
-    let address = match encoding & DW_EH_PE_APPLICATION_MASK {
-        0 => value,
-        DW_EH_PE_PCREL => i128::from(field_address)
-            .checked_add(value)
+    let address = match (encoding & DW_EH_PE_APPLICATION_MASK, signed_value) {
+        (0, Some(value)) => u64::try_from(value)
+            .map_err(|_| "retired Mach-O FDE PC-begin is outside the address space".to_owned())?,
+        (0, None) => raw,
+        (DW_EH_PE_PCREL, Some(value)) => add_signed_delta_u64(field_address, i128::from(value))
+            .ok_or_else(|| "retired Mach-O FDE PC-begin overflowed".to_owned())?,
+        (DW_EH_PE_PCREL, None) if encoding & 0x0f == DW_EH_PE_ABSPTR => {
+            field_address.wrapping_add(raw)
+        }
+        (DW_EH_PE_PCREL, None) => field_address
+            .checked_add(raw)
             .ok_or_else(|| "retired Mach-O FDE PC-begin overflowed".to_owned())?,
         _ => return Err("retired Mach-O FDE PC-begin application is unsupported".to_owned()),
     };
-    Ok((
-        u64::try_from(address)
-            .map_err(|_| "retired Mach-O FDE PC-begin is outside the address space".to_owned())?,
-        width,
-    ))
+    Ok((address, width))
+}
+
+fn validate_zero_hint_macho_archive_fde_retirement(
+    added_entries: &[crate::macho_writer::UnwindInfoEntry],
+    retired_entries: &[MachOUnwindFunctionIdentity],
+    range_zeroed_retired_fdes: &[MachOUnwindFunctionIdentity],
+) -> std::result::Result<(), String> {
+    for added in added_entries.iter().filter(|entry| {
+        entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK == ADDED_MACHO_UNWIND_MODE_DWARF
+            && entry.encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK == 0
+    }) {
+        for retired in retired_entries.iter().filter(|retired| {
+            added_macho_archive_unwind_ranges_overlap(
+                added.function_offset,
+                added.length,
+                retired.function_offset,
+                retired.length,
+            )
+        }) {
+            if !range_zeroed_retired_fdes.contains(retired) {
+                return Err(
+                    "zero-hint added Mach-O FDE overlaps an unretired historical FDE".to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn retired_macho_archive_fde_range_patches(
@@ -39717,6 +39744,13 @@ fn added_macho_archive_unwind_activation(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
+    if let Err(reason) = validate_zero_hint_macho_archive_fde_retirement(
+        &added_entries,
+        retired_entries,
+        retired_fdes,
+    ) {
+        return Ok(Err(reason));
+    }
     patches.extend(retired_fde_patches);
     let existing_entries =
         match merge_macho_unwind_info_entries(existing_entries, retired_entries, added_entries) {
@@ -68659,6 +68693,67 @@ mod tests {
         let mut malformed = output.bytes.clone();
         malformed[output.eh_frame_offset as usize + 8] = 2;
         assert!(failure(&malformed, &entries, &identities[..1], true).contains("unsupported"));
+    }
+
+    #[test]
+    fn zero_hint_added_dwarf_requires_exact_retired_fde_patch() {
+        let retired = MachOUnwindFunctionIdentity {
+            function_offset: 0x1200,
+            length: 0x80,
+        };
+        let zero_hint = crate::macho_writer::compact_unwind_dwarf_offset_hint(0x0100_0000);
+        assert_eq!(zero_hint, 0);
+        let mut added = crate::macho_writer::UnwindInfoEntry {
+            function_offset: retired.function_offset,
+            length: retired.length,
+            encoding: ADDED_MACHO_UNWIND_MODE_DWARF | zero_hint,
+            personality_offset: None,
+            lsda_offset: None,
+        };
+        let failure = validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&retired),
+            &[],
+        )
+        .unwrap_err();
+        assert!(failure.contains("unretired historical FDE"));
+        validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&retired),
+            std::slice::from_ref(&retired),
+        )
+        .unwrap();
+
+        added.encoding = ADDED_MACHO_UNWIND_MODE_DWARF | 0x100;
+        validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&retired),
+            &[],
+        )
+        .unwrap();
+        added.encoding = 0x0200_0000;
+        validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&retired),
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn output_macho_archive_fde_address_keeps_unsigned_pcrel_high_bit() {
+        let field_address = 0x1_0000_1000;
+        let raw = 0x8000_0000_u32;
+        let (address, width) = output_macho_archive_fde_address(
+            &raw.to_le_bytes(),
+            0,
+            field_address,
+            DW_EH_PE_UDATA4 | 0x10,
+            8,
+        )
+        .unwrap();
+        assert_eq!(width, 4);
+        assert_eq!(address, field_address + u64::from(raw));
     }
 
     #[test]
