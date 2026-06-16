@@ -9571,6 +9571,7 @@ struct ValidatedMachOLocalRelocationSite {
     relocation_offset: u64,
     target_symbol_index: usize,
     hash_target_symbol: bool,
+    exact_symbol_indices: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16730,16 +16731,20 @@ fn matched_macho_local_text_target_ownership(
         current_target_value.expect("checked current target value"),
         current_output_section,
     );
-    let published_targets_remain_exact = published_symbols == ExactLocalMachOOutputSymbol::Exact
-        && published_local_macho_targets_remain_exact(
+    let exact_published_symbol_indices = if published_symbols == ExactLocalMachOOutputSymbol::Exact
+    {
+        published_local_macho_target_symbol_indices(
             previous_file,
             current_file,
             &previous_position,
             &current_position,
             &current_name,
-        )?;
+        )?
+    } else {
+        None
+    };
     let local_symbol_cohort = if published_symbols == ExactLocalMachOOutputSymbol::Absent
-        || published_targets_remain_exact
+        || exact_published_symbol_indices.is_some()
     {
         None
     } else {
@@ -16795,9 +16800,11 @@ fn matched_macho_local_text_target_ownership(
             "renamed local Mach-O text target fingerprint site is unavailable".to_owned(),
         ));
     };
-    if published_symbols == ExactLocalMachOOutputSymbol::Exact {
+    if let Some((previous_symbols, current_symbols)) = exact_published_symbol_indices {
         validated_retarget.previous.hash_target_symbol = true;
+        validated_retarget.previous.exact_symbol_indices = previous_symbols.to_vec();
         validated_retarget.current.hash_target_symbol = true;
+        validated_retarget.current.exact_symbol_indices = current_symbols.to_vec();
     }
     Ok(Ok(Some(MatchedMachOLocalTextTargetOwnership {
         current_name,
@@ -16962,54 +16969,76 @@ fn renamed_local_macho_output_symbols_are_exact(
     }
 }
 
-fn local_macho_symbol_has_exact_position(
+fn local_macho_symbol_exact_index(
     file: &object::File<'_>,
     name: &[u8],
     section_index: object::SectionIndex,
     section_offset: u64,
-) -> Result<bool> {
+) -> Result<Option<usize>> {
     let matches = file
         .symbols()
         .filter(|symbol| symbol.name_bytes().is_ok_and(|candidate| candidate == name))
         .collect::<Vec<_>>();
     let [symbol] = matches.as_slice() else {
-        return Ok(false);
+        return Ok(None);
     };
     if symbol.is_global() || symbol.is_weak() || symbol.section_index() != Some(section_index) {
-        return Ok(false);
+        return Ok(None);
     }
     let section = file.section_by_index(section_index)?;
-    Ok(symbol.address().checked_sub(section.address()) == Some(section_offset))
+    Ok(
+        (symbol.address().checked_sub(section.address()) == Some(section_offset))
+            .then_some(symbol.index().0),
+    )
 }
 
-fn published_local_macho_targets_remain_exact(
+fn published_local_macho_target_symbol_indices(
     previous_file: &object::File<'_>,
     current_file: &object::File<'_>,
     previous: &MachORelocationSymbolPosition,
     current: &MachORelocationSymbolPosition,
     current_name: &[u8],
-) -> Result<bool> {
-    Ok(local_macho_symbol_has_exact_position(
+) -> Result<Option<([usize; 2], [usize; 2])>> {
+    let Some(previous_previous) = local_macho_symbol_exact_index(
         previous_file,
         &previous.name,
         previous.section_index,
         previous.section_offset,
-    )? && local_macho_symbol_has_exact_position(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(previous_current) = local_macho_symbol_exact_index(
         previous_file,
         current_name,
         previous.section_index,
         current.section_offset,
-    )? && local_macho_symbol_has_exact_position(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(current_previous) = local_macho_symbol_exact_index(
         current_file,
         &previous.name,
         current.section_index,
         previous.section_offset,
-    )? && local_macho_symbol_has_exact_position(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(current_current) = local_macho_symbol_exact_index(
         current_file,
         current_name,
         current.section_index,
         current.section_offset,
-    )?)
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        [previous_previous, previous_current],
+        [current_previous, current_current],
+    )))
 }
 
 fn macho_local_symbol_is_default_strippable(name: &[u8]) -> bool {
@@ -20912,6 +20941,7 @@ fn validated_macho_local_relocation_retarget(
             relocation_offset: previous_context.range.start as u64,
             target_symbol_index: previous_target.0,
             hash_target_symbol: false,
+            exact_symbol_indices: Vec::new(),
         },
         current: ValidatedMachOLocalRelocationSite {
             archive_identifier: current_identifier,
@@ -20919,6 +20949,7 @@ fn validated_macho_local_relocation_retarget(
             relocation_offset: current_context.range.start as u64,
             target_symbol_index: current_target.0,
             hash_target_symbol: false,
+            exact_symbol_indices: Vec::new(),
         },
     })
 }
@@ -24409,12 +24440,9 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     force_retirement_proof: bool,
     require_masked_text: bool,
-    exact_masked_symbols: bool,
+    hash_masked_local_aliases: bool,
     validated_local_retargets: &[&ValidatedMachOLocalRelocationSite],
 ) -> Option<(blake3::Hash, usize)> {
-    if !exact_masked_symbols && !validated_local_retargets.is_empty() {
-        return None;
-    }
     if validated_local_retargets
         .iter()
         .collect::<HashSet<_>>()
@@ -24475,7 +24503,8 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     let mut unmasked_relocation_symbols = HashSet::new();
     let mut hashed_relocation_symbols = HashSet::new();
     let mut consumed_local_retargets = HashSet::new();
-    let mut validated_local_target_symbols = HashSet::new();
+    let mut ignored_validated_local_target_symbols = HashSet::new();
+    let mut exact_validated_local_target_symbols = HashSet::new();
     for section in sections {
         let segment_name = section.segment_name_bytes().ok().flatten()?;
         let section_name = section.name_bytes().ok()?;
@@ -24572,8 +24601,25 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                 if relocation.subtractor().is_some() || !consumed_local_retargets.insert(index) {
                     return None;
                 }
-                if !validated_local_retargets[index].hash_target_symbol {
-                    validated_local_target_symbols.insert(target_symbol);
+                let validated_retarget = validated_local_retargets[index];
+                if validated_retarget.hash_target_symbol {
+                    let exact_symbols = validated_retarget
+                        .exact_symbol_indices
+                        .iter()
+                        .copied()
+                        .map(object::SymbolIndex)
+                        .collect::<HashSet<_>>();
+                    if exact_symbols.len() != validated_retarget.exact_symbol_indices.len()
+                        || !exact_symbols.contains(&target_symbol)
+                    {
+                        return None;
+                    }
+                    exact_validated_local_target_symbols.extend(exact_symbols);
+                } else {
+                    if !validated_retarget.exact_symbol_indices.is_empty() {
+                        return None;
+                    }
+                    ignored_validated_local_target_symbols.insert(target_symbol);
                 }
                 let object::RelocationFlags::MachO {
                     r_type,
@@ -24643,8 +24689,25 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                 let object::RelocationTarget::Symbol(symbol) = relocation.target() else {
                     return None;
                 };
-                if !validated_local_retargets[index].hash_target_symbol {
-                    validated_local_target_symbols.insert(symbol);
+                let validated_retarget = validated_local_retargets[index];
+                if validated_retarget.hash_target_symbol {
+                    let exact_symbols = validated_retarget
+                        .exact_symbol_indices
+                        .iter()
+                        .copied()
+                        .map(object::SymbolIndex)
+                        .collect::<HashSet<_>>();
+                    if exact_symbols.len() != validated_retarget.exact_symbol_indices.len()
+                        || !exact_symbols.contains(&symbol)
+                    {
+                        return None;
+                    }
+                    exact_validated_local_target_symbols.extend(exact_symbols);
+                } else {
+                    if !validated_retarget.exact_symbol_indices.is_empty() {
+                        return None;
+                    }
+                    ignored_validated_local_target_symbols.insert(symbol);
                 }
                 hash_validated_macho_local_relocation_target(
                     &mut hasher,
@@ -24683,6 +24746,44 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
         }
     }
 
+    if !ignored_validated_local_target_symbols.is_disjoint(&exact_validated_local_target_symbols) {
+        return None;
+    }
+    let exact_target_positions = exact_validated_local_target_symbols
+        .iter()
+        .map(|index| {
+            let symbol = file.symbol_by_index(*index).ok()?;
+            Some((symbol.section_index()?, symbol.address()))
+        })
+        .collect::<Option<HashSet<_>>>()?;
+    let exact_masked_local_alias_symbols =
+        if hash_masked_local_aliases || !exact_target_positions.is_empty() {
+            let mut symbols_by_position = HashMap::new();
+            for symbol in file.symbols().filter(|symbol| {
+                !symbol.is_undefined()
+                    && symbol
+                        .section_index()
+                        .is_some_and(|section| fully_masked_sections.contains(&section))
+            }) {
+                symbols_by_position
+                    .entry((symbol.section_index()?, symbol.address()))
+                    .or_insert_with(Vec::new)
+                    .push(symbol.index());
+            }
+            symbols_by_position
+                .into_iter()
+                .filter(|(position, symbols)| {
+                    exact_target_positions.contains(position)
+                        || (hash_masked_local_aliases && symbols.len() > 1)
+                })
+                .flat_map(|(_, symbols)| symbols)
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+    if !ignored_validated_local_target_symbols.is_disjoint(&exact_masked_local_alias_symbols) {
+        return None;
+    }
     let symbols = file
         .symbols()
         .filter(|symbol| {
@@ -24698,15 +24799,19 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                     .is_ok_and(|name| !ignored_defined_symbols.contains(name))
         })
         .filter(|symbol| {
-            if !exact_masked_symbols {
+            if ignored_validated_local_target_symbols.contains(&symbol.index()) {
+                false
+            } else if exact_validated_local_target_symbols.contains(&symbol.index())
+                || exact_masked_local_alias_symbols.contains(&symbol.index())
+            {
+                true
+            } else {
                 !retirement_proof
                     || symbol.scope() != object::SymbolScope::Compilation
                     || symbol
                         .section_index()
                         .is_none_or(|section| !fully_masked_sections.contains(&section))
                     || hashed_relocation_symbols.contains(&symbol.index())
-            } else {
-                !validated_local_target_symbols.contains(&symbol.index())
             }
         })
         .filter(|symbol| {
@@ -24721,7 +24826,11 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
         hash_macho_symbol_section(&mut hasher, symbol.section())?;
         let value_range = macho_symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
-        let address_is_masked = if !exact_masked_symbols {
+        let address_is_masked = if exact_validated_local_target_symbols.contains(&symbol.index())
+            || exact_masked_local_alias_symbols.contains(&symbol.index())
+        {
+            false
+        } else {
             retirement_proof
                 && symbol
                     .section_index()
@@ -24731,8 +24840,6 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                         range.start <= value_range.start && range.end >= value_range.end
                     })
                 })
-        } else {
-            false
         };
         hasher.update(&[u8::from(address_is_masked)]);
         if !address_is_masked {
@@ -49907,6 +50014,7 @@ mod tests {
                 relocation_offset: 0,
                 target_symbol_index: 0,
                 hash_target_symbol: false,
+                exact_symbol_indices: Vec::new(),
             },
             current: ValidatedMachOLocalRelocationSite {
                 archive_identifier: current_identifier,
@@ -49914,6 +50022,7 @@ mod tests {
                 relocation_offset: 0,
                 target_symbol_index: 0,
                 hash_target_symbol: false,
+                exact_symbol_indices: Vec::new(),
             },
         };
         let removed = [archive_member_patch_identifier(removed_identifier)];
@@ -56149,6 +56258,225 @@ mod tests {
             apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
                 .unwrap_err(),
             "local target fingerprint proof did not match",
+        );
+    }
+
+    #[test]
+    fn local_macho_exact_target_allows_unrelated_owned_symbol_shifts() {
+        let mut fixture = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_stable_local_transition_symbols(&mut fixture, b"l_a.1", 0, b"l_b.2", 4);
+        let (_, _, retargets) =
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
+                .unwrap();
+        assert!(
+            retargets
+                .iter()
+                .all(|retarget| retarget.previous.hash_target_symbol
+                    && retarget.current.hash_target_symbol)
+        );
+
+        let previous_target_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_target_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let ArchiveMemberMatch::Unique(previous_target) =
+            patch_archive_member_bytes(&fixture.previous, previous_target_identifier).unwrap()
+        else {
+            panic!("expected unique previous target member");
+        };
+        let ArchiveMemberMatch::Unique(current_target) =
+            patch_archive_member_bytes(&fixture.current, current_target_identifier).unwrap()
+        else {
+            panic!("expected unique current target member");
+        };
+        let previous_target = previous_target.bytes.to_vec();
+        let current_target = current_target.bytes.to_vec();
+
+        let previous_other = add_test_macho_local_alias(
+            test_macho_local_text_target_object_with_alias(b"l_c.3", b"C-target", 0, None),
+            b"shifted",
+            2,
+            12,
+        );
+        let current_other = add_test_macho_local_alias(
+            test_macho_local_text_target_object_with_alias(b"l_c.3", b"C-target", 4, None),
+            b"shifted",
+            2,
+            16,
+        );
+        let previous_other_identifier = b"other-hash.cgu.old.rcgu.o";
+        let current_other_identifier = b"other-hash.cgu.new.rcgu.o";
+        assert_eq!(
+            archive_member_patch_identifier(previous_other_identifier),
+            archive_member_patch_identifier(current_other_identifier),
+        );
+        let archive = |members: &[(&[u8], &[u8])]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let previous = archive(&[
+            (previous_target_identifier, previous_target.as_slice()),
+            (previous_other_identifier, previous_other.as_slice()),
+        ]);
+        let current = archive(&[
+            (current_target_identifier, current_target.as_slice()),
+            (current_other_identifier, current_other.as_slice()),
+        ]);
+
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, previous_other_identifier).unwrap()
+        else {
+            panic!("expected unique previous secondary member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, current_other_identifier).unwrap()
+        else {
+            panic!("expected unique current secondary member");
+        };
+        let previous_input_ref = resolved_patch_input_ref(
+            fixture.input.path.as_str(),
+            fixture.input.path.as_str(),
+            previous_member,
+        )
+        .unwrap();
+        let current_input_ref = resolved_patch_input_ref(
+            fixture.input.path.as_str(),
+            fixture.input.path.as_str(),
+            current_member,
+        )
+        .unwrap();
+        let previous_file = object::File::parse(previous_other.as_slice()).unwrap();
+        let current_file = object::File::parse(current_other.as_slice()).unwrap();
+        let mut matched = fixture.matched.clone();
+        for section_name in ["__text", "__const"] {
+            let previous_section = previous_file.section_by_name(section_name).unwrap();
+            let current_section = current_file.section_by_name(section_name).unwrap();
+            matched.push(MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input_ref.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_section.index(),
+                    )
+                    .unwrap(),
+                    section_name: None,
+                    input_size: previous_section.size(),
+                    output_offset: 0,
+                    output_size: previous_section.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input_ref.clone(),
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_section.index(),
+                    )
+                    .unwrap(),
+                    section_name: None,
+                    input_size: current_section.size(),
+                    output_offset: 0,
+                    output_size: current_section.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+            });
+        }
+
+        assert!(
+            matched_macho_local_retarget_fingerprint_matches(
+                &previous,
+                &current,
+                fixture.input.path.as_str(),
+                &matched,
+                true,
+                &retargets,
+            )
+            .unwrap(),
+            "an exact retarget must not make unrelated owned definitions exact",
+        );
+
+        let moving_global_alias = |mut object: Vec<u8>, value: u64| {
+            object = add_test_macho_local_alias(object, b"_global_alias", 2, value);
+            let entry = test_macho_symbol_entry_offset(&object, b"_global_alias");
+            object[entry + 4] |= object::macho::N_EXT;
+            object
+        };
+        let previous_global_target = moving_global_alias(previous_target.clone(), 4);
+        let current_global_target = moving_global_alias(current_target.clone(), 8);
+        let previous_with_global_alias = archive(&[
+            (
+                previous_target_identifier,
+                previous_global_target.as_slice(),
+            ),
+            (previous_other_identifier, previous_other.as_slice()),
+        ]);
+        let current_with_global_alias = archive(&[
+            (current_target_identifier, current_global_target.as_slice()),
+            (current_other_identifier, current_other.as_slice()),
+        ]);
+        assert!(
+            !matched_macho_local_retarget_fingerprint_matches(
+                &previous_with_global_alias,
+                &current_with_global_alias,
+                fixture.input.path.as_str(),
+                &matched,
+                true,
+                &retargets,
+            )
+            .unwrap(),
+            "a global alias moving with an exact local target must remain observable",
+        );
+
+        let mut duplicate_exact_symbol = retargets.clone();
+        let duplicate = duplicate_exact_symbol[0].current.exact_symbol_indices[0];
+        duplicate_exact_symbol[0]
+            .current
+            .exact_symbol_indices
+            .push(duplicate);
+        assert!(
+            !matched_macho_local_retarget_fingerprint_matches(
+                &previous,
+                &current,
+                fixture.input.path.as_str(),
+                &matched,
+                true,
+                &duplicate_exact_symbol,
+            )
+            .unwrap(),
+            "an ambiguous exact target cohort must fail closed",
+        );
+
+        let mut missing_exact_target = retargets;
+        let current_target = missing_exact_target[0].current.target_symbol_index;
+        missing_exact_target[0]
+            .current
+            .exact_symbol_indices
+            .retain(|index| *index != current_target);
+        assert!(
+            !matched_macho_local_retarget_fingerprint_matches(
+                &previous,
+                &current,
+                fixture.input.path.as_str(),
+                &matched,
+                true,
+                &missing_exact_target,
+            )
+            .unwrap(),
+            "an exact cohort without its relocation target must fail closed",
         );
     }
 
