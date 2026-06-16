@@ -210,11 +210,11 @@ if [[ "$verify_native_sld_replay" == 1 ]]; then
         fi
         # A metadata-only Rust archive rebuild can preserve the normalized member's
         # section and relocation identities without rewriting any output sections.
-        # The following edit verifies that this preserved state remains reusable.
-        if ! grep -Eq 'patched [0-9]+ changed input sections before loading inputs' \
+        # The following linked-content edit verifies that this preserved state remains reusable.
+        if ! grep -Fq 'patched 0 changed input sections before loading inputs' \
             "$metadata_rebuild_log"
         then
-            printf 'cargo +%s metadata-only edit did not report its section accounting\n' \
+            printf 'cargo +%s metadata-only edit unexpectedly patched output sections\n' \
                 "$toolchain" >&2
             cat "$metadata_rebuild_log" >&2
             exit 1
@@ -246,7 +246,7 @@ if [[ "$verify_native_sld_replay" == 1 ]]; then
         '^changed-input patch unavailable before loading inputs:|^full relink: input file changed:' \
         "$post_metadata_rebuild_log"
     then
-        printf 'cargo +%s post-metadata __text edit fell back from changed-input patching\n' \
+        printf 'cargo +%s post-metadata linked-content edit fell back from changed-input patching\n' \
             "$toolchain" >&2
         cat "$post_metadata_rebuild_log" >&2
         exit 1
@@ -254,7 +254,7 @@ if [[ "$verify_native_sld_replay" == 1 ]]; then
     if ! grep -Fq 'patched 1 changed input file before loading inputs' \
         "$post_metadata_rebuild_log"
     then
-        printf 'cargo +%s post-metadata __text edit did not patch its changed rlib input\n' \
+        printf 'cargo +%s post-metadata linked-content edit did not patch its changed rlib input\n' \
             "$toolchain" >&2
         cat "$post_metadata_rebuild_log" >&2
         exit 1
@@ -262,7 +262,7 @@ if [[ "$verify_native_sld_replay" == 1 ]]; then
     if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' \
         "$post_metadata_rebuild_log"
     then
-        printf 'cargo +%s post-metadata __text edit did not patch changed input sections\n' \
+        printf 'cargo +%s post-metadata linked-content edit did not patch changed input sections\n' \
             "$toolchain" >&2
         cat "$post_metadata_rebuild_log" >&2
         exit 1
