@@ -34949,6 +34949,9 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         })));
     }
 
+    let transactional_unwind = !changed.members.is_empty()
+        && changed.previous_common_members.len() == changed.members.len()
+        && changed.current_common_members.len() == changed.members.len();
     let incoming_reserve = match macho_eh_frame_reserve_state(&output_file, reserved_ranges)? {
         Ok(reserve) => reserve,
         Err(reason) => return Ok(Err(reason)),
@@ -34957,15 +34960,13 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         common_members: changed.previous_common_members.clone(),
         eh_frame_reserve: incoming_reserve,
     };
-    if let Err(reason) =
-        validate_macho_archive_unwind_version_output(previous_output, &rollback_version)
+    if transactional_unwind
+        && let Err(reason) =
+            validate_macho_archive_unwind_version_output(previous_output, &rollback_version)
     {
         return Ok(Err(reason));
     }
     let selected_indices = (0..changed.members.len()).collect::<Vec<_>>();
-    let transactional_unwind = !changed.members.is_empty()
-        && changed.previous_common_members.len() == changed.members.len()
-        && changed.current_common_members.len() == changed.members.len();
     let mut remaining_reserved_ranges = reserved_ranges.to_vec();
     let mut unwind_sections = current_sections.to_vec();
     unwind_sections.extend(changed.current_sections.iter().cloned());
@@ -69261,6 +69262,37 @@ mod tests {
         .unwrap();
         assert_eq!(activation.patches.len(), 2);
         assert!(activation.unwind_transaction.is_none());
+
+        apply_test_section_patches(&mut output.bytes, &activation.patches);
+        let reverse_matched = vec![MatchedPatchSection {
+            previous: matched[0].current.clone(),
+            current: matched[0].previous.clone(),
+        }];
+        let reverse_sections = vec![reverse_matched[0].current.clone()];
+        let reverse = changed_macho_archive_unwind_activation(
+            &current,
+            &previous,
+            &input_file_path,
+            &reverse_matched,
+            &[],
+            &reverse_sections,
+            &PatchInputResolver::new(&previous, true).unwrap(),
+            &output.bytes,
+            &[],
+            &activation.remaining_reserved_ranges,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            &migrated_definitions,
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(reverse.patches.len(), 2);
+        assert!(reverse.unwind_transaction.is_none());
     }
 
     #[test]
