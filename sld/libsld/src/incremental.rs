@@ -18306,14 +18306,16 @@ fn macho_local_symbol_cohort_retains_published_population(
     !(0..previous.len()).any(|node| has_cycle(node, &alternating_edges, &mut state))
 }
 
+fn macho_local_symbol_name_is_repeatable(name: &[u8]) -> bool {
+    name.strip_prefix(b"GCC_except_table")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
+}
+
 fn macho_local_symbol_cohort_addition_collides(
     previous_output: &[u8],
     entry: &MachOLocalSymbolCohortEntry,
 ) -> bool {
-    let repeatable_local_name = entry
-        .name
-        .strip_prefix(b"GCC_except_table")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit));
+    let repeatable_local_name = macho_local_symbol_name_is_repeatable(&entry.name);
     let Ok((symbol_table, string_table)) = macho_symbol_and_string_table_ranges(previous_output)
     else {
         return true;
@@ -30111,7 +30113,7 @@ fn apply_macho_local_symbol_cohort_plans(
     let mut desired = previous_output.to_vec();
     let mut modified = Vec::<std::ops::Range<usize>>::new();
     let mut planned_previous_nlists = HashSet::<u64>::new();
-    let mut planned_current_names = HashSet::<Vec<u8>>::new();
+    let mut planned_current_names = HashMap::<Vec<u8>, Vec<(u8, u64, u16)>>::new();
     let mut planned_current_sites = HashSet::<(u8, u64)>::new();
 
     for plan in plans {
@@ -30134,9 +30136,20 @@ fn apply_macho_local_symbol_cohort_plans(
             }
         }
         for entry in &plan.current {
-            if !planned_current_names.insert(entry.name.clone()) {
+            let same_name = planned_current_names.entry(entry.name.clone()).or_default();
+            if !same_name.is_empty()
+                && (!macho_local_symbol_name_is_repeatable(&entry.name)
+                    || entry.n_desc & (object::macho::N_ALT_ENTRY | object::macho::N_NO_DEAD_STRIP)
+                        != 0
+                    || same_name.iter().any(|(section, value, n_desc)| {
+                        *section != entry.output_section_index
+                            || *value == entry.output_value
+                            || *n_desc != entry.n_desc
+                    }))
+            {
                 return Err("published local Mach-O cohorts collide by name".to_owned());
             }
+            same_name.push((entry.output_section_index, entry.output_value, entry.n_desc));
             if !planned_current_sites.insert((entry.output_section_index, entry.output_value)) {
                 return Err("published local Mach-O cohorts alias an output site".to_owned());
             }
@@ -54955,6 +54968,39 @@ mod tests {
                 .err()
                 .unwrap(),
             "published local Mach-O cohorts collide by name"
+        );
+
+        let repeated = [
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a1".to_owned(),
+                current_input: "b1".to_owned(),
+                previous: vec![previous_text.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"GCC_except_table0".to_vec(),
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_text.clone()
+                }],
+            },
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a2".to_owned(),
+                current_input: "b2".to_owned(),
+                previous: vec![previous_data.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"GCC_except_table0".to_vec(),
+                    output_section_index: previous_text.output_section_index,
+                    output_value: previous_text.output_value + 8,
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_data.clone()
+                }],
+            },
+        ];
+        let mut repeated_reserves = reserves.clone();
+        assert!(
+            apply_macho_local_symbol_cohort_plans(&repeated, &output, &mut repeated_reserves,)
+                .is_ok(),
+            "ordinary repeated exception labels at distinct owned sites must compose",
         );
 
         let shared_previous = [
