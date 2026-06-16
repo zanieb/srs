@@ -1606,7 +1606,7 @@ fn write_sections(
         section.reserved1.set(LE, 0);
         section.reserved2.set(
             LE,
-            if section_name == b"__stubs" {
+            if section_flags.raw() & macho::SECTION_TYPE == macho::S_SYMBOL_STUBS {
                 crate::macho::MACHO_STUB_SIZE as u32
             } else {
                 0

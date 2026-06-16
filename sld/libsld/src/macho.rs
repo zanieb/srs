@@ -3847,9 +3847,7 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::PLT_GOT.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__stubs")),
         section_flags: SectionFlags::from_u32(
-            macho::S_SYMBOL_STUBS
-                | macho::S_ATTR_PURE_INSTRUCTIONS
-                | macho::S_ATTR_SOME_INSTRUCTIONS,
+            macho::S_REGULAR | macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS,
         ),
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
@@ -3927,7 +3925,7 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     };
     defs[output_section_id::GOT.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__got")),
-        section_flags: SectionFlags::from_u32(macho::S_NON_LAZY_SYMBOL_POINTERS),
+        section_flags: SectionFlags::from_u32(macho::S_REGULAR),
         min_alignment: alignment::GOT_ENTRY,
         ..DEFAULT_DEFS
     };
