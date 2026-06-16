@@ -20958,6 +20958,156 @@ fn macho_local_cohort_global_resolution_is_exact(
         && target.section_offset == section_offset)
 }
 
+fn macho_symbol_binding_is_public_strong_definition(
+    symbol: &object::Symbol<'_, '_>,
+    binding: MachOSymbolBindingMetadata,
+) -> bool {
+    symbol.is_definition()
+        && symbol.is_global()
+        && !symbol.is_weak()
+        && binding.n_type & object::macho::N_STAB == 0
+        && binding.n_type & object::macho::N_TYPE == object::macho::N_SECT
+        && binding.n_type & object::macho::N_EXT != 0
+        && binding.n_type & object::macho::N_PEXT == 0
+        && binding.n_desc & object::macho::N_WEAK_DEF == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_current_macho_global_atom_liveness_root(
+    symbol_resolutions: &[MachOSymbolResolutionRecord],
+    input_file_path: &str,
+    owner: &MatchedPatchSection,
+    previous_bytes: &[u8],
+    previous_file: &object::File<'_>,
+    current_bytes: &[u8],
+    current_file: &object::File<'_>,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    name: &[u8],
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<Option<(object::SectionIndex, u64)>> {
+    let previous_definitions = previous_file
+        .symbols()
+        .filter(|symbol| {
+            symbol.is_definition() && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+        })
+        .collect::<Vec<_>>();
+    let current_definitions = current_file
+        .symbols()
+        .filter(|symbol| {
+            symbol.is_definition() && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+        })
+        .collect::<Vec<_>>();
+    let ([previous_symbol], [current_symbol]) = (
+        previous_definitions.as_slice(),
+        current_definitions.as_slice(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(previous_binding) =
+        macho_symbol_entry(previous_bytes, previous_symbol).and_then(macho_symbol_binding_metadata)
+    else {
+        return Ok(None);
+    };
+    let Some(current_binding) =
+        macho_symbol_entry(current_bytes, current_symbol).and_then(macho_symbol_binding_metadata)
+    else {
+        return Ok(None);
+    };
+    if previous_binding != current_binding
+        || !macho_symbol_binding_is_public_strong_definition(previous_symbol, previous_binding)
+        || !macho_symbol_binding_is_public_strong_definition(current_symbol, current_binding)
+    {
+        return Ok(None);
+    }
+
+    let previous_section_index =
+        patch_section_object_index(previous_file, owner.previous.section_index)?;
+    let current_section_index =
+        patch_section_object_index(current_file, owner.current.section_index)?;
+    if previous_symbol.section_index() != Some(previous_section_index)
+        || current_symbol.section_index() != Some(current_section_index)
+    {
+        return Ok(None);
+    }
+    let previous_section = previous_file.section_by_index(previous_section_index)?;
+    let current_section = current_file.section_by_index(current_section_index)?;
+    let Some(previous_offset) = previous_symbol
+        .address()
+        .checked_sub(previous_section.address())
+    else {
+        return Ok(None);
+    };
+    let Some(current_offset) = current_symbol
+        .address()
+        .checked_sub(current_section.address())
+    else {
+        return Ok(None);
+    };
+    if previous_offset >= owner.previous.input_size || current_offset >= owner.current.input_size {
+        return Ok(None);
+    }
+    let Some(previous_output_offset) = owner.previous.output_offset.checked_add(previous_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(current_output_offset) = owner.current.output_offset.checked_add(current_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(previous_value) =
+        macho_output_address_for_file_offset(output_file, previous_output_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(current_value) =
+        macho_output_address_for_file_offset(output_file, current_output_offset)
+    else {
+        return Ok(None);
+    };
+    if previous_value != current_value {
+        return Ok(None);
+    }
+
+    let Ok(output_symbol_index) =
+        unique_macho_output_symbol_index(output_file, name, previous_value)
+    else {
+        return Ok(None);
+    };
+    let output_symbol = output_file.symbol_by_index(object::SymbolIndex(output_symbol_index))?;
+    let Some(output_binding) =
+        macho_symbol_entry(previous_output, &output_symbol).and_then(macho_symbol_binding_metadata)
+    else {
+        return Ok(None);
+    };
+    if output_binding != previous_binding
+        || !macho_symbol_binding_is_public_strong_definition(&output_symbol, output_binding)
+    {
+        return Ok(None);
+    }
+    let Some(output_symbol_section) = output_symbol.section_index() else {
+        return Ok(None);
+    };
+    if macho_output_section_index_for_file_offset(output_file, previous_output_offset)
+        != u8::try_from(output_symbol_section.0).ok()
+    {
+        return Ok(None);
+    }
+    if !macho_local_cohort_global_resolution_is_exact(
+        symbol_resolutions,
+        name,
+        input_file_path,
+        owner.current.input.as_str(),
+        current_section_index,
+        current_offset,
+        current_value,
+        normalize_rust_archive_patch_inputs,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some((current_section_index, current_offset)))
+}
+
 fn macho_local_cohort_section_is_rematerialized(
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     input_file_path: &str,
@@ -21444,6 +21594,7 @@ fn current_macho_local_cohort_atoms_are_live(
     previous_resolver: &PatchInputResolver<'_>,
     current_resolver: &PatchInputResolver<'_>,
     previous_file: &object::File<'_>,
+    previous_bytes: &[u8],
     current_file: &object::File<'_>,
     current_bytes: &[u8],
     output_file: &object::File<'_>,
@@ -21700,9 +21851,9 @@ fn current_macho_local_cohort_atoms_are_live(
         }
     }
 
-    // Direct patches retain the previously published atom set. Preserve a strong global atom
-    // only when its previous definition, output nlist, resolution, and section ownership are all
-    // exact; its bytes and size may change without changing that prior liveness proof.
+    // Direct patches retain the previously published atom set. Preserve a moved strong global
+    // atom only when its definitions, binding, prior nlist, stable output value, and current
+    // resolution ownership are all exact.
     for current_symbol in current_file
         .symbols()
         .filter(|symbol| symbol.is_global() && !symbol.is_undefined() && !symbol.is_weak())
@@ -21716,75 +21867,24 @@ fn current_macho_local_cohort_atoms_are_live(
         let Some(owner) = owned_sections.get(&current_section_index) else {
             continue;
         };
-        let previous_section_index =
-            patch_section_object_index(previous_file, owner.previous.section_index)?;
         let name = current_symbol.name_bytes()?;
-        let previous_matching = previous_file
-            .symbols()
-            .filter(|symbol| {
-                symbol.is_global()
-                    && !symbol.is_undefined()
-                    && !symbol.is_weak()
-                    && symbol.section_index() == Some(previous_section_index)
-                    && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
-            })
-            .collect::<Vec<_>>();
-        let [previous_symbol] = previous_matching.as_slice() else {
-            continue;
-        };
-        if previous_symbol.kind() != current_symbol.kind()
-            || previous_symbol.scope() != current_symbol.scope()
-            || previous_symbol.flags() != current_symbol.flags()
-        {
-            continue;
-        }
-        let previous_section = previous_file.section_by_index(previous_section_index)?;
-        let current_section = current_file.section_by_index(current_section_index)?;
-        let Some(previous_offset) = previous_symbol
-            .address()
-            .checked_sub(previous_section.address())
+        let Some((section_index, section_offset)) = exact_current_macho_global_atom_liveness_root(
+            symbol_resolutions,
+            input_file_path,
+            owner,
+            previous_bytes,
+            previous_file,
+            current_bytes,
+            current_file,
+            previous_output,
+            output_file,
+            name,
+            normalize_rust_archive_patch_inputs,
+        )?
         else {
             continue;
         };
-        let Some(current_offset) = current_symbol
-            .address()
-            .checked_sub(current_section.address())
-        else {
-            continue;
-        };
-        let Some(previous_output_offset) =
-            owner.previous.output_offset.checked_add(previous_offset)
-        else {
-            continue;
-        };
-        let Some(previous_value) =
-            macho_output_address_for_file_offset(output_file, previous_output_offset)
-        else {
-            continue;
-        };
-        if unique_macho_output_symbol_index(output_file, name, previous_value).is_err() {
-            continue;
-        }
-        let Some(resolution) = macho_symbol_resolution_for_name(symbol_resolutions, name) else {
-            continue;
-        };
-        let Some(target) = resolution.target.as_ref() else {
-            continue;
-        };
-        if resolution.direct_value != Some(previous_value)
-            || target.input_file != input_file_path
-            || !patch_input_refs_match(
-                input_file_path,
-                target.input.as_str(),
-                caller_section.previous.input.as_str(),
-                normalize_rust_archive_patch_inputs,
-            )?
-            || target.section_index != previous_section_index.0 as u32
-            || target.section_offset != previous_offset
-        {
-            continue;
-        }
-        if let Some(atom) = atom_for_offset(current_section_index, current_offset) {
+        if let Some(atom) = atom_for_offset(section_index, section_offset) {
             roots.insert(atom);
         }
     }
@@ -23002,6 +23102,7 @@ fn plan_macho_local_symbol_cohort(
             previous_resolver,
             current_resolver,
             previous_file,
+            previous_input.bytes,
             current_file,
             current_input.bytes,
             output_file,
@@ -58238,6 +58339,229 @@ mod tests {
     }
 
     #[test]
+    fn moved_macho_global_atom_root_requires_exact_current_ownership() {
+        let previous = test_macho_object(&[0; 16], &[0; 64], 12);
+        let current = test_macho_object(&[0; 16], &[0; 64], 4);
+        let output = test_macho_object(&[0; 16], &[0; 64], 12);
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let previous_data = previous_file.section_by_name("__data").unwrap();
+        let current_data = current_file.section_by_name("__data").unwrap();
+        let output_data = output_file.section_by_name("__data").unwrap();
+        let output_data_offset = output_data.file_range().unwrap().0;
+        let output_value = output_data.address() + 12;
+        let owner = MatchedPatchSection {
+            previous: PatchSection {
+                input: "previous-member".to_owned(),
+                section_index: patch_section_record_index(&previous_file, previous_data.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__data".to_owned()),
+                input_size: previous_data.size(),
+                output_offset: output_data_offset,
+                output_size: previous_data.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: "current-member".to_owned(),
+                section_index: patch_section_record_index(&current_file, current_data.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__data".to_owned()),
+                input_size: current_data.size(),
+                output_offset: output_data_offset + 8,
+                output_size: current_data.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        };
+        let resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_data").into(),
+            direct_value: Some(output_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "input.rlib".into(),
+                input: owner.current.input.clone().into(),
+                section_index: current_data.index().0 as u32,
+                section_offset: 4,
+            }),
+        };
+        let root = |resolutions: &[MachOSymbolResolutionRecord],
+                    owner: &MatchedPatchSection,
+                    previous: &[u8],
+                    current: &[u8],
+                    output: &[u8]| {
+            let previous_file = object::File::parse(previous).unwrap();
+            let current_file = object::File::parse(current).unwrap();
+            let output_file = object::File::parse(output).unwrap();
+            exact_current_macho_global_atom_liveness_root(
+                resolutions,
+                "input.rlib",
+                owner,
+                previous,
+                &previous_file,
+                current,
+                &current_file,
+                output,
+                &output_file,
+                b"_data",
+                false,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            root(
+                std::slice::from_ref(&resolution),
+                &owner,
+                &previous,
+                &current,
+                &output,
+            ),
+            Some((current_data.index(), 4)),
+            "a uv/ty-shaped input move with a stable published value should remain live",
+        );
+        assert!(root(&[], &owner, &previous, &current, &output).is_none());
+        assert!(
+            root(
+                &[resolution.clone(), resolution.clone()],
+                &owner,
+                &previous,
+                &current,
+                &output,
+            )
+            .is_none(),
+            "duplicate current resolutions must not establish liveness",
+        );
+        for changed in ["value", "file", "input", "section", "offset", "owner"] {
+            let mut wrong = resolution.clone();
+            match changed {
+                "value" => wrong.direct_value = Some(output_value + 1),
+                "file" => wrong.target.as_mut().unwrap().input_file = "other.rlib".into(),
+                "input" => wrong.target.as_mut().unwrap().input = "other-member".into(),
+                "section" => wrong.target.as_mut().unwrap().section_index += 1,
+                "offset" => wrong.target.as_mut().unwrap().section_offset += 1,
+                "owner" => wrong.target = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                root(&[wrong], &owner, &previous, &current, &output).is_none(),
+                "accepted mismatched current resolution {changed}",
+            );
+        }
+
+        let mut moved_output = output.clone();
+        let entry = test_macho_symbol_entry_offset(&moved_output, b"_data");
+        moved_output[entry + 8..entry + 16].copy_from_slice(&(output_value + 4).to_le_bytes());
+        assert!(
+            root(
+                std::slice::from_ref(&resolution),
+                &owner,
+                &previous,
+                &current,
+                &moved_output,
+            )
+            .is_none(),
+            "a moved prior output nlist must not establish liveness",
+        );
+        let mut moved_owner = owner.clone();
+        moved_owner.current.output_offset += 1;
+        assert!(
+            root(
+                std::slice::from_ref(&resolution),
+                &moved_owner,
+                &previous,
+                &current,
+                &output,
+            )
+            .is_none(),
+            "the current definition must retain its exact published output value",
+        );
+
+        let duplicate_previous =
+            add_test_macho_global_alias(previous.clone(), b"_data", 2, 16 + 28);
+        let duplicate_current = add_test_macho_global_alias(current.clone(), b"_data", 2, 16 + 28);
+        let duplicate_output =
+            add_test_macho_global_alias(output.clone(), b"_data", 2, output_value);
+        for (kind, previous, current, output) in [
+            (
+                "previous definition",
+                &duplicate_previous,
+                &current,
+                &output,
+            ),
+            ("current definition", &previous, &duplicate_current, &output),
+            ("prior output nlist", &previous, &current, &duplicate_output),
+        ] {
+            assert!(
+                root(
+                    std::slice::from_ref(&resolution),
+                    &owner,
+                    previous,
+                    current,
+                    output,
+                )
+                .is_none(),
+                "accepted duplicate {kind}",
+            );
+        }
+
+        let mut weak = current.clone();
+        let entry = test_macho_symbol_entry_offset(&weak, b"_data");
+        weak[entry + 6..entry + 8].copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        assert!(
+            root(
+                std::slice::from_ref(&resolution),
+                &owner,
+                &previous,
+                &weak,
+                &output,
+            )
+            .is_none(),
+            "a weak definition must not establish liveness",
+        );
+
+        let mut private_previous = previous.clone();
+        let entry = test_macho_symbol_entry_offset(&private_previous, b"_data");
+        private_previous[entry + 4] |= object::macho::N_PEXT;
+        let mut private_current = current.clone();
+        let entry = test_macho_symbol_entry_offset(&private_current, b"_data");
+        private_current[entry + 4] |= object::macho::N_PEXT;
+        let mut private_output = output.clone();
+        let entry = test_macho_symbol_entry_offset(&private_output, b"_data");
+        private_output[entry + 4] |= object::macho::N_PEXT;
+        assert!(
+            root(
+                std::slice::from_ref(&resolution),
+                &owner,
+                &private_previous,
+                &private_current,
+                &private_output,
+            )
+            .is_none(),
+            "a private definition must not establish global liveness",
+        );
+
+        let mut mismatched_metadata = current.clone();
+        let entry = test_macho_symbol_entry_offset(&mismatched_metadata, b"_data");
+        mismatched_metadata[entry + 6..entry + 8]
+            .copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
+        assert!(
+            root(
+                std::slice::from_ref(&resolution),
+                &owner,
+                &previous,
+                &mismatched_metadata,
+                &output,
+            )
+            .is_none(),
+            "binding metadata changes must not establish liveness",
+        );
+    }
+
+    #[test]
     fn macho_local_cohort_rematerialization_requires_exact_section_tuple() {
         let section = MatchedPatchSection {
             previous: PatchSection {
@@ -66699,6 +67023,31 @@ mod tests {
         bytes
     }
 
+    fn add_test_macho_global_alias(
+        mut bytes: Vec<u8>,
+        name: &[u8],
+        section: u8,
+        value: u64,
+    ) -> Vec<u8> {
+        bytes = add_test_macho_local_alias(bytes, name, section, value);
+        let entry = {
+            let file = object::File::parse(bytes.as_slice()).unwrap();
+            let symbols = file
+                .symbols()
+                .filter(|symbol| !symbol.is_global() && symbol.name_bytes().ok() == Some(name))
+                .collect::<Vec<_>>();
+            let [symbol] = symbols.as_slice() else {
+                panic!("expected one new local symbol");
+            };
+            macho_symbol_value_field_range(&bytes, symbol.index())
+                .unwrap()
+                .start
+                - 8
+        };
+        bytes[entry + 4] |= object::macho::N_EXT;
+        bytes
+    }
+
     fn mutate_test_macho_archive_member(
         archive: &[u8],
         identifier: &[u8],
@@ -68892,6 +69241,7 @@ mod tests {
                 &previous_resolver,
                 &current_resolver,
                 &previous_file,
+                &inputs[0].previous_bytes,
                 current_file,
                 current_bytes,
                 &output_file,
