@@ -17168,6 +17168,7 @@ fn matched_macho_local_text_target_ownership(
             current_file,
             previous_output,
             output_file,
+            &[],
             normalize_rust_archive_patch_inputs,
         )? {
             Ok(Some(plan)) => Some(plan),
@@ -18614,6 +18615,50 @@ fn macho_local_cohort_source_member_is_unchanged(
         .is_some_and(|(previous, current)| previous.bytes == current.bytes)
 }
 
+fn macho_local_cohort_global_resolution_is_exact(
+    resolutions: &[MachOSymbolResolutionRecord],
+    name: &[u8],
+    input_file_path: &str,
+    current_input_ref: &str,
+    section_index: object::SectionIndex,
+    section_offset: u64,
+    current_value: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    let Some(resolution) = macho_symbol_resolution_for_name(resolutions, name) else {
+        return Ok(false);
+    };
+    let Some(target) = resolution.target.as_ref() else {
+        return Ok(false);
+    };
+    Ok(resolution.direct_value == Some(current_value)
+        && target.input_file == input_file_path
+        && patch_input_refs_match(
+            input_file_path,
+            target.input.as_str(),
+            current_input_ref,
+            normalize_rust_archive_patch_inputs,
+        )?
+        && u32::try_from(section_index.0).ok() == Some(target.section_index)
+        && target.section_offset == section_offset)
+}
+
+fn macho_local_cohort_section_is_rematerialized(
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    input_file_path: &str,
+    section: &MatchedPatchSection,
+) -> bool {
+    rematerialized_sections.iter().any(
+        |(input_file, previous_input, previous_section, current_input, current_section)| {
+            input_file.as_str() == input_file_path
+                && previous_input == &section.previous.input
+                && *previous_section == section.previous.section_index
+                && current_input == &section.current.input
+                && *current_section == section.current.section_index
+        },
+    )
+}
+
 fn current_macho_local_cohort_atoms_are_live(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
@@ -18626,6 +18671,7 @@ fn current_macho_local_cohort_atoms_are_live(
     current_file: &object::File<'_>,
     current_bytes: &[u8],
     output_file: &object::File<'_>,
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
     use object::read::macho::MachHeader as _;
@@ -18781,6 +18827,14 @@ fn current_macho_local_cohort_atoms_are_live(
             patch_section_object_index(previous_file, section.previous.section_index)?;
         let previous_section = previous_file.section_by_index(previous_index)?;
         let current_section = current_file.section_by_index(current_index)?;
+        if macho_local_cohort_section_is_rematerialized(
+            rematerialized_sections,
+            input_file_path,
+            section,
+        ) {
+            fully_recorded_sections.insert(current_index);
+            continue;
+        }
         let previous_relocation_count = previous_section.relocations().count();
         if current_section.relocations().count() != previous_relocation_count {
             continue;
@@ -18843,6 +18897,64 @@ fn current_macho_local_cohort_atoms_are_live(
         let index = section_boundaries.partition_point(|boundary| *boundary <= offset);
         let Some(index) = index.checked_sub(1) else {
             return Ok(false);
+        };
+        roots.insert((section_index, section_boundaries[index]));
+    }
+
+    for symbol in current_file
+        .symbols()
+        .filter(|symbol| symbol.is_global() && !symbol.is_undefined())
+    {
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let Some(section_boundaries) = boundaries.get(&section_index) else {
+            continue;
+        };
+        let name = symbol.name_bytes()?;
+        if current_file
+            .symbols()
+            .filter(|candidate| {
+                candidate.is_global()
+                    && !candidate.is_undefined()
+                    && candidate
+                        .name_bytes()
+                        .is_ok_and(|candidate| candidate == name)
+            })
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let section = current_file.section_by_index(section_index)?;
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            continue;
+        };
+        let Some(owner) = owned_sections.get(&section_index) else {
+            continue;
+        };
+        let Some(output_offset) = owner.current.output_offset.checked_add(offset) else {
+            continue;
+        };
+        let Some(current_value) = macho_output_address_for_file_offset(output_file, output_offset)
+        else {
+            continue;
+        };
+        if !macho_local_cohort_global_resolution_is_exact(
+            symbol_resolutions,
+            name,
+            input_file_path,
+            caller_section.current.input.as_str(),
+            section_index,
+            offset,
+            current_value,
+            normalize_rust_archive_patch_inputs,
+        )? {
+            continue;
+        }
+        let index = section_boundaries.partition_point(|boundary| *boundary <= offset);
+        let Some(index) = index.checked_sub(1) else {
+            continue;
         };
         roots.insert((section_index, section_boundaries[index]));
     }
@@ -19506,6 +19618,7 @@ fn changed_macho_local_symbol_cohort_plan(
     current_file: &object::File<'_>,
     previous_output: &[u8],
     output_file: &object::File<'_>,
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
     let Some(caller_section) = member_sections.first().copied() else {
@@ -19595,6 +19708,7 @@ fn changed_macho_local_symbol_cohort_plan(
         current_file,
         previous_output,
         output_file,
+        rematerialized_sections,
         normalize_rust_archive_patch_inputs,
     )
 }
@@ -19631,6 +19745,7 @@ fn plan_macho_local_symbol_cohort(
     current_file: &object::File<'_>,
     previous_output: &[u8],
     output_file: &object::File<'_>,
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
     let mut previous_sections = Vec::new();
@@ -19757,6 +19872,7 @@ fn plan_macho_local_symbol_cohort(
             current_file,
             current_input.bytes,
             output_file,
+            rematerialized_sections,
             normalize_rust_archive_patch_inputs,
         )?;
     if !current_atoms_are_live {
@@ -22112,6 +22228,7 @@ fn macho_text_relocation_replays_for_input(
                 &current_file,
                 previous_output,
                 &output_file,
+                &rematerialized_sections,
                 normalize_rust_archive_patch_inputs,
             )? {
                 Ok(Some(cohort)) => {
@@ -53111,6 +53228,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn macho_local_cohort_global_roots_require_exact_catalog_ownership() {
+        let exact = MachOSymbolResolutionRecord {
+            name: hex::encode("root").into(),
+            direct_value: Some(0x1234),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "input".into(),
+                input: "member".into(),
+                section_index: 1,
+                section_offset: 8,
+            }),
+        };
+        let is_exact = |resolutions: &[MachOSymbolResolutionRecord]| {
+            macho_local_cohort_global_resolution_is_exact(
+                resolutions,
+                b"root",
+                "input",
+                "member",
+                object::SectionIndex(1),
+                8,
+                0x1234,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(is_exact(std::slice::from_ref(&exact)));
+        assert!(!is_exact(&[]));
+        assert!(!is_exact(&[exact.clone(), exact.clone()]));
+
+        for changed in ["value", "file", "member", "section", "offset", "owner"] {
+            let mut resolution = exact.clone();
+            match changed {
+                "value" => resolution.direct_value = Some(0x1235),
+                "file" => resolution.target.as_mut().unwrap().input_file = "other".into(),
+                "member" => resolution.target.as_mut().unwrap().input = "other".into(),
+                "section" => resolution.target.as_mut().unwrap().section_index = 2,
+                "offset" => resolution.target.as_mut().unwrap().section_offset = 9,
+                "owner" => resolution.target = None,
+                _ => unreachable!(),
+            }
+            assert!(!is_exact(&[resolution]), "accepted mismatched {changed}");
+        }
+    }
+
+    #[test]
+    fn macho_local_cohort_rematerialization_requires_exact_section_tuple() {
+        let section = MatchedPatchSection {
+            previous: PatchSection {
+                input: "previous".to_owned(),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: 0,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: "current".to_owned(),
+                section_index: 2,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 8,
+                output_offset: 0,
+                output_size: 8,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        };
+        let exact = [(
+            "input".into(),
+            "previous".to_owned(),
+            1,
+            "current".to_owned(),
+            2,
+        )];
+        assert!(macho_local_cohort_section_is_rematerialized(
+            &exact, "input", &section,
+        ));
+        assert!(!macho_local_cohort_section_is_rematerialized(
+            &[],
+            "input",
+            &section,
+        ));
+        for changed in [
+            "file",
+            "previous",
+            "previous-section",
+            "current",
+            "current-section",
+        ] {
+            let mut witness = exact.clone();
+            match changed {
+                "file" => witness[0].0 = "other".into(),
+                "previous" => witness[0].1 = "other".to_owned(),
+                "previous-section" => witness[0].2 = 3,
+                "current" => witness[0].3 = "other".to_owned(),
+                "current-section" => witness[0].4 = 3,
+                _ => unreachable!(),
+            }
+            assert!(
+                !macho_local_cohort_section_is_rematerialized(&witness, "input", &section),
+                "accepted mismatched {changed}",
+            );
+        }
+    }
+
     fn round_trip_test_reserved_ranges(
         ranges: &[ReservedRangeRecord],
         output_len: usize,
@@ -54366,6 +54592,7 @@ mod tests {
             &current_file,
             &output,
             &output_file,
+            &[],
             true,
         )
         .unwrap()
