@@ -5126,6 +5126,17 @@ struct DirectMachOCguMigrationInput {
     current_hash: String,
 }
 
+enum DirectMachOCguUnmodeledInput {
+    Changed {
+        previous_bytes: Vec<u8>,
+        current_bytes: Vec<u8>,
+    },
+    Unchanged {
+        path: PathBuf,
+        expected_content: FileContentState,
+    },
+}
+
 #[derive(Default)]
 struct DirectMachOCguMigrationPlan {
     moves: Vec<MachOSymbolResolutionMove>,
@@ -5134,8 +5145,36 @@ struct DirectMachOCguMigrationPlan {
     output_symbols: Vec<RelocationTargetSymbolPatch>,
     reusable_branch_targets: Vec<MachOReusableBranchTarget>,
     migrated_names_by_input: HashMap<String, HashSet<Vec<u8>>>,
+    recycled_names: HashSet<SharedText>,
+    added_resolutions: Vec<MachOSymbolResolutionRecord>,
+    remaining_reserved_ranges: Option<Vec<ReservedRangeRecord>>,
     current_hashes: HashMap<String, String>,
     relocation_record_owners: HashSet<String>,
+    live_reference_roots: HashMap<String, Vec<DirectMachOCguLiveReferenceRoot>>,
+}
+
+#[derive(Clone, Copy)]
+struct DirectMachOCguReference {
+    cohort_index: usize,
+    section_index: object::SectionIndex,
+    relocation_offset: u64,
+    is_supported_root: bool,
+}
+
+#[derive(Clone)]
+struct DirectMachOCguLiveReferenceRoot {
+    source_name: SharedText,
+    section_index: object::SectionIndex,
+    section_offset: u64,
+    output_value: u64,
+    relocation_offset: u64,
+    target_name: SharedText,
+}
+
+#[derive(Default)]
+struct DirectMachOCguLivenessProof {
+    definition_names: HashSet<SharedText>,
+    reference_roots_by_input: HashMap<String, Vec<DirectMachOCguLiveReferenceRoot>>,
 }
 
 #[derive(Clone)]
@@ -5203,6 +5242,166 @@ fn direct_macho_cgu_definitions(
     Ok(definitions)
 }
 
+fn direct_macho_cgu_definition_names(
+    file: &object::File<'_>,
+    names: &mut HashMap<Vec<u8>, SharedText>,
+) -> Result<()> {
+    for symbol in file
+        .symbols()
+        .filter(|symbol| symbol.is_global() && !symbol.is_undefined() && !symbol.is_weak())
+    {
+        let name = symbol.name_bytes()?;
+        if !name.is_empty() {
+            names
+                .entry(name.to_vec())
+                .or_insert_with(|| SharedText::from(hex::encode(name)));
+        }
+    }
+    Ok(())
+}
+
+fn direct_macho_cgu_references(
+    files: &[object::File<'_>],
+    requested_names: &HashMap<Vec<u8>, SharedText>,
+) -> Result<HashMap<SharedText, Vec<DirectMachOCguReference>>> {
+    let mut references = HashMap::<SharedText, Vec<DirectMachOCguReference>>::new();
+    for (cohort_index, file) in files.iter().enumerate() {
+        for section in file.sections() {
+            let is_debug = section.kind() == object::SectionKind::Debug
+                || section.segment_name_bytes().ok().flatten() == Some(b"__DWARF".as_slice());
+            if is_debug {
+                continue;
+            }
+            let is_text = section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+                && section.name_bytes().ok() == Some(b"__text".as_slice());
+            for (relocation_offset, relocation) in section.relocations() {
+                let object::RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                    continue;
+                };
+                let symbol = file.symbol_by_index(symbol_index)?;
+                if !symbol.is_undefined() || !symbol.is_global() {
+                    continue;
+                }
+                let Some(name) = requested_names.get(symbol.name_bytes()?) else {
+                    continue;
+                };
+                let is_supported_root = is_text
+                    && matches!(
+                        relocation.flags(),
+                        object::RelocationFlags::MachO {
+                            r_type: object::macho::ARM64_RELOC_BRANCH26,
+                            r_pcrel: true,
+                            r_length: 2,
+                        }
+                    );
+                references
+                    .entry(name.clone())
+                    .or_default()
+                    .push(DirectMachOCguReference {
+                        cohort_index,
+                        section_index: section.index(),
+                        relocation_offset,
+                        is_supported_root,
+                    });
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn macho_input_matching_symbol_names(
+    bytes: &[u8],
+    requested_names: &HashMap<Vec<u8>, SharedText>,
+    definitions_only: bool,
+) -> Result<HashSet<SharedText>> {
+    fn add_matching_names(
+        file: &object::File<'_>,
+        requested_names: &HashMap<Vec<u8>, SharedText>,
+        definitions_only: bool,
+        matching: &mut HashSet<SharedText>,
+    ) -> Result<()> {
+        for symbol in file.symbols() {
+            if definitions_only && symbol.is_undefined() {
+                continue;
+            }
+            if let Some(name) = requested_names.get(symbol.name_bytes()?) {
+                matching.insert(name.clone());
+            }
+        }
+        Ok(())
+    }
+
+    let mut matching = HashSet::new();
+    if let Ok(file) = object::File::parse(bytes) {
+        if !definitions_only || file.kind() == object::ObjectKind::Relocatable {
+            add_matching_names(&file, requested_names, definitions_only, &mut matching)?;
+        }
+        return Ok(matching);
+    }
+    let Ok(archive) = object::read::archive::ArchiveFile::parse(bytes) else {
+        return Ok(matching);
+    };
+    for member in archive.members() {
+        let member = member?;
+        let Ok(file) = object::File::parse(member.data(bytes)?) else {
+            continue;
+        };
+        add_matching_names(&file, requested_names, definitions_only, &mut matching)?;
+    }
+    Ok(matching)
+}
+
+impl DirectMachOCguUnmodeledInput {
+    fn conflicting_names(
+        &self,
+        requested_names: &HashMap<Vec<u8>, SharedText>,
+    ) -> Result<Option<HashSet<SharedText>>> {
+        match self {
+            Self::Changed {
+                previous_bytes,
+                current_bytes,
+            } => {
+                let mut names =
+                    macho_input_matching_symbol_names(previous_bytes, requested_names, false)?;
+                names.extend(macho_input_matching_symbol_names(
+                    current_bytes,
+                    requested_names,
+                    false,
+                )?);
+                Ok(Some(names))
+            }
+            Self::Unchanged {
+                path,
+                expected_content,
+            } => {
+                let Some((bytes, current_content)) = read_file_with_stable_identity(path)? else {
+                    return Ok(None);
+                };
+                if !direct_macho_input_content_matches_expected(expected_content, &current_content)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(macho_input_matching_symbol_names(
+                    &bytes,
+                    requested_names,
+                    true,
+                )?))
+            }
+        }
+    }
+}
+
+fn direct_macho_input_content_matches_expected(
+    expected: &FileContentState,
+    current: &FileContentState,
+) -> bool {
+    if expected.hash.is_empty() {
+        expected.identity.is_some() && expected.identity == current.identity
+    } else {
+        content_state_matches_previous(expected, current)
+    }
+}
+
 fn direct_macho_cgu_sections_are_compatible(
     source_file: &object::File<'_>,
     source_index: object::SectionIndex,
@@ -5263,11 +5462,469 @@ fn direct_macho_cgu_section_is_retained(
     Ok(true)
 }
 
+fn direct_macho_cgu_reference_is_retained(
+    inputs: &[DirectMachOCguMigrationInput],
+    previous_files: &[object::File<'_>],
+    current_files: &[object::File<'_>],
+    sections: &[SectionRecord],
+    reference: DirectMachOCguReference,
+    current: bool,
+) -> Result<bool> {
+    let input = &inputs[reference.cohort_index];
+    let previous_file = &previous_files[reference.cohort_index];
+    let current_file = &current_files[reference.cohort_index];
+    let record_index = patch_section_record_index(
+        if current { current_file } else { previous_file },
+        reference.section_index,
+    )?;
+    let Some(record) =
+        unique_direct_macho_section_record(sections, input.input_file.as_str(), record_index)?
+    else {
+        return Ok(false);
+    };
+    let current_index = if current {
+        reference.section_index
+    } else {
+        patch_section_object_index(current_file, record_index)?
+    };
+    direct_macho_cgu_section_is_retained(previous_file, current_file, current_index, record)
+}
+
+fn direct_macho_cgu_reference_source_definition(
+    file: &object::File<'_>,
+    reference: DirectMachOCguReference,
+) -> Result<Option<(SharedText, DirectMachOCguDefinition)>> {
+    let section = file.section_by_index(reference.section_index)?;
+    if reference.relocation_offset >= section.size() {
+        return Ok(None);
+    }
+    let mut boundary = None;
+    let mut definitions = Vec::new();
+    for symbol in file.symbols() {
+        if symbol.is_undefined() || symbol.section_index() != Some(reference.section_index) {
+            continue;
+        }
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            continue;
+        };
+        if n_desc & object::macho::N_ALT_ENTRY != 0 {
+            continue;
+        }
+        let Some(section_offset) = symbol.address().checked_sub(section.address()) else {
+            return Ok(None);
+        };
+        if section_offset > reference.relocation_offset {
+            continue;
+        }
+        if boundary.is_none_or(|boundary| section_offset > boundary) {
+            boundary = Some(section_offset);
+            definitions.clear();
+        }
+        if boundary != Some(section_offset) || !symbol.is_global() || symbol.is_weak() {
+            continue;
+        }
+        let name = symbol.name_bytes()?;
+        if name.is_empty() {
+            continue;
+        }
+        definitions.push((
+            SharedText::from(hex::encode(name)),
+            DirectMachOCguDefinition {
+                position: SymbolPosition {
+                    section_index: reference.section_index,
+                    section_offset,
+                    value_range: None,
+                },
+                size: symbol.size(),
+                kind: macho_symbol_kind_tag(symbol.kind()),
+                scope: macho_symbol_scope_tag(symbol.scope()),
+                n_desc,
+                eligible: true,
+            },
+        ));
+    }
+    let [definition] = definitions.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some(definition.clone()))
+}
+
+fn direct_macho_cgu_has_stable_published_incoming_reference(
+    inputs: &[DirectMachOCguMigrationInput],
+    current_files: &[object::File<'_>],
+    input_indices: &HashMap<&str, usize>,
+    sections: &[SectionRecord],
+    persisted_relocations: &[RelocationRecord],
+    referenced_input: &str,
+    source_name: &SharedText,
+    source_definition: &DirectMachOCguDefinition,
+    source_value: u64,
+) -> Result<bool> {
+    for record in persisted_relocations {
+        let Some(target) = record.target.as_ref() else {
+            continue;
+        };
+        if record.target_name.as_ref() != Some(source_name)
+            || record.target_value != source_value
+            || target.input_file != referenced_input
+            || target.input != referenced_input
+            || target.section_index != source_definition.position.section_index.0 as u32
+            || target.section_offset != source_definition.position.section_offset
+            || record.input != record.input_file
+        {
+            continue;
+        }
+        let Some(&incoming_index) = input_indices.get(record.input_file.as_str()) else {
+            continue;
+        };
+        let incoming = &inputs[incoming_index];
+        if incoming.previous_bytes != incoming.current_bytes {
+            continue;
+        }
+        let Some(section_record) = unique_direct_macho_section_record(
+            sections,
+            incoming.input_file.as_str(),
+            record.section_index,
+        )?
+        else {
+            continue;
+        };
+        if section_record
+            .output_offset
+            .checked_add(record.relocation_offset)
+            != Some(record.output_offset)
+            || record
+                .relocation_offset
+                .checked_add(record.size)
+                .is_none_or(|end| end > section_record.size)
+        {
+            continue;
+        }
+        let Some(raw) = decode_macho_aarch64_relocation_kind(record.kind) else {
+            continue;
+        };
+        if !raw.r_extern || !macho_local_cohort_relocation_follows_target(raw.r_type) {
+            continue;
+        }
+        let incoming_file = &current_files[incoming_index];
+        let incoming_section_index =
+            patch_section_object_index(incoming_file, record.section_index)?;
+        let incoming_section = incoming_file.section_by_index(incoming_section_index)?;
+        let matching = incoming_section
+            .relocations()
+            .filter(|(offset, _)| *offset == record.relocation_offset)
+            .collect::<Vec<_>>();
+        let [(_, relocation)] = matching.as_slice() else {
+            continue;
+        };
+        if relocation.addend() != record.addend
+            || !matches!(
+                relocation.flags(),
+                object::RelocationFlags::MachO {
+                    r_type,
+                    r_pcrel,
+                    r_length,
+                } if r_type == raw.r_type
+                    && r_pcrel == raw.r_pcrel
+                    && r_length == raw.r_length
+            )
+            || record.size != 1_u64 << raw.r_length
+        {
+            continue;
+        }
+        let object::RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+            continue;
+        };
+        let target_symbol = incoming_file.symbol_by_index(symbol_index)?;
+        if target_symbol.is_global()
+            && target_symbol.is_undefined()
+            && SharedText::from(hex::encode(target_symbol.name_bytes()?)) == *source_name
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_macho_cgu_live_reference_root(
+    inputs: &[DirectMachOCguMigrationInput],
+    previous_files: &[object::File<'_>],
+    current_files: &[object::File<'_>],
+    input_indices: &HashMap<&str, usize>,
+    sections: &[SectionRecord],
+    resolutions: &[MachOSymbolResolutionRecord],
+    persisted_relocations: &[RelocationRecord],
+    output_file: &object::File<'_>,
+    reference: DirectMachOCguReference,
+    target_name: &SharedText,
+) -> Result<Option<Option<DirectMachOCguLiveReferenceRoot>>> {
+    let input = &inputs[reference.cohort_index];
+    let previous_file = &previous_files[reference.cohort_index];
+    let current_file = &current_files[reference.cohort_index];
+    let Some((source_name, current_source)) =
+        direct_macho_cgu_reference_source_definition(current_file, reference)?
+    else {
+        return Ok(None);
+    };
+    if !direct_macho_cgu_definition_is_private_text(current_file, &current_source)? {
+        return Ok(None);
+    }
+    let requested = HashMap::from([(
+        hex::decode(source_name.as_str()).context("Malformed direct Mach-O source name")?,
+        source_name.clone(),
+    )]);
+    let previous_sources = direct_macho_cgu_definitions(previous_file, &requested)?;
+    let Some([previous_source]) = previous_sources.get(&source_name).map(Vec::as_slice) else {
+        return Ok(None);
+    };
+    if !direct_macho_cgu_definition_is_private_text(previous_file, previous_source)?
+        || previous_source.position.section_offset != current_source.position.section_offset
+        || previous_source.kind != current_source.kind
+        || previous_source.scope != current_source.scope
+        || previous_source.n_desc != current_source.n_desc
+    {
+        return Ok(None);
+    }
+    let record_index =
+        patch_section_record_index(current_file, current_source.position.section_index)?;
+    let Some(section_record) =
+        unique_direct_macho_section_record(sections, input.input_file.as_str(), record_index)?
+    else {
+        return Ok(None);
+    };
+    if !direct_macho_cgu_section_is_retained(
+        previous_file,
+        current_file,
+        current_source.position.section_index,
+        section_record,
+    )? || current_source.position.section_offset >= section_record.size
+    {
+        return Ok(None);
+    }
+    if macho_local_cohort_symbol_is_root(current_source.n_desc) {
+        return Ok(Some(None));
+    }
+    let Some(output_offset) = section_record
+        .output_offset
+        .checked_add(current_source.position.section_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(output_value) = macho_output_address_for_file_offset(output_file, output_offset)
+    else {
+        return Ok(None);
+    };
+    let decoded_source_name =
+        hex::decode(source_name.as_str()).context("Malformed direct Mach-O source name")?;
+    let Some(resolution) = macho_symbol_resolution_for_name(resolutions, &decoded_source_name)
+    else {
+        return Ok(None);
+    };
+    let Some(resolution_target) = resolution.target.as_ref() else {
+        return Ok(None);
+    };
+    if resolution.direct_value != Some(output_value)
+        || resolution_target.input_file != input.input_file
+        || resolution_target.input != input.input_file
+        || resolution_target.section_index != current_source.position.section_index.0 as u32
+        || resolution_target.section_offset != current_source.position.section_offset
+        || unique_macho_output_symbol_index(output_file, &decoded_source_name, output_value)
+            .is_err()
+        || !direct_macho_cgu_has_stable_published_incoming_reference(
+            inputs,
+            current_files,
+            input_indices,
+            sections,
+            persisted_relocations,
+            input.input_file.as_str(),
+            &source_name,
+            &current_source,
+            output_value,
+        )?
+    {
+        return Ok(None);
+    }
+    Ok(Some(Some(DirectMachOCguLiveReferenceRoot {
+        source_name,
+        section_index: current_source.position.section_index,
+        section_offset: current_source.position.section_offset,
+        output_value,
+        relocation_offset: reference.relocation_offset,
+        target_name: target_name.clone(),
+    })))
+}
+
+fn direct_macho_cgu_definition_is_private_text(
+    file: &object::File<'_>,
+    definition: &DirectMachOCguDefinition,
+) -> Result<bool> {
+    let section = file.section_by_index(definition.position.section_index)?;
+    Ok(definition.eligible
+        && definition.kind == Some(1)
+        && definition.scope == 2
+        && section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+        && section.name_bytes().ok() == Some(b"__text".as_slice()))
+}
+
+fn direct_macho_cgu_definition_resolution(
+    input: &DirectMachOCguMigrationInput,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    definition: &DirectMachOCguDefinition,
+    sections: &[SectionRecord],
+    output_file: &object::File<'_>,
+    name: &SharedText,
+    current: bool,
+) -> Result<Option<MachOSymbolResolutionRecord>> {
+    let definition_file = if current { current_file } else { previous_file };
+    let record_index =
+        patch_section_record_index(definition_file, definition.position.section_index)?;
+    let Some(record) =
+        unique_direct_macho_section_record(sections, input.input_file.as_str(), record_index)?
+    else {
+        return Ok(None);
+    };
+    let current_index = if current {
+        definition.position.section_index
+    } else {
+        patch_section_object_index(current_file, record_index)?
+    };
+    if !direct_macho_cgu_section_is_retained(previous_file, current_file, current_index, record)?
+        || definition.position.section_offset >= record.size
+    {
+        return Ok(None);
+    }
+    let Some(output_offset) = record
+        .output_offset
+        .checked_add(definition.position.section_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(direct_value) = macho_output_address_for_file_offset(output_file, output_offset)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(MachOSymbolResolutionRecord {
+        name: name.clone(),
+        direct_value: Some(direct_value),
+        got_address: None,
+        stub_address: None,
+        thunk_addresses: Vec::new(),
+        target: Some(RelocationTargetRecord {
+            input_file: input.input_file.clone().into(),
+            input: input.input_file.clone().into(),
+            section_index: definition.position.section_index.0 as u32,
+            section_offset: definition.position.section_offset,
+        }),
+    }))
+}
+
+fn retire_direct_macho_symbol_table_entry(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    definition: &DirectMachOCguDefinition,
+    resolution: &MachOSymbolResolutionRecord,
+    remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
+) -> std::result::Result<Vec<SectionPatch>, String> {
+    let name = hex::decode(resolution.name.as_str())
+        .map_err(|_| "malformed direct Mach-O retirement name".to_owned())?;
+    let value = resolution
+        .direct_value
+        .ok_or_else(|| "direct Mach-O retirement has no output value".to_owned())?;
+    let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
+    let symbol_index = unique_macho_output_symbol_index(output_file, &name, value)?;
+    let symbol_range =
+        macho_symbol_entry_range(previous_output, symbol_table_offset, symbol_index)?;
+    let entry = &previous_output[symbol_range.clone()];
+    let (symbol_table, string_table) = macho_symbol_and_string_table_ranges(previous_output)?;
+    let text_section = output_file
+        .sections()
+        .find(|section| {
+            section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+                && section.name_bytes().ok() == Some(b"__text".as_slice())
+        })
+        .ok_or_else(|| "direct Mach-O retirement has no output text section".to_owned())?;
+    let text_section_index = u8::try_from(text_section.index().0)
+        .map_err(|_| "direct Mach-O retirement text section exceeds u8".to_owned())?;
+    if entry[4] != (object::macho::N_SECT | object::macho::N_EXT | object::macho::N_PEXT)
+        || entry[5] != text_section_index
+        || read_u16_le(&entry[6..8]) != Some(definition.n_desc)
+    {
+        return Err("direct Mach-O retirement output symbol metadata changed".to_owned());
+    }
+    let string_index = read_u32_le(&entry[..4])
+        .ok_or_else(|| "direct Mach-O retirement symbol is truncated".to_owned())?;
+    let string_start = string_table
+        .start
+        .checked_add(u64::from(string_index))
+        .ok_or_else(|| "direct Mach-O retirement string offset overflowed".to_owned())?;
+    let string_size = u64::try_from(name.len() + 1)
+        .map_err(|_| "direct Mach-O retirement name is too large".to_owned())?;
+    let string_end = string_start
+        .checked_add(string_size)
+        .ok_or_else(|| "direct Mach-O retirement string range overflowed".to_owned())?;
+    if (symbol_range.start as u64) < symbol_table.start
+        || (symbol_range.end as u64) > symbol_table.end
+        || string_start < string_table.start
+        || string_end > string_table.end
+    {
+        return Err("direct Mach-O retirement symbol ownership is outside the tables".to_owned());
+    }
+    let string_range = usize::try_from(string_start)
+        .ok()
+        .zip(usize::try_from(string_end).ok())
+        .map(|(start, end)| start..end)
+        .ok_or_else(|| "direct Mach-O retirement string range exceeds usize".to_owned())?;
+    let mut expected_name = name;
+    expected_name.push(0);
+    if previous_output.get(string_range.clone()) != Some(expected_name.as_slice()) {
+        return Err("direct Mach-O retirement string ownership changed".to_owned());
+    }
+    return_macho_local_symbol_reserved_range(
+        remaining_reserved_ranges,
+        crate::output_section_id::SYMTAB_GLOBAL.as_usize() as u32,
+        crate::alignment::SYMTAB_ENTRY.exponent,
+        symbol_range.start as u64,
+        symbol_range.len() as u64,
+    )?;
+    return_macho_local_symbol_reserved_range(
+        remaining_reserved_ranges,
+        crate::output_section_id::STRTAB.as_usize() as u32,
+        0,
+        string_start,
+        string_size,
+    )?;
+    Ok(vec![
+        SectionPatch {
+            output_offset: symbol_range.start as u64,
+            size: symbol_range.len() as u64,
+            data: vec![0; symbol_range.len()],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        },
+        SectionPatch {
+            output_offset: string_start,
+            size: string_size,
+            data: vec![0; string_range.len()],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        },
+    ])
+}
+
 fn plan_direct_macho_cgu_migrations(
     inputs: &[DirectMachOCguMigrationInput],
+    unmodeled_changed_inputs: &[DirectMachOCguUnmodeledInput],
+    changed_input_files: &HashSet<String>,
     sections: &[SectionRecord],
     resolutions: &[MachOSymbolResolutionRecord],
     previous_output: &[u8],
+    reserved_ranges: &[ReservedRangeRecord],
+    persisted_relocations: &[RelocationRecord],
+    allow_definition_changes: bool,
 ) -> Result<std::result::Result<DirectMachOCguMigrationPlan, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous output for direct Mach-O CGU migration")?;
@@ -5291,17 +5948,13 @@ fn plan_direct_macho_cgu_migrations(
             .context("Malformed direct Mach-O CGU catalog symbol name")?;
         requested_names.insert(decoded, resolution.name.clone());
     }
-    if requested_names.is_empty() {
-        return Ok(Ok(DirectMachOCguMigrationPlan::default()));
-    }
-
     let mut previous_definitions =
         HashMap::<SharedText, Vec<(usize, DirectMachOCguDefinition)>>::new();
     let mut current_definitions =
         HashMap::<SharedText, Vec<(usize, DirectMachOCguDefinition)>>::new();
     let mut previous_files = Vec::with_capacity(inputs.len());
     let mut current_files = Vec::with_capacity(inputs.len());
-    for (cohort_index, input) in inputs.iter().enumerate() {
+    for input in inputs {
         let previous_file = object::File::parse(input.previous_bytes.as_slice())
             .context("Failed to parse previous direct Mach-O CGU")?;
         let current_file = object::File::parse(input.current_bytes.as_slice())
@@ -5313,22 +5966,49 @@ fn plan_direct_macho_cgu_migrations(
                 "direct Mach-O CGU migration cohort contains an unsupported object".to_owned(),
             ));
         }
-        for (name, definitions) in direct_macho_cgu_definitions(&previous_file, &requested_names)? {
+        previous_files.push(previous_file);
+        current_files.push(current_file);
+    }
+
+    if allow_definition_changes {
+        for (index, input) in inputs.iter().enumerate() {
+            if changed_input_files.contains(input.input_file.as_str()) {
+                direct_macho_cgu_definition_names(&previous_files[index], &mut requested_names)?;
+                direct_macho_cgu_definition_names(&current_files[index], &mut requested_names)?;
+            }
+        }
+    }
+    if requested_names.is_empty() {
+        return Ok(Ok(DirectMachOCguMigrationPlan::default()));
+    }
+    let mut unmodeled_conflicting_names = HashSet::new();
+    let mut unmodeled_inputs_are_stable = true;
+    if allow_definition_changes {
+        for input in unmodeled_changed_inputs {
+            let Some(names) = input.conflicting_names(&requested_names)? else {
+                unmodeled_inputs_are_stable = false;
+                break;
+            };
+            unmodeled_conflicting_names.extend(names);
+        }
+    }
+    for (cohort_index, file) in previous_files.iter().enumerate() {
+        for (name, definitions) in direct_macho_cgu_definitions(file, &requested_names)? {
             previous_definitions.entry(name).or_default().extend(
                 definitions
                     .into_iter()
                     .map(|definition| (cohort_index, definition)),
             );
         }
-        for (name, definitions) in direct_macho_cgu_definitions(&current_file, &requested_names)? {
+    }
+    for (cohort_index, file) in current_files.iter().enumerate() {
+        for (name, definitions) in direct_macho_cgu_definitions(file, &requested_names)? {
             current_definitions.entry(name).or_default().extend(
                 definitions
                     .into_iter()
                     .map(|definition| (cohort_index, definition)),
             );
         }
-        previous_files.push(previous_file);
-        current_files.push(current_file);
     }
 
     let mut plan = DirectMachOCguMigrationPlan::default();
@@ -5339,7 +6019,9 @@ fn plan_direct_macho_cgu_migrations(
         let Some(&source_index) = input_indices.get(previous_target.input_file.as_str()) else {
             continue;
         };
-        if previous_target.input != previous_target.input_file {
+        if previous_target.input != previous_target.input_file
+            || !changed_input_files.contains(previous_target.input_file.as_str())
+        {
             continue;
         }
         let Some(previous_value) = resolution.direct_value else {
@@ -5368,6 +6050,7 @@ fn plan_direct_macho_cgu_migrations(
             continue;
         };
         if *destination_index == source_index
+            || !changed_input_files.contains(inputs[*destination_index].input_file.as_str())
             || !current_definition.eligible
             || !previous[0].1.signature_matches(current_definition)
             || !direct_macho_cgu_sections_are_compatible(
@@ -5488,9 +6171,259 @@ fn plan_direct_macho_cgu_migrations(
             "direct Mach-O CGU migration has an ambiguous symbol name".to_owned(),
         ));
     }
+    if allow_definition_changes {
+        let previous_references = direct_macho_cgu_references(&previous_files, &requested_names)?;
+        let current_references = direct_macho_cgu_references(&current_files, &requested_names)?;
+        let migrated_names = plan
+            .moves
+            .iter()
+            .map(|moved| moved.name.clone())
+            .collect::<HashSet<_>>();
+        let mut candidate_names = requested_names.values().cloned().collect::<Vec<_>>();
+        candidate_names.sort_unstable();
+        candidate_names.dedup();
+        let mut remaining_reserved_ranges = reserved_ranges.to_vec();
+        let mut added_definitions = Vec::new();
+
+        for name in candidate_names {
+            if migrated_names.contains(&name) {
+                continue;
+            }
+            let previous = previous_definitions
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let current = current_definitions
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let previous_refs = previous_references
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let current_refs = current_references
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let decoded_name = hex::decode(name.as_str())
+                .context("Malformed direct Mach-O CGU definition name")?;
+            if !unmodeled_inputs_are_stable || unmodeled_conflicting_names.contains(&name) {
+                continue;
+            }
+            let references_are_retained =
+                |references: &[DirectMachOCguReference], current| -> Result<bool> {
+                    for reference in references {
+                        if !reference.is_supported_root
+                            || !direct_macho_cgu_reference_is_retained(
+                                inputs,
+                                &previous_files,
+                                &current_files,
+                                sections,
+                                *reference,
+                                current,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                };
+
+            if previous.is_empty()
+                && current.len() == 1
+                && previous_refs.is_empty()
+                && !current_refs.is_empty()
+                && references_are_retained(current_refs, true)?
+            {
+                let mut live_reference_roots = Vec::with_capacity(current_refs.len());
+                let mut references_are_live = true;
+                for reference in current_refs {
+                    let Some(root) = direct_macho_cgu_live_reference_root(
+                        inputs,
+                        &previous_files,
+                        &current_files,
+                        &input_indices,
+                        sections,
+                        resolutions,
+                        persisted_relocations,
+                        &output_file,
+                        *reference,
+                        &name,
+                    )?
+                    else {
+                        references_are_live = false;
+                        break;
+                    };
+                    live_reference_roots.push(root);
+                }
+                if !references_are_live {
+                    continue;
+                }
+                let (owner_index, definition) = &current[0];
+                if !changed_input_files.contains(inputs[*owner_index].input_file.as_str())
+                    || !direct_macho_cgu_definition_is_private_text(
+                        &current_files[*owner_index],
+                        definition,
+                    )?
+                    || macho_symbol_resolution_index_for_name(resolutions, name.as_str())?.is_some()
+                    || output_file.symbols().any(|symbol| {
+                        symbol.name_bytes().is_ok_and(|candidate| {
+                            hex::decode(name.as_str()).is_ok_and(|name| candidate == name)
+                        })
+                    })
+                {
+                    continue;
+                }
+                let Some(resolution) = direct_macho_cgu_definition_resolution(
+                    &inputs[*owner_index],
+                    &previous_files[*owner_index],
+                    &current_files[*owner_index],
+                    definition,
+                    sections,
+                    &output_file,
+                    &name,
+                    true,
+                )?
+                else {
+                    continue;
+                };
+                plan.migrated_names_by_input
+                    .entry(inputs[*owner_index].input_file.clone())
+                    .or_default()
+                    .insert(decoded_name.clone());
+                for (reference, live_root) in current_refs.iter().zip(live_reference_roots) {
+                    let input_file = inputs[reference.cohort_index].input_file.clone();
+                    plan.migrated_names_by_input
+                        .entry(input_file.clone())
+                        .or_default()
+                        .insert(decoded_name.clone());
+                    if let Some(live_root) = live_root {
+                        plan.live_reference_roots
+                            .entry(input_file)
+                            .or_default()
+                            .push(live_root);
+                    }
+                }
+                added_definitions.push(AddedMachOArchiveDefinition {
+                    name: decoded_name,
+                    offset: definition.position.section_offset,
+                    desc: definition.n_desc,
+                    private_external: true,
+                });
+                plan.added_resolutions.push(resolution);
+                continue;
+            }
+
+            if previous.len() == 1
+                && current.is_empty()
+                && !previous_refs.is_empty()
+                && current_refs.is_empty()
+                && references_are_retained(previous_refs, false)?
+                && !persisted_relocations.iter().any(|relocation| {
+                    relocation.target_name.as_ref() == Some(&name)
+                        && !input_indices.contains_key(relocation.input_file.as_str())
+                })
+            {
+                let (owner_index, definition) = &previous[0];
+                if !changed_input_files.contains(inputs[*owner_index].input_file.as_str())
+                    || !direct_macho_cgu_definition_is_private_text(
+                        &previous_files[*owner_index],
+                        definition,
+                    )?
+                {
+                    continue;
+                }
+                let Some(expected) = direct_macho_cgu_definition_resolution(
+                    &inputs[*owner_index],
+                    &previous_files[*owner_index],
+                    &current_files[*owner_index],
+                    definition,
+                    sections,
+                    &output_file,
+                    &name,
+                    false,
+                )?
+                else {
+                    continue;
+                };
+                let Some(resolution_index) =
+                    macho_symbol_resolution_index_for_name(resolutions, name.as_str())?
+                else {
+                    continue;
+                };
+                let resolution = &resolutions[resolution_index];
+                if resolution != &expected
+                    || resolution.got_address.is_some()
+                    || resolution.stub_address.is_some()
+                    || !resolution.thunk_addresses.is_empty()
+                {
+                    continue;
+                }
+                let patches = match retire_direct_macho_symbol_table_entry(
+                    previous_output,
+                    &output_file,
+                    definition,
+                    resolution,
+                    &mut remaining_reserved_ranges,
+                ) {
+                    Ok(patches) => patches,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                plan.output_patches.extend(patches);
+                let owner = inputs[*owner_index].input_file.clone();
+                plan.migrated_names_by_input
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(decoded_name.clone());
+                for reference in previous_refs {
+                    let input_file = inputs[reference.cohort_index].input_file.clone();
+                    plan.migrated_names_by_input
+                        .entry(input_file.clone())
+                        .or_default()
+                        .insert(decoded_name.clone());
+                }
+                plan.recycled_names.insert(name);
+            }
+        }
+
+        if !added_definitions.is_empty() {
+            let member = AddedMachOArchiveTextMember {
+                input: String::new(),
+                sections: Vec::new(),
+                unwind: None,
+                text_section_index: 0,
+                text_object_section_index: 0,
+                definitions: added_definitions,
+                referenced_names: Vec::new(),
+            };
+            let selected = (0..member.definitions.len())
+                .map(|definition_index| (0, definition_index))
+                .collect::<Vec<_>>();
+            let added = match added_macho_symbol_table_patches(
+                previous_output,
+                &output_file,
+                std::slice::from_ref(&member),
+                &selected,
+                &plan.added_resolutions,
+                &mut remaining_reserved_ranges,
+            )? {
+                Ok(patches) => patches,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if let Err(reason) = overlay_plain_section_patches(&mut plan.output_patches, &added) {
+                return Ok(Err(reason));
+            }
+            plan.output_patches.extend(added);
+        }
+        if !plan.added_resolutions.is_empty() || !plan.recycled_names.is_empty() {
+            plan.remaining_reserved_ranges = Some(remaining_reserved_ranges);
+        }
+    }
     for input in inputs {
-        plan.current_hashes
-            .insert(input.input_file.clone(), input.current_hash.clone());
+        if changed_input_files.contains(input.input_file.as_str()) {
+            plan.current_hashes
+                .insert(input.input_file.clone(), input.current_hash.clone());
+        }
     }
     Ok(Ok(plan))
 }
@@ -6080,27 +7013,115 @@ fn direct_macho_cgu_migration_inputs(
     state_dir: &Path,
     previous: &PersistedState,
     changed_inputs: &[(usize, PathBuf)],
-) -> Result<Vec<DirectMachOCguMigrationInput>> {
+) -> Result<(
+    Vec<DirectMachOCguMigrationInput>,
+    Vec<DirectMachOCguUnmodeledInput>,
+    bool,
+)> {
+    let changed_paths = changed_inputs
+        .iter()
+        .map(|(index, path)| (*index, path))
+        .collect::<HashMap<_, _>>();
     let mut inputs = Vec::new();
-    for (input_index, path) in changed_inputs {
-        let Some(input) = previous.input_files.get(*input_index) else {
+    let mut unmodeled_changed_inputs = Vec::new();
+    let mut complete_changed_inputs = true;
+    for (input_index, input) in previous.input_files.iter().enumerate() {
+        let changed_path = changed_paths.get(&input_index).copied();
+        let path = if let Some(path) = changed_path {
+            path.clone()
+        } else {
+            decode_path(&input.path)?
+        };
+        let is_direct_cgu = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".rcgu.o"));
+        if changed_path.is_none() && !is_direct_cgu {
+            unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                path,
+                expected_content: input.content.clone(),
+            });
+            continue;
+        }
+        let previous_bytes = if changed_path.is_some() {
+            let Some(previous_bytes) = read_verified_input_snapshot(state_dir, input)? else {
+                complete_changed_inputs = false;
+                continue;
+            };
+            Some(previous_bytes)
+        } else {
+            None
+        };
+        let Some((current_bytes, current_content)) = read_file_with_stable_identity(&path)? else {
+            if changed_path.is_some() {
+                complete_changed_inputs = false;
+            } else {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                    path,
+                    expected_content: input.content.clone(),
+                });
+            }
             continue;
         };
-        let Some(previous_bytes) = read_verified_input_snapshot(state_dir, input)? else {
+        if changed_path.is_none()
+            && !direct_macho_input_content_matches_expected(&input.content, &current_content)
+        {
+            unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                path,
+                expected_content: input.content.clone(),
+            });
             continue;
-        };
-        let Some((current_bytes, _)) = read_file_with_stable_identity(path)? else {
+        }
+        let previous_bytes = previous_bytes.unwrap_or_else(|| current_bytes.clone());
+        if !is_direct_cgu {
+            unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Changed {
+                previous_bytes,
+                current_bytes,
+            });
             continue;
-        };
+        }
         let Ok(previous_file) = object::File::parse(previous_bytes.as_slice()) else {
+            if changed_path.is_some() {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Changed {
+                    previous_bytes,
+                    current_bytes,
+                });
+            } else {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                    path,
+                    expected_content: input.content.clone(),
+                });
+            }
             continue;
         };
         let Ok(current_file) = object::File::parse(current_bytes.as_slice()) else {
+            if changed_path.is_some() {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Changed {
+                    previous_bytes,
+                    current_bytes,
+                });
+            } else {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                    path,
+                    expected_content: input.content.clone(),
+                });
+            }
             continue;
         };
         if !is_supported_incremental_macho_object(&previous_file)
             || !is_supported_incremental_macho_object(&current_file)
         {
+            if changed_path.is_some() {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Changed {
+                    previous_bytes,
+                    current_bytes,
+                });
+            } else {
+                unmodeled_changed_inputs.push(DirectMachOCguUnmodeledInput::Unchanged {
+                    path,
+                    expected_content: input.content.clone(),
+                });
+            }
             continue;
         }
         inputs.push(DirectMachOCguMigrationInput {
@@ -6110,7 +7131,7 @@ fn direct_macho_cgu_migration_inputs(
             current_bytes,
         });
     }
-    Ok(inputs)
+    Ok((inputs, unmodeled_changed_inputs, complete_changed_inputs))
 }
 
 fn migrated_macho_archive_definition_names(
@@ -6199,8 +7220,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut indexed_changed_input_macho_definitions = None;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(previous_output_source));
     let mut direct_macho_cgu_migration_plan = DirectMachOCguMigrationPlan::default();
+    let mut direct_macho_cgu_liveness_proof = DirectMachOCguLivenessProof::default();
+    let mut possible_macho_text_relocation_target_removals = Vec::new();
+    let mut current_macho_global_references = MachOCurrentGlobalReferenceSummary::default();
     if records_complete && record_coverage.has_complete_macho_symbol_resolutions() {
-        let migration_inputs =
+        let (migration_inputs, unmodeled_changed_inputs, complete_changed_inputs) =
             direct_macho_cgu_migration_inputs(state_dir, &previous, changed_inputs)?;
         if migration_inputs.len() >= 2 {
             let migration_input_files = migration_inputs
@@ -6240,13 +7264,72 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
             direct_macho_cgu_migration_plan = match plan_direct_macho_cgu_migrations(
                 &migration_inputs,
+                &unmodeled_changed_inputs,
+                &changed_input_files,
                 &previous.sections,
                 &previous.macho_symbol_resolutions,
                 previous_output.get()?,
+                &previous.reserved_ranges,
+                &previous.relocations,
+                complete_changed_inputs,
             )? {
                 Ok(plan) => plan,
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             };
+            direct_macho_cgu_liveness_proof.definition_names.extend(
+                direct_macho_cgu_migration_plan
+                    .added_resolutions
+                    .iter()
+                    .map(|resolution| resolution.name.clone()),
+            );
+            direct_macho_cgu_liveness_proof
+                .reference_roots_by_input
+                .extend(
+                    direct_macho_cgu_migration_plan
+                        .live_reference_roots
+                        .iter()
+                        .map(|(input, roots)| (input.clone(), roots.clone())),
+                );
+            if !direct_macho_cgu_migration_plan.added_resolutions.is_empty() {
+                previous.macho_symbol_resolutions.extend(
+                    direct_macho_cgu_migration_plan
+                        .added_resolutions
+                        .iter()
+                        .cloned(),
+                );
+                previous.macho_symbol_resolutions.sort_unstable();
+                if previous
+                    .macho_symbol_resolutions
+                    .windows(2)
+                    .any(|pair| pair[0].name == pair[1].name)
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "direct Mach-O CGU activation collided with the resolution catalog"
+                            .to_owned(),
+                    ));
+                }
+                previous.macho_symbol_resolutions_file = None;
+                previous.sections_file = None;
+            }
+            if !direct_macho_cgu_migration_plan.recycled_names.is_empty() {
+                previous.macho_symbol_resolutions.retain(|resolution| {
+                    !direct_macho_cgu_migration_plan
+                        .recycled_names
+                        .contains(&resolution.name)
+                });
+                previous.macho_symbol_resolutions_file = None;
+                previous.sections_file = None;
+            }
+            if let Some(remaining) = direct_macho_cgu_migration_plan
+                .remaining_reserved_ranges
+                .clone()
+            {
+                previous.reserved_ranges = remaining;
+                validate_reserved_ranges_against_sections(
+                    &previous.reserved_ranges,
+                    &previous.sections,
+                )?;
+            }
             if !direct_macho_cgu_migration_plan.moves.is_empty() {
                 if let Err(reason) = apply_direct_macho_cgu_resolution_migrations(
                     &mut previous.macho_symbol_resolutions,
@@ -6257,10 +7340,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 }
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
-                patches.append(&mut direct_macho_cgu_migration_plan.output_patches);
-                patches.append(&mut direct_macho_cgu_migration_plan.chained_fixup_patches);
-                output_symbol_patches.append(&mut direct_macho_cgu_migration_plan.output_symbols);
             }
+            patches.append(&mut direct_macho_cgu_migration_plan.output_patches);
+            patches.append(&mut direct_macho_cgu_migration_plan.chained_fixup_patches);
+            output_symbol_patches.append(&mut direct_macho_cgu_migration_plan.output_symbols);
         }
     }
     for (input_index, path) in changed_inputs {
@@ -7547,6 +8630,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             previous_output.get()?,
                             &mut relocation_target_patches,
                             &macho_resolution_moves,
+                            &direct_macho_cgu_liveness_proof,
                             record_coverage.has_changed_input_records(),
                             records_complete,
                         )? {
@@ -7588,6 +8672,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             previous_output.get()?,
                             &mut relocation_target_patches,
                             &macho_resolution_moves,
+                            &direct_macho_cgu_liveness_proof,
                             &mut replays.local_symbol_cohorts,
                         )?
                     };
@@ -7616,6 +8701,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         local_symbol_cohorts: Vec::new(),
                         normalize_rust_archive_patch_inputs: false,
                         symbol_resolutions_changed: false,
+                        possible_removed_resolution_names: Vec::new(),
                     }
                 }
             };
@@ -7664,7 +8750,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .into_iter()
                         .flat_map(|names| names.iter().cloned()),
                 );
-                match changed_macho_archive_unwind_activation(
+                let validated_local_symbol_renames = macho_text_relocation_replays
+                    .local_symbol_cohorts
+                    .iter()
+                    .flat_map(|plan| plan.validated_local_symbol_renames.iter().cloned())
+                    .collect::<Vec<_>>();
+                match changed_macho_archive_unwind_activation_with_local_symbol_renames(
                     previous_bytes,
                     &bytes,
                     input.path.as_str(),
@@ -7688,6 +8779,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &reactivated_macho_archive_identifiers,
                     &migrated_definitions,
                     &relocation_target_patches.validated_macho_local_retargets,
+                    &validated_local_symbol_renames,
                 )? {
                     Ok(activation) => activation,
                     Err(reason) => {
@@ -7702,6 +8794,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .replays
                     .extend(activation.relocation_replays.iter().cloned());
             }
+            current_macho_global_references.record_replays(&macho_text_relocation_replays.replays);
+            possible_macho_text_relocation_target_removals.extend(
+                std::mem::take(
+                    &mut macho_text_relocation_replays.possible_removed_resolution_names,
+                )
+                .into_iter()
+                .map(|name| (name, input.path.clone())),
+            );
             let recycled_resolution_names = added_macho_archive_text_activation
                 .as_ref()
                 .into_iter()
@@ -8454,10 +9554,25 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .local_symbol_cohorts
                     .is_empty()
             {
+                let previous_output_bytes = previous_output.get()?;
+                let materialized_previous_output = (!macho_text_relocation_replays
+                    .local_symbol_cohorts
+                    .is_empty())
+                .then(|| {
+                    materialize_pending_macho_symbol_table_patches(previous_output_bytes, &patches)
+                })
+                .transpose();
+                let materialized_previous_output = match materialized_previous_output {
+                    Ok(output) => output,
+                    Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+                };
+                let replay_previous_output = materialized_previous_output
+                    .as_deref()
+                    .unwrap_or(previous_output_bytes);
                 match apply_macho_text_relocation_replays(
                     &mut resolved_patches,
                     &macho_text_relocation_replays,
-                    previous_output.get()?,
+                    replay_previous_output,
                     &mut previous.relocations,
                     &mut previous.macho_symbol_resolutions,
                     remaining_reserved_ranges,
@@ -8470,6 +9585,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 false
             };
+            if let Err(reason) =
+                overlay_plain_section_patches(&mut patches, &macho_local_symbol_cohort_patches)
+            {
+                return Ok(ChangedInputPatchResult::Unsupported(reason));
+            }
             if let Err(reason) = compose_relocation_target_patches_with_section_patches(
                 &mut resolved_patches,
                 &mut relocation_target_patches.output_patches,
@@ -9214,6 +10334,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 bytes,
             ));
         }
+    }
+
+    if let Err(reason) = validate_deferred_macho_text_relocation_target_removals(
+        &possible_macho_text_relocation_target_removals,
+        &current_macho_global_references,
+        &previous.macho_symbol_resolutions,
+    ) {
+        return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
     if !direct_macho_cgu_migration_plan.moves.is_empty() {
@@ -10159,6 +11287,70 @@ fn compose_nested_plain_patches(
     Ok(())
 }
 
+fn overlay_plain_section_patches(
+    base_patches: &mut Vec<SectionPatch>,
+    overlay_patches: &[SectionPatch],
+) -> std::result::Result<(), String> {
+    for overlay in overlay_patches {
+        let overlay_is_plain = overlay.deferred_relocation.is_none()
+            && overlay.preserve_ranges.is_empty()
+            && overlay.adjustments.is_empty()
+            && overlay.data.len() as u64 == overlay.size;
+        if !overlay_is_plain {
+            return Err("overlay patch is not plain".to_owned());
+        }
+        let overlay_end = overlay
+            .output_offset
+            .checked_add(overlay.size)
+            .ok_or_else(|| "overlay patch range overflowed".to_owned())?;
+        let mut remaining = Vec::with_capacity(base_patches.len() + 1);
+        for base in base_patches.drain(..) {
+            let base_end = base
+                .output_offset
+                .checked_add(base.size)
+                .ok_or_else(|| "base patch range overflowed".to_owned())?;
+            if base_end <= overlay.output_offset || overlay_end <= base.output_offset {
+                remaining.push(base);
+                continue;
+            }
+            let base_is_plain = base.deferred_relocation.is_none()
+                && base.preserve_ranges.is_empty()
+                && base.adjustments.is_empty()
+                && base.data.len() as u64 == base.size;
+            if !base_is_plain {
+                return Err("overlay patch overlaps a non-plain patch".to_owned());
+            }
+            if base.output_offset < overlay.output_offset {
+                let size = overlay.output_offset - base.output_offset;
+                let end =
+                    usize::try_from(size).map_err(|_| "left base patch is too large".to_owned())?;
+                remaining.push(SectionPatch {
+                    output_offset: base.output_offset,
+                    size,
+                    data: base.data[..end].to_vec(),
+                    deferred_relocation: None,
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                });
+            }
+            if overlay_end < base_end {
+                let start = usize::try_from(overlay_end - base.output_offset)
+                    .map_err(|_| "right base patch offset is too large".to_owned())?;
+                remaining.push(SectionPatch {
+                    output_offset: overlay_end,
+                    size: base_end - overlay_end,
+                    data: base.data[start..].to_vec(),
+                    deferred_relocation: None,
+                    preserve_ranges: Vec::new(),
+                    adjustments: Vec::new(),
+                });
+            }
+        }
+        *base_patches = remaining;
+    }
+    Ok(())
+}
+
 struct DynamicRelocationPatch {
     record: DynamicRelocationRecord,
     input_range: Option<std::ops::Range<usize>>,
@@ -10201,6 +11393,19 @@ struct ValidatedMachOLocalRelocationRetarget {
     current: ValidatedMachOLocalRelocationSite,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ValidatedMachOLocalSymbolSite {
+    archive_identifier: Vec<u8>,
+    section_index: usize,
+    symbol_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedMachOLocalSymbolRename {
+    previous: ValidatedMachOLocalSymbolSite,
+    current: ValidatedMachOLocalSymbolSite,
+}
+
 struct MatchedMachOLocalTextTargetOwnership {
     current_name: Vec<u8>,
     current_target_value: u64,
@@ -10224,6 +11429,7 @@ struct MachOLocalSymbolCohortPlan {
     current_input: String,
     previous: Vec<MachOLocalSymbolCohortEntry>,
     current: Vec<MachOLocalSymbolCohortEntry>,
+    validated_local_symbol_renames: Vec<ValidatedMachOLocalSymbolRename>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16700,12 +17906,89 @@ struct MachOCurrentTargetValue {
     used_normalized_alias: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MachOCurrentGlobalReference {
+    target_value: u64,
+    target: Option<RelocationTargetRecord>,
+}
+
+#[derive(Default)]
+struct MachOCurrentGlobalReferenceSummary {
+    references_by_name: HashMap<SharedText, Option<MachOCurrentGlobalReference>>,
+}
+
+impl MachOCurrentGlobalReferenceSummary {
+    fn record_replays(&mut self, replays: &[MachOTextRelocationReplay]) {
+        for replay in replays.iter().filter(|replay| replay.target_is_global) {
+            let Some(name) = replay.target_name.as_ref() else {
+                continue;
+            };
+            let reference = MachOCurrentGlobalReference {
+                target_value: replay.current_target_value,
+                target: replay.target.clone(),
+            };
+            match self.references_by_name.entry(name.clone()) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(reference));
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().as_ref() != Some(&reference) {
+                        *entry.get_mut() = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn removed_macho_text_relocation_target_reason(name: &SharedText, input: &str) -> String {
+    format!(
+        "removed Mach-O text relocation target may change symbol liveness: `{}` in {}",
+        display_hex_text(name),
+        display_hex_path(input),
+    )
+}
+
+fn validate_deferred_macho_text_relocation_target_removals(
+    possible_removals: &[(SharedText, String)],
+    current_references: &MachOCurrentGlobalReferenceSummary,
+    resolutions: &[MachOSymbolResolutionRecord],
+) -> std::result::Result<(), String> {
+    let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
+    for (name, input) in possible_removals {
+        let Some(reference) = current_references.references_by_name.get(name.as_str()) else {
+            return Err(removed_macho_text_relocation_target_reason(name, input));
+        };
+        let Some(reference) = reference else {
+            return Err(format!(
+                "ambiguous current Mach-O text relocation target `{}`",
+                display_hex_text(name),
+            ));
+        };
+        let Some(resolution_index) = resolution_lookup.unique_index_encoded(name.as_str())? else {
+            return Err(removed_macho_text_relocation_target_reason(name, input));
+        };
+        let resolution = &resolutions[resolution_index];
+        if resolution.direct_value != Some(reference.target_value)
+            || reference.target.is_none()
+            || resolution.target != reference.target
+        {
+            return Err(format!(
+                "unvalidated current Mach-O text relocation target `{}`",
+                display_hex_text(name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct MachOTextRelocationReplays {
     replays: Vec<MachOTextRelocationReplay>,
     rematerialized_sections: Vec<(SharedText, String, u32, String, u32)>,
     local_symbol_cohorts: Vec<MachOLocalSymbolCohortPlan>,
     normalize_rust_archive_patch_inputs: bool,
     symbol_resolutions_changed: bool,
+    possible_removed_resolution_names: Vec<SharedText>,
 }
 
 impl MachOTextRelocationReplays {
@@ -17425,6 +18708,7 @@ fn matched_macho_local_text_target_ownership(
     previous_output: &[u8],
     output_symbols: &MachOLocalOutputSymbolLookup,
     output_file: &object::File<'_>,
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MatchedMachOLocalTextTargetOwnership>, String>> {
     let Some(current_name) = renamed_local_macho_relocation_target_candidate_name(
@@ -17592,6 +18876,8 @@ fn matched_macho_local_text_target_ownership(
                 current_file,
                 previous_output,
                 output_file,
+                &[],
+                direct_macho_cgu_liveness_proof,
                 normalize_rust_archive_patch_inputs,
             )? {
                 Ok(Some(plan)) => plan,
@@ -17744,6 +19030,7 @@ fn matched_macho_local_text_target_ownership(
             previous_output,
             output_file,
             &[],
+            direct_macho_cgu_liveness_proof,
             normalize_rust_archive_patch_inputs,
         )? {
             Ok(Some(plan)) => Some(plan),
@@ -18062,6 +19349,7 @@ struct MachOLocalConstAtom {
     section_offset: u64,
     atom_end: u64,
     symbols_at_site: usize,
+    symbol_index: usize,
 }
 
 #[derive(Debug)]
@@ -18071,6 +19359,7 @@ struct MachOLocalSymbolCohortSupplement {
     previous: Vec<MachOLocalSymbolCohortEntry>,
     current: Vec<MachOLocalSymbolCohortEntry>,
     output_sites: HashSet<(u8, u64)>,
+    symbol_pairs: Vec<(usize, usize)>,
 }
 
 fn macho_local_const_atoms(
@@ -18141,6 +19430,7 @@ fn macho_local_const_atoms(
             section_offset: offset,
             atom_end: 0,
             symbols_at_site: 0,
+            symbol_index: symbol.index().0,
         });
     }
     boundaries.sort_unstable();
@@ -18283,10 +19573,14 @@ fn macho_local_const_atom_has_recorded_output_owner(
     previous_input_ref: &str,
     target_section_index: u32,
     target_section_offset: u64,
-    target_name: &[u8],
+    previous_target_name: &[u8],
+    current_target_name: &[u8],
     output_value: u64,
 ) -> bool {
-    let expected_name = hex::encode(target_name);
+    let expected_names = [
+        hex::encode(previous_target_name),
+        hex::encode(current_target_name),
+    ];
     relocations.iter().any(|relocation| {
         let Some(target) = &relocation.target else {
             return false;
@@ -18295,7 +19589,11 @@ fn macho_local_const_atom_has_recorded_output_owner(
             && target.input.as_str() == previous_input_ref
             && target.section_index == target_section_index
             && target.section_offset == target_section_offset
-            && relocation.target_name.as_deref() == Some(expected_name.as_str())
+            && relocation.target_name.as_deref().is_some_and(|name| {
+                expected_names
+                    .iter()
+                    .any(|expected| name == expected.as_str())
+            })
             && relocation
                 .applied_target_value
                 .unwrap_or(relocation.target_value)
@@ -18453,6 +19751,7 @@ fn supplemental_macho_local_const_cohort(
     let mut current_entries = Vec::new();
     let mut output_sites = HashSet::new();
     let mut output_ranges = Vec::new();
+    let mut symbol_pairs = Vec::new();
     let mut has_unpublished_atoms = false;
     for (previous, current) in previous_atoms.iter().zip(&current_atoms) {
         let output_matches = output_symbols_by_name
@@ -18531,11 +19830,44 @@ fn supplemental_macho_local_const_cohort(
             previous_record_index,
             previous.section_offset,
             &previous.name,
+            &current.name,
             output_symbol.address(),
         ) {
-            return Ok(Err(
-                "published local Mach-O const atom has no recorded output owner".to_owned(),
-            ));
+            let expected_names = [hex::encode(&previous.name), hex::encode(&current.name)];
+            let matching = relocations
+                .iter()
+                .filter_map(|relocation| {
+                    let target = relocation.target.as_ref()?;
+                    (relocation.target_name.as_deref().is_some_and(|name| {
+                        expected_names
+                            .iter()
+                            .any(|expected| name == expected.as_str())
+                    }) && relocation
+                        .applied_target_value
+                        .unwrap_or(relocation.target_value)
+                        == output_symbol.address())
+                    .then(|| {
+                        format!(
+                            "{}:{}:{}:{:#x}",
+                            display_hex_path(&target.input_file),
+                            display_hex_text(&target.input),
+                            target.section_index,
+                            target.section_offset,
+                        )
+                    })
+                })
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(Err(format!(
+                "published local Mach-O const atom `{}` has no recorded output owner in `{}` \
+                 at section {} offset {:#x}; matching records: [{}]",
+                String::from_utf8_lossy(&previous.name),
+                display_hex_text(previous_input_ref),
+                previous_record_index,
+                previous.section_offset,
+                matching,
+            )));
         }
         if macho_atom_incoming_relocation_from_sections(
             current_file,
@@ -18593,6 +19925,7 @@ fn supplemental_macho_local_const_cohort(
             output_entry_offset: None,
             string_index: None,
         });
+        symbol_pairs.push((previous.symbol_index, current.symbol_index));
     }
     output_ranges.sort_unstable_by_key(|range| range.start);
     if output_ranges
@@ -18617,6 +19950,7 @@ fn supplemental_macho_local_const_cohort(
         previous: previous_entries,
         current: current_entries,
         output_sites,
+        symbol_pairs,
     })))
 }
 
@@ -18771,6 +20105,164 @@ fn macho_local_symbol_cohort_retains_published_sites(
     previous.len() == current.len()
         && previous_sites.len() == previous.len()
         && previous_sites == current_sites
+}
+
+fn macho_local_symbol_cohort_retained_current_names(
+    previous: &[MachOLocalSymbolCohortEntry],
+    current: &[MachOLocalSymbolCohortEntry],
+) -> HashSet<Vec<u8>> {
+    fn perfect_matching(candidates: &[Vec<usize>], current_len: usize) -> Option<Vec<usize>> {
+        fn assign(
+            previous_index: usize,
+            candidates: &[Vec<usize>],
+            current_to_previous: &mut [Option<usize>],
+            visited: &mut [bool],
+        ) -> bool {
+            for &current_index in &candidates[previous_index] {
+                if visited[current_index] {
+                    continue;
+                }
+                visited[current_index] = true;
+                if current_to_previous[current_index].is_none_or(|assigned| {
+                    assign(assigned, candidates, current_to_previous, visited)
+                }) {
+                    current_to_previous[current_index] = Some(previous_index);
+                    return true;
+                }
+            }
+            false
+        }
+
+        let mut current_to_previous = vec![None; current_len];
+        for previous_index in 0..candidates.len() {
+            let mut visited = vec![false; current_len];
+            if !assign(
+                previous_index,
+                candidates,
+                &mut current_to_previous,
+                &mut visited,
+            ) {
+                return None;
+            }
+        }
+        current_to_previous.into_iter().collect()
+    }
+
+    fn has_cycle(node: usize, edges: &[Vec<usize>], state: &mut [u8]) -> bool {
+        if state[node] != 0 {
+            return state[node] == 1;
+        }
+        state[node] = 1;
+        if edges[node]
+            .iter()
+            .any(|target| has_cycle(*target, edges, state))
+        {
+            return true;
+        }
+        state[node] = 2;
+        false
+    }
+
+    let entries_match = |previous: &MachOLocalSymbolCohortEntry,
+                         current: &MachOLocalSymbolCohortEntry| {
+        previous.n_desc == current.n_desc
+            && previous.output_section_index == current.output_section_index
+            && (previous.name == current.name || previous.output_value == current.output_value)
+    };
+    let previous_to_current = previous
+        .iter()
+        .map(|previous| {
+            current
+                .iter()
+                .enumerate()
+                .filter_map(|(index, current)| entries_match(previous, current).then_some(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut current_to_previous = vec![Vec::new(); current.len()];
+    for (previous_index, candidates) in previous_to_current.iter().enumerate() {
+        for current_index in candidates {
+            current_to_previous[*current_index].push(previous_index);
+        }
+    }
+
+    let mut retained = HashSet::new();
+    let mut seen_previous = vec![false; previous.len()];
+    let mut seen_current = vec![false; current.len()];
+    for start in 0..previous.len() {
+        if seen_previous[start] || previous_to_current[start].is_empty() {
+            continue;
+        }
+        let mut previous_component = Vec::new();
+        let mut current_component = Vec::new();
+        let mut previous_queue = vec![start];
+        seen_previous[start] = true;
+        let mut previous_cursor = 0;
+        let mut current_cursor = 0;
+        while previous_cursor < previous_queue.len() || current_cursor < current_component.len() {
+            while let Some(previous_index) = previous_queue.get(previous_cursor).copied() {
+                previous_cursor += 1;
+                previous_component.push(previous_index);
+                for &current_index in &previous_to_current[previous_index] {
+                    if !seen_current[current_index] {
+                        seen_current[current_index] = true;
+                        current_component.push(current_index);
+                    }
+                }
+            }
+            while let Some(current_index) = current_component.get(current_cursor).copied() {
+                current_cursor += 1;
+                for &previous_index in &current_to_previous[current_index] {
+                    if !seen_previous[previous_index] {
+                        seen_previous[previous_index] = true;
+                        previous_queue.push(previous_index);
+                    }
+                }
+            }
+        }
+        if previous_component.len() != current_component.len() {
+            continue;
+        }
+        let current_positions = current_component
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (*index, position))
+            .collect::<HashMap<_, _>>();
+        let component_candidates = previous_component
+            .iter()
+            .map(|previous_index| {
+                previous_to_current[*previous_index]
+                    .iter()
+                    .map(|current_index| current_positions[current_index])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let Some(matched_current_to_previous) =
+            perfect_matching(&component_candidates, current_component.len())
+        else {
+            continue;
+        };
+        let mut alternating_edges = vec![Vec::new(); previous_component.len()];
+        for (previous_position, candidates) in component_candidates.iter().enumerate() {
+            for current_position in candidates {
+                let matched_previous = matched_current_to_previous[*current_position];
+                if matched_previous != previous_position {
+                    alternating_edges[previous_position].push(matched_previous);
+                }
+            }
+        }
+        let mut state = vec![0; previous_component.len()];
+        if (0..previous_component.len()).any(|node| has_cycle(node, &alternating_edges, &mut state))
+        {
+            continue;
+        }
+        retained.extend(
+            current_component
+                .into_iter()
+                .map(|current_index| current[current_index].name.clone()),
+        );
+    }
+    retained
 }
 
 #[cfg(test)]
@@ -19215,6 +20707,7 @@ fn macho_local_cohort_entry_liveness_is_proven(
         && (required_current_entries == 0 || required_atoms_are_reachable)
 }
 
+#[cfg(test)]
 fn macho_local_cohort_atom_graph_is_complete(
     boundaries: &HashMap<object::SectionIndex, Vec<u64>>,
     roots: &HashSet<(object::SectionIndex, u64)>,
@@ -19771,6 +21264,8 @@ fn current_macho_local_cohort_atoms_are_live(
     previous_output: &[u8],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     required_current_entries: &[MachOLocalSymbolCohortEntry],
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
+    retained_local_atom_names: &HashSet<Vec<u8>>,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
     use object::read::macho::MachHeader as _;
@@ -20000,29 +21495,144 @@ fn current_macho_local_cohort_atoms_are_live(
         roots.insert((section_index, section_boundaries[index]));
     }
 
+    for symbol in current_file.symbols().filter(|symbol| !symbol.is_global()) {
+        if !retained_local_atom_names.contains(symbol.name_bytes()?) {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        if !gc_sections.contains(&section_index) || symbol.is_weak() || symbol.is_undefined() {
+            continue;
+        }
+        let section = current_file.section_by_index(section_index)?;
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            continue;
+        };
+        if let Some(atom) = atom_for_offset(section_index, offset) {
+            roots.insert(atom);
+        }
+    }
+
+    // Direct patches retain the previously published atom set. Preserve a strong global atom
+    // only when its previous definition, output nlist, resolution, and section ownership are all
+    // exact; its bytes and size may change without changing that prior liveness proof.
+    for current_symbol in current_file
+        .symbols()
+        .filter(|symbol| symbol.is_global() && !symbol.is_undefined() && !symbol.is_weak())
+    {
+        let Some(current_section_index) = current_symbol.section_index() else {
+            continue;
+        };
+        if !gc_sections.contains(&current_section_index) {
+            continue;
+        }
+        let Some(owner) = owned_sections.get(&current_section_index) else {
+            continue;
+        };
+        let previous_section_index =
+            patch_section_object_index(previous_file, owner.previous.section_index)?;
+        let name = current_symbol.name_bytes()?;
+        let previous_matching = previous_file
+            .symbols()
+            .filter(|symbol| {
+                symbol.is_global()
+                    && !symbol.is_undefined()
+                    && !symbol.is_weak()
+                    && symbol.section_index() == Some(previous_section_index)
+                    && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+            })
+            .collect::<Vec<_>>();
+        let [previous_symbol] = previous_matching.as_slice() else {
+            continue;
+        };
+        if previous_symbol.kind() != current_symbol.kind()
+            || previous_symbol.scope() != current_symbol.scope()
+            || previous_symbol.flags() != current_symbol.flags()
+        {
+            continue;
+        }
+        let previous_section = previous_file.section_by_index(previous_section_index)?;
+        let current_section = current_file.section_by_index(current_section_index)?;
+        let Some(previous_offset) = previous_symbol
+            .address()
+            .checked_sub(previous_section.address())
+        else {
+            continue;
+        };
+        let Some(current_offset) = current_symbol
+            .address()
+            .checked_sub(current_section.address())
+        else {
+            continue;
+        };
+        let Some(previous_output_offset) =
+            owner.previous.output_offset.checked_add(previous_offset)
+        else {
+            continue;
+        };
+        let Some(previous_value) =
+            macho_output_address_for_file_offset(output_file, previous_output_offset)
+        else {
+            continue;
+        };
+        if unique_macho_output_symbol_index(output_file, name, previous_value).is_err() {
+            continue;
+        }
+        let Some(resolution) = macho_symbol_resolution_for_name(symbol_resolutions, name) else {
+            continue;
+        };
+        let Some(target) = resolution.target.as_ref() else {
+            continue;
+        };
+        if resolution.direct_value != Some(previous_value)
+            || target.input_file != input_file_path
+            || !patch_input_refs_match(
+                input_file_path,
+                target.input.as_str(),
+                caller_section.previous.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?
+            || target.section_index != previous_section_index.0 as u32
+            || target.section_offset != previous_offset
+        {
+            continue;
+        }
+        if let Some(atom) = atom_for_offset(current_section_index, current_offset) {
+            roots.insert(atom);
+        }
+    }
+
+    // A direct-CGU activation proves one strong private definition and at least one retained raw
+    // branch root before publishing its resolution. Carry that independent proof into this graph;
+    // a catalog entry alone is not a liveness root.
+    let mut current_global_definition_counts = HashMap::<Vec<u8>, usize>::new();
     for symbol in current_file
         .symbols()
         .filter(|symbol| symbol.is_global() && !symbol.is_undefined())
     {
+        *current_global_definition_counts
+            .entry(symbol.name_bytes()?.to_vec())
+            .or_default() += 1;
+    }
+    for symbol in current_file
+        .symbols()
+        .filter(|symbol| symbol.is_global() && !symbol.is_undefined())
+    {
+        let name = symbol.name_bytes()?;
+        let encoded_name = SharedText::from(hex::encode(name));
+        if !direct_macho_cgu_liveness_proof
+            .definition_names
+            .contains(&encoded_name)
+            || current_global_definition_counts.get(name) != Some(&1)
+            || symbol.is_weak()
+        {
+            continue;
+        }
         let Some(section_index) = symbol.section_index() else {
             continue;
         };
-        let Some(section_boundaries) = boundaries.get(&section_index) else {
-            continue;
-        };
-        let name = symbol.name_bytes()?;
-        if current_file
-            .symbols()
-            .filter(|candidate| {
-                candidate.is_global()
-                    && !candidate.is_undefined()
-                    && candidate
-                        .name_bytes()
-                        .is_ok_and(|candidate| candidate == name)
-            })
-            .count()
-            != 1
-        {
+        if !gc_sections.contains(&section_index) {
             continue;
         }
         let section = current_file.section_by_index(section_index)?;
@@ -20039,23 +21649,170 @@ fn current_macho_local_cohort_atoms_are_live(
         else {
             continue;
         };
-        if !macho_local_cohort_global_resolution_is_exact(
-            symbol_resolutions,
-            name,
-            input_file_path,
-            caller_section.current.input.as_str(),
-            section_index,
-            offset,
-            current_value,
-            normalize_rust_archive_patch_inputs,
-        )? {
-            continue;
-        }
-        let index = section_boundaries.partition_point(|boundary| *boundary <= offset);
-        let Some(index) = index.checked_sub(1) else {
+        let Some(resolution) = macho_symbol_resolution_for_name(symbol_resolutions, name) else {
             continue;
         };
-        roots.insert((section_index, section_boundaries[index]));
+        let Some(target) = resolution.target.as_ref() else {
+            continue;
+        };
+        if resolution.direct_value != Some(current_value)
+            || target.input_file != input_file_path
+            || !patch_input_refs_match(
+                input_file_path,
+                target.input.as_str(),
+                caller_section.current.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?
+            || u32::try_from(section_index.0).ok() != Some(target.section_index)
+            || target.section_offset != offset
+        {
+            continue;
+        }
+        if let Some(atom) = atom_for_offset(section_index, offset) {
+            roots.insert(atom);
+        }
+    }
+
+    if patch_input_refs_match(
+        input_file_path,
+        caller_section.current.input.as_str(),
+        input_file_path,
+        normalize_rust_archive_patch_inputs,
+    )? && let Some(reference_roots) = direct_macho_cgu_liveness_proof
+        .reference_roots_by_input
+        .get(input_file_path)
+    {
+        for reference_root in reference_roots {
+            if !gc_sections.contains(&reference_root.section_index) {
+                continue;
+            }
+            let Ok(source_name) = hex::decode(reference_root.source_name.as_str()) else {
+                continue;
+            };
+            let current_matching = current_file
+                .symbols()
+                .filter(|symbol| {
+                    symbol.is_global()
+                        && !symbol.is_undefined()
+                        && !symbol.is_weak()
+                        && symbol.name_bytes().is_ok_and(|name| name == source_name)
+                        && symbol.section_index() == Some(reference_root.section_index)
+                })
+                .collect::<Vec<_>>();
+            let [current_source] = current_matching.as_slice() else {
+                continue;
+            };
+            let current_section = current_file.section_by_index(reference_root.section_index)?;
+            if current_source
+                .address()
+                .checked_sub(current_section.address())
+                != Some(reference_root.section_offset)
+            {
+                continue;
+            }
+            let Some(owner) = owned_sections.get(&reference_root.section_index) else {
+                continue;
+            };
+            let Some(output_offset) = owner
+                .current
+                .output_offset
+                .checked_add(reference_root.section_offset)
+            else {
+                continue;
+            };
+            if macho_output_address_for_file_offset(output_file, output_offset)
+                != Some(reference_root.output_value)
+                || unique_macho_output_symbol_index(
+                    output_file,
+                    &source_name,
+                    reference_root.output_value,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let previous_section_index =
+                patch_section_object_index(previous_file, owner.previous.section_index)?;
+            let previous_section = previous_file.section_by_index(previous_section_index)?;
+            let previous_matching = previous_file
+                .symbols()
+                .filter(|symbol| {
+                    symbol.is_global()
+                        && !symbol.is_undefined()
+                        && !symbol.is_weak()
+                        && symbol.name_bytes().is_ok_and(|name| name == source_name)
+                        && symbol.section_index() == Some(previous_section_index)
+                })
+                .collect::<Vec<_>>();
+            let [previous_source] = previous_matching.as_slice() else {
+                continue;
+            };
+            if previous_source
+                .address()
+                .checked_sub(previous_section.address())
+                != Some(reference_root.section_offset)
+                || previous_source.kind() != current_source.kind()
+                || previous_source.scope() != current_source.scope()
+                || previous_source.flags() != current_source.flags()
+            {
+                continue;
+            }
+            let Some(resolution) =
+                macho_symbol_resolution_for_name(symbol_resolutions, &source_name)
+            else {
+                continue;
+            };
+            let Some(resolution_target) = resolution.target.as_ref() else {
+                continue;
+            };
+            if resolution.direct_value != Some(reference_root.output_value)
+                || resolution_target.input_file != input_file_path
+                || !patch_input_refs_match(
+                    input_file_path,
+                    resolution_target.input.as_str(),
+                    caller_section.current.input.as_str(),
+                    normalize_rust_archive_patch_inputs,
+                )?
+                || resolution_target.section_index != reference_root.section_index.0 as u32
+                || resolution_target.section_offset != reference_root.section_offset
+            {
+                continue;
+            }
+            if atom_for_offset(
+                reference_root.section_index,
+                reference_root.relocation_offset,
+            ) != Some((reference_root.section_index, reference_root.section_offset))
+            {
+                continue;
+            }
+            let matching = current_section
+                .relocations()
+                .filter(|(offset, _)| *offset == reference_root.relocation_offset)
+                .collect::<Vec<_>>();
+            let [(_, relocation)] = matching.as_slice() else {
+                continue;
+            };
+            if !matches!(
+                relocation.flags(),
+                object::RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_BRANCH26,
+                    r_pcrel: true,
+                    r_length: 2,
+                }
+            ) {
+                continue;
+            }
+            let object::RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                continue;
+            };
+            let target = current_file.symbol_by_index(symbol_index)?;
+            if target.is_global()
+                && target.is_undefined()
+                && SharedText::from(hex::encode(target.name_bytes()?)) == reference_root.target_name
+            {
+                roots.insert((reference_root.section_index, reference_root.section_offset));
+            }
+        }
     }
 
     // Direct patches preserve the previously live atom set instead of recomputing dead-strip GC.
@@ -20740,6 +22497,7 @@ fn supplemental_macho_local_symbol_sources_changed(
                             record_index,
                             section_offset,
                             &entry.name,
+                            &entry.name,
                             symbol.address(),
                         )
                 }) {
@@ -20772,6 +22530,7 @@ fn changed_macho_local_symbol_cohort_plan(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
     let Some(caller_section) = member_sections.first().copied() else {
@@ -20862,6 +22621,7 @@ fn changed_macho_local_symbol_cohort_plan(
         previous_output,
         output_file,
         rematerialized_sections,
+        direct_macho_cgu_liveness_proof,
         normalize_rust_archive_patch_inputs,
     )
 }
@@ -20882,6 +22642,7 @@ fn plan_macho_local_symbol_cohort(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
     let mut previous_sections = Vec::new();
@@ -20970,6 +22731,45 @@ fn plan_macho_local_symbol_cohort(
     let supplement_retains_published_sites = supplement.as_ref().is_none_or(|supplement| {
         macho_local_symbol_cohort_retains_published_sites(&supplement.previous, &supplement.current)
     });
+    let validated_local_symbol_renames = if let Some(supplement) = &supplement {
+        if supplement.symbol_pairs.len() != supplement.previous.len()
+            || supplement.symbol_pairs.len() != supplement.current.len()
+        {
+            return Ok(Err(
+                "published local Mach-O const cohort has incomplete symbol identity".to_owned(),
+            ));
+        }
+        let previous_identifier = previous_input
+            .archive_identifier
+            .map(archive_member_patch_identifier)
+            .unwrap_or_default();
+        let current_identifier = current_input
+            .archive_identifier
+            .map(archive_member_patch_identifier)
+            .unwrap_or_default();
+        supplement
+            .previous
+            .iter()
+            .zip(&supplement.current)
+            .zip(&supplement.symbol_pairs)
+            .filter_map(|((previous, current), (previous_symbol, current_symbol))| {
+                (previous.name != current.name).then(|| ValidatedMachOLocalSymbolRename {
+                    previous: ValidatedMachOLocalSymbolSite {
+                        archive_identifier: previous_identifier.clone(),
+                        section_index: supplement.previous_section.0,
+                        symbol_index: *previous_symbol,
+                    },
+                    current: ValidatedMachOLocalSymbolSite {
+                        archive_identifier: current_identifier.clone(),
+                        section_index: supplement.current_section.0,
+                        symbol_index: *current_symbol,
+                    },
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(supplement) = &supplement {
         previous.extend(supplement.previous.iter().cloned());
         current.extend(supplement.current.iter().cloned());
@@ -21002,6 +22802,8 @@ fn plan_macho_local_symbol_cohort(
     }
     // Direct patches preserve the liveness of exact previously published entries. Entries that
     // are added, moved, renamed, or metadata-changed still require a current graph proof.
+    let retained_local_atom_names =
+        macho_local_symbol_cohort_retained_current_names(&previous, &current);
     let required_atoms_are_reachable = if required_current_entries.is_empty() {
         true
     } else {
@@ -21020,6 +22822,8 @@ fn plan_macho_local_symbol_cohort(
             previous_output,
             rematerialized_sections,
             &required_current_entries,
+            direct_macho_cgu_liveness_proof,
+            &retained_local_atom_names,
             normalize_rust_archive_patch_inputs,
         )?
     };
@@ -21029,9 +22833,10 @@ fn plan_macho_local_symbol_cohort(
         required_atoms_are_reachable,
     );
     if !current_atoms_are_live {
-        return Ok(Err(
-            "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
-        ));
+        return Ok(Err(format!(
+            "published local Mach-O cohort has no complete current atom-liveness proof in `{}`",
+            display_hex_text(&caller_section.current.input),
+        )));
     }
     let previous_names = previous
         .iter()
@@ -21061,6 +22866,7 @@ fn plan_macho_local_symbol_cohort(
         current_input: caller_section.current.input.clone(),
         previous,
         current,
+        validated_local_symbol_renames,
     })))
 }
 
@@ -22188,14 +23994,17 @@ fn relocation_is_in_rematerialized_macho_text_section(
 fn relocation_matches_macho_symbol_resolution(
     relocation: &RelocationRecord,
     resolutions: &[MachOSymbolResolutionRecord],
+    resolution_indices_by_name: &HashMap<SharedText, Option<usize>>,
     normalize_rust_archive_patch_inputs: bool,
 ) -> std::result::Result<bool, String> {
     let Some(target_name) = relocation.target_name.as_deref() else {
         return Ok(false);
     };
-    let Some(resolution_index) = macho_symbol_resolution_index_for_name(resolutions, target_name)?
-    else {
+    let Some(resolution_index) = resolution_indices_by_name.get(target_name).copied() else {
         return Ok(false);
+    };
+    let Some(resolution_index) = resolution_index else {
+        return Err("ambiguous Mach-O symbol resolution catalog entry".to_owned());
     };
     let resolution = &resolutions[resolution_index];
     Ok(resolution.direct_value == Some(relocation.target_value)
@@ -22214,8 +24023,20 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
     normalize_rust_archive_patch_inputs: bool,
     retiring_names: &[SharedText],
     input: &FileState,
-) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool), String> {
+) -> std::result::Result<(Vec<RelocationTargetSymbolPatch>, bool, Vec<SharedText>), String> {
     let mut affected_names = HashSet::<SharedText>::new();
+    let mut possible_removed_resolution_names = Vec::new();
+    let mut resolution_indices_by_name = HashMap::with_capacity(resolutions.len());
+    for (index, resolution) in resolutions.iter().enumerate() {
+        match resolution_indices_by_name.entry(resolution.name.clone()) {
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(index));
+            }
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = None;
+            }
+        }
+    }
     let relocation_section_index = MachORelocationSectionIndex::new(
         relocations,
         input.path.as_str(),
@@ -22246,15 +24067,13 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
         if relocation_matches_macho_symbol_resolution(
             relocation,
             resolutions,
+            &resolution_indices_by_name,
             normalize_rust_archive_patch_inputs,
         )? {
             affected_names.insert(target_name.clone());
         }
     }
-    for replay in replays
-        .iter()
-        .filter(|replay| replay.relocation_index.is_none() && replay.target_is_global)
-    {
+    for replay in replays.iter().filter(|replay| replay.target_is_global) {
         let Some(target_name) = replay.target_name.as_ref() else {
             continue;
         };
@@ -22275,6 +24094,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
             && relocation_matches_macho_symbol_resolution(
                 relocation,
                 resolutions,
+                &resolution_indices_by_name,
                 normalize_rust_archive_patch_inputs,
             )?
         {
@@ -22284,10 +24104,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 .push((relocation.target_value, relocation.target.clone()));
         }
     }
-    for replay in replays
-        .iter()
-        .filter(|replay| replay.relocation_index.is_none() && replay.target_is_global)
-    {
+    for replay in replays.iter().filter(|replay| replay.target_is_global) {
         let Some(target_name) = replay.target_name.as_ref() else {
             continue;
         };
@@ -22343,8 +24160,16 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 display_hex_path(&input.path)
             ));
         }
-        let resolution_index =
-            macho_symbol_resolution_index_for_name(resolutions, target_name.as_str())?;
+        let resolution_index = match resolution_indices_by_name
+            .get(target_name.as_str())
+            .copied()
+        {
+            Some(Some(index)) => Some(index),
+            Some(None) => {
+                return Err("ambiguous Mach-O symbol resolution catalog entry".to_owned());
+            }
+            None => None,
+        };
         let catalog_has_owner = resolution_index
             .and_then(|index| resolutions[index].target.as_ref())
             .is_some();
@@ -22382,10 +24207,7 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 && resolution.stub_address.is_none()
                 && resolution.thunk_addresses.is_empty()
             {
-                return Err(format!(
-                    "removed Mach-O text relocation target may change symbol liveness in {}",
-                    display_hex_path(&input.path)
-                ));
+                possible_removed_resolution_names.push(target_name);
             }
             continue;
         };
@@ -22429,18 +24251,20 @@ fn reconcile_rematerialized_macho_symbol_resolutions(
                 allow_missing: true,
                 source: "new rematerialized Mach-O symbol resolution",
             });
+            let resolution_index = resolutions.len();
             resolutions.push(MachOSymbolResolutionRecord {
-                name: target_name,
+                name: target_name.clone(),
                 direct_value: Some(current_target_value),
                 got_address: None,
                 stub_address: None,
                 thunk_addresses: Vec::new(),
                 target: Some(current_target),
             });
+            resolution_indices_by_name.insert(target_name, Some(resolution_index));
             changed = true;
         }
     }
-    Ok((output_symbols, changed))
+    Ok((output_symbols, changed, possible_removed_resolution_names))
 }
 
 fn retire_missing_macho_symbol_resolutions(
@@ -22558,6 +24382,7 @@ fn macho_text_relocation_replays_for_input(
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     changed_input_records_loaded: bool,
     records_complete: bool,
 ) -> Result<std::result::Result<MachOTextRelocationReplays, String>> {
@@ -22573,6 +24398,7 @@ fn macho_text_relocation_replays_for_input(
             local_symbol_cohorts,
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         }));
     }
     let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
@@ -22985,6 +24811,7 @@ fn macho_text_relocation_replays_for_input(
                         previous_output,
                         &output_symbols,
                         &output_file,
+                        direct_macho_cgu_liveness_proof,
                         normalize_rust_archive_patch_inputs,
                     )? {
                         Ok(ownership) => ownership,
@@ -23381,6 +25208,7 @@ fn macho_text_relocation_replays_for_input(
                 previous_output,
                 &output_file,
                 &rematerialized_sections,
+                direct_macho_cgu_liveness_proof,
                 normalize_rust_archive_patch_inputs,
             )? {
                 Ok(Some(cohort)) => {
@@ -23459,10 +25287,11 @@ fn macho_text_relocation_replays_for_input(
         retained_output_resolution_start,
         retained_output_resolutions.len(),
     );
-    let (resolution_output_symbols, symbol_resolutions_changed) = match reconciled {
-        Ok(updates) => updates,
-        Err(reason) => return Ok(Err(reason)),
-    };
+    let (resolution_output_symbols, symbol_resolutions_changed, possible_removed_resolution_names) =
+        match reconciled {
+            Ok(updates) => updates,
+            Err(reason) => return Ok(Err(reason)),
+        };
     target_patches
         .output_symbols
         .extend(resolution_output_symbols);
@@ -23472,6 +25301,7 @@ fn macho_text_relocation_replays_for_input(
         local_symbol_cohorts,
         normalize_rust_archive_patch_inputs,
         symbol_resolutions_changed,
+        possible_removed_resolution_names,
     }))
 }
 
@@ -23506,6 +25336,7 @@ fn validate_macho_data_relocations_are_stable(
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
+    direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     local_symbol_cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
 ) -> Result<std::result::Result<bool, String>> {
     let output_file = object::File::parse(previous_output)
@@ -24105,6 +25936,8 @@ fn validate_macho_data_relocations_are_stable(
                         &current_file,
                         previous_output,
                         &output_file,
+                        &[],
+                        direct_macho_cgu_liveness_proof,
                         normalize_rust_archive_patch_inputs,
                     )? {
                         Ok(plan) => plan,
@@ -27475,6 +29308,7 @@ fn archive_macho_semantic_patch_proof_fingerprint(
         false,
         false,
         &[],
+        &[],
     )
 }
 
@@ -27485,6 +29319,24 @@ fn archive_macho_masked_local_semantic_fingerprint_with_retargets(
     ignored_defined_symbols: &HashSet<Vec<u8>>,
     validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
 ) -> Result<Option<blake3::Hash>> {
+    archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+        bytes,
+        ranges,
+        ignored_identifiers,
+        ignored_defined_symbols,
+        validated_local_retargets,
+        &[],
+    )
+}
+
+fn archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    ignored_identifiers: &[Vec<u8>],
+    ignored_defined_symbols: &HashSet<Vec<u8>>,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolSite],
+) -> Result<Option<blake3::Hash>> {
     archive_macho_semantic_patch_proof_fingerprint_with_options(
         bytes,
         ranges,
@@ -27493,6 +29345,7 @@ fn archive_macho_masked_local_semantic_fingerprint_with_retargets(
         true,
         true,
         validated_local_retargets,
+        validated_local_symbol_renames,
     )
 }
 
@@ -27527,8 +29380,9 @@ fn direct_macho_masked_local_semantic_fingerprint_with_retargets(
         true,
         !validated_local_retargets.is_empty(),
         &retargets,
+        &[],
     )
-    .map(|(fingerprint, _)| fingerprint))
+    .map(|(fingerprint, _, _)| fingerprint))
 }
 
 fn archive_macho_semantic_patch_proof_fingerprint_with_options(
@@ -27539,6 +29393,7 @@ fn archive_macho_semantic_patch_proof_fingerprint_with_options(
     ignore_masked_unwind_sections: bool,
     force_retirement_proof: bool,
     validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolSite],
 ) -> Result<Option<blake3::Hash>> {
     let Some(members) = archive_macho_semantic_patch_proof_members(
         bytes,
@@ -27548,6 +29403,7 @@ fn archive_macho_semantic_patch_proof_fingerprint_with_options(
         ignore_masked_unwind_sections,
         force_retirement_proof,
         validated_local_retargets,
+        validated_local_symbol_renames,
     )?
     else {
         return Ok(None);
@@ -27571,12 +29427,14 @@ fn archive_macho_semantic_patch_proof_members(
     ignore_masked_unwind_sections: bool,
     force_retirement_proof: bool,
     validated_local_retargets: &[ValidatedMachOLocalRelocationSite],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolSite],
 ) -> Result<Option<Vec<(Vec<u8>, blake3::Hash)>>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
     };
     let mut members = Vec::new();
     let mut consumed_local_retargets = 0;
+    let mut consumed_local_symbol_renames = 0;
     for entry in archive {
         let ArchiveEntry::Regular(content) = entry? else {
             return Ok(None);
@@ -27600,31 +29458,42 @@ fn archive_macho_semantic_patch_proof_members(
             .iter()
             .filter(|site| site.archive_identifier == identifier)
             .collect::<Vec<_>>();
+        let member_local_symbol_renames = validated_local_symbol_renames
+            .iter()
+            .filter(|site| site.archive_identifier == identifier)
+            .collect::<Vec<_>>();
         let mut ignored_sections = HashSet::new();
         if ignore_masked_unwind_sections {
             ignored_sections =
                 fully_masked_macho_unwind_sections(&file, content.data_offset, ranges)?;
         }
-        let Some((member_hash, member_consumed_local_retargets)) =
-            macho_object_semantic_patch_fingerprint_with_retargets(
-                content.entry_data,
-                content.data_offset,
-                ranges,
-                &ignored_sections,
-                &HashSet::new(),
-                ignored_defined_symbols,
-                force_retirement_proof,
-                true,
-                !validated_local_retargets.is_empty(),
-                &member_local_retargets,
-            )
+        let Some((
+            member_hash,
+            member_consumed_local_retargets,
+            member_consumed_local_symbol_renames,
+        )) = macho_object_semantic_patch_fingerprint_with_retargets(
+            content.entry_data,
+            content.data_offset,
+            ranges,
+            &ignored_sections,
+            &HashSet::new(),
+            ignored_defined_symbols,
+            force_retirement_proof,
+            true,
+            !validated_local_retargets.is_empty(),
+            &member_local_retargets,
+            &member_local_symbol_renames,
+        )
         else {
             return Ok(None);
         };
         consumed_local_retargets += member_consumed_local_retargets;
+        consumed_local_symbol_renames += member_consumed_local_symbol_renames;
         members.push((identifier, member_hash));
     }
-    if consumed_local_retargets != validated_local_retargets.len() {
+    if consumed_local_retargets != validated_local_retargets.len()
+        || consumed_local_symbol_renames != validated_local_symbol_renames.len()
+    {
         return Ok(None);
     }
     Ok(Some(members))
@@ -27778,7 +29647,7 @@ fn archive_macho_unowned_text_fingerprint_with_retargets(
             .iter()
             .filter(|site| site.archive_identifier == identifier)
             .collect::<Vec<_>>();
-        let Some((member_hash, member_consumed_local_retargets)) =
+        let Some((member_hash, member_consumed_local_retargets, _)) =
             macho_object_semantic_patch_fingerprint_with_retargets(
                 content.entry_data,
                 content.data_offset,
@@ -27790,6 +29659,7 @@ fn archive_macho_unowned_text_fingerprint_with_retargets(
                 true,
                 !validated_local_retargets.is_empty(),
                 &member_local_retargets,
+                &[],
             )
         else {
             return Ok(None);
@@ -27976,6 +29846,7 @@ fn archive_diff_allows_changed_macho_symbols(
             true,
             false,
             &previous_local_retargets,
+            &[],
         )?
     } else {
         archive_macho_semantic_patch_proof_fingerprint_with_options(
@@ -27986,6 +29857,7 @@ fn archive_diff_allows_changed_macho_symbols(
             false,
             false,
             &previous_local_retargets,
+            &[],
         )?
     };
     let current_fingerprint = if ignore_masked_unwind_sections {
@@ -27997,6 +29869,7 @@ fn archive_diff_allows_changed_macho_symbols(
             true,
             false,
             &current_local_retargets,
+            &[],
         )?
     } else {
         archive_macho_semantic_patch_proof_fingerprint_with_options(
@@ -28007,6 +29880,7 @@ fn archive_diff_allows_changed_macho_symbols(
             false,
             false,
             &current_local_retargets,
+            &[],
         )?
     };
     Ok(previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint)
@@ -28258,8 +30132,9 @@ fn macho_object_semantic_patch_fingerprint(
         require_masked_text,
         false,
         &[],
+        &[],
     )
-    .map(|(fingerprint, _)| fingerprint)
+    .map(|(fingerprint, _, _)| fingerprint)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28274,7 +30149,8 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     require_masked_text: bool,
     hash_masked_local_aliases: bool,
     validated_local_retargets: &[&ValidatedMachOLocalRelocationSite],
-) -> Option<(blake3::Hash, usize)> {
+    validated_local_symbol_renames: &[&ValidatedMachOLocalSymbolSite],
+) -> Option<(blake3::Hash, usize, usize)> {
     if validated_local_retargets
         .iter()
         .collect::<HashSet<_>>()
@@ -28283,6 +30159,11 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
         || validated_local_retargets
             .iter()
             .any(|site| site.hash_target_symbol && site.hash_unmasked_target_offset)
+        || validated_local_symbol_renames
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != validated_local_symbol_renames.len()
     {
         return None;
     }
@@ -28298,6 +30179,19 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     let object::FileFlags::MachO { flags } = file.flags() else {
         return None;
     };
+    let validated_local_symbol_indices = validated_local_symbol_renames
+        .iter()
+        .map(|site| site.symbol_index)
+        .collect::<HashSet<_>>();
+    if validated_local_symbol_indices.len() != validated_local_symbol_renames.len() {
+        return None;
+    }
+    if validated_local_retargets.iter().any(|site| {
+        site.hash_target_symbol
+            && validated_local_symbol_indices.contains(&site.target_symbol_index)
+    }) {
+        return None;
+    }
 
     let mut hasher = blake3::Hasher::new();
     let retirement_proof = force_retirement_proof || !ignored_defined_symbols.is_empty();
@@ -28338,6 +30232,7 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     let mut unmasked_relocation_symbols = HashSet::new();
     let mut hashed_relocation_symbols = HashSet::new();
     let mut consumed_local_retargets = HashSet::new();
+    let mut consumed_local_symbol_renames = HashSet::new();
     let mut ignored_validated_local_target_symbols = HashSet::new();
     let mut exact_validated_local_target_symbols = HashSet::new();
     for section in sections {
@@ -28478,7 +30373,8 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                     target_symbol,
                     file_offset,
                     ranges,
-                    validated_retarget.hash_unmasked_target_offset,
+                    validated_retarget.hash_unmasked_target_offset
+                        || validated_local_symbol_indices.contains(&target_symbol.0),
                 )?;
             }
             continue;
@@ -28554,7 +30450,8 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                     symbol,
                     file_offset,
                     ranges,
-                    validated_retarget.hash_unmasked_target_offset,
+                    validated_retarget.hash_unmasked_target_offset
+                        || validated_local_symbol_indices.contains(&symbol.0),
                 )?;
             } else if retirement_proof {
                 if let object::RelocationTarget::Symbol(symbol) = relocation.target() {
@@ -28648,7 +30545,9 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                     .is_ok_and(|name| !ignored_defined_symbols.contains(name))
         })
         .filter(|symbol| {
-            if ignored_validated_local_target_symbols.contains(&symbol.index()) {
+            if ignored_validated_local_target_symbols.contains(&symbol.index())
+                && !validated_local_symbol_indices.contains(&symbol.index().0)
+            {
                 false
             } else if exact_validated_local_target_symbols.contains(&symbol.index())
                 || exact_masked_local_alias_symbols.contains(&symbol.index())
@@ -28671,7 +30570,24 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
         .collect::<Vec<_>>();
     hasher.update(&(symbols.len() as u64).to_le_bytes());
     for symbol in symbols {
-        hash_length_prefixed(&mut hasher, symbol.name_bytes().ok()?);
+        let validated_local_symbol_rename = validated_local_symbol_renames
+            .iter()
+            .enumerate()
+            .find(|(_, site)| site.symbol_index == symbol.index().0);
+        if let Some((index, site)) = validated_local_symbol_rename {
+            if symbol.section_index().map(|section| section.0) != Some(site.section_index)
+                || symbol.is_undefined()
+                || symbol.is_global()
+                || symbol.is_weak()
+                || symbol.scope() != object::SymbolScope::Compilation
+                || !consumed_local_symbol_renames.insert(index)
+            {
+                return None;
+            }
+            hasher.update(b"sld-macho-validated-local-symbol-name-v1");
+        } else {
+            hash_length_prefixed(&mut hasher, symbol.name_bytes().ok()?);
+        }
         hash_macho_symbol_section(&mut hasher, symbol.section())?;
         let value_range = macho_symbol_value_field_range(bytes, symbol.index())
             .map(|range| file_offset + range.start..file_offset + range.end);
@@ -28716,8 +30632,18 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
     if consumed_local_retargets.len() != validated_local_retargets.len() {
         return None;
     }
-    (retirement_proof || (has_masked_section && (!require_masked_text || has_masked_text)))
-        .then(|| (hasher.finalize(), consumed_local_retargets.len()))
+    if consumed_local_symbol_renames.len() != validated_local_symbol_renames.len() {
+        return None;
+    }
+    (retirement_proof || (has_masked_section && (!require_masked_text || has_masked_text))).then(
+        || {
+            (
+                hasher.finalize(),
+                consumed_local_retargets.len(),
+                consumed_local_symbol_renames.len(),
+            )
+        },
+    )
 }
 
 fn direct_macho_cgu_migration_fingerprint_matches(
@@ -28849,8 +30775,9 @@ fn matched_macho_local_retarget_fingerprint_matches(
                 true,
                 true,
                 &previous_refs,
+                &[],
             )
-            .map(|(fingerprint, _)| fingerprint),
+            .map(|(fingerprint, _, _)| fingerprint),
             macho_object_semantic_patch_fingerprint_with_retargets(
                 current_bytes,
                 0,
@@ -28862,8 +30789,9 @@ fn matched_macho_local_retarget_fingerprint_matches(
                 true,
                 true,
                 &current_refs,
+                &[],
             )
-            .map(|(fingerprint, _)| fingerprint),
+            .map(|(fingerprint, _, _)| fingerprint),
         )
     };
     Ok(previous.is_some() && previous == current)
@@ -30090,7 +32018,7 @@ fn changed_macho_archive_unwind_members(
     }))
 }
 
-fn archive_diff_allows_changed_macho_unwind(
+fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
     previous_bytes: &[u8],
     current_bytes: &[u8],
     input_file_path: &str,
@@ -30101,6 +32029,7 @@ fn archive_diff_allows_changed_macho_unwind(
     ignored_current_identifiers: &[Vec<u8>],
     ignored_migrated_definitions: &HashSet<Vec<u8>>,
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolRename],
 ) -> Result<bool> {
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let Some(mut previous_ranges) = patch_ranges_with_resolver(
@@ -30160,20 +32089,32 @@ fn archive_diff_allows_changed_macho_unwind(
         .iter()
         .map(|retarget| retarget.current.clone())
         .collect::<Vec<_>>();
-    let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
-        previous_bytes,
-        &previous_ranges,
-        ignored_previous_identifiers,
-        ignored_migrated_definitions,
-        &previous_local_retargets,
-    )?;
-    let current_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
-        current_bytes,
-        &current_ranges,
-        ignored_current_identifiers,
-        ignored_migrated_definitions,
-        &current_local_retargets,
-    )?;
+    let previous_local_symbol_renames = validated_local_symbol_renames
+        .iter()
+        .map(|rename| rename.previous.clone())
+        .collect::<Vec<_>>();
+    let current_local_symbol_renames = validated_local_symbol_renames
+        .iter()
+        .map(|rename| rename.current.clone())
+        .collect::<Vec<_>>();
+    let previous_fingerprint =
+        archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+            previous_bytes,
+            &previous_ranges,
+            ignored_previous_identifiers,
+            ignored_migrated_definitions,
+            &previous_local_retargets,
+            &previous_local_symbol_renames,
+        )?;
+    let current_fingerprint =
+        archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+            current_bytes,
+            &current_ranges,
+            ignored_current_identifiers,
+            ignored_migrated_definitions,
+            &current_local_retargets,
+            &current_local_symbol_renames,
+        )?;
     let archive_migrated_definitions_are_unique = if ignored_migrated_definitions.is_empty() {
         true
     } else {
@@ -30222,7 +32163,36 @@ fn archive_diff_allows_changed_macho_unwind(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn changed_macho_archive_unwind_activation(
+#[cfg(test)]
+fn archive_diff_allows_changed_macho_unwind(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    changed: &ChangedMachOArchiveUnwindMembers,
+    ignored_previous_identifiers: &[Vec<u8>],
+    ignored_current_identifiers: &[Vec<u8>],
+    ignored_migrated_definitions: &HashSet<Vec<u8>>,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+) -> Result<bool> {
+    archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
+        previous_bytes,
+        current_bytes,
+        input_file_path,
+        matched_sections,
+        current_resolver,
+        changed,
+        ignored_previous_identifiers,
+        ignored_current_identifiers,
+        ignored_migrated_definitions,
+        validated_local_retargets,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
     previous_bytes: &[u8],
     current_bytes: &[u8],
     input_file_path: &str,
@@ -30240,6 +32210,7 @@ fn changed_macho_archive_unwind_activation(
     ignored_current_identifiers: &[Vec<u8>],
     ignored_migrated_definitions: &HashSet<Vec<u8>>,
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    validated_local_symbol_renames: &[ValidatedMachOLocalSymbolRename],
 ) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for changed unwind metadata")?;
@@ -30258,7 +32229,7 @@ fn changed_macho_archive_unwind_activation(
     if changed.members.is_empty() {
         return Ok(Ok(None));
     }
-    let allows_unwind_only = archive_diff_allows_changed_macho_unwind(
+    let allows_unwind_only = archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
         previous_bytes,
         current_bytes,
         input_file_path,
@@ -30269,6 +32240,7 @@ fn changed_macho_archive_unwind_activation(
         ignored_current_identifiers,
         ignored_migrated_definitions,
         validated_local_retargets,
+        validated_local_symbol_renames,
     )?;
     let allows_unwind_and_definitions = !allows_unwind_only
         && archive_diff_allows_changed_macho_symbols(
@@ -30288,9 +32260,10 @@ fn changed_macho_archive_unwind_activation(
         )?;
     if !allows_unwind_only && !allows_unwind_and_definitions {
         return Ok(Err(format!(
-            "changed Mach-O archive member differs outside text and unwind metadata: members={}, local-retargets={}",
+            "changed Mach-O archive member differs outside text and unwind metadata: members={}, local-retargets={}, local-renames={}",
             changed.members.len(),
             validated_local_retargets.len(),
+            validated_local_symbol_renames.len(),
         )));
     }
     if reuse_owned_output {
@@ -30329,6 +32302,49 @@ fn changed_macho_archive_unwind_activation(
         current_input_ranges: changed.current_input_ranges,
         remaining_reserved_ranges,
     })))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn changed_macho_archive_unwind_activation(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    matched_sections: &[MatchedPatchSection],
+    section_records: &[SectionRecord],
+    current_sections: &[PatchSection],
+    current_resolver: &PatchInputResolver<'_>,
+    previous_output: &[u8],
+    resolutions: &[MachOSymbolResolutionRecord],
+    reserved_ranges: &[ReservedRangeRecord],
+    added_definition_names: &[SharedText],
+    retired_definition_names: &[SharedText],
+    reuse_owned_output: bool,
+    ignored_previous_identifiers: &[Vec<u8>],
+    ignored_current_identifiers: &[Vec<u8>],
+    ignored_migrated_definitions: &HashSet<Vec<u8>>,
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+) -> Result<std::result::Result<Option<ChangedMachOArchiveUnwindActivation>, String>> {
+    changed_macho_archive_unwind_activation_with_local_symbol_renames(
+        previous_bytes,
+        current_bytes,
+        input_file_path,
+        matched_sections,
+        section_records,
+        current_sections,
+        current_resolver,
+        previous_output,
+        resolutions,
+        reserved_ranges,
+        added_definition_names,
+        retired_definition_names,
+        reuse_owned_output,
+        ignored_previous_identifiers,
+        ignored_current_identifiers,
+        ignored_migrated_definitions,
+        validated_local_retargets,
+        &[],
+    )
 }
 
 fn added_macho_archive_text_activations(
@@ -31698,6 +33714,43 @@ fn macho_symbol_and_string_table_ranges(
     ranges.ok_or_else(|| "Mach-O local symbol cohort has no symbol table".to_owned())
 }
 
+fn materialize_pending_macho_symbol_table_patches(
+    previous_output: &[u8],
+    pending_patches: &[SectionPatch],
+) -> std::result::Result<Vec<u8>, String> {
+    let (symbol_table, string_table) = macho_symbol_and_string_table_ranges(previous_output)?;
+    let mut desired = previous_output.to_vec();
+    for patch in pending_patches {
+        let end = patch
+            .output_offset
+            .checked_add(patch.size)
+            .ok_or_else(|| "pending Mach-O symbol patch range overflowed".to_owned())?;
+        let overlaps_table = (patch.output_offset < symbol_table.end && end > symbol_table.start)
+            || (patch.output_offset < string_table.end && end > string_table.start);
+        if !overlaps_table {
+            continue;
+        }
+        let contained = (patch.output_offset >= symbol_table.start && end <= symbol_table.end)
+            || (patch.output_offset >= string_table.start && end <= string_table.end);
+        let is_plain = patch.deferred_relocation.is_none()
+            && patch.preserve_ranges.is_empty()
+            && patch.adjustments.is_empty()
+            && patch.data.len() as u64 == patch.size;
+        if !contained || !is_plain {
+            return Err("pending Mach-O symbol patch cannot be materialized".to_owned());
+        }
+        let start = usize::try_from(patch.output_offset)
+            .map_err(|_| "pending Mach-O symbol patch offset exceeds usize".to_owned())?;
+        let end = usize::try_from(end)
+            .map_err(|_| "pending Mach-O symbol patch end exceeds usize".to_owned())?;
+        let Some(bytes) = desired.get_mut(start..end) else {
+            return Err("pending Mach-O symbol patch is outside output".to_owned());
+        };
+        bytes.copy_from_slice(&patch.data);
+    }
+    Ok(desired)
+}
+
 fn return_macho_local_symbol_reserved_range(
     ranges: &mut Vec<ReservedRangeRecord>,
     output_section_id: u32,
@@ -31960,7 +34013,10 @@ fn apply_macho_local_symbol_cohort_plans(
                 .chain(string_bytes)
                 .any(|byte| *byte != 0)
             {
-                return Err("Mach-O local symbol allocation is not zero-filled".to_owned());
+                return Err(format!(
+                    "Mach-O local symbol allocation for `{}` is not zero-filled: nlist={symbol_start:#x}..{symbol_end:#x}, string={string_start:#x}..{string_end:#x}",
+                    display_hex_text(&hex::encode(&current.name)),
+                ));
             }
             let string_index = string_allocation
                 .output_offset
@@ -50509,6 +52565,7 @@ mod tests {
                 true,
                 true,
                 &[],
+                &[],
             )
             .unwrap()
             .0
@@ -50577,6 +52634,7 @@ mod tests {
                 true,
                 true,
                 &[&site],
+                &[],
             )
         };
         let previous_unaliased =
@@ -50636,8 +52694,9 @@ mod tests {
                     true,
                     true,
                     &[&site],
+                    &[],
                 )
-                .map(|(fingerprint, _)| fingerprint)
+                .map(|(fingerprint, _, _)| fingerprint)
             };
         let previous =
             test_macho_local_text_target_object_with_alias(b"l_a.1", b"constant", 0, None);
@@ -55827,6 +57886,7 @@ mod tests {
             current_input: "member-b".to_owned(),
             previous: previous_a.clone(),
             current: current_b,
+            validated_local_symbol_renames: Vec::new(),
         };
         let mut reserves_b = reserves_a.clone();
         let forward_patches =
@@ -55866,6 +57926,7 @@ mod tests {
             current_input: "member-a".to_owned(),
             previous: previous_b,
             current: current_a,
+            validated_local_symbol_renames: Vec::new(),
         };
         let mut restored_reserves_a = reserves_b.clone();
         let reverse_patches =
@@ -55908,6 +57969,7 @@ mod tests {
             current_input: "member-b".to_owned(),
             previous: previous_a2,
             current: current_b2,
+            validated_local_symbol_renames: Vec::new(),
         };
         let mut reserves_b2 = restored_reserves_a;
         let reapply_patches =
@@ -55973,6 +58035,7 @@ mod tests {
             current_input: "ty-member.new".to_owned(),
             previous: previous.clone(),
             current: current.clone(),
+            validated_local_symbol_renames: Vec::new(),
         };
         let mut reserves_b = reserves_a.clone();
         let forward_patches =
@@ -56000,6 +58063,7 @@ mod tests {
                     ..entry.clone()
                 })
                 .collect(),
+            validated_local_symbol_renames: Vec::new(),
         };
         let reverse_patches =
             apply_macho_local_symbol_cohort_plans(&[reverse], &output_b, &mut reserves_b).unwrap();
@@ -56047,6 +58111,7 @@ mod tests {
             current_input: "normalized-member.new".to_owned(),
             previous: previous_a.clone(),
             current: current_b,
+            validated_local_symbol_renames: Vec::new(),
         };
         let mut reserves = Vec::new();
         let patches =
@@ -56071,6 +58136,7 @@ mod tests {
                     ..entry.clone()
                 })
                 .collect(),
+            validated_local_symbol_renames: Vec::new(),
         };
         let reverse_patches =
             apply_macho_local_symbol_cohort_plans(&[reverse], &output_b, &mut reserves).unwrap();
@@ -56465,6 +58531,29 @@ mod tests {
             &previous,
             &renamed[..1],
         ));
+
+        let added = vec![
+            entry(b"old.0", 1, 0x1020, 0),
+            entry(b"old.1", 1, 0x1030, 0),
+            entry(b"new.2", 1, 0x1040, 0),
+        ];
+        assert_eq!(
+            macho_local_symbol_cohort_retained_current_names(&previous, &added),
+            HashSet::from([b"old.0".to_vec(), b"old.1".to_vec()]),
+        );
+        assert_eq!(
+            macho_local_symbol_cohort_retained_current_names(&previous, &renamed[..1]),
+            HashSet::from([b"new.0".to_vec()]),
+        );
+        assert!(
+            macho_local_symbol_cohort_retained_current_names(&previous, &ambiguous).is_empty(),
+            "a name/site cycle must not manufacture a retained root",
+        );
+        let unrooted_additions = vec![entry(b"new.0", 1, 0x1020, 0), entry(b"new.1", 1, 0x1030, 0)];
+        assert!(
+            macho_local_symbol_cohort_retained_current_names(&previous, &unrooted_additions)
+                .is_empty(),
+        );
     }
 
     #[test]
@@ -56482,6 +58571,7 @@ mod tests {
             current_input: "current".to_owned(),
             previous: vec![entry(b"old", 2, 0x100, 0)],
             current: vec![entry(b"new", 2, 0x100, 0)],
+            validated_local_symbol_renames: Vec::new(),
         };
         assert_eq!(
             macho_local_symbol_cohort_target_transition(&plan, b"old", b"new", 0x100),
@@ -56698,7 +58788,47 @@ mod tests {
             &supplement.previous,
             &supplement.current,
         ));
-        assert_eq!(
+        let mut current_name_owner = owner.clone();
+        current_name_owner.target_name = Some(hex::encode("new.0").into());
+        assert!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &current,
+                &previous_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&current_name_owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .is_ok(),
+            "an exact owner refreshed to the paired current name must remain valid",
+        );
+        let mut unrelated_name_owner = owner.clone();
+        unrelated_name_owner.target_name = Some(hex::encode("other.0").into());
+        assert!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &current,
+                &previous_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&unrelated_name_owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err()
+            .contains("has no recorded output owner"),
+        );
+        assert!(
             supplemental_macho_local_const_cohort(
                 &previous,
                 &current,
@@ -56713,12 +58843,12 @@ mod tests {
                 &direct_input,
             )
             .unwrap()
-            .unwrap_err(),
-            "published local Mach-O const atom has no recorded output owner",
+            .unwrap_err()
+            .starts_with("published local Mach-O const atom `"),
         );
         let mut wrong_section_owner = owner.clone();
         wrong_section_owner.target.as_mut().unwrap().section_index -= 1;
-        assert_eq!(
+        assert!(
             supplemental_macho_local_const_cohort(
                 &previous,
                 &current,
@@ -56733,8 +58863,8 @@ mod tests {
                 &direct_input,
             )
             .unwrap()
-            .unwrap_err(),
-            "published local Mach-O const atom has no recorded output owner",
+            .unwrap_err()
+            .contains("has no recorded output owner"),
         );
         let mut verified = supplement.previous.clone();
         verify_previous_macho_local_symbol_cohort(
@@ -56837,6 +58967,7 @@ mod tests {
             &output,
             &output_file,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
         )
         .unwrap()
@@ -56844,8 +58975,176 @@ mod tests {
         .unwrap();
         assert_eq!(plan.previous.len(), 1);
         assert_eq!(plan.current.len(), 1);
+        assert_eq!(plan.validated_local_symbol_renames.len(), 1);
+        let validated_rename = &plan.validated_local_symbol_renames[0];
+        let previous_ranges = patch_ranges_with_lookup(
+            &previous_archive,
+            &input_file,
+            matched.iter().map(|section| section.previous.clone()),
+            PatchInputLookup::MatchArchiveMember,
+        )
+        .unwrap()
+        .unwrap();
+        let current_ranges = patch_ranges_with_lookup(
+            &current_archive,
+            &input_file,
+            matched.iter().map(|section| section.current.clone()),
+            PatchInputLookup::MatchArchiveMember,
+        )
+        .unwrap()
+        .unwrap();
+        let relocation_site = |file: &object::File<'_>,
+                               source: object::SectionIndex,
+                               target_name: &[u8],
+                               archive_identifier: Vec<u8>| {
+            let target = file
+                .symbols()
+                .find(|symbol| symbol.name_bytes().ok() == Some(target_name))
+                .unwrap();
+            file.section_by_index(source)
+                .unwrap()
+                .relocations()
+                .filter(|(_, relocation)| {
+                    relocation.target() == object::RelocationTarget::Symbol(target.index())
+                })
+                .map(|(offset, _)| ValidatedMachOLocalRelocationSite {
+                    archive_identifier: archive_identifier.clone(),
+                    section_index: source.0,
+                    relocation_offset: offset,
+                    normalize_relocation_offset: false,
+                    target_symbol_index: target.index().0,
+                    hash_target_symbol: false,
+                    hash_unmasked_target_offset: false,
+                    exact_symbol_indices: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let previous_retarget = relocation_site(
+            &previous_file,
+            previous_source.index(),
+            b"old.0",
+            validated_rename.previous.archive_identifier.clone(),
+        );
+        let current_retarget = relocation_site(
+            &current_file,
+            current_source.index(),
+            b"new.0",
+            validated_rename.current.archive_identifier.clone(),
+        );
+        assert!(!previous_retarget.is_empty());
+        assert_eq!(previous_retarget.len(), current_retarget.len());
+        assert_eq!(
+            validated_rename.previous.archive_identifier,
+            archive_member_patch_identifier(previous_identifier),
+        );
+        let previous_ignored_sections = fully_masked_macho_unwind_sections(
+            &previous_file,
+            previous_input_bytes.file_offset,
+            &previous_ranges,
+        )
+        .unwrap();
+        assert!(
+            macho_object_semantic_patch_fingerprint_with_retargets(
+                previous_input_bytes.bytes,
+                previous_input_bytes.file_offset,
+                &previous_ranges,
+                &previous_ignored_sections,
+                &HashSet::new(),
+                &HashSet::new(),
+                true,
+                true,
+                true,
+                &previous_retarget.iter().collect::<Vec<_>>(),
+                &[&validated_rename.previous],
+            )
+            .is_some(),
+            "the exact member-local relocation and symbol pair must be consumable",
+        );
+        let fingerprint = |bytes: &[u8],
+                           ranges: &[std::ops::Range<usize>],
+                           retargets: &[ValidatedMachOLocalRelocationSite],
+                           rename: &ValidatedMachOLocalSymbolSite| {
+            archive_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
+                bytes,
+                ranges,
+                &[],
+                &HashSet::new(),
+                retargets,
+                std::slice::from_ref(rename),
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            archive_macho_masked_local_semantic_fingerprint_with_retargets(
+                &previous_archive,
+                &previous_ranges,
+                &[],
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap(),
+            archive_macho_masked_local_semantic_fingerprint_with_retargets(
+                &current_archive,
+                &current_ranges,
+                &[],
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap(),
+        );
+        let previous_fingerprint = fingerprint(
+            &previous_archive,
+            &previous_ranges,
+            &previous_retarget,
+            &validated_rename.previous,
+        );
+        assert!(previous_fingerprint.is_some());
+        assert_eq!(
+            previous_fingerprint,
+            fingerprint(
+                &current_archive,
+                &current_ranges,
+                &current_retarget,
+                &validated_rename.current,
+            ),
+        );
+        let mut wrong_site = validated_rename.current.clone();
+        wrong_site.section_index += 1;
+        assert!(
+            fingerprint(
+                &current_archive,
+                &current_ranges,
+                &current_retarget,
+                &wrong_site,
+            )
+            .is_none()
+        );
+        let mut changed_current_archive = current_archive.clone();
+        let (current_const_offset, _) = current_file
+            .sections()
+            .find(|section| {
+                section.segment_name().ok().flatten() == Some("__TEXT")
+                    && section.name().ok() == Some("__const")
+            })
+            .unwrap()
+            .file_range()
+            .unwrap();
+        changed_current_archive
+            [current_input_bytes.file_offset + usize::try_from(current_const_offset).unwrap()] ^= 1;
+        assert_ne!(
+            previous_fingerprint,
+            fingerprint(
+                &changed_current_archive,
+                &current_ranges,
+                &current_retarget,
+                &validated_rename.current,
+            ),
+            "a validated local rename must not hide unrelated atom bytes",
+        );
+
         let patches =
-            apply_macho_local_symbol_cohort_plans(&[plan], &output, &mut Vec::new()).unwrap();
+            apply_macho_local_symbol_cohort_plans(&[plan.clone()], &output, &mut Vec::new())
+                .unwrap();
         let mut migrated = output.clone();
         apply_test_output_patches(&mut migrated, &patches);
         let migrated_file = object::File::parse(migrated.as_slice()).unwrap();
@@ -57645,6 +59944,7 @@ mod tests {
                 added,
             ]
             .into(),
+            validated_local_symbol_renames: Vec::new(),
         };
 
         let mut exhausted = reserves
@@ -57668,12 +59968,31 @@ mod tests {
             })
             .unwrap();
         output[symbol_reserve.output_offset as usize] = 1;
+        let pending_retirement = SectionPatch {
+            output_offset: symbol_reserve.output_offset,
+            size: 16,
+            data: vec![0; 16],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let staged_output = materialize_pending_macho_symbol_table_patches(
+            &output,
+            std::slice::from_ref(&pending_retirement),
+        )
+        .unwrap();
+        let mut recycled = reserves.clone();
+        assert!(
+            apply_macho_local_symbol_cohort_plans(&[plan.clone()], &staged_output, &mut recycled,)
+                .is_ok()
+        );
+
         let mut occupied = reserves.clone();
-        assert_eq!(
+        assert!(
             apply_macho_local_symbol_cohort_plans(&[plan], &output, &mut occupied)
                 .err()
-                .unwrap(),
-            "Mach-O local symbol allocation is not zero-filled"
+                .unwrap()
+                .starts_with("Mach-O local symbol allocation for")
         );
         assert_eq!(occupied, reserves);
     }
@@ -57700,12 +60019,14 @@ mod tests {
                 current_input: "b1".to_owned(),
                 previous: vec![previous_text.clone()],
                 current: vec![current(&previous_text)],
+                validated_local_symbol_renames: Vec::new(),
             },
             MachOLocalSymbolCohortPlan {
                 previous_input: "a2".to_owned(),
                 current_input: "b2".to_owned(),
                 previous: vec![previous_data.clone()],
                 current: vec![current(&previous_data)],
+                validated_local_symbol_renames: Vec::new(),
             },
         ];
         assert_eq!(
@@ -57759,6 +60080,7 @@ mod tests {
                     string_index: None,
                     ..previous_text.clone()
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
             MachOLocalSymbolCohortPlan {
                 previous_input: "a2".to_owned(),
@@ -57770,6 +60092,7 @@ mod tests {
                     string_index: None,
                     ..previous_text.clone()
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
         ];
         assert_eq!(
@@ -57790,6 +60113,7 @@ mod tests {
                     string_index: None,
                     ..previous_text.clone()
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
             MachOLocalSymbolCohortPlan {
                 previous_input: "a2".to_owned(),
@@ -57803,6 +60127,7 @@ mod tests {
                     string_index: None,
                     ..previous_data
                 }],
+                validated_local_symbol_renames: Vec::new(),
             },
         ];
         assert_eq!(
@@ -57828,6 +60153,7 @@ mod tests {
             current_input: "b".to_owned(),
             previous: vec![entry(b"old", 10)],
             current: vec![entry(b"new", 20)],
+            validated_local_symbol_renames: Vec::new(),
         };
         let owned = RelocationTargetSymbolPatch {
             target_name: hex::encode(b"old"),
@@ -59550,6 +61876,7 @@ mod tests {
             current_input: current_input.clone(),
             previous: previous_entries,
             current: current_entries,
+            validated_local_symbol_renames: Vec::new(),
         };
         let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
         let current_resolver = PatchInputResolver::new(&current, true).unwrap();
@@ -59578,6 +61905,7 @@ mod tests {
                 &previous_output,
                 &mut target_patches,
                 &[],
+                &DirectMachOCguLivenessProof::default(),
                 &mut cohorts,
             )
             .unwrap();
@@ -63640,6 +65968,7 @@ mod tests {
             &fixture.previous_output,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             records_complete,
         )
@@ -64961,16 +67290,966 @@ mod tests {
         (inputs, sections, resolutions, output.bytes)
     }
 
+    fn direct_macho_definition_change_object_named(name: &[u8; 5], active: bool) -> Vec<u8> {
+        let mut bytes = test_macho_object(&0xd503_201f_u32.to_le_bytes(), &[0; 4], 0);
+        let text_entry = test_macho_symbol_entry_offset(&bytes, b"_text");
+        let string_offset = macho_string_table_offset(&bytes).unwrap() as usize;
+        bytes[string_offset + 1..string_offset + 6].copy_from_slice(name);
+        bytes[text_entry + 4] |= object::macho::N_PEXT;
+        if active {
+            bytes
+        } else {
+            retire_test_macho_symbol(bytes, 0)
+        }
+    }
+
+    fn direct_macho_definition_change_object(active: bool) -> Vec<u8> {
+        direct_macho_definition_change_object_named(b"_new!", active)
+    }
+
+    fn direct_macho_undefined_branch_object_named(
+        name: &[u8; 5],
+        active: bool,
+        supported_branch: bool,
+    ) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_RELOCATION_COUNT_OFFSET: usize = 60;
+
+        let mut bytes =
+            test_macho_object_with_text_relocation(&0x1400_0000_u32.to_le_bytes(), &[0; 4]);
+        if supported_branch {
+            set_test_macho_text_relocation_type(&mut bytes, object::macho::ARM64_RELOC_BRANCH26);
+        }
+        let text_entry = test_macho_symbol_entry_offset(&bytes, b"_text");
+        let data_entry = test_macho_symbol_entry_offset(&bytes, b"_data");
+        let string_offset = macho_string_table_offset(&bytes).unwrap() as usize;
+        bytes[string_offset + 1..string_offset + 6].copy_from_slice(name);
+        bytes[data_entry..data_entry + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[data_entry + 4] = object::macho::N_EXT;
+        bytes[data_entry + 5] = 0;
+        bytes[data_entry + 6..data_entry + 16].fill(0);
+        bytes[text_entry + 4] = object::macho::N_STAB;
+        bytes[text_entry + 5] = 0;
+        bytes[text_entry + 6..text_entry + 16].fill(0);
+        if !active {
+            let nreloc = HEADER_SIZE + SEGMENT_COMMAND_SIZE + SECTION_RELOCATION_COUNT_OFFSET;
+            bytes[nreloc..nreloc + 4].fill(0);
+        }
+        bytes
+    }
+
+    fn direct_macho_definition_reference_object_named(
+        name: &[u8; 5],
+        active: bool,
+        supported_branch: bool,
+    ) -> Vec<u8> {
+        let mut bytes = direct_macho_undefined_branch_object_named(name, active, supported_branch);
+        bytes = add_test_macho_local_alias(bytes, b"_src!", 1, 0);
+        let source_entry = test_macho_symbol_entry_offset(&bytes, b"_src!");
+        bytes[source_entry + 4] =
+            object::macho::N_SECT | object::macho::N_EXT | object::macho::N_PEXT;
+        bytes[source_entry + 6..source_entry + 8]
+            .copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
+        bytes
+    }
+
+    fn direct_macho_definition_reference_object(active: bool, supported_branch: bool) -> Vec<u8> {
+        direct_macho_definition_reference_object_named(b"_new!", active, supported_branch)
+    }
+
+    fn direct_macho_definition_change_fixture() -> (
+        Vec<DirectMachOCguMigrationInput>,
+        Vec<SectionRecord>,
+        Vec<u8>,
+        Vec<ReservedRangeRecord>,
+    ) {
+        let owner_previous = direct_macho_definition_change_object(false);
+        let owner_current = direct_macho_definition_change_object(true);
+        let reference_previous = direct_macho_definition_reference_object(false, true);
+        let reference_current = direct_macho_definition_reference_object(true, true);
+        let (output, reserves) =
+            add_test_macho_symbol_table_reserves(test_macho_object(&[0; 64], &[0; 8], 0), 1, 16);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let text_offset = output_file
+            .section_by_name("__text")
+            .unwrap()
+            .file_range()
+            .unwrap()
+            .0;
+        (
+            vec![
+                DirectMachOCguMigrationInput {
+                    input_file: "owner.o".to_owned(),
+                    previous_bytes: owner_previous,
+                    current_hash: hash_bytes(&owner_current),
+                    current_bytes: owner_current,
+                },
+                DirectMachOCguMigrationInput {
+                    input_file: "reference.o".to_owned(),
+                    previous_bytes: reference_previous,
+                    current_hash: hash_bytes(&reference_current),
+                    current_bytes: reference_current,
+                },
+            ],
+            vec![
+                SectionRecord {
+                    input_file: "owner.o".into(),
+                    input: "owner.o".into(),
+                    section_index: 0,
+                    output_offset: text_offset,
+                    size: 4,
+                },
+                SectionRecord {
+                    input_file: "reference.o".into(),
+                    input: "reference.o".into(),
+                    section_index: 0,
+                    output_offset: text_offset + 16,
+                    size: 4,
+                },
+            ],
+            output,
+            reserves,
+        )
+    }
+
+    fn apply_direct_macho_plan_patches(output: &[u8], patches: &[SectionPatch]) -> Vec<u8> {
+        let mut patched = output.to_vec();
+        for patch in patches {
+            let start = patch.output_offset as usize;
+            let end = start + patch.data.len();
+            patched[start..end].copy_from_slice(&patch.data);
+        }
+        patched
+    }
+
+    fn direct_macho_changed_input_files(
+        inputs: &[DirectMachOCguMigrationInput],
+    ) -> HashSet<String> {
+        inputs
+            .iter()
+            .map(|input| input.input_file.clone())
+            .collect()
+    }
+
+    #[test]
+    fn direct_macho_inputs_keep_spoofed_rcgu_archive_as_collision_witness() {
+        let object = direct_macho_definition_change_object(true);
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"hidden.o".to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let input = tempfile::Builder::new()
+            .suffix(".rcgu.o")
+            .tempfile()
+            .unwrap();
+        std::fs::write(input.path(), &archive).unwrap();
+        let input_path = input.path().to_str().unwrap();
+        let previous = state("args", &[], &[(input_path, archive.as_slice())]);
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let (modeled, witnesses, complete) =
+            direct_macho_cgu_migration_inputs(state_dir.path(), &previous, &[]).unwrap();
+
+        assert!(complete);
+        assert!(modeled.is_empty());
+        assert_eq!(witnesses.len(), 1);
+        let encoded_name = SharedText::from(hex::encode("_new!"));
+        let requested = HashMap::from([(b"_new!".to_vec(), encoded_name.clone())]);
+        assert!(
+            witnesses[0]
+                .conflicting_names(&requested)
+                .unwrap()
+                .unwrap()
+                .contains(&encoded_name)
+        );
+    }
+
+    #[test]
+    fn direct_macho_inputs_reject_mismatched_unchanged_rcgu_generation() {
+        let expected = direct_macho_definition_change_object(false);
+        let current = direct_macho_definition_change_object(true);
+        let input = tempfile::Builder::new()
+            .suffix(".rcgu.o")
+            .tempfile()
+            .unwrap();
+        std::fs::write(input.path(), &current).unwrap();
+        let input_path = input.path().to_str().unwrap();
+        let previous = state("args", &[], &[(input_path, expected.as_slice())]);
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let (modeled, witnesses, complete) =
+            direct_macho_cgu_migration_inputs(state_dir.path(), &previous, &[]).unwrap();
+
+        assert!(complete);
+        assert!(modeled.is_empty());
+        assert_eq!(witnesses.len(), 1);
+        let encoded_name = SharedText::from(hex::encode("_new!"));
+        let requested = HashMap::from([(b"_new!".to_vec(), encoded_name)]);
+        assert!(
+            witnesses[0]
+                .conflicting_names(&requested)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_macho_definition_activation_and_retirement_round_trip() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let forward = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(forward.added_resolutions.len(), 1);
+        assert_eq!(forward.added_resolutions[0].name, hex::encode("_new!"));
+        assert_eq!(
+            forward.added_resolutions[0]
+                .target
+                .as_ref()
+                .unwrap()
+                .input_file,
+            "owner.o"
+        );
+        assert_eq!(forward.output_patches.len(), 2);
+        assert!(forward.remaining_reserved_ranges.is_some());
+
+        let activated_output = apply_direct_macho_plan_patches(&output, &forward.output_patches);
+        let mut reverse_inputs = inputs;
+        for input in &mut reverse_inputs {
+            std::mem::swap(&mut input.previous_bytes, &mut input.current_bytes);
+            input.current_hash = hash_bytes(&input.current_bytes);
+        }
+        let reverse = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &[],
+            &direct_macho_changed_input_files(&reverse_inputs),
+            &sections,
+            &forward.added_resolutions,
+            &activated_output,
+            forward.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reverse.recycled_names,
+            HashSet::from([hex::encode("_new!").into()])
+        );
+        assert_eq!(reverse.output_patches.len(), 2);
+        assert_eq!(
+            apply_direct_macho_plan_patches(&activated_output, &reverse.output_patches),
+            output
+        );
+        assert_eq!(reverse.remaining_reserved_ranges.as_ref(), Some(&reserves));
+
+        for input in &mut reverse_inputs {
+            std::mem::swap(&mut input.previous_bytes, &mut input.current_bytes);
+            input.current_hash = hash_bytes(&input.current_bytes);
+        }
+        let second_forward = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &[],
+            &direct_macho_changed_input_files(&reverse_inputs),
+            &sections,
+            &[],
+            &output,
+            reverse.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second_forward.added_resolutions, forward.added_resolutions);
+        assert_eq!(
+            apply_direct_macho_plan_patches(&output, &second_forward.output_patches),
+            activated_output
+        );
+    }
+
+    #[test]
+    fn direct_macho_definition_activation_is_an_explicit_local_atom_root() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let forward = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let previous_file = object::File::parse(inputs[0].previous_bytes.as_slice()).unwrap();
+        let current_file = object::File::parse(inputs[0].current_bytes.as_slice()).unwrap();
+        let previous_resolver = PatchInputResolver::new(&inputs[0].previous_bytes, false).unwrap();
+        let current_resolver = PatchInputResolver::new(&inputs[0].current_bytes, false).unwrap();
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: "owner.o".into(),
+                section_index: 0,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: sections[0].output_offset,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: "owner.o".into(),
+                section_index: 0,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: sections[0].output_offset,
+                output_size: 4,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let liveness_proof = DirectMachOCguLivenessProof {
+            definition_names: forward
+                .added_resolutions
+                .iter()
+                .map(|resolution| resolution.name.clone())
+                .collect(),
+            ..DirectMachOCguLivenessProof::default()
+        };
+        let atoms_are_live = |resolutions: &[MachOSymbolResolutionRecord],
+                              liveness_proof,
+                              current_file: &object::File<'_>,
+                              current_bytes: &[u8]| {
+            current_macho_local_cohort_atoms_are_live(
+                &[],
+                resolutions,
+                "owner.o",
+                &matched[0],
+                &matched,
+                &previous_resolver,
+                &current_resolver,
+                &previous_file,
+                current_file,
+                current_bytes,
+                &output_file,
+                liveness_proof,
+                &HashSet::new(),
+                false,
+            )
+            .unwrap()
+        };
+
+        assert!(atoms_are_live(
+            &forward.added_resolutions,
+            &liveness_proof,
+            &current_file,
+            &inputs[0].current_bytes,
+        ));
+        let empty_liveness_proof = DirectMachOCguLivenessProof::default();
+        assert!(!atoms_are_live(
+            &forward.added_resolutions,
+            &empty_liveness_proof,
+            &current_file,
+            &inputs[0].current_bytes,
+        ));
+        let mut wrong_value = forward.added_resolutions.clone();
+        wrong_value[0].direct_value = wrong_value[0].direct_value.map(|value| value + 4);
+        assert!(!atoms_are_live(
+            &wrong_value,
+            &liveness_proof,
+            &current_file,
+            &inputs[0].current_bytes,
+        ));
+        for mutate in [
+            |target: &mut RelocationTargetRecord| target.input_file = "other.o".into(),
+            |target: &mut RelocationTargetRecord| target.section_index += 1,
+            |target: &mut RelocationTargetRecord| target.section_offset += 1,
+        ] {
+            let mut wrong_target = forward.added_resolutions.clone();
+            mutate(wrong_target[0].target.as_mut().unwrap());
+            assert!(!atoms_are_live(
+                &wrong_target,
+                &liveness_proof,
+                &current_file,
+                &inputs[0].current_bytes,
+            ));
+        }
+        let mut weak_bytes = inputs[0].current_bytes.clone();
+        let entry = test_macho_symbol_entry_offset(&weak_bytes, b"_new!");
+        weak_bytes[entry + 6..entry + 8].copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        let weak_file = object::File::parse(weak_bytes.as_slice()).unwrap();
+        assert!(!atoms_are_live(
+            &forward.added_resolutions,
+            &liveness_proof,
+            &weak_file,
+            &weak_bytes,
+        ));
+    }
+
+    #[test]
+    fn direct_macho_reference_root_requires_stable_published_incoming_edge() {
+        let mut previous_reference =
+            direct_macho_definition_reference_object_named(b"_new!", false, true);
+        let mut current_reference =
+            direct_macho_definition_reference_object_named(b"_new!", true, true);
+        for bytes in [&mut previous_reference, &mut current_reference] {
+            let source_entry = test_macho_symbol_entry_offset(bytes, b"_src!");
+            bytes[source_entry + 6..source_entry + 8].fill(0);
+        }
+        let incoming = direct_macho_undefined_branch_object_named(b"_src!", true, true);
+        let mut output = test_macho_object(&[0; 64], &[0; 8], 0);
+        output = add_test_macho_local_alias(output, b"_src!", 1, 16);
+        let source_entry = test_macho_symbol_entry_offset(&output, b"_src!");
+        output[source_entry + 4] =
+            object::macho::N_SECT | object::macho::N_EXT | object::macho::N_PEXT;
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let text_offset = output_file
+            .section_by_name("__text")
+            .unwrap()
+            .file_range()
+            .unwrap()
+            .0;
+        let source_value =
+            macho_output_address_for_file_offset(&output_file, text_offset + 16).unwrap();
+        let inputs = vec![
+            DirectMachOCguMigrationInput {
+                input_file: "reference.o".to_owned(),
+                previous_bytes: previous_reference,
+                current_hash: hash_bytes(&current_reference),
+                current_bytes: current_reference,
+            },
+            DirectMachOCguMigrationInput {
+                input_file: "incoming.o".to_owned(),
+                previous_bytes: incoming.clone(),
+                current_hash: hash_bytes(&incoming),
+                current_bytes: incoming,
+            },
+        ];
+        let previous_files = inputs
+            .iter()
+            .map(|input| object::File::parse(input.previous_bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let current_files = inputs
+            .iter()
+            .map(|input| object::File::parse(input.current_bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let input_indices = HashMap::from([("reference.o", 0), ("incoming.o", 1)]);
+        let sections = vec![
+            SectionRecord {
+                input_file: "reference.o".into(),
+                input: "reference.o".into(),
+                section_index: 0,
+                output_offset: text_offset + 16,
+                size: 4,
+            },
+            SectionRecord {
+                input_file: "incoming.o".into(),
+                input: "incoming.o".into(),
+                section_index: 0,
+                output_offset: text_offset + 32,
+                size: 4,
+            },
+        ];
+        let resolutions = [MachOSymbolResolutionRecord {
+            name: hex::encode("_src!").into(),
+            direct_value: Some(source_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "reference.o".into(),
+                input: "reference.o".into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+        }];
+        let persisted = [RelocationRecord {
+            target_symbol_id: 0,
+            written_value: Some(0),
+            target_value: source_value,
+            applied_target_value: None,
+            target_name: Some(hex::encode("_src!").into()),
+            target: resolutions[0].target.clone(),
+            input_file: "incoming.o".into(),
+            input: "incoming.o".into(),
+            section_index: 0,
+            relocation_offset: 0,
+            output_offset: text_offset + 32,
+            size: 4,
+            kind: encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            }),
+            addend: 0,
+        }];
+        let reference = DirectMachOCguReference {
+            cohort_index: 0,
+            section_index: object::SectionIndex(1),
+            relocation_offset: 0,
+            is_supported_root: true,
+        };
+        let root = direct_macho_cgu_live_reference_root(
+            &inputs,
+            &previous_files,
+            &current_files,
+            &input_indices,
+            &sections,
+            &resolutions,
+            &persisted,
+            &output_file,
+            reference,
+            &hex::encode("_new!").into(),
+        )
+        .unwrap()
+        .flatten()
+        .expect("stable incoming edge should prove the published source atom");
+        assert_eq!(root.source_name, hex::encode("_src!"));
+        assert_eq!(root.section_offset, 0);
+        assert_eq!(root.output_value, source_value);
+
+        assert!(
+            direct_macho_cgu_live_reference_root(
+                &inputs,
+                &previous_files,
+                &current_files,
+                &input_indices,
+                &sections,
+                &resolutions,
+                &[],
+                &output_file,
+                reference,
+                &hex::encode("_new!").into(),
+            )
+            .unwrap()
+            .is_none(),
+            "the new edge must not root its own source atom",
+        );
+        let changed_incoming_previous =
+            direct_macho_undefined_branch_object_named(b"_src!", false, true);
+        let changed_incoming_current =
+            direct_macho_undefined_branch_object_named(b"_src!", true, true);
+        let cycle_inputs = vec![
+            DirectMachOCguMigrationInput {
+                input_file: "reference.o".to_owned(),
+                previous_bytes: inputs[0].previous_bytes.clone(),
+                current_hash: inputs[0].current_hash.clone(),
+                current_bytes: inputs[0].current_bytes.clone(),
+            },
+            DirectMachOCguMigrationInput {
+                input_file: "incoming.o".to_owned(),
+                previous_bytes: changed_incoming_previous,
+                current_hash: hash_bytes(&changed_incoming_current),
+                current_bytes: changed_incoming_current,
+            },
+        ];
+        let cycle_previous_files = cycle_inputs
+            .iter()
+            .map(|input| object::File::parse(input.previous_bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let cycle_current_files = cycle_inputs
+            .iter()
+            .map(|input| object::File::parse(input.current_bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            direct_macho_cgu_live_reference_root(
+                &cycle_inputs,
+                &cycle_previous_files,
+                &cycle_current_files,
+                &input_indices,
+                &sections,
+                &resolutions,
+                &persisted,
+                &output_file,
+                reference,
+                &hex::encode("_new!").into(),
+            )
+            .unwrap()
+            .is_none(),
+            "an edge from another changed atom must not prove an unrooted cycle",
+        );
+    }
+
+    #[test]
+    fn direct_macho_definition_exchange_composes_recycled_symbol_patches() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let activated = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let activated_output = apply_direct_macho_plan_patches(&output, &activated.output_patches);
+
+        let mut exchange_inputs = inputs;
+        for input in &mut exchange_inputs {
+            std::mem::swap(&mut input.previous_bytes, &mut input.current_bytes);
+            input.current_hash = hash_bytes(&input.current_bytes);
+        }
+        let new_owner = direct_macho_definition_change_object_named(b"_alt!", true);
+        let new_reference = direct_macho_definition_reference_object_named(b"_alt!", true, true);
+        exchange_inputs.extend([
+            DirectMachOCguMigrationInput {
+                input_file: "new-owner.o".to_owned(),
+                previous_bytes: direct_macho_definition_change_object_named(b"_alt!", false),
+                current_hash: hash_bytes(&new_owner),
+                current_bytes: new_owner,
+            },
+            DirectMachOCguMigrationInput {
+                input_file: "new-reference.o".to_owned(),
+                previous_bytes: direct_macho_definition_reference_object_named(
+                    b"_alt!", false, true,
+                ),
+                current_hash: hash_bytes(&new_reference),
+                current_bytes: new_reference,
+            },
+        ]);
+        let mut exchange_sections = sections;
+        exchange_sections.extend([
+            SectionRecord {
+                input_file: "new-owner.o".into(),
+                input: "new-owner.o".into(),
+                section_index: 0,
+                output_offset: exchange_sections[0].output_offset + 32,
+                size: 4,
+            },
+            SectionRecord {
+                input_file: "new-reference.o".into(),
+                input: "new-reference.o".into(),
+                section_index: 0,
+                output_offset: exchange_sections[0].output_offset + 48,
+                size: 4,
+            },
+        ]);
+        let exchange = plan_direct_macho_cgu_migrations(
+            &exchange_inputs,
+            &[],
+            &direct_macho_changed_input_files(&exchange_inputs),
+            &exchange_sections,
+            &activated.added_resolutions,
+            &activated_output,
+            activated.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(exchange.added_resolutions.len(), 1);
+        assert_eq!(exchange.added_resolutions[0].name, hex::encode("_alt!"));
+        assert_eq!(
+            exchange.recycled_names,
+            HashSet::from([hex::encode("_new!").into()])
+        );
+        let mut patches = exchange.output_patches;
+        merge_compatible_overlapping_section_patches(&mut patches, Some(&activated_output))
+            .unwrap();
+        let exchanged_output = apply_direct_macho_plan_patches(&activated_output, &patches);
+        let exchanged_file = object::File::parse(exchanged_output.as_slice()).unwrap();
+        assert!(
+            exchanged_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"_alt!"))
+        );
+        assert!(
+            !exchanged_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"_new!"))
+        );
+    }
+
+    #[test]
+    fn direct_macho_definition_activation_requires_unique_rooted_definition() {
+        let (mut inputs, mut sections, output, reserves) = direct_macho_definition_change_fixture();
+        inputs[1].current_bytes = direct_macho_definition_reference_object(false, true);
+        inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
+        let unreferenced = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unreferenced.added_resolutions.is_empty());
+
+        inputs[1].current_bytes = direct_macho_definition_reference_object(true, true);
+        inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
+        let changed_input_files = direct_macho_changed_input_files(&inputs);
+        let duplicate = DirectMachOCguMigrationInput {
+            input_file: "duplicate.o".to_owned(),
+            previous_bytes: direct_macho_definition_change_object(false),
+            current_bytes: direct_macho_definition_change_object(true),
+            current_hash: hash_bytes(&direct_macho_definition_change_object(true)),
+        };
+        inputs.push(duplicate);
+        sections.push(SectionRecord {
+            input_file: "duplicate.o".into(),
+            input: "duplicate.o".into(),
+            section_index: 0,
+            output_offset: sections[0].output_offset + 32,
+            size: 4,
+        });
+        let ambiguous = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &changed_input_files,
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ambiguous.added_resolutions.is_empty());
+
+        inputs.pop();
+        sections.pop();
+        let unmodeled = [DirectMachOCguUnmodeledInput::Changed {
+            previous_bytes: direct_macho_definition_change_object(false),
+            current_bytes: direct_macho_definition_change_object(true),
+        }];
+        let ambiguous = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &unmodeled,
+            &changed_input_files,
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ambiguous.added_resolutions.is_empty());
+
+        let unchanged = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            unchanged.path(),
+            direct_macho_definition_change_object(true),
+        )
+        .unwrap();
+        let unmodeled = [DirectMachOCguUnmodeledInput::Unchanged {
+            path: unchanged.path().to_owned(),
+            expected_content: FileContentState::from_path(unchanged.path()).unwrap(),
+        }];
+        let ambiguous = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &unmodeled,
+            &changed_input_files,
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ambiguous.added_resolutions.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_definition_exchange_coalesces_adjacent_retired_name_patches() {
+        let patch = |output_offset: u64, data: Vec<u8>| SectionPatch {
+            output_offset,
+            size: data.len() as u64,
+            data,
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let mut retired = vec![patch(100, vec![0; 6]), patch(106, vec![0; 6])];
+        let added = vec![patch(100, b"_long_name!\0".to_vec())];
+
+        overlay_plain_section_patches(&mut retired, &added).unwrap();
+        retired.extend(added);
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].data, b"_long_name!\0");
+    }
+
+    #[test]
+    fn direct_macho_definition_exchange_overlays_retired_name_and_adjacent_reserve() {
+        let mut retired = vec![SectionPatch {
+            output_offset: 100,
+            size: 6,
+            data: vec![0; 6],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        }];
+        let added = [SectionPatch {
+            output_offset: 100,
+            size: 12,
+            data: b"_long_name!\0".to_vec(),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        }];
+
+        overlay_plain_section_patches(&mut retired, &added).unwrap();
+        retired.extend(added);
+
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].data, b"_long_name!\0");
+    }
+
+    #[test]
+    fn direct_macho_definition_activation_rejects_unsupported_reference() {
+        let (mut inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        inputs[1].current_bytes = direct_macho_definition_reference_object(true, false);
+        inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
+        let plan = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.added_resolutions.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_definition_retirement_rejects_live_or_unowned_reference() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let forward = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let activated_output = apply_direct_macho_plan_patches(&output, &forward.output_patches);
+        let mut reverse_inputs = inputs;
+        let owner = &mut reverse_inputs[0];
+        std::mem::swap(&mut owner.previous_bytes, &mut owner.current_bytes);
+        reverse_inputs[0].current_hash = hash_bytes(&reverse_inputs[0].current_bytes);
+        let live = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &[],
+            &direct_macho_changed_input_files(&reverse_inputs),
+            &sections,
+            &forward.added_resolutions,
+            &activated_output,
+            forward.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(live.recycled_names.is_empty());
+
+        let reference = &mut reverse_inputs[1];
+        std::mem::swap(&mut reference.previous_bytes, &mut reference.current_bytes);
+        reverse_inputs[1].current_hash = hash_bytes(&reverse_inputs[1].current_bytes);
+        let persisted = [RelocationRecord {
+            input_file: "unchanged.o".into(),
+            input: "unchanged.o".into(),
+            section_index: 1,
+            relocation_offset: 0,
+            output_offset: 0,
+            size: 4,
+            kind: 0,
+            addend: 0,
+            target_value: forward.added_resolutions[0].direct_value.unwrap(),
+            target_name: Some(hex::encode("_new!").into()),
+            target_symbol_id: 0,
+            target: forward.added_resolutions[0].target.clone(),
+            written_value: Some(0),
+            applied_target_value: None,
+        }];
+        let unowned = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &[],
+            &direct_macho_changed_input_files(&reverse_inputs),
+            &sections,
+            &forward.added_resolutions,
+            &activated_output,
+            forward.remaining_reserved_ranges.as_deref().unwrap(),
+            &persisted,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unowned.recycled_names.is_empty());
+    }
+
     #[test]
     fn direct_macho_cgu_migration_is_order_independent() {
         let (mut inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
-        let forward = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
-            .unwrap()
-            .unwrap();
+        let forward = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
         inputs.reverse();
-        let reversed = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
-            .unwrap()
-            .unwrap();
+        let reversed = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(forward.moves, reversed.moves);
         assert_eq!(forward.moves.len(), 1);
@@ -64999,9 +68278,19 @@ mod tests {
             size: 4,
         });
 
-        let plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
-            .unwrap()
-            .unwrap();
+        let plan = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert!(plan.moves.is_empty());
     }
 
@@ -65016,9 +68305,19 @@ mod tests {
             .copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
         inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
 
-        let plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
-            .unwrap()
-            .unwrap();
+        let plan = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert!(plan.moves.is_empty());
     }
 
@@ -65375,9 +68674,19 @@ mod tests {
     #[test]
     fn direct_macho_cgu_migration_retargets_absolute_relocation() {
         let (inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
-        let mut plan = plan_direct_macho_cgu_migrations(&inputs, &sections, &resolutions, &output)
-            .unwrap()
-            .unwrap();
+        let mut plan = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let moved = plan.moves[0].clone();
         let output_offset = sections[0].output_offset + 0x200;
         let mut relocations = vec![RelocationRecord {
@@ -70212,7 +73521,7 @@ mod tests {
         relocation.applied_target_value = Some(recorded_stub);
 
         let recorded = recorded_macho_import_stub_candidates(
-            &[relocation],
+            std::slice::from_ref(&relocation),
             &target_name,
             0,
             &previous_output,
@@ -70745,6 +74054,7 @@ mod tests {
             &elf,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             true,
         )
@@ -70765,6 +74075,7 @@ mod tests {
                 &elf,
                 &mut target_patches,
                 &[],
+                &DirectMachOCguLivenessProof::default(),
                 &mut local_symbol_cohorts,
             )
             .unwrap()
@@ -70861,6 +74172,7 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             true,
         )
@@ -70907,6 +74219,7 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             true,
         )
@@ -71019,6 +74332,7 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             true,
         )
@@ -71070,6 +74384,7 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &DirectMachOCguLivenessProof::default(),
             true,
             true,
         )
@@ -71169,25 +74484,27 @@ mod tests {
         assert!(replay.target.is_none());
 
         let mut resolutions = Vec::new();
-        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
-            &mut resolutions,
-            std::slice::from_ref(&relocation),
-            std::slice::from_ref(&replay),
-            &[(
-                input.path.clone().into(),
-                current_input.clone(),
-                matched[0].previous.section_index,
-                current_input,
-                matched[0].current.section_index,
-            )],
-            false,
-            &[],
-            &input,
-        )
-        .unwrap();
+        let (output_symbols, changed, possible_removals) =
+            reconcile_rematerialized_macho_symbol_resolutions(
+                &mut resolutions,
+                std::slice::from_ref(&relocation),
+                std::slice::from_ref(&replay),
+                &[(
+                    input.path.clone().into(),
+                    current_input.clone(),
+                    matched[0].previous.section_index,
+                    current_input,
+                    matched[0].current.section_index,
+                )],
+                false,
+                &[],
+                &input,
+            )
+            .unwrap();
 
         assert!(output_symbols.is_empty());
         assert!(!changed);
+        assert!(possible_removals.is_empty());
         assert!(resolutions.is_empty());
     }
 
@@ -71502,6 +74819,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: true,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let can_activate = |replays: &MachOTextRelocationReplays,
                             resolutions: &[MachOSymbolResolutionRecord],
@@ -71616,6 +74934,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let input_file = hex::encode(input);
         let relocations = vec![relocation_record(
@@ -71690,6 +75009,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -71886,6 +75206,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: true,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -71979,6 +75300,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -72071,6 +75393,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -72139,6 +75462,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut next_patches = vec![ResolvedSectionPatch {
             section: patches[0].section.clone(),
@@ -72178,6 +75502,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut grown_patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -72257,6 +75582,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut patches = vec![ResolvedSectionPatch {
             section: PatchSection {
@@ -72348,6 +75674,7 @@ mod tests {
             local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
+            possible_removed_resolution_names: Vec::new(),
         };
         let mut next_patches = vec![ResolvedSectionPatch {
             section: patches[0].section.clone(),
@@ -72395,24 +75722,26 @@ mod tests {
             rematerialized_macho_replay("input.o", "_new_target", 0x1000_4020, target.clone());
         let mut resolutions = Vec::new();
 
-        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
-            &mut resolutions,
-            &[],
-            &[replay],
-            &[(
-                SharedText::from(hex::encode("input.o")),
-                hex::encode("input.o"),
-                1,
-                hex::encode("input.o"),
-                1,
-            )],
-            false,
-            &[],
-            &input,
-        )
-        .unwrap();
+        let (output_symbols, changed, possible_removals) =
+            reconcile_rematerialized_macho_symbol_resolutions(
+                &mut resolutions,
+                &[],
+                &[replay],
+                &[(
+                    SharedText::from(hex::encode("input.o")),
+                    hex::encode("input.o"),
+                    1,
+                    hex::encode("input.o"),
+                    1,
+                )],
+                false,
+                &[],
+                &input,
+            )
+            .unwrap();
 
         assert!(changed);
+        assert!(possible_removals.is_empty());
         assert_eq!(output_symbols.len(), 1);
         assert_eq!(output_symbols[0].target_name, hex::encode("_new_target"));
         assert_eq!(output_symbols[0].previous_target_value, 0);
@@ -72467,25 +75796,27 @@ mod tests {
         ];
         let mut resolutions = Vec::new();
 
-        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
-            &mut resolutions,
-            &relocations,
-            &[],
-            &[(
-                input.path.clone().into(),
-                hex::encode("first.o"),
-                1,
-                hex::encode("first.o"),
-                1,
-            )],
-            false,
-            &[],
-            &input,
-        )
-        .unwrap();
+        let (output_symbols, changed, possible_removals) =
+            reconcile_rematerialized_macho_symbol_resolutions(
+                &mut resolutions,
+                &relocations,
+                &[],
+                &[(
+                    input.path.clone().into(),
+                    hex::encode("first.o"),
+                    1,
+                    hex::encode("first.o"),
+                    1,
+                )],
+                false,
+                &[],
+                &input,
+            )
+            .unwrap();
 
         assert!(output_symbols.is_empty());
         assert!(!changed);
+        assert!(possible_removals.is_empty());
         assert!(resolutions.is_empty());
     }
 
@@ -72550,25 +75881,27 @@ mod tests {
             target: Some(catalog_target.clone()),
         }];
 
-        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
-            &mut resolutions,
-            &relocations,
-            &[],
-            &[(
-                input.path.clone().into(),
-                hex::encode("first.o"),
-                1,
-                hex::encode("first.o"),
-                1,
-            )],
-            false,
-            &[],
-            &input,
-        )
-        .unwrap();
+        let (output_symbols, changed, possible_removals) =
+            reconcile_rematerialized_macho_symbol_resolutions(
+                &mut resolutions,
+                &relocations,
+                &[],
+                &[(
+                    input.path.clone().into(),
+                    hex::encode("first.o"),
+                    1,
+                    hex::encode("first.o"),
+                    1,
+                )],
+                false,
+                &[],
+                &input,
+            )
+            .unwrap();
 
         assert!(output_symbols.is_empty());
         assert!(!changed);
+        assert!(possible_removals.is_empty());
         assert_eq!(resolutions[0].target.as_ref(), Some(&catalog_target));
     }
 
@@ -72626,25 +75959,27 @@ mod tests {
             target: Some(catalog_target.clone()),
         }];
 
-        let (output_symbols, changed) = reconcile_rematerialized_macho_symbol_resolutions(
-            &mut resolutions,
-            &relocations,
-            &[replay],
-            &[(
-                SharedText::from(hex::encode("changed.o")),
-                hex::encode("changed.o"),
-                1,
-                hex::encode("changed.o"),
-                1,
-            )],
-            false,
-            &[],
-            &input,
-        )
-        .unwrap();
+        let (output_symbols, changed, possible_removals) =
+            reconcile_rematerialized_macho_symbol_resolutions(
+                &mut resolutions,
+                &relocations,
+                &[replay],
+                &[(
+                    SharedText::from(hex::encode("changed.o")),
+                    hex::encode("changed.o"),
+                    1,
+                    hex::encode("changed.o"),
+                    1,
+                )],
+                false,
+                &[],
+                &input,
+            )
+            .unwrap();
 
         assert!(output_symbols.is_empty());
         assert!(!changed);
+        assert!(possible_removals.is_empty());
         assert_eq!(resolutions[0].target.as_ref(), Some(&catalog_target));
     }
 
@@ -72683,7 +76018,34 @@ mod tests {
             target: relocation.target.clone(),
         }];
 
-        let result = reconcile_rematerialized_macho_symbol_resolutions(
+        let mut replay = rematerialized_macho_replay(
+            "input.o",
+            "_target",
+            0x1000_4010,
+            relocation.target.clone().unwrap(),
+        );
+        replay.relocation_index = Some(0);
+        let retained = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            std::slice::from_ref(&relocation),
+            &[replay],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            false,
+            &[],
+            &input,
+        )
+        .unwrap();
+        assert!(retained.0.is_empty());
+        assert!(!retained.1);
+        assert!(retained.2.is_empty());
+
+        let deferred = reconcile_rematerialized_macho_symbol_resolutions(
             &mut resolutions,
             &[relocation.clone()],
             &[],
@@ -72697,8 +76059,17 @@ mod tests {
             false,
             &[],
             &input,
-        );
+        )
+        .unwrap();
 
+        assert_eq!(deferred.2, vec![resolutions[0].name.clone()]);
+        let possible_removals = vec![(deferred.2[0].clone(), input.path.clone())];
+        let current_references = MachOCurrentGlobalReferenceSummary::default();
+        let result = validate_deferred_macho_text_relocation_target_removals(
+            &possible_removals,
+            &current_references,
+            &resolutions,
+        );
         assert!(matches!(
             result,
             Err(reason)
@@ -72710,7 +76081,7 @@ mod tests {
         let retiring_name = SharedText::from(hex::encode("_target"));
         let result = reconcile_rematerialized_macho_symbol_resolutions(
             &mut resolutions,
-            &[relocation],
+            std::slice::from_ref(&relocation),
             &[],
             &[(
                 SharedText::from(hex::encode("input.o")),
@@ -72726,7 +76097,267 @@ mod tests {
         .unwrap();
         assert!(result.0.is_empty());
         assert!(!result.1);
+        assert!(result.2.is_empty());
         assert_eq!(resolutions[0].name, retiring_name);
+    }
+
+    #[test]
+    fn deferred_macho_text_target_removal_accepts_cross_input_reference_in_any_order() {
+        let name = SharedText::from(hex::encode("_target"));
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("target.o")),
+            input: SharedText::from(hex::encode("target.o")),
+            section_index: 3,
+            section_offset: 16,
+        };
+        let resolution = MachOSymbolResolutionRecord {
+            name: name.clone(),
+            direct_value: Some(0x1000_4010),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(target.clone()),
+        };
+        let replay =
+            rematerialized_macho_replay("current-source.o", "_target", 0x1000_4010, target.clone());
+
+        for current_reference_first in [false, true] {
+            let mut possible_removals = Vec::new();
+            let mut current_references = MachOCurrentGlobalReferenceSummary::default();
+            if current_reference_first {
+                current_references.record_replays(std::slice::from_ref(&replay));
+            }
+            possible_removals.push((name.clone(), hex::encode("previous-source.o")));
+            if !current_reference_first {
+                current_references.record_replays(std::slice::from_ref(&replay));
+            }
+            validate_deferred_macho_text_relocation_target_removals(
+                &possible_removals,
+                &current_references,
+                std::slice::from_ref(&resolution),
+            )
+            .unwrap();
+        }
+
+        let possible_removals = vec![(name.clone(), hex::encode("previous-source.o"))];
+        let result = validate_deferred_macho_text_relocation_target_removals(
+            &possible_removals,
+            &MachOCurrentGlobalReferenceSummary::default(),
+            std::slice::from_ref(&resolution),
+        );
+        assert!(matches!(
+            result,
+            Err(reason)
+                if reason.contains(
+                    "removed Mach-O text relocation target may change symbol liveness"
+                )
+        ));
+
+        let mut non_global = replay.clone();
+        non_global.target_is_global = false;
+        let mut current_references = MachOCurrentGlobalReferenceSummary::default();
+        current_references.record_replays(&[non_global]);
+        assert!(
+            validate_deferred_macho_text_relocation_target_removals(
+                &possible_removals,
+                &current_references,
+                std::slice::from_ref(&resolution),
+            )
+            .is_err()
+        );
+
+        let mut conflicting = replay.clone();
+        conflicting.current_target_value += 4;
+        let mut current_references = MachOCurrentGlobalReferenceSummary::default();
+        current_references.record_replays(&[replay.clone(), conflicting]);
+        let result = validate_deferred_macho_text_relocation_target_removals(
+            &possible_removals,
+            &current_references,
+            std::slice::from_ref(&resolution),
+        );
+        assert!(matches!(
+            result,
+            Err(reason) if reason.contains("ambiguous current Mach-O text relocation target")
+        ));
+
+        let mut unvalidated = replay;
+        unvalidated.target.as_mut().unwrap().section_offset += 4;
+        let mut current_references = MachOCurrentGlobalReferenceSummary::default();
+        current_references.record_replays(&[unvalidated]);
+        let result = validate_deferred_macho_text_relocation_target_removals(
+            &possible_removals,
+            &current_references,
+            &[resolution],
+        );
+        assert!(matches!(
+            result,
+            Err(reason) if reason.contains("unvalidated current Mach-O text relocation target")
+        ));
+    }
+
+    #[test]
+    fn rematerialized_macho_symbol_resolution_index_rejects_duplicates() {
+        let input = state("args", b"output", &[("input.o", b"input")])
+            .input_files
+            .remove(0);
+        let relocation = relocation_record(
+            "input.o",
+            1,
+            1,
+            Some(0),
+            0x1000_4010,
+            Some("_target"),
+            Some(("input.o", 3, 16)),
+            0,
+            0x350,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_PAGE21,
+            }),
+            0,
+        );
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(0x1000_4010),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: relocation.target.clone(),
+        };
+        let mut resolutions = vec![resolution.clone(), resolution];
+
+        let result = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            std::slice::from_ref(&relocation),
+            &[],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            false,
+            &[],
+            &input,
+        );
+
+        assert!(matches!(
+            result,
+            Err(reason) if reason == "ambiguous Mach-O symbol resolution catalog entry"
+        ));
+
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: SharedText::from("not-hex"),
+            direct_value: Some(0x1000_4010),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: None,
+        }];
+        let result = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &[relocation],
+            &[],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            false,
+            &[],
+            &input,
+        )
+        .unwrap();
+        assert!(result.0.is_empty());
+        assert!(!result.1);
+        assert_eq!(resolutions[0].name.as_str(), "not-hex");
+    }
+
+    #[test]
+    fn rematerialized_macho_symbol_resolution_index_scales_with_catalog_and_relocations() {
+        let input = state("args", b"output", &[("input.o", b"input")])
+            .input_files
+            .remove(0);
+        let target_value = 0x1000_4010;
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode("input.o")),
+            input: SharedText::from(hex::encode("input.o")),
+            section_index: 3,
+            section_offset: 16,
+        };
+        let relocation_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_PAGE21,
+        });
+        let relocations = (0..4096_u32)
+            .map(|index| {
+                relocation_record(
+                    "input.o",
+                    index + 1,
+                    index,
+                    Some(0),
+                    target_value,
+                    Some("_target"),
+                    Some(("input.o", 3, 16)),
+                    0,
+                    0x350 + u64::from(index) * 4,
+                    4,
+                    relocation_kind,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut resolutions = (0..4096)
+            .map(|index| MachOSymbolResolutionRecord {
+                name: SharedText::from(hex::encode(format!("_unrelated_{index}"))),
+                direct_value: Some(0x2000_0000 + index),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: None,
+            })
+            .collect::<Vec<_>>();
+        resolutions.push(MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(target_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(target),
+        });
+
+        let result = reconcile_rematerialized_macho_symbol_resolutions(
+            &mut resolutions,
+            &relocations,
+            &[],
+            &[(
+                SharedText::from(hex::encode("input.o")),
+                hex::encode("input.o"),
+                1,
+                hex::encode("input.o"),
+                1,
+            )],
+            false,
+            &[],
+            &input,
+        )
+        .unwrap();
+
+        assert!(result.0.is_empty());
+        assert!(!result.1);
+        assert_eq!(resolutions.len(), 4097);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
