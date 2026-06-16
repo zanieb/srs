@@ -7110,8 +7110,7 @@ fn verify_sld_macho_chained_fixups(
     let data_segment = obj
         .segments()
         .find(|segment| segment.name().ok().flatten() == Some("__DATA"))
-        .context("SLD Mach-O output has no __DATA segment")?;
-    let (data_file_offset, data_file_size) = data_segment.file_range();
+        .map(|segment| segment.file_range());
 
     let mut saw_segment_fixups = false;
     for segment_index in 0..segment_count {
@@ -7127,6 +7126,8 @@ fn verify_sld_macho_chained_fixups(
             "SLD Mach-O output has chained fixups in multiple segments"
         );
         saw_segment_fixups = true;
+        let (data_file_offset, data_file_size) =
+            data_segment.context("SLD Mach-O output has fixups but no __DATA segment")?;
 
         let segment_info_start = starts_offset
             .checked_add(segment_info_offset)
