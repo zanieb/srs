@@ -24147,14 +24147,13 @@ fn validate_macho_data_relocations_are_stable(
                 let validated_local_retarget = (renamed_local_target_is_stable
                     && (!requires_target_transition || local_target_transition))
                     .then(|| {
-                        validated_macho_local_relocation_retarget(
+                        validated_macho_data_local_relocation_retarget(
                             previous_input_bytes,
                             current_input_bytes,
                             previous_index,
                             current_index,
                             previous_context,
                             current_context,
-                            false,
                         )
                     })
                     .flatten()
@@ -24305,6 +24304,25 @@ fn moved_local_macho_data_relocation_patch(
     let (patch, _) = moved_macho_data_relocation_patch(relocation, target_move, None)?;
     relocation.target_name = Some(SharedText::from(hex::encode(current_name)));
     Ok(patch)
+}
+
+fn validated_macho_data_local_relocation_retarget(
+    previous_input: PatchInputBytes<'_>,
+    current_input: PatchInputBytes<'_>,
+    previous_section: object::SectionIndex,
+    current_section: object::SectionIndex,
+    previous_context: &MachODataRelocationContext,
+    current_context: &MachODataRelocationContext,
+) -> Option<ValidatedMachOLocalRelocationRetarget> {
+    validated_macho_local_relocation_retarget(
+        previous_input,
+        current_input,
+        previous_section,
+        current_section,
+        previous_context,
+        current_context,
+        previous_input.archive_identifier.is_none() && current_input.archive_identifier.is_none(),
+    )
 }
 
 fn validated_macho_local_relocation_retarget(
@@ -59281,6 +59299,89 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_data_const_retarget_records_unarchived_proof() {
+        let previous = test_macho_local_data_retarget_object(b"l_anon.20", 0x10);
+        let current = test_macho_local_data_retarget_object(b"l_anon.22", 0x10);
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let previous_section = previous_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__DATA")
+            })
+            .unwrap();
+        let current_section = current_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__DATA")
+            })
+            .unwrap();
+        let previous_contexts = macho_aarch64_data_relocation_contexts(
+            &previous_file,
+            &previous_section,
+            previous_section.data().unwrap(),
+        )
+        .unwrap();
+        let current_contexts = macho_aarch64_data_relocation_contexts(
+            &current_file,
+            &current_section,
+            current_section.data().unwrap(),
+        )
+        .unwrap();
+        let previous_input = PatchInputBytes {
+            bytes: &previous,
+            file_offset: 0,
+            archive_identifier: None,
+        };
+        let current_input = PatchInputBytes {
+            bytes: &current,
+            file_offset: 0,
+            archive_identifier: None,
+        };
+
+        let retarget = validated_macho_data_local_relocation_retarget(
+            previous_input,
+            current_input,
+            previous_section.index(),
+            current_section.index(),
+            &previous_contexts[0],
+            &current_contexts[0],
+        )
+        .unwrap();
+        assert!(retarget.previous.archive_identifier.is_empty());
+        assert!(retarget.current.archive_identifier.is_empty());
+        assert_eq!(retarget.previous.section_index, previous_section.index().0);
+        assert_eq!(retarget.current.section_index, current_section.index().0);
+        assert_eq!(
+            retarget.previous.relocation_offset,
+            previous_contexts[0].range.start as u64
+        );
+        assert_eq!(
+            retarget.current.relocation_offset,
+            current_contexts[0].range.start as u64
+        );
+
+        let archived_current = PatchInputBytes {
+            archive_identifier: Some(b"unit.rcgu.o"),
+            ..current_input
+        };
+        assert!(
+            validated_macho_data_local_relocation_retarget(
+                previous_input,
+                archived_current,
+                previous_section.index(),
+                current_section.index(),
+                &previous_contexts[0],
+                &current_contexts[0],
+            )
+            .is_none(),
+            "mixed direct and archived inputs must not share a retarget proof",
         );
     }
 
