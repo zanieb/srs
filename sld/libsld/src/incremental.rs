@@ -21934,6 +21934,8 @@ fn validate_macho_data_relocations_are_stable(
                     if target_moves_by_index.contains_key(&relocation_index) {
                         handled_target_moves.insert(relocation_index);
                     }
+                    relocation.input = patch_section.current.input.clone().into();
+                    relocation.section_index = patch_section.current.section_index;
                     changed = true;
                     continue;
                 }
@@ -21970,6 +21972,8 @@ fn validate_macho_data_relocations_are_stable(
                         relocation.target = selected_target;
                         target_patches.output_patches.push(patch);
                         target_patches.output_symbols.push(symbol_patch);
+                        relocation.input = patch_section.current.input.clone().into();
+                        relocation.section_index = patch_section.current.section_index;
                         changed = true;
                         continue;
                     }
@@ -54383,6 +54387,344 @@ mod tests {
         );
         assert_eq!(relocation.target_value, 0x1000);
         assert_eq!(relocation.target.as_ref().unwrap().section_offset, 0x112);
+    }
+
+    #[test]
+    fn moved_macho_data_relocation_refreshes_normalized_archive_source() {
+        fn archive(identifier: &[u8], metadata: &[u8], object: &[u8]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(b"rust.metadata.bin".to_vec(), metadata.len() as u64),
+                    metadata,
+                )
+                .unwrap();
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        }
+
+        fn make_target_global(bytes: &mut [u8]) {
+            const HEADER_SIZE: usize = 32;
+            const SEGMENT_COMMAND_SIZE: usize = 72;
+            const SECTION_SIZE: usize = 80;
+            let symtab_command = HEADER_SIZE + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE;
+            let symoff =
+                read_u32_le(&bytes[symtab_command + 8..symtab_command + 12]).unwrap() as usize;
+            bytes[symoff + 4] |= object::macho::N_EXT;
+        }
+
+        fn section<'data>(
+            file: &'data object::File<'data>,
+            segment: &[u8],
+        ) -> object::Section<'data, 'data> {
+            file.sections()
+                .find(|section| {
+                    section.name_bytes().ok() == Some(b"__const".as_slice())
+                        && section.segment_name_bytes().ok().flatten() == Some(segment)
+                })
+                .unwrap()
+        }
+
+        fn empty_target_patches() -> RelocationTargetPatches {
+            RelocationTargetPatches {
+                input_ranges: Vec::new(),
+                output_patches: Vec::new(),
+                output_symbols: Vec::new(),
+                macho_target_moves: Vec::new(),
+                macho_cross_input_target_moves: Vec::new(),
+                validated_macho_local_retargets: Vec::new(),
+                validated_macho_local_text_retargets: Vec::new(),
+                changed_relocation_indices: Vec::new(),
+            }
+        }
+
+        let mut previous_object = test_macho_local_data_retarget_object(b"_target", 0x12);
+        let mut current_object = test_macho_local_data_retarget_object(b"_target", 0x26);
+        make_target_global(&mut previous_object);
+        make_target_global(&mut current_object);
+        let previous_identifier = b"crate-hash.cgu.old.rcgu.o";
+        let current_identifier = b"crate-hash.cgu.new.rcgu.o";
+        let previous = archive(previous_identifier, b"old", &previous_object);
+        let current = archive(
+            current_identifier,
+            b"new metadata with a different size",
+            &current_object,
+        );
+        let input_file = hex::encode("lib.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, previous_identifier).unwrap()
+        else {
+            panic!("expected unique previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, current_identifier).unwrap()
+        else {
+            panic!("expected unique current archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap();
+        let current_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap();
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_source = section(&previous_file, b"__DATA");
+        let current_source = section(&current_file, b"__DATA");
+        let previous_target = section(&previous_file, b"__TEXT");
+        let current_target = section(&current_file, b"__TEXT");
+        let source_output_offset = 0x200;
+        let target_output_offset = 0x300;
+        let matched = [
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_source.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: previous_source.size(),
+                    output_offset: source_output_offset,
+                    output_size: previous_source.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input.clone(),
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_source.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: current_source.size(),
+                    output_offset: source_output_offset,
+                    output_size: current_source.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+            },
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_target.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__TEXT,__const".to_owned()),
+                    input_size: previous_target.size(),
+                    output_offset: target_output_offset,
+                    output_size: previous_target.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input.clone(),
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_target.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__TEXT,__const".to_owned()),
+                    input_size: current_target.size(),
+                    output_offset: target_output_offset,
+                    output_size: current_target.size(),
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                },
+            },
+        ];
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 3,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        };
+        let kind = encode_macho_aarch64_relocation_kind(raw_relocation);
+        let previous_target_value = previous_target.address() + 0x12;
+        let current_target_value = current_target.address() + 0x26;
+        let stable_target_value = previous_target.address() + 0x30;
+        let previous_target_record = RelocationTargetRecord {
+            input_file: input_file.clone().into(),
+            input: previous_input.clone().into(),
+            section_index: previous_target.index().0 as u32,
+            section_offset: 0x12,
+        };
+        let current_target_record = RelocationTargetRecord {
+            input_file: input_file.clone().into(),
+            input: current_input.clone().into(),
+            section_index: current_target.index().0 as u32,
+            section_offset: 0x26,
+        };
+        let resolution_move = MachOSymbolResolutionMove {
+            name: SharedText::from(hex::encode("_target")),
+            previous_value: previous_target_value,
+            current_value: current_target_value,
+            previous_target: previous_target_record.clone(),
+            current_target: current_target_record.clone(),
+        };
+        let previous_output = test_macho_unwind_output(0x1000).bytes;
+        let input = state("args", b"output", &[("lib.rlib", &current)])
+            .input_files
+            .remove(0);
+        let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+
+        let make_relocations = || {
+            let mut moved = relocation_record(
+                "lib.rlib",
+                matched[0].previous.section_index,
+                0,
+                Some(previous_target_value),
+                previous_target_value,
+                Some("_target"),
+                None,
+                0,
+                source_output_offset,
+                8,
+                kind,
+                0,
+            );
+            moved.input_file = input_file.clone().into();
+            moved.input = previous_input.clone().into();
+            moved.target = Some(previous_target_record.clone());
+            moved.applied_target_value = Some(previous_target_value);
+            let mut stable = relocation_record(
+                "lib.rlib",
+                matched[0].previous.section_index,
+                1,
+                Some(stable_target_value),
+                stable_target_value,
+                Some("l_anon.21"),
+                None,
+                8,
+                source_output_offset + 8,
+                8,
+                kind,
+                0,
+            );
+            stable.input_file = input_file.clone().into();
+            stable.input = previous_input.clone().into();
+            stable.target = Some(RelocationTargetRecord {
+                input_file: input_file.clone().into(),
+                input: previous_input.clone().into(),
+                section_index: previous_target.index().0 as u32,
+                section_offset: 0x30,
+            });
+            stable.applied_target_value = Some(stable_target_value);
+            vec![moved, stable]
+        };
+
+        for use_selected_resolution in [false, true] {
+            let mut relocations = make_relocations();
+            let before = resolved_patch_sections_for_input_with_resolver_detailed(
+                &input_file,
+                [matched[0].current.clone()],
+                std::iter::empty(),
+                &relocations,
+                &current_resolver,
+            )
+            .unwrap();
+            assert!(matches!(
+                before,
+                Err(reason)
+                    if reason == "changed patch section __DATA,__const cannot be directly patched"
+            ));
+
+            let resolutions = use_selected_resolution
+                .then(|| MachOSymbolResolutionRecord {
+                    name: SharedText::from(hex::encode("_target")),
+                    direct_value: Some(current_target_value),
+                    got_address: None,
+                    stub_address: None,
+                    thunk_addresses: Vec::new(),
+                    target: Some(current_target_record.clone()),
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let resolution_moves = (!use_selected_resolution)
+                .then_some(resolution_move.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut target_patches = empty_target_patches();
+            let changed = validate_macho_data_relocations_are_stable(
+                &mut relocations,
+                &resolutions,
+                &input,
+                &matched,
+                &previous_resolver,
+                &current_resolver,
+                &previous_output,
+                &mut target_patches,
+                &resolution_moves,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert!(changed);
+            assert!(
+                target_patches
+                    .output_patches
+                    .iter()
+                    .any(|patch| patch.data == current_target_value.to_le_bytes())
+            );
+            assert!(
+                relocations
+                    .iter()
+                    .all(|relocation| relocation.input == current_input)
+            );
+            assert!(relocations.iter().all(|relocation| {
+                relocation.section_index == matched[0].current.section_index
+            }));
+
+            let resolved = resolved_patch_sections_for_input_with_resolver_detailed(
+                &input_file,
+                [matched[0].current.clone()],
+                std::iter::empty(),
+                &relocations,
+                &current_resolver,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolved[0].patch.preserve_ranges, vec![0..8, 8..16]);
+        }
+
+        let mut moved_field = matched.clone();
+        moved_field[0].current.output_offset += 8;
+        let mut relocations = make_relocations();
+        let mut target_patches = empty_target_patches();
+        let rejected = validate_macho_data_relocations_are_stable(
+            &mut relocations,
+            &[],
+            &input,
+            &moved_field,
+            &previous_resolver,
+            &current_resolver,
+            &previous_output,
+            &mut target_patches,
+            std::slice::from_ref(&resolution_move),
+        )
+        .unwrap();
+        let Err(reason) = rejected else {
+            panic!("moved Mach-O data relocation field was accepted");
+        };
+        assert!(
+            reason.contains("changed Mach-O data relocation layout")
+                || reason.contains("moved Mach-O data relocation field")
+        );
+        assert!(
+            relocations
+                .iter()
+                .all(|relocation| relocation.input == previous_input)
+        );
     }
 
     #[test]
