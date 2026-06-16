@@ -8572,17 +8572,22 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             for update in &activation.state_updates {
                 match update {
                     MachOArchiveActivationStateUpdate::Replace(index, state) => {
-                        let Some(stored) = macho_archive_members.get_mut(*index) else {
-                            return Ok(ChangedInputPatchResult::Unsupported(
-                                "changed Mach-O definition ownership moved".to_owned(),
-                            ));
-                        };
-                        if !stored.kind.is_changed_definitions() {
-                            return Ok(ChangedInputPatchResult::Unsupported(
-                                "changed Mach-O definition ownership changed kind".to_owned(),
-                            ));
+                        match replace_changed_macho_definition_activation_state(
+                            &mut macho_archive_members,
+                            *index,
+                            state,
+                        ) {
+                            Ok(true) => newly_retired_macho_archive_states.push(
+                                RetiredMachOArchiveStateRef {
+                                    input_index: *input_index,
+                                    state_index: *index,
+                                },
+                            ),
+                            Ok(false) => {}
+                            Err(reason) => {
+                                return Ok(ChangedInputPatchResult::Unsupported(reason));
+                            }
                         }
-                        *stored = state.clone();
                     }
                     MachOArchiveActivationStateUpdate::Add(state) => {
                         if macho_archive_members.iter().any(|stored| {
@@ -9214,14 +9219,15 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         &mut expected_changed_inputs,
         deferred_loaded_input_content_hashes,
     )?;
-    if let Err(reason) = refresh_newly_retired_macho_archive_rollback_patches(
-        &mut previous.input_files,
-        &newly_retired_macho_archive_states,
-        &output,
-    ) {
-        return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
-    }
-
+    let refreshed_macho_archive_rollback_patch_count =
+        match refresh_newly_retired_macho_archive_rollback_patches(
+            &mut previous.input_files,
+            &newly_retired_macho_archive_states,
+            &output,
+        ) {
+            Ok(count) => count,
+            Err(reason) => return Ok(ChangedInputPatchResult::StartedUnsupported(reason)),
+        };
     {
         timing_phase!("Flush changed incremental output ranges");
         if directly_patched_output.is_generation() {
@@ -9331,6 +9337,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         state.write_metadata_update_for_inputs(state_dir, metadata_update_input_indices)?;
     }
     clear_incremental_update_marker(state_dir)?;
+
+    if !newly_retired_macho_archive_states.is_empty() {
+        append_log(
+            state_dir,
+            &format!(
+                "refreshed {refreshed_macho_archive_rollback_patch_count} rollback patches for {} newly retired Mach-O archive ownership states",
+                newly_retired_macho_archive_states.len(),
+            ),
+        )?;
+    }
 
     append_log(
         state_dir,
@@ -11161,6 +11177,22 @@ impl ChangedMachODefinitionActivation {
 enum MachOArchiveActivationStateUpdate {
     Replace(usize, MachOArchiveActivationState),
     Add(MachOArchiveActivationState),
+}
+
+fn replace_changed_macho_definition_activation_state(
+    states: &mut [MachOArchiveActivationState],
+    index: usize,
+    state: &MachOArchiveActivationState,
+) -> std::result::Result<bool, String> {
+    let stored = states
+        .get_mut(index)
+        .ok_or_else(|| "changed Mach-O definition ownership moved".to_owned())?;
+    if !stored.kind.is_changed_definitions() {
+        return Err("changed Mach-O definition ownership changed kind".to_owned());
+    }
+    let newly_retired = stored.active && !state.active;
+    *stored = state.clone();
+    Ok(newly_retired)
 }
 
 struct AddedMachOArchiveTextActivations {
@@ -25223,7 +25255,7 @@ fn refresh_newly_retired_macho_archive_rollback_patches(
     input_files: &mut [FileState],
     retired_states: &[RetiredMachOArchiveStateRef],
     current_output: &[u8],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<usize, String> {
     let mut seen = HashSet::with_capacity(retired_states.len());
     let mut updates = Vec::new();
 
@@ -25315,6 +25347,7 @@ fn refresh_newly_retired_macho_archive_rollback_patches(
         }
     }
 
+    let refreshed_patch_count = updates.len();
     for (input_index, state_index, rollback_index, data) in updates {
         input_files[input_index]
             .patch
@@ -25324,7 +25357,7 @@ fn refresh_newly_retired_macho_archive_rollback_patches(
             .rollback_patches[rollback_index]
             .data = data;
     }
-    Ok(())
+    Ok(refreshed_patch_count)
 }
 
 fn initially_owned_macho_archive_removal_state(
@@ -63696,6 +63729,43 @@ mod tests {
         assert_eq!(
             inputs[0].patch.as_ref().unwrap().macho_archive_members[0].rollback_patches[0].data,
             b,
+        );
+    }
+
+    #[test]
+    fn changed_macho_definition_replacement_reports_new_retirement() {
+        let state = |kind, active| MachOArchiveActivationState {
+            kind,
+            members: Vec::new(),
+            active,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: Vec::new(),
+            rollback_patches: Vec::new(),
+        };
+        let mut states = vec![state(MachOArchiveActivationKind::ChangedDefinitions, true)];
+        let dormant = state(MachOArchiveActivationKind::ChangedDefinitions, false);
+        assert!(
+            replace_changed_macho_definition_activation_state(&mut states, 0, &dormant).unwrap()
+        );
+
+        let active = state(MachOArchiveActivationKind::ChangedDefinitions, true);
+        assert!(
+            !replace_changed_macho_definition_activation_state(&mut states, 0, &active).unwrap()
+        );
+        assert!(
+            replace_changed_macho_definition_activation_state(&mut states, 1, &dormant)
+                .unwrap_err()
+                .contains("ownership moved")
+        );
+
+        states[0] = state(MachOArchiveActivationKind::AddedMembers, true);
+        assert!(
+            replace_changed_macho_definition_activation_state(&mut states, 0, &dormant)
+                .unwrap_err()
+                .contains("changed kind")
         );
     }
 
