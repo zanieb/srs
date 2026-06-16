@@ -34147,7 +34147,12 @@ fn macho_unwind_fde_identities(
         })
         .map(|fde| (fde.function.clone(), fde.function_length))
         .collect::<Vec<_>>();
-    macho_unwind_positions_to_identities(input, functions, sections, output_file)
+    let physical_fde_count = functions.len();
+    let identities = macho_unwind_positions_to_identities(input, functions, sections, output_file)?;
+    if identities.len() != physical_fde_count {
+        return Err("changed Mach-O unwind has duplicate physical FDE identities".to_owned());
+    }
+    Ok(identities)
 }
 
 fn macho_unwind_positions_to_identities(
@@ -68738,6 +68743,26 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn duplicate_physical_fdes_cannot_cover_zero_hint_retirement() {
+        let (member, mut sections) = test_added_macho_unwind_member(false);
+        let output = test_macho_unwind_output(0x1000);
+        sections[0].output_offset = output.text_offset + 0x100;
+        let mut unwind = member.unwind.unwrap();
+        for entry in &mut unwind.compact_unwind.as_mut().unwrap().entries {
+            entry.encoding =
+                (entry.encoding & !ADDED_MACHO_UNWIND_MODE_MASK) | ADDED_MACHO_UNWIND_MODE_DWARF;
+        }
+        let eh_frame = unwind.eh_frame.as_mut().unwrap();
+        eh_frame.fdes.push(eh_frame.fdes[0].clone());
+
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let failure =
+            macho_unwind_fde_identities(member.input.as_str(), &unwind, &sections, &output_file)
+                .unwrap_err();
+        assert!(failure.contains("duplicate physical FDE identities"));
     }
 
     #[test]
