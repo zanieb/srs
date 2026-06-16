@@ -28930,6 +28930,9 @@ fn reactivated_macho_archive_indirect_target_is_current(
     let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
         return false;
     };
+    if !macho_aarch64_cross_input_relocation_is_supported(raw, relocation.size) {
+        return false;
+    }
     match raw.r_type {
         object::macho::ARM64_RELOC_BRANCH26 => {
             resolution.stub_address == Some(applied_target)
@@ -72475,6 +72478,63 @@ mod tests {
                 &output.bytes,
             )
             .unwrap();
+            assert_eq!(states, unchanged);
+        }
+    }
+
+    #[test]
+    fn dormant_macho_archive_reactivation_rejects_malformed_import_indirection_atomically() {
+        let output = test_macho_unwind_output(0x1000);
+        let target = RelocationTargetRecord {
+            input_file: "unused.o".into(),
+            input: "unused.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let import_name: SharedText = hex::encode("_import").into();
+        for (external, pcrel, length, size) in [
+            (false, true, 2, 4),
+            (true, false, 2, 4),
+            (true, true, 3, 4),
+            (true, true, 2, 8),
+        ] {
+            let mut state =
+                dormant_external_relocation_state(output.text_offset, 0, target.clone());
+            let relocation = &mut state.relocations[0];
+            relocation.written_value = Some(0);
+            relocation.target_name = Some(import_name.clone());
+            relocation.target = None;
+            relocation.size = size;
+            relocation.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: pcrel,
+                r_length: length,
+                r_extern: external,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            });
+            relocation.applied_target_value = Some(0x6000);
+            let resolution = MachOSymbolResolutionRecord {
+                name: import_name.clone(),
+                direct_value: None,
+                got_address: Some(0x5000),
+                stub_address: Some(0x6000),
+                thunk_addresses: Vec::new(),
+                target: None,
+            };
+            let mut states = vec![state];
+            let unchanged = states.clone();
+            let reason = rematerialize_reactivated_macho_archive_relocations(
+                "archive.rlib",
+                &mut states,
+                &[resolution],
+                &output.bytes,
+            )
+            .unwrap_err();
+            assert!(
+                reason.contains("no direct value"),
+                "unexpected reason: {reason}"
+            );
             assert_eq!(states, unchanged);
         }
     }
