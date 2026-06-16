@@ -11667,6 +11667,7 @@ fn macho_local_symbol_cohort_target_transition(
     previous_name: &[u8],
     current_name: &[u8],
     previous_value: u64,
+    current_value: u64,
 ) -> Option<(u8, u64, u16)> {
     let previous = plan
         .previous
@@ -11682,7 +11683,7 @@ fn macho_local_symbol_cohort_target_transition(
         .filter(|entry| {
             entry.name == current_name
                 && entry.output_section_index == previous.output_section_index
-                && entry.output_value == previous.output_value
+                && entry.output_value == current_value
                 && entry.n_desc == previous.n_desc
         })
         .collect::<Vec<_>>();
@@ -11703,6 +11704,7 @@ fn macho_local_symbol_cohort_has_target_transition(
     previous_name: &[u8],
     current_name: &[u8],
     previous_value: u64,
+    current_value: u64,
 ) -> bool {
     plans
         .iter()
@@ -11713,10 +11715,34 @@ fn macho_local_symbol_cohort_has_target_transition(
                 previous_name,
                 current_name,
                 previous_value,
+                current_value,
             )
         })
         .count()
         == 1
+}
+
+#[allow(clippy::too_many_arguments)]
+fn macho_local_data_target_has_validated_cohort_transition(
+    plans: &[MachOLocalSymbolCohortPlan],
+    previous_input: &str,
+    current_input: &str,
+    previous_name: &[u8],
+    current_name: &[u8],
+    previous_value: u64,
+    current_value: u64,
+    has_validated_retarget: bool,
+) -> bool {
+    (previous_value == current_value || has_validated_retarget)
+        && macho_local_symbol_cohort_has_target_transition(
+            plans,
+            previous_input,
+            current_input,
+            previous_name,
+            current_name,
+            previous_value,
+            current_value,
+        )
 }
 
 fn merge_macho_local_symbol_cohort_plan(
@@ -19091,6 +19117,7 @@ fn matched_macho_local_text_target_ownership(
                 &plan,
                 &previous_position.name,
                 &current_name,
+                relocation.target_value,
                 relocation.target_value,
             ) {
                 let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
@@ -26548,14 +26575,28 @@ fn validate_macho_data_relocations_are_stable(
                     planned_local_symbol_cohorts.insert(cohort_key);
                 }
                 let relocation = &mut relocations[relocation_index];
+                let validated_local_retarget = renamed_local_target_is_stable
+                    .then(|| {
+                        validated_macho_data_local_relocation_retarget(
+                            previous_input_bytes,
+                            current_input_bytes,
+                            previous_index,
+                            current_index,
+                            previous_context,
+                            current_context,
+                        )
+                    })
+                    .flatten();
                 let local_target_transition = if renamed_local_target_is_stable {
-                    macho_local_symbol_cohort_has_target_transition(
+                    macho_local_data_target_has_validated_cohort_transition(
                         local_symbol_cohorts,
                         patch_section.previous.input.as_str(),
                         patch_section.current.input.as_str(),
                         previous_local_name,
                         current_local_name,
                         relocation_target_value,
+                        target_address,
+                        validated_local_retarget.is_some(),
                     )
                 } else {
                     false
@@ -26573,19 +26614,8 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path),
                     )));
                 }
-                let validated_local_retarget = (renamed_local_target_is_stable
-                    && (!requires_target_transition || local_target_transition))
-                    .then(|| {
-                        validated_macho_data_local_relocation_retarget(
-                            previous_input_bytes,
-                            current_input_bytes,
-                            previous_index,
-                            current_index,
-                            previous_context,
-                            current_context,
-                        )
-                    })
-                    .flatten()
+                let validated_local_retarget = validated_local_retarget
+                    .filter(|_| !requires_target_transition || local_target_transition)
                     .map(|mut retarget| {
                         if target_section.is_none() && local_target_transition {
                             retarget.previous.hash_unmasked_target_offset = true;
@@ -60131,67 +60161,131 @@ mod tests {
         let plan = MachOLocalSymbolCohortPlan {
             previous_input: "previous".to_owned(),
             current_input: "current".to_owned(),
-            previous: vec![entry(b"old", 2, 0x100, 0)],
-            current: vec![entry(b"new", 2, 0x100, 0)],
+            previous: vec![entry(b"old.2", 2, 0x100, 0)],
+            current: vec![entry(b"new.3", 2, 0x120, 0)],
             validated_local_symbol_renames: Vec::new(),
         };
         assert_eq!(
-            macho_local_symbol_cohort_target_transition(&plan, b"old", b"new", 0x100),
-            Some((2, 0x100, 0)),
+            macho_local_symbol_cohort_target_transition(&plan, b"old.2", b"new.3", 0x100, 0x120,),
+            Some((2, 0x120, 0)),
         );
         assert!(macho_local_symbol_cohort_has_target_transition(
             std::slice::from_ref(&plan),
             "previous",
             "current",
-            b"old",
-            b"new",
+            b"old.2",
+            b"new.3",
             0x100,
+            0x120,
         ));
         assert!(!macho_local_symbol_cohort_has_target_transition(
             &[plan.clone(), plan.clone()],
             "previous",
             "current",
-            b"old",
-            b"new",
+            b"old.2",
+            b"new.3",
             0x100,
+            0x120,
         ));
         assert!(!macho_local_symbol_cohort_has_target_transition(
             std::slice::from_ref(&plan),
             "wrong-previous",
             "current",
-            b"old",
-            b"new",
+            b"old.2",
+            b"new.3",
             0x100,
+            0x120,
+        ));
+        assert!(!macho_local_symbol_cohort_has_target_transition(
+            std::slice::from_ref(&plan),
+            "previous",
+            "current",
+            b"old.2",
+            b"new.3",
+            0x100,
+            0x121,
         ));
 
         let mut ambiguous_previous = plan.clone();
         ambiguous_previous.previous.push(plan.previous[0].clone());
         assert_eq!(
-            macho_local_symbol_cohort_target_transition(&ambiguous_previous, b"old", b"new", 0x100,),
+            macho_local_symbol_cohort_target_transition(
+                &ambiguous_previous,
+                b"old.2",
+                b"new.3",
+                0x100,
+                0x120,
+            ),
             None,
         );
 
         let mut ambiguous_current = plan.clone();
         ambiguous_current.current.push(plan.current[0].clone());
         assert_eq!(
-            macho_local_symbol_cohort_target_transition(&ambiguous_current, b"old", b"new", 0x100,),
+            macho_local_symbol_cohort_target_transition(
+                &ambiguous_current,
+                b"old.2",
+                b"new.3",
+                0x100,
+                0x120,
+            ),
             None,
         );
 
         for current in [
-            entry(b"new", 3, 0x100, 0),
-            entry(b"new", 2, 0x101, 0),
-            entry(b"new", 2, 0x100, object::macho::N_NO_DEAD_STRIP),
+            entry(b"new.3", 3, 0x120, 0),
+            entry(b"new.3", 2, 0x121, 0),
+            entry(b"new.3", 2, 0x120, object::macho::N_NO_DEAD_STRIP),
         ] {
             let changed = MachOLocalSymbolCohortPlan {
                 current: vec![current],
                 ..plan.clone()
             };
             assert_eq!(
-                macho_local_symbol_cohort_target_transition(&changed, b"old", b"new", 0x100),
+                macho_local_symbol_cohort_target_transition(
+                    &changed, b"old.2", b"new.3", 0x100, 0x120,
+                ),
                 None,
             );
         }
+
+        assert!(macho_local_data_target_has_validated_cohort_transition(
+            std::slice::from_ref(&plan),
+            "previous",
+            "current",
+            b"old.2",
+            b"new.3",
+            0x100,
+            0x120,
+            true,
+        ));
+        assert!(
+            !macho_local_data_target_has_validated_cohort_transition(
+                std::slice::from_ref(&plan),
+                "previous",
+                "current",
+                b"old.2",
+                b"new.3",
+                0x100,
+                0x120,
+                false,
+            ),
+            "a moved target requires an independently validated relocation retarget",
+        );
+        let equal_value = MachOLocalSymbolCohortPlan {
+            current: vec![entry(b"new.3", 2, 0x100, 0)],
+            ..plan.clone()
+        };
+        assert!(macho_local_data_target_has_validated_cohort_transition(
+            std::slice::from_ref(&equal_value),
+            "previous",
+            "current",
+            b"old.2",
+            b"new.3",
+            0x100,
+            0x100,
+            false,
+        ));
     }
 
     #[test]
