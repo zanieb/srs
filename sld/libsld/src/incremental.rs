@@ -5364,43 +5364,54 @@ fn direct_macho_cgu_references(
 fn macho_input_matching_symbol_names(
     bytes: &[u8],
     requested_names: &HashMap<Vec<u8>, SharedText>,
-    definitions_only: bool,
-) -> Result<HashSet<SharedText>> {
+) -> Option<HashSet<SharedText>> {
     fn add_matching_names(
         file: &object::File<'_>,
         requested_names: &HashMap<Vec<u8>, SharedText>,
-        definitions_only: bool,
         matching: &mut HashSet<SharedText>,
-    ) -> Result<()> {
+    ) -> Option<()> {
         for symbol in file.symbols() {
-            if definitions_only && symbol.is_undefined() {
-                continue;
-            }
-            if let Some(name) = requested_names.get(symbol.name_bytes()?) {
+            if let Some(name) = requested_names.get(symbol.name_bytes().ok()?) {
                 matching.insert(name.clone());
             }
         }
-        Ok(())
+        Some(())
     }
 
     let mut matching = HashSet::new();
     if let Ok(file) = object::File::parse(bytes) {
-        if !definitions_only || file.kind() == object::ObjectKind::Relocatable {
-            add_matching_names(&file, requested_names, definitions_only, &mut matching)?;
+        if !is_supported_incremental_macho_object(&file) {
+            return None;
         }
-        return Ok(matching);
+        add_matching_names(&file, requested_names, &mut matching)?;
+        return Some(matching);
     }
     let Ok(archive) = object::read::archive::ArchiveFile::parse(bytes) else {
-        return Ok(matching);
+        return None;
     };
-    for member in archive.members() {
-        let member = member?;
-        let Ok(file) = object::File::parse(member.data(bytes)?) else {
-            continue;
-        };
-        add_matching_names(&file, requested_names, definitions_only, &mut matching)?;
+    if archive.is_thin() {
+        return None;
     }
-    Ok(matching)
+    for member in archive.members() {
+        let Ok(member) = member else {
+            return None;
+        };
+        let identifier = trim_archive_member_nul_padding(member.name());
+        if crate::input_data::should_skip_archive_member(identifier) {
+            continue;
+        }
+        let Ok(member_bytes) = member.data(bytes) else {
+            return None;
+        };
+        let Ok(file) = object::File::parse(member_bytes) else {
+            return None;
+        };
+        if !is_supported_incremental_macho_object(&file) {
+            return None;
+        }
+        add_matching_names(&file, requested_names, &mut matching)?;
+    }
+    Some(matching)
 }
 
 impl DirectMachOCguUnmodeledInput {
@@ -5413,13 +5424,17 @@ impl DirectMachOCguUnmodeledInput {
                 previous_bytes,
                 current_bytes,
             } => {
-                let mut names =
-                    macho_input_matching_symbol_names(previous_bytes, requested_names, false)?;
-                names.extend(macho_input_matching_symbol_names(
-                    current_bytes,
-                    requested_names,
-                    false,
-                )?);
+                let Some(mut names) =
+                    macho_input_matching_symbol_names(previous_bytes, requested_names)
+                else {
+                    return Ok(None);
+                };
+                let Some(current_names) =
+                    macho_input_matching_symbol_names(current_bytes, requested_names)
+                else {
+                    return Ok(None);
+                };
+                names.extend(current_names);
                 Ok(Some(names))
             }
             Self::Unchanged {
@@ -5433,11 +5448,7 @@ impl DirectMachOCguUnmodeledInput {
                 {
                     return Ok(None);
                 }
-                Ok(Some(macho_input_matching_symbol_names(
-                    &bytes,
-                    requested_names,
-                    true,
-                )?))
+                Ok(macho_input_matching_symbol_names(&bytes, requested_names))
             }
         }
     }
@@ -68710,6 +68721,124 @@ mod tests {
     }
 
     #[test]
+    fn direct_macho_definition_activation_rejects_unchanged_unmodeled_reference() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let changed_input_files = direct_macho_changed_input_files(&inputs);
+        let unrelated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            unrelated.path(),
+            direct_macho_definition_reference_object_named(b"_alt!", true, true),
+        )
+        .unwrap();
+        let unrelated_input = [DirectMachOCguUnmodeledInput::Unchanged {
+            path: unrelated.path().to_owned(),
+            expected_content: FileContentState::from_path(unrelated.path()).unwrap(),
+        }];
+        let control = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &unrelated_input,
+            &changed_input_files,
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.added_resolutions.len(), 1);
+
+        let reference = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            reference.path(),
+            direct_macho_definition_reference_object(true, true),
+        )
+        .unwrap();
+        let referenced_input = [DirectMachOCguUnmodeledInput::Unchanged {
+            path: reference.path().to_owned(),
+            expected_content: FileContentState::from_path(reference.path()).unwrap(),
+        }];
+        let referenced = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &referenced_input,
+            &changed_input_files,
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(referenced.added_resolutions.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_definition_changes_fail_closed_for_opaque_unmodeled_inputs() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, bytes) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        *bytes,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let changed_input_files = direct_macho_changed_input_files(&inputs);
+        let plan_with = |bytes: Vec<u8>| {
+            plan_direct_macho_cgu_migrations(
+                &inputs,
+                &[DirectMachOCguUnmodeledInput::Changed {
+                    previous_bytes: bytes.clone(),
+                    current_bytes: bytes,
+                }],
+                &changed_input_files,
+                &sections,
+                &[],
+                &output,
+                &reserves,
+                &[],
+                true,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let unrelated = direct_macho_definition_reference_object_named(b"_alt!", true, true);
+        let metadata = b"opaque Rust metadata";
+        let supported_archive = archive(&[
+            (b"lib.rmeta", metadata),
+            (b"unrelated.rcgu.o", unrelated.as_slice()),
+        ]);
+        assert_eq!(plan_with(supported_archive).added_resolutions.len(), 1);
+
+        assert!(
+            plan_with(b"opaque input".to_vec())
+                .added_resolutions
+                .is_empty()
+        );
+        let unsupported_macho = test_macho_unwind_output(0x1000).bytes;
+        assert_ne!(
+            object::File::parse(unsupported_macho.as_slice())
+                .unwrap()
+                .kind(),
+            object::ObjectKind::Relocatable,
+        );
+        assert!(plan_with(unsupported_macho).added_resolutions.is_empty());
+        let opaque_archive = archive(&[
+            (b"unrelated.rcgu.o", unrelated.as_slice()),
+            (b"opaque-member.bin", b"opaque member"),
+        ]);
+        assert!(plan_with(opaque_archive).added_resolutions.is_empty());
+    }
+
+    #[test]
     fn direct_macho_definition_exchange_coalesces_adjacent_retired_name_patches() {
         let patch = |output_offset: u64, data: Vec<u8>| SectionPatch {
             output_offset,
@@ -68845,6 +68974,81 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(unowned.recycled_names.is_empty());
+    }
+
+    #[test]
+    fn direct_macho_definition_retirement_rejects_unchanged_unmodeled_reference() {
+        let (inputs, sections, output, reserves) = direct_macho_definition_change_fixture();
+        let forward = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &[],
+            &output,
+            &reserves,
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let activated_output = apply_direct_macho_plan_patches(&output, &forward.output_patches);
+        let mut reverse_inputs = inputs;
+        for input in &mut reverse_inputs {
+            std::mem::swap(&mut input.previous_bytes, &mut input.current_bytes);
+            input.current_hash = hash_bytes(&input.current_bytes);
+        }
+        let changed_input_files = direct_macho_changed_input_files(&reverse_inputs);
+
+        let unrelated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            unrelated.path(),
+            direct_macho_definition_reference_object_named(b"_alt!", true, true),
+        )
+        .unwrap();
+        let unrelated_input = [DirectMachOCguUnmodeledInput::Unchanged {
+            path: unrelated.path().to_owned(),
+            expected_content: FileContentState::from_path(unrelated.path()).unwrap(),
+        }];
+        let control = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &unrelated_input,
+            &changed_input_files,
+            &sections,
+            &forward.added_resolutions,
+            &activated_output,
+            forward.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.recycled_names.len(), 1);
+
+        let reference = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            reference.path(),
+            direct_macho_definition_reference_object(true, true),
+        )
+        .unwrap();
+        let referenced_input = [DirectMachOCguUnmodeledInput::Unchanged {
+            path: reference.path().to_owned(),
+            expected_content: FileContentState::from_path(reference.path()).unwrap(),
+        }];
+        let referenced = plan_direct_macho_cgu_migrations(
+            &reverse_inputs,
+            &referenced_input,
+            &changed_input_files,
+            &sections,
+            &forward.added_resolutions,
+            &activated_output,
+            forward.remaining_reserved_ranges.as_deref().unwrap(),
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(referenced.recycled_names.is_empty());
     }
 
     #[test]
