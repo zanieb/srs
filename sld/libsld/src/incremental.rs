@@ -28666,8 +28666,31 @@ fn rematerialize_reactivated_macho_archive_relocations(
         transaction_ranges.push(start..end);
     }
 
+    let mut relocation_ranges = Vec::new();
+    for relocation in ownership_snapshot
+        .iter()
+        .flat_map(|state| &state.relocations)
+    {
+        if relocation.size == 0 {
+            return Err("reactivated Mach-O archive relocation has an empty field".to_owned());
+        }
+        let end = relocation
+            .output_offset
+            .checked_add(relocation.size)
+            .ok_or_else(|| {
+                "reactivated Mach-O archive relocation output range overflowed".to_owned()
+            })?;
+        relocation_ranges.push(relocation.output_offset..end);
+    }
+    relocation_ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    if relocation_ranges
+        .windows(2)
+        .any(|ranges| ranges[0].end > ranges[1].start)
+    {
+        return Err("reactivated Mach-O archive relocation fields overlap ambiguously".to_owned());
+    }
+
     let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
-    let mut patched_relocation_ranges = HashSet::new();
     for state_index in 0..updated.len() {
         for relocation_index in 0..updated[state_index].relocations.len() {
             let relocation = &ownership_snapshot[state_index].relocations[relocation_index];
@@ -28722,10 +28745,12 @@ fn rematerialize_reactivated_macho_archive_relocations(
                 )?,
                 None => None,
             };
-            let (current_target_value, current_target, current_resolution) = if let Some(value) =
+            let (current_target_value, current_target, stable_indirect_target) = if let Some(
+                value,
+            ) =
                 owned_target_value
             {
-                (value, relocation.target.clone(), None)
+                (value, relocation.target.clone(), false)
             } else {
                 let target_name = relocation.target_name.as_deref().ok_or_else(|| {
                     "reactivated Mach-O archive relocation has no current target owner".to_owned()
@@ -28742,10 +28767,23 @@ fn rematerialize_reactivated_macho_archive_relocations(
                         )
                     })?;
                 let resolution = &resolutions[resolution_index];
-                let value = resolution.direct_value.ok_or_else(|| {
-                    "reactivated Mach-O archive relocation resolution has no direct value"
-                        .to_owned()
-                })?;
+                let stable_indirect_target = reactivated_macho_archive_indirect_target_is_current(
+                    relocation,
+                    resolution,
+                    previous_applied_target_value,
+                );
+                let value = match resolution.direct_value {
+                    Some(value) => value,
+                    None if stable_indirect_target && resolution.target.is_none() => {
+                        previous_target_value
+                    }
+                    None => {
+                        return Err(
+                            "reactivated Mach-O archive relocation resolution has no direct value"
+                                .to_owned(),
+                        );
+                    }
+                };
                 if let Some(target) = resolution.target.as_ref()
                     && let Some(owned_value) = reactivated_macho_archive_owned_target_value(
                         input_file_path,
@@ -28760,42 +28798,23 @@ fn rematerialize_reactivated_macho_archive_relocations(
                             .to_owned(),
                     );
                 }
-                (value, resolution.target.clone(), Some(resolution))
+                (value, resolution.target.clone(), stable_indirect_target)
             };
 
-            if previous_applied_target_value != previous_target_value {
-                let Some(resolution) = current_resolution else {
-                    return Err(
-                        "reactivated Mach-O archive owned relocation uses an untracked indirect target"
-                            .to_owned(),
-                    );
-                };
-                let indirect_target_is_current = resolution.got_address
-                    == Some(previous_applied_target_value)
-                    || resolution.stub_address == Some(previous_applied_target_value)
-                    || resolution
-                        .thunk_addresses
-                        .contains(&previous_applied_target_value);
-                if !indirect_target_is_current {
-                    return Err(
-                        "reactivated Mach-O archive relocation indirect target is no longer current"
-                            .to_owned(),
-                    );
-                }
+            if stable_indirect_target {
                 let relocation = &mut updated[state_index].relocations[relocation_index];
                 relocation.target_value = current_target_value;
                 relocation.target = current_target;
                 continue;
             }
+            if previous_applied_target_value != previous_target_value {
+                return Err(
+                    "reactivated Mach-O archive relocation indirect target is no longer current"
+                        .to_owned(),
+                );
+            }
 
             if previous_target_value != current_target_value {
-                let range_key = (relocation.output_offset, relocation.size);
-                if !patched_relocation_ranges.insert(range_key) {
-                    return Err(
-                        "reactivated Mach-O archive relocation output ownership is ambiguous"
-                            .to_owned(),
-                    );
-                }
                 let raw_relocation = decode_macho_aarch64_relocation_kind(relocation.kind)
                     .ok_or_else(|| {
                         "reactivated Mach-O archive relocation has an unsupported kind".to_owned()
@@ -28901,6 +28920,29 @@ fn rematerialize_reactivated_macho_archive_relocations(
 
     states.clone_from_slice(&updated);
     Ok(())
+}
+
+fn reactivated_macho_archive_indirect_target_is_current(
+    relocation: &RelocationRecord,
+    resolution: &MachOSymbolResolutionRecord,
+    applied_target: u64,
+) -> bool {
+    let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+        return false;
+    };
+    match raw.r_type {
+        object::macho::ARM64_RELOC_BRANCH26 => {
+            resolution.stub_address == Some(applied_target)
+                || resolution.thunk_addresses.contains(&applied_target)
+        }
+        object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+        | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+            resolution.got_address == Some(applied_target)
+        }
+        _ => false,
+    }
 }
 
 fn reactivated_macho_archive_owned_target_value(
@@ -72364,6 +72406,148 @@ mod tests {
             &activation.reactivated_output_patches[0].data[16..24],
             &(value_b + 0x10).to_le_bytes()
         );
+    }
+
+    #[test]
+    fn dormant_macho_archive_reactivation_accepts_exact_import_indirection() {
+        let output = test_macho_unwind_output(0x1000);
+        let target = RelocationTargetRecord {
+            input_file: "unused.o".into(),
+            input: "unused.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let import_name: SharedText = hex::encode("_import").into();
+        for (r_type, applied_target, got_address, stub_address, thunk_addresses) in [
+            (
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x6000,
+                Some(0x5000),
+                Some(0x6000),
+                Vec::new(),
+            ),
+            (
+                object::macho::ARM64_RELOC_BRANCH26,
+                0x7000,
+                None,
+                None,
+                vec![0x7000],
+            ),
+            (
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                0x5000,
+                Some(0x5000),
+                None,
+                Vec::new(),
+            ),
+        ] {
+            let mut state =
+                dormant_external_relocation_state(output.text_offset, 0, target.clone());
+            state.forward_patches[0].data[16..24].fill(0);
+            let relocation = &mut state.relocations[0];
+            relocation.written_value = Some(0);
+            relocation.target_name = Some(import_name.clone());
+            relocation.target = None;
+            relocation.size = 4;
+            relocation.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type,
+            });
+            relocation.applied_target_value = Some(applied_target);
+            let resolution = MachOSymbolResolutionRecord {
+                name: import_name.clone(),
+                direct_value: None,
+                got_address,
+                stub_address,
+                thunk_addresses,
+                target: None,
+            };
+            let mut states = vec![state];
+            let unchanged = states.clone();
+            rematerialize_reactivated_macho_archive_relocations(
+                "archive.rlib",
+                &mut states,
+                &[resolution],
+                &output.bytes,
+            )
+            .unwrap();
+            assert_eq!(states, unchanged);
+        }
+    }
+
+    #[test]
+    fn dormant_macho_archive_reactivation_rejects_partial_relocation_overlap_atomically() {
+        let output = test_macho_unwind_output(0x1000);
+        let target = RelocationTargetRecord {
+            input_file: "target.o".into(),
+            input: "target.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let mut state =
+            dormant_external_relocation_state(output.text_offset, 0x2000, target.clone());
+        let mut overlapping = state.relocations[0].clone();
+        overlapping.target_symbol_id += 1;
+        overlapping.relocation_offset += 4;
+        overlapping.output_offset += 4;
+        state.relocations.push(overlapping);
+        let mut states = vec![state];
+        let unchanged = states.clone();
+        let reason = rematerialize_reactivated_macho_archive_relocations(
+            "archive.rlib",
+            &mut states,
+            &[external_relocation_resolution(Some(0x3000), target)],
+            &output.bytes,
+        )
+        .unwrap_err();
+        assert!(reason.contains("relocation fields overlap ambiguously"));
+        assert_eq!(states, unchanged);
+    }
+
+    #[test]
+    fn dormant_macho_archive_reactivation_rejects_unchanged_changed_overlap_atomically() {
+        let output = test_macho_unwind_output(0x1000);
+        let stable_target = RelocationTargetRecord {
+            input_file: "stable.o".into(),
+            input: "stable.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let moved_target = RelocationTargetRecord {
+            input_file: "moved.o".into(),
+            input: "moved.o".into(),
+            section_index: 2,
+            section_offset: 0,
+        };
+        let mut state =
+            dormant_external_relocation_state(output.text_offset, 0x2000, stable_target.clone());
+        let moved_name: SharedText = hex::encode("_moved").into();
+        let mut moved = state.relocations[0].clone();
+        moved.target_symbol_id += 1;
+        moved.target_name = Some(moved_name.clone());
+        moved.relocation_offset += 4;
+        moved.output_offset += 4;
+        state.relocations.push(moved);
+        let mut moved_resolution = external_relocation_resolution(Some(0x3000), moved_target);
+        moved_resolution.name = moved_name;
+        let mut states = vec![state];
+        let unchanged = states.clone();
+        let reason = rematerialize_reactivated_macho_archive_relocations(
+            "archive.rlib",
+            &mut states,
+            &[
+                external_relocation_resolution(Some(0x2000), stable_target),
+                moved_resolution,
+            ],
+            &output.bytes,
+        )
+        .unwrap_err();
+        assert!(reason.contains("relocation fields overlap ambiguously"));
+        assert_eq!(states, unchanged);
     }
 
     #[test]
