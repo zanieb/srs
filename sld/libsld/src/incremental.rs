@@ -3472,6 +3472,21 @@ fn retained_macho_output_owner_mappings(
     Ok(Ok(mappings))
 }
 
+struct RetainedMachOTextTargetMoveOwnerMapping {
+    matched_section_index: Option<usize>,
+    mapping: MatchedPatchSection,
+}
+
+fn upsert_changed_patch_section(sections: &mut Vec<PatchSection>, section: PatchSection) {
+    if let Some(existing) = sections.iter_mut().find(|existing| {
+        existing.input == section.input && existing.section_index == section.section_index
+    }) {
+        *existing = section;
+    } else {
+        sections.push(section);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn retained_macho_text_target_move_owner_mappings(
     previous_bytes: &[u8],
@@ -3481,21 +3496,43 @@ fn retained_macho_text_target_move_owner_mappings(
     matched_sections: &[MatchedPatchSection],
     relocations: &[RelocationRecord],
     target_moves: &[MachORelocationTargetMove],
-) -> Result<std::result::Result<Vec<MatchedPatchSection>, String>> {
+    trace: &mut Vec<String>,
+) -> Result<std::result::Result<Vec<RetainedMachOTextTargetMoveOwnerMapping>, String>> {
+    trace.push(format!(
+        "pending moved Mach-O target sources: {}",
+        target_moves.len()
+    ));
     let mut candidates = HashSet::new();
     for target_move in target_moves {
         let Some(relocation) = relocations.get(target_move.relocation_index) else {
+            trace.push(format!(
+                "move {} rejected: missing relocation",
+                target_move.relocation_index
+            ));
             return Ok(Err(
                 "moved Mach-O target has no retained source relocation".to_owned()
             ));
         };
         if relocation.input_file != input_file_path {
+            trace.push(format!(
+                "move {} skipped: cross-input source {}",
+                target_move.relocation_index,
+                display_hex_path(&relocation.input_file).replace('\0', "\\0"),
+            ));
             continue;
         }
         let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+            trace.push(format!(
+                "move {} skipped: undecodable relocation kind {}",
+                target_move.relocation_index, relocation.kind,
+            ));
             continue;
         };
         if raw.r_type == object::macho::ARM64_RELOC_UNSIGNED {
+            trace.push(format!(
+                "move {} skipped: unsigned relocation",
+                target_move.relocation_index,
+            ));
             continue;
         }
         let Some(input_bytes) = current_resolver.resolve(
@@ -3504,16 +3541,27 @@ fn retained_macho_text_target_move_owner_mappings(
             PatchInputLookup::MatchArchiveMember,
         )?
         else {
+            trace.push(format!(
+                "move {} skipped: source input did not resolve",
+                target_move.relocation_index,
+            ));
             continue;
         };
         let current_input =
             resolved_patch_input_ref(input_file_path, relocation.input.as_str(), input_bytes)?;
+        trace.push(format!(
+            "move {} accepted candidate input {} section {} type {}",
+            target_move.relocation_index,
+            display_hex_path(&current_input).replace('\0', "\\0"),
+            relocation.section_index,
+            raw.r_type,
+        ));
         candidates.insert((current_input, relocation.section_index));
     }
 
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort_unstable();
-    let mut mappings = Vec::new();
+    let mut mappings = Vec::<RetainedMachOTextTargetMoveOwnerMapping>::new();
     for (current_input, section_index) in candidates {
         let Some(input_bytes) = current_resolver.resolve(
             input_file_path,
@@ -3521,25 +3569,84 @@ fn retained_macho_text_target_move_owner_mappings(
             PatchInputLookup::MatchArchiveMember,
         )?
         else {
+            trace.push(format!(
+                "candidate {} section {} rejected: current input did not resolve",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
             continue;
         };
         let Ok(current_file) = object::File::parse(input_bytes.bytes) else {
+            trace.push(format!(
+                "candidate {} section {} rejected: current input did not parse",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
             continue;
         };
         if !is_supported_incremental_macho_object(&current_file) {
+            trace.push(format!(
+                "candidate {} section {} rejected: unsupported current input",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
             continue;
         }
         let current_section = current_file
             .section_by_index(patch_section_object_index(&current_file, section_index)?)?;
         let object::SectionFlags::MachO { flags } = current_section.flags() else {
+            trace.push(format!(
+                "candidate {} section {} rejected: non-Mach-O section",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
             continue;
         };
         if current_section.segment_name_bytes().ok().flatten() != Some(b"__TEXT".as_slice())
             || current_section.name_bytes().ok() != Some(b"__text".as_slice())
             || flags & object::macho::SECTION_TYPE != object::macho::S_REGULAR
         {
+            trace.push(format!(
+                "candidate {} section {} rejected: not regular __TEXT,__text",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
             continue;
         }
+        let matching_records = section_records
+            .iter()
+            .filter(|record| {
+                record.input_file == input_file_path
+                    && record.section_index == section_index
+                    && (record.input == current_input
+                        || normalized_archive_input_refs_match(
+                            input_file_path,
+                            record.input.as_str(),
+                            &current_input,
+                        )
+                        .unwrap_or(false))
+            })
+            .count();
+        let matched_section_index = matched_sections.iter().position(|section| {
+            section.current.input == current_input && section.current.section_index == section_index
+        });
+        let already_claimed = matched_section_index.is_some();
+        trace.push(format!(
+            "candidate {} section {} proof inputs: records={} already-claimed={already_claimed}",
+            display_hex_path(&current_input).replace('\0', "\\0"),
+            section_index,
+            matching_records,
+        ));
+        let claimed_sections = matched_sections
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != matched_section_index)
+            .map(|(_, section)| section.clone())
+            .collect::<Vec<_>>();
+        let supplemental_sections = mappings
+            .iter()
+            .map(|mapping| mapping.mapping.clone())
+            .collect::<Vec<_>>();
         let mapping = match retained_macho_section_owner_mapping(
             previous_bytes,
             input_file_path,
@@ -3547,14 +3654,40 @@ fn retained_macho_text_target_move_owner_mappings(
             &current_file,
             section_index,
             section_records,
-            matched_sections,
-            &mappings,
+            &claimed_sections,
+            &supplemental_sections,
         )? {
             Ok(mapping) => mapping,
             Err(reason) => return Ok(Err(reason)),
         };
         if let Some(mapping) = mapping {
-            mappings.push(mapping);
+            if let Some(index) = matched_section_index {
+                let claimed = &matched_sections[index];
+                if mapping.current.input != claimed.current.input
+                    || mapping.current.section_index != claimed.current.section_index
+                    || mapping.current.output_offset != claimed.current.output_offset
+                    || mapping.current.output_size != claimed.current.output_size
+                {
+                    return Ok(Err(
+                        "moved Mach-O target source conflicts with claimed output owner".to_owned(),
+                    ));
+                }
+            }
+            trace.push(format!(
+                "candidate {} section {} recovered",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
+            mappings.push(RetainedMachOTextTargetMoveOwnerMapping {
+                matched_section_index,
+                mapping,
+            });
+        } else {
+            trace.push(format!(
+                "candidate {} section {} not recovered",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
         }
     }
     Ok(Ok(mappings))
@@ -6717,6 +6850,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     current_sections.push(mapping.current.clone());
                     matched_sections.push(mapping);
                 }
+                let mut target_move_owner_trace = Vec::new();
                 let mappings = match retained_macho_text_target_move_owner_mappings(
                     previous_bytes,
                     input.path.as_str(),
@@ -6725,16 +6859,26 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &matched_sections,
                     &previous.relocations,
                     &relocation_target_patches.macho_target_moves,
+                    &mut target_move_owner_trace,
                 )? {
                     Ok(mappings) => mappings,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 };
-                for mapping in mappings {
+                for entry in target_move_owner_trace {
+                    append_log(state_dir, &format!("moved-target owner trace: {entry}"))?;
+                }
+                for recovered in mappings {
+                    let mapping = recovered.mapping;
                     if let Some(changed_sections) = &mut matched_changed_sections {
-                        changed_sections.push(mapping.current.clone());
+                        upsert_changed_patch_section(changed_sections, mapping.current.clone());
                     }
-                    current_sections.push(mapping.current.clone());
-                    matched_sections.push(mapping);
+                    if let Some(index) = recovered.matched_section_index {
+                        current_sections[index] = mapping.current.clone();
+                        matched_sections[index] = mapping;
+                    } else {
+                        current_sections.push(mapping.current.clone());
+                        matched_sections.push(mapping);
+                    }
                 }
             }
             let mut macho_text_section_activation = if args.should_activate_macho_text_sections()
@@ -51009,7 +51153,10 @@ mod tests {
         let mut previous_builder = ar::Builder::new(Vec::new());
         previous_builder
             .append(
-                &ar::Header::new(b"unit.rcgu.o".to_vec(), previous_object.len() as u64),
+                &ar::Header::new(
+                    b"crate-hash.cgu.old.rcgu.o".to_vec(),
+                    previous_object.len() as u64,
+                ),
                 previous_object.as_slice(),
             )
             .unwrap();
@@ -51017,7 +51164,10 @@ mod tests {
         let mut current_builder = ar::Builder::new(Vec::new());
         current_builder
             .append(
-                &ar::Header::new(b"unit.rcgu.o".to_vec(), current_object.len() as u64),
+                &ar::Header::new(
+                    b"crate-hash.cgu.new.rcgu.o".to_vec(),
+                    current_object.len() as u64,
+                ),
                 current_object.as_slice(),
             )
             .unwrap();
@@ -51157,13 +51307,56 @@ mod tests {
             &[],
             &[relocation.clone()],
             &target_moves,
+            &mut Vec::new(),
         )
         .unwrap()
         .unwrap();
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].previous.input, previous_input);
-        assert_eq!(mappings[0].current.input, current_input);
-        assert_eq!(mappings[0].current.section_index, text_index);
+        assert_eq!(mappings[0].mapping.previous.input, previous_input);
+        assert_eq!(mappings[0].mapping.current.input, current_input);
+        assert_eq!(mappings[0].mapping.current.section_index, text_index);
+
+        let mut claimed = mappings[0].mapping.clone();
+        claimed.previous.input = current_input.clone();
+        let rebound = retained_macho_text_target_move_owner_mappings(
+            &previous,
+            &input_file_path,
+            &current_resolver,
+            &records,
+            std::slice::from_ref(&claimed),
+            std::slice::from_ref(&relocation),
+            &target_moves,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(rebound[0].matched_section_index, Some(0));
+        assert_eq!(rebound[0].mapping.previous.input, previous_input);
+        assert_eq!(rebound[0].mapping.current.input, current_input);
+        let mut changed_sections = vec![claimed.current.clone()];
+        changed_sections[0].data_hash = Some("raw-text-change".to_owned());
+        upsert_changed_patch_section(&mut changed_sections, rebound[0].mapping.current.clone());
+        assert_eq!(changed_sections.len(), 1);
+        assert_eq!(changed_sections[0].input, current_input);
+        assert_eq!(changed_sections[0].section_index, text_index);
+
+        claimed.current.output_offset += 4;
+        let conflicting = retained_macho_text_target_move_owner_mappings(
+            &previous,
+            &input_file_path,
+            &current_resolver,
+            &records,
+            &[claimed],
+            std::slice::from_ref(&relocation),
+            &target_moves,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let Err(reason) = conflicting else {
+            panic!("conflicting claimed output owner was accepted");
+        };
+        assert!(reason.contains("conflicts with claimed output owner"));
 
         assert!(
             retained_macho_text_target_move_owner_mappings(
@@ -51174,6 +51367,7 @@ mod tests {
                 &[],
                 std::slice::from_ref(&relocation),
                 &[],
+                &mut Vec::new(),
             )
             .unwrap()
             .unwrap()
@@ -51188,6 +51382,7 @@ mod tests {
             &[],
             std::slice::from_ref(&relocation),
             &target_moves,
+            &mut Vec::new(),
         )
         .unwrap();
         let Err(reason) = duplicate else {
@@ -51211,6 +51406,7 @@ mod tests {
                 &[],
                 &[relocation],
                 &target_moves,
+                &mut Vec::new(),
             )
             .unwrap()
             .unwrap()
