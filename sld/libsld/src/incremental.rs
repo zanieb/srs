@@ -601,6 +601,12 @@ struct RetiredMachOArchiveActivation {
     newly_tracked: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RetiredMachOArchiveStateRef {
+    input_index: usize,
+    state_index: usize,
+}
+
 impl std::ops::Deref for RetiredMachOArchiveActivation {
     type Target = MachOArchiveActivationState;
 
@@ -5871,6 +5877,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut deferred_loaded_input_content_hashes = Vec::new();
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
+    let mut newly_retired_macho_archive_states = Vec::new();
     let mut record_override_input_files = HashSet::new();
     let changed_input_files = changed_inputs
         .iter()
@@ -8592,7 +8599,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             }
         }
         for retired in &retired_macho_archive_activations {
-            let stored = macho_archive_members.iter_mut().find(|stored| {
+            let stored_index = macho_archive_members.iter().position(|stored| {
                 stored.active
                     && stored
                         .members
@@ -8603,8 +8610,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .iter()
                             .map(|member| member.normalized_identifier.as_slice()))
             });
-            if let Some(stored) = stored {
-                *stored = retired.state.clone();
+            let state_index = if let Some(stored_index) = stored_index {
+                macho_archive_members[stored_index] = retired.state.clone();
+                stored_index
             } else if retired.newly_tracked
                 && !macho_archive_members.iter().any(|stored| {
                     stored.members.iter().any(|stored_member| {
@@ -8616,11 +8624,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 })
             {
                 macho_archive_members.push(retired.state.clone());
+                macho_archive_members.len() - 1
             } else {
                 return Ok(ChangedInputPatchResult::Unsupported(
                     "removed Mach-O archive activation ownership changed".to_owned(),
                 ));
-            }
+            };
+            newly_retired_macho_archive_states.push(RetiredMachOArchiveStateRef {
+                input_index: *input_index,
+                state_index,
+            });
         }
         if let Some(activation) = &added_macho_archive_text_activation {
             for member in &activation.member_states {
@@ -9201,6 +9214,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         &mut expected_changed_inputs,
         deferred_loaded_input_content_hashes,
     )?;
+    if let Err(reason) = refresh_newly_retired_macho_archive_rollback_patches(
+        &mut previous.input_files,
+        &newly_retired_macho_archive_states,
+        &output,
+    ) {
+        return Ok(ChangedInputPatchResult::StartedUnsupported(reason));
+    }
 
     {
         timing_phase!("Flush changed incremental output ranges");
@@ -25122,6 +25142,57 @@ fn symbol_only_macho_archive_transaction_is_valid(
             .all(|ranges| ranges[0].end <= ranges[1].start))
 }
 
+fn symbol_only_macho_archive_transaction_has_exact_counterpart(
+    input_file_path: &str,
+    state: &MachOArchiveActivationState,
+    states: &[MachOArchiveActivationState],
+) -> Result<bool> {
+    if state
+        .forward_patches
+        .iter()
+        .any(|forward| forward.data.len() < std::mem::size_of::<u32>())
+    {
+        return Ok(false);
+    }
+    let canonical_rollback = state
+        .forward_patches
+        .iter()
+        .map(|forward| {
+            let mut rollback = forward.clone();
+            rollback.data[..std::mem::size_of::<u32>()].fill(0);
+            rollback
+        })
+        .collect::<Vec<_>>();
+    if !symbol_only_macho_archive_transaction_is_valid(
+        input_file_path,
+        &state.members,
+        &state.symbol_resolutions,
+        &state.forward_patches,
+        &canonical_rollback,
+    )? {
+        return Ok(false);
+    }
+
+    for (rollback, canonical) in state.rollback_patches.iter().zip(&canonical_rollback) {
+        if rollback == canonical {
+            continue;
+        }
+        let matching_counterpart = states
+            .iter()
+            .filter(|candidate| {
+                candidate.active != state.active
+                    && macho_archive_transaction_patches_match(candidate)
+            })
+            .flat_map(|candidate| &candidate.forward_patches)
+            .filter(|forward| *forward == rollback)
+            .count();
+        if matching_counterpart != 1 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn tracked_symbol_only_macho_archive_transaction_is_current(
     state: &MachOArchiveActivationState,
     current_resolutions: &[MachOSymbolResolutionRecord],
@@ -25146,6 +25217,114 @@ fn stored_output_patches_match(patches: &[StoredOutputPatch], output: &[u8]) -> 
                 .and_then(|end| output.get(start..end))
         }) == Some(patch.data.as_slice())
     })
+}
+
+fn refresh_newly_retired_macho_archive_rollback_patches(
+    input_files: &mut [FileState],
+    retired_states: &[RetiredMachOArchiveStateRef],
+    current_output: &[u8],
+) -> std::result::Result<(), String> {
+    let mut seen = HashSet::with_capacity(retired_states.len());
+    let mut updates = Vec::new();
+
+    for retired_ref in retired_states {
+        if !seen.insert(*retired_ref) {
+            return Err("newly retired Mach-O archive ownership is duplicated".to_owned());
+        }
+        let patch = input_files
+            .get(retired_ref.input_index)
+            .and_then(|input| input.patch.as_ref())
+            .ok_or_else(|| "newly retired Mach-O archive ownership is missing".to_owned())?;
+        let retired = patch
+            .macho_archive_members
+            .get(retired_ref.state_index)
+            .filter(|state| !state.active)
+            .ok_or_else(|| "newly retired Mach-O archive ownership changed".to_owned())?;
+        if !macho_archive_transaction_patches_match(retired) {
+            return Err("newly retired Mach-O archive transaction is incomplete".to_owned());
+        }
+
+        for (rollback_index, rollback) in retired.rollback_patches.iter().enumerate() {
+            let start = usize::try_from(rollback.output_offset)
+                .map_err(|_| "newly retired Mach-O rollback offset is too large".to_owned())?;
+            let end = start
+                .checked_add(rollback.data.len())
+                .ok_or_else(|| "newly retired Mach-O rollback range overflowed".to_owned())?;
+            let actual = current_output.get(start..end).ok_or_else(|| {
+                "newly retired Mach-O rollback range is outside output".to_owned()
+            })?;
+
+            let mut exact_replacement = None;
+            for active in patch
+                .macho_archive_members
+                .iter()
+                .filter(|state| state.active)
+            {
+                for forward in &active.forward_patches {
+                    let forward_start = usize::try_from(forward.output_offset).map_err(|_| {
+                        "active Mach-O archive replacement offset is too large".to_owned()
+                    })?;
+                    let forward_end =
+                        forward_start
+                            .checked_add(forward.data.len())
+                            .ok_or_else(|| {
+                                "active Mach-O archive replacement range overflowed".to_owned()
+                            })?;
+                    if start >= forward_end || forward_start >= end {
+                        continue;
+                    }
+                    if !macho_archive_transaction_patches_match(active) {
+                        return Err("active Mach-O archive replacement is incomplete".to_owned());
+                    }
+                    if start != forward_start || end != forward_end {
+                        return Err(
+                            "active Mach-O archive replacement partially shadows a newly retired rollback"
+                                .to_owned(),
+                        );
+                    }
+                    if exact_replacement.replace(forward.data.as_slice()).is_some() {
+                        return Err(
+                            "active Mach-O archive replacements ambiguously shadow a newly retired rollback"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+
+            match exact_replacement {
+                Some(replacement) if actual == replacement => updates.push((
+                    retired_ref.input_index,
+                    retired_ref.state_index,
+                    rollback_index,
+                    actual.to_vec(),
+                )),
+                Some(_) => {
+                    return Err(
+                        "active Mach-O archive replacement differs from finalized output"
+                            .to_owned(),
+                    );
+                }
+                None if actual == rollback.data => {}
+                None => {
+                    return Err(
+                        "newly retired Mach-O archive output changed without an exact replacement"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    for (input_index, state_index, rollback_index, data) in updates {
+        input_files[input_index]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members[state_index]
+            .rollback_patches[rollback_index]
+            .data = data;
+    }
+    Ok(())
 }
 
 fn initially_owned_macho_archive_removal_state(
@@ -40670,21 +40849,6 @@ fn parse_macho_archive_member_states(
                 "Incremental Mach-O archive transaction is incomplete"
             ));
         }
-        if kind == MachOArchiveActivationKind::AddedMembers
-            && sections.is_empty()
-            && (!relocation_records.relocations.is_empty()
-                || !symbol_only_macho_archive_transaction_is_valid(
-                    input_file,
-                    &members,
-                    &symbol_resolutions,
-                    &forward_patches,
-                    &rollback_patches,
-                )?)
-        {
-            return Err(crate::error!(
-                "Invalid incremental symbol-only Mach-O archive member state"
-            ));
-        }
         states.push(MachOArchiveActivationState {
             kind,
             members,
@@ -40696,6 +40860,25 @@ fn parse_macho_archive_member_states(
             forward_patches,
             rollback_patches,
         });
+    }
+    for state in &states {
+        if state.kind == MachOArchiveActivationKind::AddedMembers
+            && state.sections.is_empty()
+            && (!state.relocations.is_empty()
+                || (!symbol_only_macho_archive_transaction_is_valid(
+                    input_file,
+                    &state.members,
+                    &state.symbol_resolutions,
+                    &state.forward_patches,
+                    &state.rollback_patches,
+                )? && !symbol_only_macho_archive_transaction_has_exact_counterpart(
+                    input_file, state, &states,
+                )?))
+        {
+            return Err(crate::error!(
+                "Invalid incremental symbol-only Mach-O archive member state"
+            ));
+        }
     }
     Ok(states)
 }
@@ -63393,6 +63576,417 @@ mod tests {
             dormant_macho_archive_reactivation_indices(&retained, &[current_identifier.to_vec()],)
                 .unwrap(),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn newly_retired_macho_archive_nlist_rollback_snapshots_round_trip() {
+        let mut inputs = state("args", b"output", &[("libarchive.rlib", b"archive")]).input_files;
+        let input_file = inputs[0].path.clone();
+        let archive_input_ref = |member: &[u8]| {
+            let mut input = hex::decode(&input_file).unwrap();
+            input.push(0);
+            input.extend_from_slice(member);
+            input.push(0);
+            input.extend_from_slice(b"1:2");
+            hex::encode(input)
+        };
+        let archive_state =
+            |active, member: &[u8], forward: &[u8], rollback: &[u8]| MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: vec![MachOArchiveMemberIdentity {
+                    normalized_identifier: archive_member_patch_identifier(member),
+                    object_hash: "a".repeat(blake3::OUT_LEN * 2),
+                }],
+                active,
+                sections: vec![FilePatchSectionState {
+                    input: archive_input_ref(member),
+                    section_index: 1,
+                    section_name: Some("__TEXT,__text".to_owned()),
+                    input_size: 16,
+                    output_offset: 64,
+                    output_size: 16,
+                    data_hash: Some("section-hash".to_owned()),
+                    cstring_nul_boundaries_hash: None,
+                }],
+                relocations: Vec::new(),
+                symbol_resolutions: Vec::new(),
+                rollback_symbol_resolutions: Vec::new(),
+                forward_patches: vec![StoredOutputPatch {
+                    output_offset: 16,
+                    data: forward.to_vec(),
+                }],
+                rollback_patches: vec![StoredOutputPatch {
+                    output_offset: 16,
+                    data: rollback.to_vec(),
+                }],
+            };
+        let round_trip = |inputs: &mut [FileState]| {
+            let patch = inputs[0].patch.as_mut().unwrap();
+            let rendered = render_macho_archive_member_states(&patch.macho_archive_members);
+            patch.macho_archive_members =
+                parse_macho_archive_member_states(&input_file, &rendered).unwrap();
+        };
+        let nlist = |string_index: u32, value: u64| {
+            let mut entry =
+                vec![0; std::mem::size_of::<object::macho::Nlist64<object::Endianness>>()];
+            entry[..4].copy_from_slice(&string_index.to_le_bytes());
+            entry[4] = object::macho::N_SECT | object::macho::N_EXT;
+            entry[5] = 1;
+            entry[8..].copy_from_slice(&value.to_le_bytes());
+            entry
+        };
+        let a = nlist(11, 0x1000);
+        let b = nlist(22, 0x2000);
+        let mut empty = a.clone();
+        empty[..4].fill(0);
+        let stale = archive_state(false, b"stale", &nlist(33, 0x3000), &nlist(44, 0x4000));
+        let mut unrelated = archive_state(true, b"unrelated", &[9; 4], &[10; 4]);
+        unrelated.forward_patches.clear();
+        unrelated.rollback_patches.clear();
+        inputs[0].patch = Some(FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: vec![
+                archive_state(false, b"a", &a, &empty),
+                archive_state(true, b"b", &b, &empty),
+                stale.clone(),
+                unrelated,
+            ],
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+        let retired_a = [RetiredMachOArchiveStateRef {
+            input_index: 0,
+            state_index: 0,
+        }];
+        let mut output = vec![0; 48];
+        output[16..32].copy_from_slice(&b);
+
+        refresh_newly_retired_macho_archive_rollback_patches(&mut inputs, &retired_a, &output)
+            .unwrap();
+        round_trip(&mut inputs);
+        let members = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
+        assert_eq!(members[0].rollback_patches[0].data, b);
+        assert_eq!(members[2], stale, "an older dormant state was refreshed");
+
+        members[0].active = true;
+        members[1].active = false;
+        output[16..32].copy_from_slice(&a);
+        refresh_newly_retired_macho_archive_rollback_patches(
+            &mut inputs,
+            &[RetiredMachOArchiveStateRef {
+                input_index: 0,
+                state_index: 1,
+            }],
+            &output,
+        )
+        .unwrap();
+        round_trip(&mut inputs);
+        let members = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
+        assert_eq!(members[1].rollback_patches[0].data, a);
+
+        members[0].active = false;
+        members[1].active = true;
+        output[16..32].copy_from_slice(&b);
+        refresh_newly_retired_macho_archive_rollback_patches(&mut inputs, &retired_a, &output)
+            .unwrap();
+        round_trip(&mut inputs);
+        assert_eq!(
+            inputs[0].patch.as_ref().unwrap().macho_archive_members[0].rollback_patches[0].data,
+            b,
+        );
+    }
+
+    #[test]
+    fn symbol_only_macho_archive_rollback_requires_one_active_replacement() {
+        let input_file = hex::encode("libarchive.rlib");
+        let input_ref = |member: &[u8]| {
+            let mut input = hex::decode(&input_file).unwrap();
+            input.push(0);
+            input.extend_from_slice(member);
+            input.push(0);
+            input.extend_from_slice(b"1:2");
+            hex::encode(input)
+        };
+        let nlist = |string_index: u32, value: u64| {
+            let mut entry =
+                vec![0; std::mem::size_of::<object::macho::Nlist64<object::Endianness>>()];
+            entry[..4].copy_from_slice(&string_index.to_le_bytes());
+            entry[4] = object::macho::N_SECT | object::macho::N_EXT;
+            entry[5] = 2;
+            entry[8..].copy_from_slice(&value.to_le_bytes());
+            entry
+        };
+        let old_member = b"crate.old.rcgu.o";
+        let new_member = b"crate.new.rcgu.o";
+        let old_forward = nlist(11, 0x1000);
+        let mut old_canonical_rollback = old_forward.clone();
+        old_canonical_rollback[..4].fill(0);
+        let new_forward = nlist(22, 0x2000);
+        let mut new_rollback = new_forward.clone();
+        new_rollback[..4].fill(0);
+        let dormant = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: vec![MachOArchiveMemberIdentity {
+                normalized_identifier: archive_member_patch_identifier(old_member),
+                object_hash: "a".repeat(blake3::OUT_LEN * 2),
+            }],
+            active: false,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: vec![MachOSymbolResolutionRecord {
+                name: hex::encode("_old").into(),
+                direct_value: Some(0x1000),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(RelocationTargetRecord {
+                    input_file: input_file.clone().into(),
+                    input: input_ref(old_member).into(),
+                    section_index: 1,
+                    section_offset: 0,
+                }),
+            }],
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 16,
+                data: old_forward.clone(),
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 16,
+                data: old_canonical_rollback,
+            }],
+        };
+        let active = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: vec![MachOArchiveMemberIdentity {
+                normalized_identifier: archive_member_patch_identifier(new_member),
+                object_hash: "b".repeat(blake3::OUT_LEN * 2),
+            }],
+            active: true,
+            sections: vec![FilePatchSectionState {
+                input: input_ref(new_member),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 4,
+                output_offset: 64,
+                output_size: 4,
+                data_hash: Some("section-hash".to_owned()),
+                cstring_nul_boundaries_hash: None,
+            }],
+            relocations: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 16,
+                data: new_forward.clone(),
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 16,
+                data: new_rollback,
+            }],
+        };
+        let mut inputs = state("args", b"output", &[("libarchive.rlib", b"archive")]).input_files;
+        inputs[0].patch = Some(FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: vec![dormant, active],
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+        let mut output = vec![0; 48];
+        output[16..32].copy_from_slice(&new_forward);
+
+        refresh_newly_retired_macho_archive_rollback_patches(
+            &mut inputs,
+            &[RetiredMachOArchiveStateRef {
+                input_index: 0,
+                state_index: 0,
+            }],
+            &output,
+        )
+        .unwrap();
+        let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
+        let rendered = render_macho_archive_member_states(states);
+        assert_eq!(
+            parse_macho_archive_member_states(&input_file, &rendered).unwrap(),
+            *states,
+        );
+
+        let mut missing_active = states.clone();
+        missing_active[1].active = false;
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&missing_active),
+            )
+            .is_err()
+        );
+        let mut duplicate_active = states.clone();
+        let mut duplicate = duplicate_active[1].clone();
+        duplicate.members[0].normalized_identifier = b"duplicate".to_vec();
+        duplicate.sections[0].input = input_ref(b"duplicate");
+        duplicate_active.push(duplicate);
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&duplicate_active),
+            )
+            .is_err()
+        );
+        let mut tampered = states.clone();
+        tampered[1].forward_patches[0].data[0] ^= 1;
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&tampered),
+            )
+            .is_err()
+        );
+
+        let states = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
+        states[0].active = true;
+        states[1].active = false;
+        output[16..32].copy_from_slice(&old_forward);
+        refresh_newly_retired_macho_archive_rollback_patches(
+            &mut inputs,
+            &[RetiredMachOArchiveStateRef {
+                input_index: 0,
+                state_index: 1,
+            }],
+            &output,
+        )
+        .unwrap();
+        let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
+        let rendered = render_macho_archive_member_states(states);
+        assert_eq!(
+            parse_macho_archive_member_states(&input_file, &rendered).unwrap(),
+            *states,
+        );
+
+        let states = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
+        states[0].active = false;
+        states[1].active = true;
+        output[16..32].copy_from_slice(&new_forward);
+        refresh_newly_retired_macho_archive_rollback_patches(
+            &mut inputs,
+            &[RetiredMachOArchiveStateRef {
+                input_index: 0,
+                state_index: 0,
+            }],
+            &output,
+        )
+        .unwrap();
+        let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
+        let rendered = render_macho_archive_member_states(states);
+        assert_eq!(
+            parse_macho_archive_member_states(&input_file, &rendered).unwrap(),
+            *states,
+        );
+    }
+
+    #[test]
+    fn newly_retired_macho_archive_rollback_refresh_is_atomic_and_exact() {
+        let archive_state = |active, member: &[u8], offset, forward: &[u8], rollback: &[u8]| {
+            MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: vec![MachOArchiveMemberIdentity {
+                    normalized_identifier: member.to_vec(),
+                    object_hash: "a".repeat(blake3::OUT_LEN * 2),
+                }],
+                active,
+                sections: Vec::new(),
+                relocations: Vec::new(),
+                symbol_resolutions: Vec::new(),
+                rollback_symbol_resolutions: Vec::new(),
+                forward_patches: vec![StoredOutputPatch {
+                    output_offset: offset,
+                    data: forward.to_vec(),
+                }],
+                rollback_patches: vec![StoredOutputPatch {
+                    output_offset: offset,
+                    data: rollback.to_vec(),
+                }],
+            }
+        };
+        let retired_ref = [RetiredMachOArchiveStateRef {
+            input_index: 0,
+            state_index: 0,
+        }];
+        let input_files = |replacement_offset| {
+            let mut inputs =
+                state("args", b"output", &[("libarchive.rlib", b"archive")]).input_files;
+            inputs[0].patch = Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: vec![
+                    archive_state(false, b"retired", 16, &[1, 2, 3, 4], &[0; 4]),
+                    archive_state(
+                        true,
+                        b"replacement",
+                        replacement_offset,
+                        &[5, 6, 7, 8],
+                        &[0; 4],
+                    ),
+                ],
+                sections: Vec::new(),
+                raw_sections: None,
+            });
+            inputs
+        };
+
+        let mut tampered = input_files(16);
+        let original = tampered.clone();
+        let mut output = vec![0; 32];
+        output[16..20].copy_from_slice(&[5, 6, 7, 9]);
+        assert!(
+            refresh_newly_retired_macho_archive_rollback_patches(
+                &mut tampered,
+                &retired_ref,
+                &output,
+            )
+            .unwrap_err()
+            .contains("differs from finalized output")
+        );
+        assert_eq!(
+            tampered, original,
+            "a failed refresh changed persisted state"
+        );
+
+        let mut partial = input_files(18);
+        let original = partial.clone();
+        assert!(
+            refresh_newly_retired_macho_archive_rollback_patches(
+                &mut partial,
+                &retired_ref,
+                &output,
+            )
+            .unwrap_err()
+            .contains("partially shadows")
+        );
+        assert_eq!(
+            partial, original,
+            "a partial shadow changed persisted state"
+        );
+
+        let mut stale = input_files(24);
+        let original = stale.clone();
+        assert!(
+            refresh_newly_retired_macho_archive_rollback_patches(
+                &mut stale,
+                &retired_ref,
+                &output,
+            )
+            .unwrap_err()
+            .contains("without an exact replacement")
+        );
+        assert_eq!(
+            stale, original,
+            "an unexplained change updated the snapshot"
         );
     }
 
