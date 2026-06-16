@@ -30088,7 +30088,30 @@ fn archive_diff_allows_changed_macho_unwind(
         ignored_migrated_definitions,
         &current_local_retargets,
     )?;
-    if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
+    let archive_migrated_definitions_are_unique = if ignored_migrated_definitions.is_empty() {
+        true
+    } else {
+        let previous_counts = archive_macho_defined_symbol_counts(
+            previous_bytes,
+            ignored_previous_identifiers,
+            ignored_migrated_definitions,
+        )?;
+        let current_counts = archive_macho_defined_symbol_counts(
+            current_bytes,
+            ignored_current_identifiers,
+            ignored_migrated_definitions,
+        )?;
+        match (previous_counts, current_counts) {
+            (Some(previous), Some(current)) => ignored_migrated_definitions.iter().all(|name| {
+                previous.get(name) == Some(&1) && current.get(name) == Some(&1)
+            }),
+            _ => false,
+        }
+    };
+    if archive_migrated_definitions_are_unique
+        && previous_fingerprint.is_some()
+        && previous_fingerprint == current_fingerprint
+    {
         return Ok(true);
     }
     if ignored_migrated_definitions.is_empty()
@@ -60935,6 +60958,299 @@ mod tests {
     }
 
     #[test]
+    fn changed_archive_unwind_activation_composes_with_resolution_migration() {
+        let add_migrated_definition = |mut object: Vec<u8>| {
+            let file = object::File::parse(object.as_slice()).unwrap();
+            let text = file.section_by_name("__text").unwrap();
+            let text_section = u8::try_from(text.index().0).unwrap();
+            let text_value = text.address();
+            drop(file);
+            object = add_test_macho_local_alias(
+                object,
+                b"_migrated",
+                text_section,
+                text_value,
+            );
+            let entry = test_macho_symbol_entry_offset(&object, b"_migrated");
+            object[entry + 4] |= object::macho::N_EXT;
+            object
+        };
+        let retire_migrated_definition = |object: Vec<u8>| {
+            let file = object::File::parse(object.as_slice()).unwrap();
+            let symbol_index = file
+                .symbols()
+                .find(|symbol| symbol.name_bytes().ok() == Some(b"_migrated"))
+                .unwrap()
+                .index()
+                .0;
+            retire_test_macho_symbol(object, symbol_index)
+        };
+        let replace_unwind_length =
+            |mut object: Vec<u8>, previous_length: u32, current_length: u32| {
+                let (compact_length_offset, eh_frame_length_offset, text_offset) = {
+                    let file = object::File::parse(object.as_slice()).unwrap();
+                    let compact = file.section_by_name("__compact_unwind").unwrap();
+                    let eh_frame = file.section_by_name("__eh_frame").unwrap();
+                    let (compact_offset, _) = compact.file_range().unwrap();
+                    let (eh_frame_offset, _) = eh_frame.file_range().unwrap();
+                    let compact_length = compact
+                        .data()
+                        .unwrap()
+                        .windows(4)
+                        .position(|bytes| bytes == previous_length.to_le_bytes())
+                        .unwrap();
+                    let eh_frame_length = eh_frame
+                        .data()
+                        .unwrap()
+                        .windows(8)
+                        .position(|bytes| bytes == u64::from(previous_length).to_le_bytes())
+                        .unwrap();
+                    (
+                        compact_offset as usize + compact_length,
+                        eh_frame_offset as usize + eh_frame_length,
+                        file.section_by_name("__text")
+                            .unwrap()
+                            .file_range()
+                            .unwrap()
+                            .0 as usize,
+                    )
+                };
+                object[compact_length_offset..compact_length_offset + 4]
+                    .copy_from_slice(&current_length.to_le_bytes());
+                object[eh_frame_length_offset..eh_frame_length_offset + 8]
+                    .copy_from_slice(&u64::from(current_length).to_le_bytes());
+                object[text_offset] ^= 1;
+                object
+            };
+
+        let previous_defined =
+            add_migrated_definition(test_observed_049_macho_unwind_object(false));
+        let previous_retired = retire_migrated_definition(previous_defined.clone());
+        let current_changed = retire_migrated_definition(replace_unwind_length(
+            previous_defined.clone(),
+            0x258,
+            0x250,
+        ));
+        let input_file_path = hex::encode("input.rlib");
+        let source_identifier = b"crate.source.rcgu.o";
+        let destination_identifier = b"crate.destination.rcgu.o";
+        let archive = |source: &[u8], destination: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, member) in [
+                (source_identifier.as_slice(), source),
+                (destination_identifier.as_slice(), destination),
+            ] {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), member.len() as u64),
+                        member,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let previous_archive = archive(&previous_defined, &previous_retired);
+        let current_archive = archive(&current_changed, &previous_defined);
+        let input_ref = |bytes: &[u8], identifier: &[u8]| {
+            let ArchiveMemberMatch::Unique(member) =
+                patch_archive_member_bytes(bytes, identifier).unwrap()
+            else {
+                panic!("expected one archive member");
+            };
+            resolved_patch_input_ref(&input_file_path, &input_file_path, member).unwrap()
+        };
+        let previous_source = input_ref(&previous_archive, source_identifier);
+        let previous_destination = input_ref(&previous_archive, destination_identifier);
+        let current_source = input_ref(&current_archive, source_identifier);
+        let current_destination = input_ref(&current_archive, destination_identifier);
+        let previous_file = object::File::parse(previous_defined.as_slice()).unwrap();
+        let current_file = object::File::parse(current_changed.as_slice()).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+
+        let mut output = test_macho_unwind_output(0x1000);
+        let (previous_member, mut previous_sections) = test_added_macho_unwind_member(false);
+        previous_sections[0].output_offset = output.text_offset + 0x100;
+        let mut reserves = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+            alignment_exponent: 3,
+            output_offset: output.eh_frame_offset,
+            size: output.eh_frame_size,
+        }];
+        let initial = {
+            let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+            added_macho_archive_unwind_activation(
+                std::slice::from_ref(&previous_member),
+                &[0],
+                &previous_sections,
+                &output_file,
+                &[],
+                &[],
+                &mut reserves,
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        };
+        apply_test_section_patches(&mut output.bytes, &initial.patches);
+
+        let section = |input: String, output_offset: u64, current: bool| {
+            let (file, text) = if current {
+                (&current_file, &current_text)
+            } else {
+                (&previous_file, &previous_text)
+            };
+            PatchSection {
+                input,
+                section_index: patch_section_record_index(file, text.index()).unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            }
+        };
+        let matched = vec![
+            MatchedPatchSection {
+                previous: section(previous_source.clone(), output.text_offset + 0x100, false),
+                current: section(current_source, output.text_offset + 0x100, true),
+            },
+            MatchedPatchSection {
+                previous: section(
+                    previous_destination,
+                    output.text_offset + 0x200,
+                    false,
+                ),
+                current: section(
+                    current_destination.clone(),
+                    output.text_offset + 0x200,
+                    false,
+                ),
+            },
+        ];
+        let current_sections = matched
+            .iter()
+            .map(|section| section.current.clone())
+            .collect::<Vec<_>>();
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let previous_value = macho_output_address_for_file_offset(
+            &output_file,
+            output.text_offset + 0x100,
+        )
+        .unwrap();
+        let input = state(
+            "args",
+            &output.bytes,
+            &[("input.rlib", &previous_archive)],
+        )
+        .input_files
+        .remove(0);
+        assert_eq!(input.path, input_file_path);
+        let mut resolutions = vec![MachOSymbolResolutionRecord {
+            name: hex::encode("_migrated").into(),
+            direct_value: Some(previous_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input.path.clone().into(),
+                input: previous_source.into(),
+                section_index: relocation_target_record_index(previous_text.index()).unwrap(),
+                section_offset: 0,
+            }),
+        }];
+        let updates = update_macho_symbol_resolutions_for_input(
+            &mut resolutions,
+            &input,
+            &current_archive,
+            false,
+            Some((&matched, &output.bytes)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updates.moves.len(), 1);
+        assert_eq!(
+            updates.moves[0].current_target.input.as_str(),
+            current_destination,
+        );
+        let migrated =
+            migrated_macho_archive_definition_names(&input.path, &updates.moves).unwrap();
+        assert_eq!(migrated, HashSet::from([b"_migrated".to_vec()]));
+        let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+
+        let without_migration = changed_macho_archive_unwind_activation(
+            &previous_archive,
+            &current_archive,
+            &input.path,
+            &matched,
+            &[],
+            &current_sections,
+            &current_resolver,
+            &output.bytes,
+            &resolutions,
+            &reserves,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            &HashSet::new(),
+            &[],
+        )
+        .unwrap();
+        assert!(without_migration.is_err());
+        let activation = changed_macho_archive_unwind_activation(
+            &previous_archive,
+            &current_archive,
+            &input.path,
+            &matched,
+            &[],
+            &current_sections,
+            &current_resolver,
+            &output.bytes,
+            &resolutions,
+            &reserves,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            &migrated,
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(activation.patches.len(), 2);
+
+        let mut unrelated_source = current_changed;
+        unrelated_source[24] ^= 1;
+        let unrelated_archive = archive(&unrelated_source, &previous_defined);
+        let unrelated = changed_macho_archive_unwind_activation(
+            &previous_archive,
+            &unrelated_archive,
+            &input.path,
+            &matched,
+            &[],
+            &current_sections,
+            &PatchInputResolver::new(&unrelated_archive, true).unwrap(),
+            &output.bytes,
+            &resolutions,
+            &reserves,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            &migrated,
+            &[],
+        )
+        .unwrap();
+        assert!(unrelated.is_err());
+    }
+
+    #[test]
     fn added_macho_archive_unwind_activation_advances_terminator_and_rolls_back() {
         let (mut member, mut sections) = test_added_macho_unwind_member(false);
         let compact = member
@@ -64813,6 +65129,64 @@ mod tests {
                 &[],
             )
             .unwrap(),
+        );
+
+        let archive_with_duplicate = |source: &[u8], destination: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, member) in [
+                (source_identifier.as_slice(), source),
+                (destination_identifier.as_slice(), destination),
+                (b"crate.duplicate.rcgu.o".as_slice(), defined.as_slice()),
+            ] {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), member.len() as u64),
+                        member,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let duplicate_previous = archive_with_duplicate(&defined, &retired);
+        let duplicate_current = archive_with_duplicate(&retired, &defined);
+        let previous_source = input_ref(&duplicate_previous, source_identifier);
+        let previous_destination = input_ref(&duplicate_previous, destination_identifier);
+        let current_source = input_ref(&duplicate_current, source_identifier);
+        let current_destination = input_ref(&duplicate_current, destination_identifier);
+        let duplicate_matched = vec![
+            MatchedPatchSection {
+                previous: section(previous_source.clone()),
+                current: section(current_source),
+            },
+            MatchedPatchSection {
+                previous: section(previous_destination),
+                current: section(current_destination.clone()),
+            },
+        ];
+        let duplicate_move = MachOSymbolResolutionMove {
+            name: hex::encode("_text").into(),
+            previous_value: 0x1000,
+            current_value: 0x2000,
+            previous_target: target(previous_source),
+            current_target: target(current_destination),
+        };
+        let duplicate_migrated =
+            migrated_macho_archive_definition_names(&input_file, &[duplicate_move]).unwrap();
+        assert!(
+            !archive_diff_allows_changed_macho_unwind(
+                &duplicate_previous,
+                &duplicate_current,
+                &input_file,
+                &duplicate_matched,
+                &PatchInputResolver::new(&duplicate_current, true).unwrap(),
+                &changed,
+                &[],
+                &[],
+                &duplicate_migrated,
+                &[],
+            )
+            .unwrap(),
+            "a name-wide migration exception requires one exact definition per archive",
         );
     }
 
