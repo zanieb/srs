@@ -19288,6 +19288,16 @@ fn published_macho_local_symbol_sources_changed(
             return Ok(true);
         }
     }
+    let published_sites = published
+        .iter()
+        .map(|entry| entry.output_offset)
+        .collect::<HashSet<_>>();
+    if current.iter().any(|entry| {
+        !published_names.contains(entry.name.as_slice())
+            && published_sites.contains(&entry.output_offset)
+    }) {
+        return Ok(true);
+    }
     let metadata = |entry: &MachOLocalSymbolCohortSourceEntry| {
         let scope = match entry.scope {
             object::SymbolScope::Unknown => 0,
@@ -19359,7 +19369,14 @@ fn changed_macho_local_symbol_cohort_plan(
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
     };
-    let supplemental_changed = previous_supplemental != current_supplemental;
+    let supplemental_changed = match published_macho_local_symbol_sources_changed(
+        &[],
+        &previous_supplemental,
+        &current_supplemental,
+    ) {
+        Ok(changed) => changed,
+        Err(reason) => return Ok(Err(reason)),
+    };
     let published = match previous_output_published_macho_local_symbol_sources(
         previous_output,
         output_file,
@@ -20131,11 +20148,14 @@ fn macho_text_relocation_target_candidates(
     resolutions: &[MachOSymbolResolutionRecord],
     resolution_lookup: &MachOSymbolResolutionLookup<'_>,
     target_name: Option<&str>,
+    target_is_global: bool,
     r_type: u8,
     target_value: u64,
     previous_applied_target_values: &[u64],
 ) -> Vec<u64> {
-    let resolution = target_name.and_then(|name| resolution_lookup.get_encoded(resolutions, name));
+    let resolution = target_is_global
+        .then(|| target_name.and_then(|name| resolution_lookup.get_encoded(resolutions, name)))
+        .flatten();
     macho_text_relocation_target_candidates_for_resolution(
         resolution,
         r_type,
@@ -20504,9 +20524,11 @@ fn rematerialized_macho_text_relocation_replay(
             if !name.is_empty() {
                 target_name = Some(SharedText::from(hex::encode(&name)));
                 target_is_global = symbol.is_global();
-                resolution = resolution_lookup.get_name(resolutions, &name).or_else(|| {
-                    macho_symbol_resolution_for_name(retained_output_resolutions, &name)
-                });
+                if target_is_global {
+                    resolution = resolution_lookup.get_name(resolutions, &name).or_else(|| {
+                        macho_symbol_resolution_for_name(retained_output_resolutions, &name)
+                    });
+                }
             }
             if let Some(section_index) = symbol.section_index() {
                 let section = current_file.section_by_index(section_index)?;
@@ -21831,13 +21853,18 @@ fn macho_text_relocation_replays_for_input(
                     resolutions,
                     &resolution_lookup,
                     replay_target_name.as_deref(),
+                    current_target_is_global,
                     raw_relocation.r_type,
                     current_target_value,
                     &previous_applied_target_values,
                 );
-                let current_resolution = replay_target_name
-                    .as_deref()
-                    .and_then(|name| resolution_lookup.get_encoded(resolutions, name));
+                let current_resolution = current_target_is_global
+                    .then(|| {
+                        replay_target_name
+                            .as_deref()
+                            .and_then(|name| resolution_lookup.get_encoded(resolutions, name))
+                    })
+                    .flatten();
 
                 replays.push(MachOTextRelocationReplay {
                     relocation_index: Some(relocation_index),
@@ -33877,13 +33904,18 @@ fn added_macho_archive_text_relocation_replays(
                 resolutions,
                 &resolution_lookup,
                 target_name.as_deref(),
+                target_is_global,
                 context.r_type,
                 current_target_value,
                 &recorded_target_candidates,
             );
-            let current_resolution = target_name
-                .as_deref()
-                .and_then(|name| resolution_lookup.get_encoded(resolutions, name));
+            let current_resolution = target_is_global
+                .then(|| {
+                    target_name
+                        .as_deref()
+                        .and_then(|name| resolution_lookup.get_encoded(resolutions, name))
+                })
+                .flatten();
             let target_symbol_id = relocations
                 .iter()
                 .find(|relocation| {
@@ -52924,10 +52956,21 @@ mod tests {
         assert!(
             !published_macho_local_symbol_sources_changed(&published, &previous, &current).unwrap()
         );
+        assert!(
+            !published_macho_local_symbol_sources_changed(&[], &previous[1..], &current[1..])
+                .unwrap(),
+            "unpublished supplemental position churn must not force planning",
+        );
 
         let renamed = [entry(b"published", 8), entry(b"renamed", 12)];
         assert!(
             !published_macho_local_symbol_sources_changed(&published, &previous, &renamed).unwrap()
+        );
+
+        let colliding = [entry(b"published", 8), entry(b"stripped", 8)];
+        assert!(
+            published_macho_local_symbol_sources_changed(&published, &previous, &colliding)
+                .unwrap()
         );
 
         let moved_published = [entry(b"published", 28), entry(b"stripped", 12)];
@@ -65296,6 +65339,7 @@ mod tests {
                 &resolutions,
                 &lookup,
                 Some(target_name.as_str()),
+                true,
                 object::macho::ARM64_RELOC_BRANCH26,
                 0x1000,
                 &[0x4000],
@@ -65307,11 +65351,25 @@ mod tests {
                 &resolutions,
                 &lookup,
                 Some(target_name.as_str()),
+                true,
                 object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
                 0x1000,
                 &[],
             ),
             vec![0x1800]
+        );
+        assert_eq!(
+            macho_text_relocation_target_candidates(
+                &resolutions,
+                &lookup,
+                Some(target_name.as_str()),
+                false,
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                0x1000,
+                &[],
+            ),
+            vec![0x1000],
+            "a local target must not inherit a same-name global GOT",
         );
     }
 
@@ -65324,6 +65382,7 @@ mod tests {
             &[],
             &MachOSymbolResolutionLookup::new(&[]),
             Some(&hex::encode("_Unwind_Resume")),
+            true,
             object::macho::ARM64_RELOC_BRANCH26,
             direct_target,
             &[recorded_stub],
@@ -65360,6 +65419,7 @@ mod tests {
             &[],
             &MachOSymbolResolutionLookup::new(&[]),
             Some(&hex::encode("_target")),
+            true,
             object::macho::ARM64_RELOC_BRANCH26,
             0x1000_1000,
             &[0x1000_1000],
@@ -65410,6 +65470,7 @@ mod tests {
             &[],
             &MachOSymbolResolutionLookup::new(&[]),
             Some(target_name.as_str()),
+            true,
             object::macho::ARM64_RELOC_BRANCH26,
             0,
             &recorded,
@@ -66422,6 +66483,7 @@ mod tests {
             &[],
             &MachOSymbolResolutionLookup::new(&[]),
             Some(target_name.as_str()),
+            true,
             object::macho::ARM64_RELOC_BRANCH26,
             target_value,
             &recorded,

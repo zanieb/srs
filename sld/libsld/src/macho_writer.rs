@@ -719,6 +719,7 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::RelocationKind;
     use super::UNWIND_ARM64_MODE_DWARF;
     use super::UNWIND_HAS_LSDA;
     use super::UnwindInfoEntry;
@@ -728,6 +729,7 @@ mod tests {
     use super::compact_unwind_dwarf_offset_hint;
     use super::compact_unwind_section_addend;
     use super::encode_chained_rebase;
+    use super::macho_relocation_target_value;
     use super::parse_macho_unwind_info;
     use super::path_matches_library;
     use super::read_u32;
@@ -767,6 +769,35 @@ mod tests {
             b"/usr/lib/libcompression.dylib",
             b"libc",
         ));
+    }
+
+    #[test]
+    fn direct_got_relaxation_applies_paired_addend_once() {
+        let target = 0x1000;
+        let addend = 0x28;
+        let raw_value = target + addend;
+        assert_eq!(
+            macho_relocation_target_value(
+                raw_value,
+                None,
+                None,
+                RelocationKind::Got,
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+                addend as i64,
+            ),
+            raw_value,
+        );
+        assert_eq!(
+            macho_relocation_target_value(
+                raw_value,
+                Some(0x2000),
+                None,
+                RelocationKind::Got,
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+                addend as i64,
+            ),
+            0x2000 + addend,
+        );
     }
 
     #[test]
@@ -1988,6 +2019,34 @@ fn read_relocation_addend(out: &[u8], offset: usize, size: RelocationSize) -> Re
     Ok(u64::from_le_bytes(value))
 }
 
+fn macho_relocation_target_value(
+    raw_value: u64,
+    got_address: Option<u64>,
+    stub_address: Option<u64>,
+    kind: RelocationKind,
+    r_type: u8,
+    paired_addend: i64,
+) -> u64 {
+    let uses_tlv_got = matches!(
+        r_type,
+        macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) && got_address.is_some();
+    match kind {
+        RelocationKind::Got | RelocationKind::GotRelative => got_address
+            .map_or(raw_value, |address| {
+                address.wrapping_add(paired_addend as u64)
+            }),
+        RelocationKind::Relative if uses_tlv_got => got_address.unwrap_or(raw_value),
+        RelocationKind::PltRelative => stub_address.unwrap_or(raw_value),
+        RelocationKind::Relative
+            if r_type == macho::ARM64_RELOC_BRANCH26 && stub_address.is_some() =>
+        {
+            stub_address.unwrap_or(raw_value)
+        }
+        _ => raw_value,
+    }
+}
+
 #[inline(always)]
 fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
@@ -2035,28 +2094,20 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         rel.r_type,
         macho::ARM64_RELOC_TLVP_LOAD_PAGE21 | macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
     ) && resolution.format_specific.got_address.is_some();
-    let target_value = match rel_info.kind {
-        RelocationKind::Got | RelocationKind::GotRelative => resolution
+    let target_value = macho_relocation_target_value(
+        raw_value,
+        resolution
             .format_specific
             .got_address
-            .map_or(raw_value, |address| address.get())
-            .wrapping_add(paired_addend as u64),
-        RelocationKind::Relative if uses_tlv_got => resolution
-            .format_specific
-            .got_address
-            .map_or(raw_value, |address| address.get()),
-        RelocationKind::PltRelative => resolution
+            .map(|address| address.get()),
+        resolution
             .format_specific
             .stub_address
-            .map_or(raw_value, |address| address.get()),
-        RelocationKind::Relative
-            if rel.r_type == macho::ARM64_RELOC_BRANCH26
-                && resolution.format_specific.stub_address.is_some() =>
-        {
-            resolution.format_specific.stub_address.unwrap().get()
-        }
-        _ => raw_value,
-    };
+            .map(|address| address.get()),
+        rel_info.kind,
+        rel.r_type,
+        paired_addend,
+    );
 
     let target_name = || {
         local_symbol_id.map_or_else(
