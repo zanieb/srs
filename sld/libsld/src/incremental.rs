@@ -3781,6 +3781,7 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
     let mut reusable_branch_targets = Vec::new();
     let mut retiring_names = Vec::new();
     let mut section_mappings = Vec::<MatchedPatchSection>::new();
+    let mut symbol_bindings = HashMap::new();
     let mut changed = false;
     let mut requested_names = Vec::new();
     for resolution in resolutions.iter() {
@@ -3908,6 +3909,12 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
                 ));
             }
         };
+        let Some(binding) = current.macho_binding else {
+            return Ok(Err(
+                "Mach-O symbol catalog target has no nlist binding metadata".to_owned(),
+            ));
+        };
+        symbol_bindings.insert(resolution.name.clone(), binding);
         let current_section = indexed_input.file.section_by_index(current.section_index)?;
         if current.section_offset >= current_section.size() {
             return Ok(Err(format!(
@@ -4133,6 +4140,7 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
         reusable_branch_targets,
         retiring_names,
         section_mappings,
+        symbol_bindings,
         changed,
     }))
 }
@@ -4699,6 +4707,22 @@ fn finalize_retired_macho_archive_symbol_resolutions(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MachOSymbolBindingMetadata {
+    n_type: u8,
+    n_desc: u16,
+}
+
+fn macho_symbol_binding_metadata(entry: &[u8]) -> Option<MachOSymbolBindingMetadata> {
+    if entry.len() != std::mem::size_of::<object::macho::Nlist64<object::Endianness>>() {
+        return None;
+    }
+    Some(MachOSymbolBindingMetadata {
+        n_type: entry[4],
+        n_desc: read_u16_le(&entry[6..8])?,
+    })
+}
+
 fn validate_active_macho_archive_rollback_symbol_resolutions_for_input(
     input_files: &[FileState],
     input: &FileState,
@@ -4706,44 +4730,100 @@ fn validate_active_macho_archive_rollback_symbol_resolutions_for_input(
     output_context: Option<(&[MatchedPatchSection], &[u8])>,
     reuse_context: Option<(&[u8], &[SectionRecord])>,
 ) -> Result<std::result::Result<(), String>> {
-    let mut rollback_symbol_resolutions = input_files
+    let rollback_states = input_files
         .iter()
         .filter_map(|input| input.patch.as_ref())
         .flat_map(|patch| &patch.macho_archive_members)
         .filter(|state| state.active)
-        .flat_map(|state| &state.rollback_symbol_resolutions)
-        .filter(|resolution| {
-            resolution
-                .target
-                .as_ref()
-                .is_some_and(|target| target.input_file == input.path)
+        .filter(|state| {
+            state.rollback_symbol_resolutions.iter().any(|resolution| {
+                resolution
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.input_file == input.path)
+            })
         })
-        .cloned()
         .collect::<Vec<_>>();
-    rollback_symbol_resolutions.sort_unstable();
-    rollback_symbol_resolutions.dedup();
-
-    for stored in rollback_symbol_resolutions {
-        let mut current = stored.clone();
-        let updates = match update_macho_symbol_resolutions_for_input_with_reuse(
-            std::slice::from_mut(&mut current),
-            input,
-            bytes,
-            false,
-            output_context,
-            reuse_context,
-        )? {
-            Ok(updates) => updates,
-            Err(reason) => {
-                return Ok(Err(format!(
-                    "could not validate Mach-O symbol shadowed by an active rollback transaction: {reason}"
-                )));
-            }
-        };
-        if updates.changed || current != stored {
+    if rollback_states.is_empty() {
+        return Ok(Ok(()));
+    }
+    let Some((_, previous_output)) = output_context else {
+        return Ok(Err(
+            "could not validate Mach-O symbol shadowed by an active rollback transaction without the previous output"
+                .to_owned(),
+        ));
+    };
+    let Some(string_table_offset) = macho_string_table_offset(previous_output) else {
+        return Ok(Err(
+            "could not validate Mach-O symbol shadowed by an active rollback transaction without the output string table"
+                .to_owned(),
+        ));
+    };
+    for state in rollback_states {
+        if !macho_archive_transaction_patches_match(state) {
             return Ok(Err(
-                "Mach-O symbol shadowed by an active rollback transaction changed".to_owned(),
+                "could not validate Mach-O symbol shadowed by an active rollback transaction with incomplete rollback patches"
+                    .to_owned(),
             ));
+        }
+        for stored in state
+            .rollback_symbol_resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.input_file == input.path)
+            })
+        {
+            let matching_patches = state
+                .rollback_patches
+                .iter()
+                .filter(|patch| {
+                    macho_symbol_entry_matches_resolution(
+                        previous_output,
+                        string_table_offset,
+                        &patch.data,
+                        stored,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let [rollback_patch] = matching_patches.as_slice() else {
+                return Ok(Err(
+                    "could not validate Mach-O symbol shadowed by an active rollback transaction: rollback nlist entry is not unique"
+                        .to_owned(),
+                ));
+            };
+            let Some(rollback_binding) = macho_symbol_binding_metadata(&rollback_patch.data) else {
+                return Ok(Err(
+                    "could not validate Mach-O symbol shadowed by an active rollback transaction: rollback nlist entry is truncated"
+                        .to_owned(),
+                ));
+            };
+            let mut current = stored.clone();
+            let updates = match update_macho_symbol_resolutions_for_input_with_reuse(
+                std::slice::from_mut(&mut current),
+                input,
+                bytes,
+                false,
+                output_context,
+                reuse_context,
+            )? {
+                Ok(updates) => updates,
+                Err(reason) => {
+                    return Ok(Err(format!(
+                        "could not validate Mach-O symbol shadowed by an active rollback transaction: {reason}"
+                    )));
+                }
+            };
+            if updates.changed
+                || current != *stored
+                || updates.symbol_bindings.get(&stored.name) != Some(&rollback_binding)
+            {
+                return Ok(Err(
+                    "Mach-O symbol shadowed by an active rollback transaction changed".to_owned(),
+                ));
+            }
         }
     }
     Ok(Ok(()))
@@ -5156,6 +5236,7 @@ struct SymbolPosition {
     section_index: object::SectionIndex,
     section_offset: u64,
     value_range: Option<std::ops::Range<usize>>,
+    macho_binding: Option<MachOSymbolBindingMetadata>,
 }
 
 enum IndexedSymbolPosition {
@@ -5281,6 +5362,7 @@ fn direct_macho_cgu_definitions(
                     section_index,
                     section_offset,
                     value_range: None,
+                    macho_binding: None,
                 },
                 size: symbol.size(),
                 kind: macho_symbol_kind_tag(symbol.kind()),
@@ -5597,6 +5679,7 @@ fn direct_macho_cgu_reference_source_definition(
                     section_index: reference.section_index,
                     section_offset,
                     value_range: None,
+                    macho_binding: None,
                 },
                 size: symbol.size(),
                 kind: macho_symbol_kind_tag(symbol.kind()),
@@ -6724,6 +6807,8 @@ fn indexed_unique_symbol_positions(
                     section_index,
                     section_offset,
                     value_range,
+                    macho_binding: macho_symbol_entry(bytes, &symbol)
+                        .and_then(macho_symbol_binding_metadata),
                 }));
             }
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
@@ -6763,6 +6848,7 @@ fn symbol_position_by_name(
             section_index,
             section_offset,
             value_range,
+            macho_binding: None,
         }));
     }
     Ok(None)
@@ -6799,6 +6885,7 @@ fn unique_symbol_position_by_name(
             section_index,
             section_offset,
             value_range,
+            macho_binding: None,
         });
     }
     Ok(Ok(matched))
@@ -6897,6 +6984,7 @@ fn symbol_position_by_name_and_value(
             section_index,
             section_offset: symbol.address(),
             value_range,
+            macho_binding: None,
         });
     }
     if matched_symbol.is_none() && name_was_present {
@@ -11679,6 +11767,7 @@ struct MachOSymbolResolutionUpdates {
     reusable_branch_targets: Vec<MachOReusableBranchTarget>,
     retiring_names: Vec<SharedText>,
     section_mappings: Vec<MatchedPatchSection>,
+    symbol_bindings: HashMap<SharedText, MachOSymbolBindingMetadata>,
     changed: bool,
 }
 
@@ -53944,9 +54033,10 @@ mod tests {
         let data = file.section_by_name("__data").unwrap();
         let input_path = hex::encode("input.o");
         let owner_path = hex::encode("owner.rlib");
-        let output = test_macho_unwind_output(0x1000);
-        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
-        let output_offset = output.text_offset + 0x100;
+        let output = test_macho_object(&vec![0; 0x200], &vec![0; 0x200], 0x100);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let output_data = output_file.section_by_name("__data").unwrap();
+        let output_offset = output_data.file_range().unwrap().0 + 0x100;
         let previous_value =
             macho_output_address_for_file_offset(&output_file, output_offset).unwrap();
         let section_index = patch_section_record_index(&file, data.index()).unwrap();
@@ -54003,6 +54093,8 @@ mod tests {
             }),
             ..rollback.clone()
         };
+        let output_entry = test_macho_symbol_entry_offset(&output, b"_data");
+        let rollback_nlist = output[output_entry..output_entry + 16].to_vec();
         let active = MachOArchiveActivationState {
             kind: MachOArchiveActivationKind::AddedMembers,
             members: Vec::new(),
@@ -54013,11 +54105,11 @@ mod tests {
             rollback_symbol_resolutions: vec![rollback.clone()],
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 0,
-                data: vec![1],
+                data: rollback_nlist.clone(),
             }],
             rollback_patches: vec![StoredOutputPatch {
                 output_offset: 0,
-                data: vec![0],
+                data: rollback_nlist,
             }],
         };
         let owner = FileState {
@@ -54040,7 +54132,7 @@ mod tests {
             &[input.clone(), owner.clone()],
             &input,
             &current,
-            Some((&matched, &output.bytes)),
+            Some((&matched, &output)),
             None,
         )
         .unwrap()
@@ -54051,11 +54143,41 @@ mod tests {
             &[input.clone(), owner.clone()],
             &input,
             &previous,
-            Some((&matched, &output.bytes)),
+            Some((&matched, &output)),
             None,
         )
         .unwrap()
         .unwrap();
+
+        let mut weak = previous.clone();
+        let entry = test_macho_symbol_entry_offset(&weak, b"_data");
+        weak[entry + 6..entry + 8].copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        let mut private = previous.clone();
+        let entry = test_macho_symbol_entry_offset(&private, b"_data");
+        private[entry + 4] |= object::macho::N_PEXT;
+        let mut changed_desc = previous.clone();
+        let entry = test_macho_symbol_entry_offset(&changed_desc, b"_data");
+        changed_desc[entry + 6..entry + 8]
+            .copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
+        for (kind, changed) in [
+            ("weak", weak),
+            ("private", private),
+            ("n_desc", changed_desc),
+        ] {
+            let reason = validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+                &[input.clone(), owner.clone()],
+                &input,
+                &changed,
+                Some((&matched, &output)),
+                None,
+            )
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                reason.contains("shadowed by an active rollback transaction changed"),
+                "unexpected {kind} binding validation result: {reason}"
+            );
+        }
 
         let mut dormant_owner = owner.clone();
         dormant_owner.patch.as_mut().unwrap().macho_archive_members[0].active = false;
@@ -54063,7 +54185,7 @@ mod tests {
             &[input.clone(), dormant_owner],
             &input,
             &current,
-            Some((&matched, &output.bytes)),
+            Some((&matched, &output)),
             None,
         )
         .unwrap()
@@ -54080,7 +54202,7 @@ mod tests {
                 patch: None,
             },
             &current,
-            Some((&matched, &output.bytes)),
+            Some((&matched, &output)),
             None,
         )
         .unwrap()
