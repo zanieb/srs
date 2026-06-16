@@ -31866,7 +31866,14 @@ fn plan_macho_chained_fixup_slots(
         return Err("added Mach-O chained rebase overlaps an existing slot".to_owned());
     }
 
-    let page_count = usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
+    let last_slot = slots
+        .last()
+        .ok_or_else(|| "Mach-O chained fixup plan has no slots".to_owned())?
+        .0;
+    let last_slot_offset = last_slot
+        .checked_sub(data_address)
+        .ok_or_else(|| "Mach-O chained fixup slot precedes __DATA".to_owned())?;
+    let page_count = usize::try_from(last_slot_offset / crate::macho::MACHO_PAGE_SIZE + 1)
         .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
     let mut page_starts = vec![MACHO_CHAINED_PTR_START_NONE; page_count];
     let mut existing_values = Vec::new();
@@ -32041,11 +32048,10 @@ fn read_macho_chained_fixup_slots(
         return Err("Mach-O chained fixup __DATA segment offset changed".to_owned());
     }
     let page_count = usize::from(read_u16(segment_start + 20)?);
-    let expected_page_count =
-        usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
-            .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
-    if page_count != expected_page_count {
-        return Err("Mach-O chained fixup page count changed".to_owned());
+    let max_page_count = usize::try_from(data_size.div_ceil(crate::macho::MACHO_PAGE_SIZE).max(1))
+        .map_err(|_| "Mach-O chained fixup page count is too large".to_owned())?;
+    if page_count == 0 || page_count > max_page_count {
+        return Err("Mach-O chained fixup page count exceeds __DATA".to_owned());
     }
     let page_starts_offset = segment_start + 22;
     if page_starts_offset
@@ -32057,11 +32063,13 @@ fn read_macho_chained_fixup_slots(
 
     let mut slots = Vec::new();
     let mut seen = HashSet::new();
+    let mut last_fixup_page = None;
     for page_index in 0..page_count {
         let page_start = read_u16(page_starts_offset + page_index * 2)?;
         if page_start == MACHO_CHAINED_PTR_START_NONE {
             continue;
         }
+        last_fixup_page = Some(page_index);
         if page_start & 0x8000 != 0
             || !page_start.is_multiple_of(4)
             || u64::from(page_start) >= crate::macho::MACHO_PAGE_SIZE
@@ -32113,6 +32121,9 @@ fn read_macho_chained_fixup_slots(
                 .checked_add(next * 4)
                 .ok_or_else(|| "Mach-O chained fixup next offset overflowed".to_owned())?;
         }
+    }
+    if last_fixup_page.map(|page| page + 1) != Some(page_count) {
+        return Err("Mach-O chained fixup table has trailing pages without fixups".to_owned());
     }
     slots.sort_by_key(|slot| slot.address);
     Ok(slots)
@@ -56950,6 +56961,58 @@ mod tests {
     }
 
     #[test]
+    fn macho_chained_fixup_slots_allow_trailing_data_pages() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let data_file_offset = 0x100;
+        let mut output = vec![0; data_file_offset + crate::macho::MACHO_PAGE_SIZE as usize];
+        let value = encode_incremental_macho_chained_rebase(data_address + 0x100, 0).unwrap();
+        output[data_file_offset + 0x20..data_file_offset + 0x28]
+            .copy_from_slice(&value.to_le_bytes());
+
+        let slots = read_macho_chained_fixup_slots(
+            &output,
+            &test_macho_chained_fixup_table(0x20),
+            data_address,
+            crate::macho::MACHO_PAGE_SIZE * 3,
+            data_file_offset as u64,
+            crate::macho::MACHO_PAGE_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].address, data_address + 0x20);
+    }
+
+    #[test]
+    fn macho_chained_fixup_slots_reject_trailing_empty_pages() {
+        let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
+        let data_file_offset = 0x100;
+        let mut output = vec![0; data_file_offset + crate::macho::MACHO_PAGE_SIZE as usize];
+        let value = encode_incremental_macho_chained_rebase(data_address + 0x100, 0).unwrap();
+        output[data_file_offset + 0x20..data_file_offset + 0x28]
+            .copy_from_slice(&value.to_le_bytes());
+        let mut table = test_macho_chained_fixup_table(0x20);
+        let segment_start = 32 + 24;
+        write_macho_chained_fixup_u32(&mut table, segment_start, 26).unwrap();
+        write_macho_chained_fixup_u16(&mut table, segment_start + 20, 2).unwrap();
+        write_macho_chained_fixup_u16(&mut table, segment_start + 24, MACHO_CHAINED_PTR_START_NONE)
+            .unwrap();
+
+        assert_eq!(
+            read_macho_chained_fixup_slots(
+                &output,
+                &table,
+                data_address,
+                crate::macho::MACHO_PAGE_SIZE * 2,
+                data_file_offset as u64,
+                crate::macho::MACHO_PAGE_SIZE,
+            )
+            .unwrap_err(),
+            "Mach-O chained fixup table has trailing pages without fixups"
+        );
+    }
+
+    #[test]
     fn macho_chained_fixup_slots_reject_multi_start_pages() {
         let data_address = crate::macho::MACHO_START_MEM_ADDRESS + 0x4000;
         let output = vec![0; 0x100 + crate::macho::MACHO_PAGE_SIZE as usize];
@@ -57089,7 +57152,7 @@ mod tests {
                 (data_address + 0x50, data_address + 0x350, 50),
             ],
             data_address,
-            crate::macho::MACHO_PAGE_SIZE,
+            crate::macho::MACHO_PAGE_SIZE * 4,
         )
         .unwrap();
 
