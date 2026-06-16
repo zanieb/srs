@@ -7077,6 +7077,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     MachOTextRelocationReplays {
                         replays: Vec::new(),
                         rematerialized_sections: Vec::new(),
+                        local_symbol_cohorts: Vec::new(),
                         normalize_rust_archive_patch_inputs: false,
                         symbol_resolutions_changed: false,
                     }
@@ -7179,7 +7180,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     previous.sections_file = None;
                 }
             }
-            output_symbol_patches.extend(relocation_target_patches.output_symbols.iter().cloned());
+            for patch in &relocation_target_patches.output_symbols {
+                match macho_local_symbol_cohort_owns_output_symbol_patch(
+                    &macho_text_relocation_replays.local_symbol_cohorts,
+                    patch,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => output_symbol_patches.push(patch.clone()),
+                    Err(reason) => {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
+                    }
+                }
+            }
             if args.should_validate_x86_64_elf_got_relaxation_contexts() {
                 let mut got_contexts_are_stable = {
                     timing_phase!("Validate changed ELF GOT contexts");
@@ -7853,21 +7865,28 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 ));
             }
             let mut macho_reserved_thunk_patches = Vec::new();
-            let remaining_reserved_ranges =
-                if let Some(activation) = added_macho_archive_text_activation.as_mut() {
-                    &mut activation.remaining_reserved_ranges
-                } else if let Some(activation) = changed_macho_archive_unwind_activation.as_mut() {
-                    &mut activation.remaining_reserved_ranges
-                } else if let Some(activation) = changed_macho_definition_activation.as_mut() {
-                    &mut activation.remaining_reserved_ranges
-                } else if let Some(activation) = macho_text_section_activation.as_mut() {
-                    &mut activation.remaining_reserved_ranges
-                } else {
-                    &mut previous.reserved_ranges
-                };
+            let mut macho_local_symbol_cohort_patches = Vec::new();
+            let remaining_reserved_ranges = select_macho_local_symbol_cohort_reserved_ranges(
+                changed_macho_archive_unwind_activation
+                    .as_mut()
+                    .map(|activation| &mut activation.remaining_reserved_ranges),
+                added_macho_archive_text_activation
+                    .as_mut()
+                    .map(|activation| &mut activation.remaining_reserved_ranges),
+                changed_macho_definition_activation
+                    .as_mut()
+                    .map(|activation| &mut activation.remaining_reserved_ranges),
+                macho_text_section_activation
+                    .as_mut()
+                    .map(|activation| &mut activation.remaining_reserved_ranges),
+                &mut previous.reserved_ranges,
+            );
             let relocation_records_changed = if !macho_text_relocation_replays.replays.is_empty()
                 || !macho_text_relocation_replays
                     .rematerialized_sections
+                    .is_empty()
+                || !macho_text_relocation_replays
+                    .local_symbol_cohorts
                     .is_empty()
             {
                 match apply_macho_text_relocation_replays(
@@ -7878,6 +7897,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     &mut previous.macho_symbol_resolutions,
                     remaining_reserved_ranges,
                     &mut macho_reserved_thunk_patches,
+                    &mut macho_local_symbol_cohort_patches,
                 ) {
                     Ok(changed) => changed,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
@@ -8212,6 +8232,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .chained_fixup_patches
                 .len();
             patched_section_count += macho_reserved_thunk_patches.len();
+            patched_section_count += macho_local_symbol_cohort_patches.len();
             patched_section_count += changed_macho_definition_patches.len();
             patched_section_count += macho_text_auxiliary_patches.len();
             patched_section_count += changed_macho_archive_unwind_patches.len();
@@ -8252,7 +8273,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             append_log(
                 state_dir,
                 &format!(
-                    "changed patch categories from index {}: sections={} dynamic={} relocation-addend={} relocation-target={} resolution-thunk={} forwarding-thunk={} migrated-resolution={} migrated-chained={} reserved-thunk={} text-auxiliary={} eh-frame={} changed-definition={} symbol-table={} chained-fixup={} added-unwind={} reactivated={} changed-unwind={} retired={}",
+                    "changed patch categories from index {}: sections={} dynamic={} relocation-addend={} relocation-target={} resolution-thunk={} forwarding-thunk={} migrated-resolution={} migrated-chained={} reserved-thunk={} local-symbol-cohort={} text-auxiliary={} eh-frame={} changed-definition={} symbol-table={} chained-fixup={} added-unwind={} reactivated={} changed-unwind={} retired={}",
                     patches.len(),
                     resolved_patches.len(),
                     dynamic_relocation_patches.len(),
@@ -8265,6 +8286,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .chained_fixup_patches
                         .len(),
                     macho_reserved_thunk_patches.len(),
+                    macho_local_symbol_cohort_patches.len(),
                     macho_text_auxiliary_patches.len(),
                     eh_frame_patches
                         .iter()
@@ -8301,6 +8323,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     .chain(migrated_macho_resolution_updates.patches)
                     .chain(migrated_macho_resolution_updates.chained_fixup_patches)
                     .chain(macho_reserved_thunk_patches)
+                    .chain(macho_local_symbol_cohort_patches)
                     .chain(macho_text_auxiliary_patches)
                     .chain(eh_frame_patches.into_iter().filter_map(|fde| fde.patch))
                     .chain(changed_macho_definition_patches)
@@ -9560,6 +9583,25 @@ struct MatchedMachOLocalTextTargetOwnership {
     current_name: Vec<u8>,
     current_target_value: u64,
     validated_retarget: ValidatedMachOLocalRelocationRetarget,
+    local_symbol_cohort: Option<MachOLocalSymbolCohortPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MachOLocalSymbolCohortEntry {
+    name: Vec<u8>,
+    n_desc: u16,
+    output_section_index: u8,
+    output_value: u64,
+    output_entry_offset: Option<u64>,
+    string_index: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MachOLocalSymbolCohortPlan {
+    previous_input: String,
+    current_input: String,
+    previous: Vec<MachOLocalSymbolCohortEntry>,
+    current: Vec<MachOLocalSymbolCohortEntry>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15842,6 +15884,7 @@ struct MachOTextRelocationReplay {
 struct MachOTextRelocationReplays {
     replays: Vec<MachOTextRelocationReplay>,
     rematerialized_sections: Vec<(SharedText, String, u32, String, u32)>,
+    local_symbol_cohorts: Vec<MachOLocalSymbolCohortPlan>,
     normalize_rust_archive_patch_inputs: bool,
     symbol_resolutions_changed: bool,
 }
@@ -16457,11 +16500,14 @@ fn renamed_local_macho_relocation_target_candidate_name(
 #[allow(clippy::too_many_arguments)]
 fn matched_macho_local_text_target_ownership(
     relocations: &[RelocationRecord],
+    symbol_resolutions: &[MachOSymbolResolutionRecord],
     relocation_index: usize,
     records_complete: bool,
     input: &FileState,
     caller_section: &MatchedPatchSection,
     matched_sections: &[MatchedPatchSection],
+    previous_resolver: &PatchInputResolver<'_>,
+    current_resolver: &PatchInputResolver<'_>,
     previous_input: PatchInputBytes<'_>,
     current_input: PatchInputBytes<'_>,
     previous_file: &object::File<'_>,
@@ -16470,6 +16516,7 @@ fn matched_macho_local_text_target_ownership(
     current_caller_section: object::SectionIndex,
     previous_context: &MachOTextRelocationContext,
     current_context: &MachOTextRelocationContext,
+    previous_output: &[u8],
     output_symbols: &MachOLocalOutputSymbolLookup,
     output_file: &object::File<'_>,
     normalize_rust_archive_patch_inputs: bool,
@@ -16683,20 +16730,50 @@ fn matched_macho_local_text_target_ownership(
         current_target_value.expect("checked current target value"),
         current_output_section,
     );
-    if published_symbols == ExactLocalMachOOutputSymbol::Inexact
-        || (published_symbols == ExactLocalMachOOutputSymbol::Exact
-            && !published_local_macho_targets_remain_exact(
-                previous_file,
-                current_file,
-                &previous_position,
-                &current_position,
-                &current_name,
-            )?)
+    let published_targets_remain_exact = published_symbols == ExactLocalMachOOutputSymbol::Exact
+        && published_local_macho_targets_remain_exact(
+            previous_file,
+            current_file,
+            &previous_position,
+            &current_position,
+            &current_name,
+        )?;
+    let local_symbol_cohort = if published_symbols == ExactLocalMachOOutputSymbol::Absent
+        || published_targets_remain_exact
     {
-        return Ok(Err(
-            "renamed local Mach-O text target is present in the output symbol table".to_owned(),
-        ));
-    }
+        None
+    } else {
+        match plan_macho_local_symbol_cohort(
+            relocations,
+            symbol_resolutions,
+            input.path.as_str(),
+            caller_section,
+            matched_sections,
+            previous_resolver,
+            current_resolver,
+            previous_input,
+            current_input,
+            previous_file,
+            current_file,
+            previous_output,
+            output_file,
+            normalize_rust_archive_patch_inputs,
+        )? {
+            Ok(Some(plan)) => Some(plan),
+            Ok(None) => {
+                return Ok(Err(
+                    "renamed local Mach-O text target has no complete output-symbol transition"
+                        .to_owned(),
+                ));
+            }
+            Err(_reason) => {
+                return Ok(Err(
+                    "renamed local Mach-O text target is present in the output symbol table"
+                        .to_owned(),
+                ));
+            }
+        }
+    };
     let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
         previous_input,
         current_input,
@@ -16726,6 +16803,7 @@ fn matched_macho_local_text_target_ownership(
         current_name,
         current_target_value: current_target_value.expect("checked current target value"),
         validated_retarget,
+        local_symbol_cohort,
     })))
 }
 
@@ -16932,6 +17010,986 @@ fn published_local_macho_targets_remain_exact(
         current.section_index,
         current.section_offset,
     )?)
+}
+
+fn macho_local_symbol_is_default_strippable(name: &[u8]) -> bool {
+    name.starts_with(b"ltmp")
+        || name.starts_with(b".L")
+        || name.starts_with(b"_.L")
+        || name == b"l_.str"
+        || name.starts_with(b"l_.str.")
+}
+
+fn macho_local_symbol_cohort_entries(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    sections: &[PatchSection],
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<Vec<MachOLocalSymbolCohortEntry>, String>> {
+    let mut owned_sections = Vec::with_capacity(sections.len());
+    for section in sections {
+        let object_index = patch_section_object_index(file, section.section_index)?;
+        if owned_sections
+            .iter()
+            .any(|(index, _): &(object::SectionIndex, &PatchSection)| *index == object_index)
+        {
+            return Ok(Err(
+                "published local Mach-O cohort has ambiguous section ownership".to_owned(),
+            ));
+        }
+        owned_sections.push((object_index, section));
+    }
+
+    let mut entries = Vec::new();
+    for symbol in file.symbols() {
+        if symbol.is_global() {
+            continue;
+        }
+        let name = symbol.name_bytes()?;
+        if name.is_empty() || macho_local_symbol_is_default_strippable(name) {
+            continue;
+        }
+        if symbol.is_undefined()
+            || symbol.is_weak()
+            || symbol.scope() != object::SymbolScope::Compilation
+        {
+            return Ok(Err(
+                "published local Mach-O cohort contains an unsupported local symbol".to_owned(),
+            ));
+        }
+        let Some(section_index) = symbol.section_index() else {
+            return Ok(Err(
+                "published local Mach-O cohort contains a symbol without a section".to_owned(),
+            ));
+        };
+        let Some((_, owner)) = owned_sections
+            .iter()
+            .find(|(index, _)| *index == section_index)
+        else {
+            return Ok(Err(
+                "published local Mach-O cohort is not completely section-owned".to_owned(),
+            ));
+        };
+        let value_range = macho_symbol_value_field_range(bytes, symbol.index())
+            .ok_or_else(|| crate::error!("Missing Mach-O local cohort symbol entry"))?;
+        let Some(entry_start) = value_range.start.checked_sub(8) else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol entry is truncated".to_owned(),
+            ));
+        };
+        let Some(raw) = bytes.get(entry_start..value_range.end) else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol entry is truncated".to_owned(),
+            ));
+        };
+        let expected_input_section = u8::try_from(section_index.0).ok();
+        let Some(n_desc) = read_u16_le(&raw[6..8]) else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol metadata is truncated".to_owned(),
+            ));
+        };
+        if raw[4] != object::macho::N_SECT || Some(raw[5]) != expected_input_section {
+            return Ok(Err(
+                "published local Mach-O cohort contains external, STAB, or unsupported metadata"
+                    .to_owned(),
+            ));
+        }
+        if n_desc & (object::macho::N_ALT_ENTRY | object::macho::N_NO_DEAD_STRIP) != 0 {
+            return Ok(Err(
+                "published local Mach-O cohort contains liveness-significant metadata".to_owned(),
+            ));
+        }
+        let input_section = file.section_by_index(section_index)?;
+        let Some(section_offset) = symbol.address().checked_sub(input_section.address()) else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol precedes its section".to_owned(),
+            ));
+        };
+        if section_offset >= owner.input_size || section_offset >= owner.output_size {
+            return Ok(Err(
+                "published local Mach-O cohort symbol is outside its owned section".to_owned(),
+            ));
+        }
+        let Some(output_offset) = owner.output_offset.checked_add(section_offset) else {
+            return Ok(Err(
+                "published local Mach-O cohort output offset overflowed".to_owned(),
+            ));
+        };
+        let Some(output_value) = macho_output_address_for_file_offset(output_file, output_offset)
+        else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol has no output address".to_owned(),
+            ));
+        };
+        let Some(output_section_index) =
+            macho_output_section_index_for_file_offset(output_file, output_offset)
+        else {
+            return Ok(Err(
+                "published local Mach-O cohort symbol has no unique output section".to_owned(),
+            ));
+        };
+        entries.push(MachOLocalSymbolCohortEntry {
+            name: name.to_vec(),
+            n_desc,
+            output_section_index,
+            output_value,
+            output_entry_offset: None,
+            string_index: None,
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    if entries.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Ok(Err(
+            "published local Mach-O cohort contains duplicate names".to_owned(),
+        ));
+    }
+    let mut sites = HashSet::new();
+    for entry in &entries {
+        if !sites.insert((entry.output_section_index, entry.output_value)) {
+            return Ok(Err(
+                "published local Mach-O cohort contains aliased output sites".to_owned(),
+            ));
+        }
+    }
+    Ok(Ok(entries))
+}
+
+fn verify_previous_macho_local_symbol_cohort(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    sections: &[PatchSection],
+    entries: &mut [MachOLocalSymbolCohortEntry],
+) -> std::result::Result<(), String> {
+    let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
+    let mut owned_ranges = Vec::with_capacity(sections.len());
+    for section in sections {
+        let start = macho_output_address_for_file_offset(output_file, section.output_offset)
+            .ok_or_else(|| {
+                "published local Mach-O owned section has no output address".to_owned()
+            })?;
+        let end = start
+            .checked_add(section.input_size)
+            .ok_or_else(|| "published local Mach-O owned section range overflowed".to_owned())?;
+        let section_index =
+            macho_output_section_index_for_file_offset(output_file, section.output_offset)
+                .ok_or_else(|| {
+                    "published local Mach-O owned section has no unique output section".to_owned()
+                })?;
+        owned_ranges.push((section_index, start..end));
+    }
+    owned_ranges.sort_by_key(|(section_index, range)| (*section_index, range.start));
+    if owned_ranges
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1.end > pair[1].1.start)
+    {
+        return Err("published local Mach-O owned output ranges overlap".to_owned());
+    }
+    let expected_names = entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<HashSet<_>>();
+    let mut observed_names = HashSet::new();
+    for symbol in output_file.symbols() {
+        if symbol.is_global() || symbol.is_undefined() {
+            continue;
+        }
+        let Ok(name) = symbol.name_bytes() else {
+            return Err("published local Mach-O output has a malformed name".to_owned());
+        };
+        if name.is_empty() || macho_local_symbol_is_default_strippable(name) {
+            continue;
+        }
+        let in_owned_range = symbol.section_index().is_some_and(|symbol_section| {
+            owned_ranges.iter().any(|(section_index, range)| {
+                symbol_section.0 == usize::from(*section_index) && range.contains(&symbol.address())
+            })
+        });
+        if in_owned_range && !observed_names.insert(name.to_vec()) {
+            return Err("published local Mach-O output contains duplicate cohort names".to_owned());
+        }
+    }
+    if observed_names.len() != expected_names.len()
+        || observed_names
+            .iter()
+            .any(|name| !expected_names.contains(name))
+    {
+        return Err("published local Mach-O output population is incomplete or aliased".to_owned());
+    }
+
+    for entry in entries.iter_mut() {
+        let matches = output_file
+            .symbols()
+            .filter(|symbol| {
+                symbol
+                    .name_bytes()
+                    .is_ok_and(|candidate| candidate == entry.name)
+            })
+            .collect::<Vec<_>>();
+        let [symbol] = matches.as_slice() else {
+            return Err("published local Mach-O cohort has no unique output nlist".to_owned());
+        };
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            return Err("published local Mach-O output has non-Mach-O metadata".to_owned());
+        };
+        if symbol.is_global()
+            || symbol.is_weak()
+            || symbol.scope() != object::SymbolScope::Compilation
+            || symbol.section_index().map(|index| index.0)
+                != Some(usize::from(entry.output_section_index))
+            || symbol.address() != entry.output_value
+            || n_desc != entry.n_desc
+        {
+            return Err("published local Mach-O cohort output metadata changed".to_owned());
+        }
+        let range =
+            macho_symbol_entry_range(previous_output, symbol_table_offset, symbol.index().0)?;
+        let raw = &previous_output[range.clone()];
+        if raw[4] != object::macho::N_SECT
+            || raw[5] != entry.output_section_index
+            || read_u16_le(&raw[6..8]) != Some(entry.n_desc)
+            || read_u64_le(&raw[8..16]) != Some(entry.output_value)
+        {
+            return Err("published local Mach-O cohort output nlist is not exact".to_owned());
+        }
+        entry.output_entry_offset = Some(range.start as u64);
+        entry.string_index = read_u32_le(&raw[..4]);
+    }
+
+    let (symbol_table, string_table) = macho_symbol_and_string_table_ranges(previous_output)?;
+    let owned_strings = entries
+        .iter()
+        .map(|entry| {
+            let entry_offset = entry
+                .output_entry_offset
+                .ok_or_else(|| "published local Mach-O cohort has no owned nlist".to_owned())?;
+            let string_index = entry
+                .string_index
+                .ok_or_else(|| "published local Mach-O cohort has no string index".to_owned())?;
+            let start = string_table
+                .start
+                .checked_add(u64::from(string_index))
+                .ok_or_else(|| "published local Mach-O string offset overflowed".to_owned())?;
+            let size = u64::try_from(entry.name.len() + 1)
+                .map_err(|_| "published local Mach-O name is too large".to_owned())?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| "published local Mach-O string range overflowed".to_owned())?;
+            Ok((entry_offset, start..end))
+        })
+        .collect::<std::result::Result<HashMap<_, _>, String>>()?;
+    let symbol_start = usize::try_from(symbol_table.start)
+        .map_err(|_| "published local Mach-O symbol table exceeds usize".to_owned())?;
+    let symbol_end = usize::try_from(symbol_table.end)
+        .map_err(|_| "published local Mach-O symbol table exceeds usize".to_owned())?;
+    let string_start = usize::try_from(string_table.start)
+        .map_err(|_| "published local Mach-O string table exceeds usize".to_owned())?;
+    let string_end = usize::try_from(string_table.end)
+        .map_err(|_| "published local Mach-O string table exceeds usize".to_owned())?;
+    let mut referenced_strings = Vec::new();
+    for entry_start in (symbol_start..symbol_end).step_by(16) {
+        let raw = &previous_output[entry_start..entry_start + 16];
+        let Some(string_index) = read_u32_le(&raw[..4]) else {
+            return Err("published local Mach-O nlist is truncated".to_owned());
+        };
+        if string_index == 0 {
+            continue;
+        }
+        let start_u64 = string_table
+            .start
+            .checked_add(u64::from(string_index))
+            .ok_or_else(|| "published local Mach-O string offset overflowed".to_owned())?;
+        let start = usize::try_from(start_u64)
+            .map_err(|_| "published local Mach-O string offset exceeds usize".to_owned())?;
+        if start < string_start || start >= string_end {
+            return Err(
+                "published local Mach-O nlist string is outside the string table".to_owned(),
+            );
+        }
+        let nul = previous_output[start..string_end]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| "published local Mach-O nlist string is unterminated".to_owned())?;
+        let end = start_u64
+            .checked_add(
+                u64::try_from(nul + 1)
+                    .map_err(|_| "published local Mach-O nlist string is too large".to_owned())?,
+            )
+            .ok_or_else(|| "published local Mach-O string range overflowed".to_owned())?;
+        let owned = owned_strings.get(&(entry_start as u64));
+        if owned.is_some_and(|expected| expected.start != start_u64 || expected.end != end) {
+            return Err("published local Mach-O string ownership changed".to_owned());
+        }
+        referenced_strings.push((start_u64..end, owned.is_some()));
+    }
+    referenced_strings.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut active_end = 0;
+    let mut active_owned_end = 0;
+    for (range, owned) in referenced_strings {
+        if (owned && range.start < active_end) || (!owned && range.start < active_owned_end) {
+            return Err("published local Mach-O cohort string ownership is shared".to_owned());
+        }
+        active_end = active_end.max(range.end);
+        if owned {
+            active_owned_end = active_owned_end.max(range.end);
+        }
+    }
+    Ok(())
+}
+
+fn macho_local_cohort_atom_graph_is_complete(
+    boundaries: &HashMap<object::SectionIndex, Vec<u64>>,
+    roots: &HashSet<(object::SectionIndex, u64)>,
+    edges: &HashMap<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>,
+) -> bool {
+    let mut reachable = roots.clone();
+    let mut queue = roots.iter().copied().collect::<Vec<_>>();
+    let mut index = 0;
+    while let Some(source) = queue.get(index).copied() {
+        index += 1;
+        for target in edges.get(&source).into_iter().flatten() {
+            if reachable.insert(*target) {
+                queue.push(*target);
+            }
+        }
+    }
+    boundaries
+        .iter()
+        .all(|(section_index, section_boundaries)| {
+            section_boundaries
+                .iter()
+                .all(|offset| reachable.contains(&(*section_index, *offset)))
+        })
+}
+
+fn macho_local_cohort_symbol_is_root(n_desc: u16) -> bool {
+    n_desc & (object::macho::N_ALT_ENTRY | object::macho::N_NO_DEAD_STRIP)
+        == object::macho::N_NO_DEAD_STRIP
+}
+
+fn macho_local_cohort_relocation_follows_target(r_type: u8) -> bool {
+    !matches!(
+        r_type,
+        object::macho::ARM64_RELOC_ADDEND | object::macho::ARM64_RELOC_SUBTRACTOR
+    )
+}
+
+fn macho_local_cohort_source_member_is_unchanged(
+    previous: Option<PatchInputBytes<'_>>,
+    current: Option<PatchInputBytes<'_>>,
+) -> bool {
+    previous
+        .zip(current)
+        .is_some_and(|(previous, current)| previous.bytes == current.bytes)
+}
+
+fn current_macho_local_cohort_atoms_are_live(
+    relocations: &[RelocationRecord],
+    symbol_resolutions: &[MachOSymbolResolutionRecord],
+    input_file_path: &str,
+    caller_section: &MatchedPatchSection,
+    matched_sections: &[MatchedPatchSection],
+    previous_resolver: &PatchInputResolver<'_>,
+    current_resolver: &PatchInputResolver<'_>,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    current_bytes: &[u8],
+    output_file: &object::File<'_>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(current_bytes, 0)
+        .context("Failed to parse current Mach-O local cohort header")?;
+    let endian = header
+        .endian()
+        .context("Failed to read current Mach-O local cohort endianness")?;
+    if header.flags(endian) & object::macho::MH_SUBSECTIONS_VIA_SYMBOLS == 0 {
+        return Ok(true);
+    }
+
+    let mut owned_sections = HashMap::<object::SectionIndex, &MatchedPatchSection>::new();
+    for section in matched_sections {
+        if !patch_input_refs_match(
+            input_file_path,
+            section.previous.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )? || !patch_input_refs_match(
+            input_file_path,
+            section.current.input.as_str(),
+            caller_section.current.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )? {
+            continue;
+        }
+        let current_index =
+            patch_section_object_index(current_file, section.current.section_index)?;
+        if owned_sections.insert(current_index, section).is_some() {
+            return Ok(false);
+        }
+    }
+
+    let mut gc_sections = HashSet::new();
+    for section_index in owned_sections.keys().copied() {
+        let section = current_file.section_by_index(section_index)?;
+        let object::SectionFlags::MachO { flags } = section.flags() else {
+            return Ok(false);
+        };
+        let retained = flags & object::macho::S_ATTR_NO_DEAD_STRIP != 0;
+        let executable = flags
+            & (object::macho::S_ATTR_PURE_INSTRUCTIONS | object::macho::S_ATTR_SOME_INSTRUCTIONS)
+            != 0;
+        let name = section.name_bytes()?;
+        if !retained && (executable || name == b"__const" || name == b"__gcc_except_tab") {
+            gc_sections.insert(section_index);
+        }
+    }
+    if gc_sections.is_empty() {
+        return Ok(true);
+    }
+
+    let mut boundaries = gc_sections
+        .iter()
+        .copied()
+        .map(|section_index| (section_index, Vec::<u64>::new()))
+        .collect::<HashMap<_, _>>();
+    let mut commands = header
+        .load_commands(endian, current_bytes, 0)
+        .context("Failed to parse current Mach-O local cohort load commands")?;
+    let mut symbol_table = None;
+    while let Some(command) = commands
+        .next()
+        .context("Failed to parse current Mach-O local cohort load command")?
+    {
+        let Some(symtab) = command
+            .symtab()
+            .context("Failed to parse current Mach-O local cohort symbol table")?
+        else {
+            continue;
+        };
+        if symbol_table.replace(symtab).is_some() {
+            return Ok(false);
+        }
+    }
+    let Some(symbol_table) = symbol_table else {
+        return Ok(false);
+    };
+    let symbol_start = usize::try_from(symbol_table.symoff.get(endian))
+        .context("Current Mach-O local cohort symbol offset exceeds usize")?;
+    let symbol_count = usize::try_from(symbol_table.nsyms.get(endian))
+        .context("Current Mach-O local cohort symbol count exceeds usize")?;
+    for symbol_number in 0..symbol_count {
+        let Some(entry_start) = symbol_number
+            .checked_mul(16)
+            .and_then(|offset| symbol_start.checked_add(offset))
+        else {
+            return Ok(false);
+        };
+        let Some(entry_end) = entry_start.checked_add(16) else {
+            return Ok(false);
+        };
+        let Some(raw) = current_bytes.get(entry_start..entry_end) else {
+            return Ok(false);
+        };
+        let section_index = object::SectionIndex(usize::from(raw[5]));
+        if raw[4] & object::macho::N_STAB != 0 {
+            if gc_sections.contains(&section_index) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if raw[4] & object::macho::N_TYPE != object::macho::N_SECT {
+            continue;
+        }
+        let Some(section_boundaries) = boundaries.get_mut(&section_index) else {
+            continue;
+        };
+        let Some(n_desc) = read_u16_le(&raw[6..8]) else {
+            return Ok(false);
+        };
+        if n_desc & object::macho::N_ALT_ENTRY != 0 {
+            continue;
+        }
+        let section = current_file.section_by_index(section_index)?;
+        let Some(address) = read_u64_le(&raw[8..16]) else {
+            return Ok(false);
+        };
+        let Some(offset) = address.checked_sub(section.address()) else {
+            return Ok(false);
+        };
+        if offset < section.size() {
+            section_boundaries.push(offset);
+        }
+    }
+    for section_boundaries in boundaries.values_mut() {
+        section_boundaries.sort_unstable();
+        section_boundaries.dedup();
+        if section_boundaries
+            .first()
+            .is_some_and(|offset| *offset != 0)
+        {
+            section_boundaries.insert(0, 0);
+        }
+    }
+    let atom_for_offset =
+        |section_index: object::SectionIndex, offset: u64| -> Option<(object::SectionIndex, u64)> {
+            let section_boundaries = boundaries.get(&section_index)?;
+            let index = section_boundaries.partition_point(|boundary| *boundary <= offset);
+            index
+                .checked_sub(1)
+                .map(|index| (section_index, section_boundaries[index]))
+        };
+
+    let mut fully_recorded_sections = HashSet::new();
+    for (&current_index, section) in &owned_sections {
+        if !gc_sections.contains(&current_index) {
+            continue;
+        }
+        let previous_index =
+            patch_section_object_index(previous_file, section.previous.section_index)?;
+        let previous_section = previous_file.section_by_index(previous_index)?;
+        let current_section = current_file.section_by_index(current_index)?;
+        let previous_relocation_count = previous_section.relocations().count();
+        if current_section.relocations().count() != previous_relocation_count {
+            continue;
+        }
+        let previous_output_end = section
+            .previous
+            .output_offset
+            .checked_add(section.previous.output_size)
+            .context("Previous Mach-O local cohort section range overflow")?;
+        let mut matching_records = 0;
+        let mut recorded_offsets = HashSet::new();
+        for record in relocations {
+            if record.input_file != input_file_path
+                || record.section_index != section.previous.section_index
+            {
+                continue;
+            }
+            if patch_input_refs_match(
+                input_file_path,
+                record.input.as_str(),
+                section.previous.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )? {
+                let Some(record_end) = record.output_offset.checked_add(record.size) else {
+                    continue;
+                };
+                if record.output_offset < section.previous.output_offset
+                    || record_end > previous_output_end
+                    || !recorded_offsets.insert(record.relocation_offset)
+                {
+                    continue;
+                }
+                matching_records += 1;
+            }
+        }
+        if matching_records != previous_relocation_count {
+            continue;
+        }
+        fully_recorded_sections.insert(current_index);
+    }
+
+    let mut roots = HashSet::new();
+    for symbol in current_file.symbols() {
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let Some(section_boundaries) = boundaries.get(&section_index) else {
+            continue;
+        };
+        let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
+            return Ok(false);
+        };
+        if !macho_local_cohort_symbol_is_root(n_desc) {
+            continue;
+        }
+        let section = current_file.section_by_index(section_index)?;
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            return Ok(false);
+        };
+        let index = section_boundaries.partition_point(|boundary| *boundary <= offset);
+        let Some(index) = index.checked_sub(1) else {
+            return Ok(false);
+        };
+        roots.insert((section_index, section_boundaries[index]));
+    }
+
+    // Direct patches preserve the previously live atom set instead of recomputing dead-strip GC.
+    // A byte-identical member therefore retains its recorded live source atom, while the current
+    // resolution check below proves that the unchanged edge still owns this exact target.
+    for record in relocations {
+        let Some(record_relocation) = decode_macho_aarch64_relocation_kind(record.kind) else {
+            continue;
+        };
+        if !macho_local_cohort_relocation_follows_target(record_relocation.r_type) {
+            continue;
+        }
+        let Some(target) = record.target.as_ref() else {
+            continue;
+        };
+        if record.input_file != input_file_path
+            || target.input_file != input_file_path
+            || !patch_input_refs_match(
+                input_file_path,
+                target.input.as_str(),
+                caller_section.previous.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?
+            || patch_input_refs_match(
+                input_file_path,
+                record.input.as_str(),
+                caller_section.previous.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?
+        {
+            continue;
+        }
+        let mut trusted_source = None;
+        for section in matched_sections {
+            if section.previous.section_index != record.section_index
+                || section.previous.output_offset > record.output_offset
+                || !section
+                    .previous
+                    .output_offset
+                    .checked_add(section.previous.output_size)
+                    .is_some_and(|end| record.output_offset < end)
+                || section.previous.input_size != section.current.input_size
+                || section.previous.output_offset != section.current.output_offset
+                || !patch_input_refs_match(
+                    input_file_path,
+                    section.previous.input.as_str(),
+                    record.input.as_str(),
+                    normalize_rust_archive_patch_inputs,
+                )?
+            {
+                continue;
+            }
+            if trusted_source.replace(section).is_some() {
+                trusted_source = None;
+                break;
+            }
+        }
+        let Some(trusted_source) = trusted_source else {
+            continue;
+        };
+        let previous_source = previous_resolver.resolve(
+            input_file_path,
+            trusted_source.previous.input.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?;
+        let current_source = current_resolver.resolve(
+            input_file_path,
+            trusted_source.current.input.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?;
+        if !macho_local_cohort_source_member_is_unchanged(previous_source, current_source) {
+            continue;
+        }
+        let Some(name) = record.target_name.as_deref() else {
+            continue;
+        };
+        let Ok(name) = hex::decode(name) else {
+            continue;
+        };
+        let previous_matching = previous_file
+            .symbols()
+            .filter(|symbol| {
+                symbol.is_global() && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+            })
+            .collect::<Vec<_>>();
+        let [previous_symbol] = previous_matching.as_slice() else {
+            continue;
+        };
+        let Some(previous_section_index) = previous_symbol.section_index() else {
+            continue;
+        };
+        let previous_section = previous_file.section_by_index(previous_section_index)?;
+        if u32::try_from(previous_section_index.0).ok() != Some(target.section_index)
+            || previous_symbol
+                .address()
+                .checked_sub(previous_section.address())
+                != Some(target.section_offset)
+        {
+            continue;
+        }
+        let matching = current_file
+            .symbols()
+            .filter(|symbol| {
+                symbol.is_global()
+                    && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+                    && symbol
+                        .section_index()
+                        .is_some_and(|index| gc_sections.contains(&index))
+            })
+            .collect::<Vec<_>>();
+        let [symbol] = matching.as_slice() else {
+            continue;
+        };
+        let section_index = symbol.section_index().expect("filtered defined symbol");
+        let section = current_file.section_by_index(section_index)?;
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            continue;
+        };
+        let Some(resolution) = macho_symbol_resolution_for_name(symbol_resolutions, &name) else {
+            continue;
+        };
+        let Some(resolution_target) = resolution.target.as_ref() else {
+            continue;
+        };
+        let Some(owner) = owned_sections.get(&section_index) else {
+            continue;
+        };
+        let Some(output_offset) = owner.current.output_offset.checked_add(offset) else {
+            continue;
+        };
+        let Some(current_value) = macho_output_address_for_file_offset(output_file, output_offset)
+        else {
+            continue;
+        };
+        if resolution.direct_value != Some(current_value)
+            || resolution_target.input_file != input_file_path
+            || !patch_input_refs_match(
+                input_file_path,
+                resolution_target.input.as_str(),
+                caller_section.current.input.as_str(),
+                normalize_rust_archive_patch_inputs,
+            )?
+            || u32::try_from(section_index.0).ok() != Some(resolution_target.section_index)
+            || resolution_target.section_offset != offset
+        {
+            continue;
+        }
+        if let Some(atom) = atom_for_offset(section_index, offset) {
+            roots.insert(atom);
+        }
+    }
+
+    let mut edges = HashMap::<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>::new();
+    for section_index in fully_recorded_sections {
+        let section = current_file.section_by_index(section_index)?;
+        for (offset, relocation) in section.relocations() {
+            if offset >= section.size() {
+                continue;
+            }
+            if matches!(
+                relocation.flags(),
+                object::RelocationFlags::MachO { r_type, .. }
+                    if !macho_local_cohort_relocation_follows_target(r_type)
+            ) {
+                continue;
+            }
+            let Some(source) = atom_for_offset(section_index, offset) else {
+                continue;
+            };
+            let object::RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                continue;
+            };
+            let target = current_file.symbol_by_index(symbol_index)?;
+            if target.scope() != object::SymbolScope::Compilation {
+                continue;
+            }
+            let Some(target_section_index) = target.section_index() else {
+                continue;
+            };
+            let target_section = current_file.section_by_index(target_section_index)?;
+            let Some(target_offset) = target.address().checked_sub(target_section.address()) else {
+                continue;
+            };
+            let Some(target) = atom_for_offset(target_section_index, target_offset) else {
+                continue;
+            };
+            edges.entry(source).or_default().push(target);
+        }
+    }
+
+    Ok(macho_local_cohort_atom_graph_is_complete(
+        &boundaries,
+        &roots,
+        &edges,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_macho_local_symbol_cohort(
+    relocations: &[RelocationRecord],
+    symbol_resolutions: &[MachOSymbolResolutionRecord],
+    input_file_path: &str,
+    caller_section: &MatchedPatchSection,
+    matched_sections: &[MatchedPatchSection],
+    previous_resolver: &PatchInputResolver<'_>,
+    current_resolver: &PatchInputResolver<'_>,
+    previous_input: PatchInputBytes<'_>,
+    current_input: PatchInputBytes<'_>,
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
+    let mut previous_sections = Vec::new();
+    let mut current_sections = Vec::new();
+    for section in matched_sections {
+        let previous_matches = patch_input_refs_match(
+            input_file_path,
+            section.previous.input.as_str(),
+            caller_section.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?;
+        let current_matches = patch_input_refs_match(
+            input_file_path,
+            section.current.input.as_str(),
+            caller_section.current.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?;
+        if previous_matches != current_matches {
+            return Ok(Err(
+                "published local Mach-O cohort changed archive-member ownership".to_owned(),
+            ));
+        }
+        if previous_matches {
+            previous_sections.push(section.previous.clone());
+            current_sections.push(section.current.clone());
+        }
+    }
+    if previous_sections.is_empty() {
+        return Ok(Err(
+            "published local Mach-O cohort has no matched section ownership".to_owned(),
+        ));
+    }
+    let mut previous = match macho_local_symbol_cohort_entries(
+        previous_input.bytes,
+        previous_file,
+        &previous_sections,
+        output_file,
+    )? {
+        Ok(entries) => entries,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if !current_macho_local_cohort_atoms_are_live(
+        relocations,
+        symbol_resolutions,
+        input_file_path,
+        caller_section,
+        matched_sections,
+        previous_resolver,
+        current_resolver,
+        previous_file,
+        current_file,
+        current_input.bytes,
+        output_file,
+        normalize_rust_archive_patch_inputs,
+    )? {
+        return Ok(Err(
+            "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
+        ));
+    }
+    let current = match macho_local_symbol_cohort_entries(
+        current_input.bytes,
+        current_file,
+        &current_sections,
+        output_file,
+    )? {
+        Ok(entries) => entries,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if previous.is_empty() || current.is_empty() {
+        return Ok(Err(
+            "published local Mach-O cohort has an empty emitted population".to_owned(),
+        ));
+    }
+    if let Err(reason) = verify_previous_macho_local_symbol_cohort(
+        previous_output,
+        output_file,
+        &previous_sections,
+        &mut previous,
+    ) {
+        return Ok(Err(reason));
+    }
+    let previous_names = previous
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<HashSet<_>>();
+    for entry in &current {
+        if previous_names.contains(&entry.name) {
+            continue;
+        }
+        if output_file.symbols().any(|symbol| {
+            symbol
+                .name_bytes()
+                .is_ok_and(|candidate| candidate == entry.name)
+        }) {
+            return Ok(Err(
+                "published local Mach-O cohort addition collides with an output symbol".to_owned(),
+            ));
+        }
+    }
+    let unchanged = previous.len() == current.len()
+        && previous.iter().zip(&current).all(|(previous, current)| {
+            previous.name == current.name
+                && previous.n_desc == current.n_desc
+                && previous.output_section_index == current.output_section_index
+                && previous.output_value == current.output_value
+        });
+    if unchanged {
+        return Ok(Ok(None));
+    }
+    Ok(Ok(Some(MachOLocalSymbolCohortPlan {
+        previous_input: caller_section.previous.input.clone(),
+        current_input: caller_section.current.input.clone(),
+        previous,
+        current,
+    })))
+}
+
+fn macho_local_symbol_cohort_owns_output_symbol_patch(
+    cohorts: &[MachOLocalSymbolCohortPlan],
+    patch: &RelocationTargetSymbolPatch,
+) -> std::result::Result<bool, String> {
+    let name = hex::decode(&patch.target_name).map_err(|_| {
+        "published local Mach-O output-symbol patch has a malformed name".to_owned()
+    })?;
+    let matching = cohorts
+        .iter()
+        .filter(|cohort| {
+            cohort
+                .previous
+                .iter()
+                .chain(&cohort.current)
+                .any(|entry| entry.name == name)
+        })
+        .collect::<Vec<_>>();
+    let [cohort] = matching.as_slice() else {
+        return if matching.is_empty() {
+            Ok(false)
+        } else {
+            Err(
+                "published local Mach-O output-symbol patch has ambiguous cohort ownership"
+                    .to_owned(),
+            )
+        };
+    };
+    let previous = cohort.previous.iter().find(|entry| entry.name == name);
+    let current = cohort.current.iter().find(|entry| entry.name == name);
+    if let Some(previous) = previous {
+        if previous.output_value != patch.previous_target_value
+            || !cohort
+                .current
+                .iter()
+                .any(|entry| entry.output_value == patch.target_value)
+        {
+            return Err(
+                "published local Mach-O output-symbol patch conflicts with its cohort".to_owned(),
+            );
+        }
+    } else if !patch.allow_missing
+        || current.is_none_or(|entry| entry.output_value != patch.target_value)
+    {
+        return Err(
+            "published local Mach-O output-symbol patch conflicts with its cohort".to_owned(),
+        );
+    }
+    Ok(true)
 }
 
 fn macho_data_relocation_target_position(
@@ -18234,12 +19292,14 @@ fn macho_text_relocation_replays_for_input(
 ) -> Result<std::result::Result<MachOTextRelocationReplays, String>> {
     let mut replays = Vec::new();
     let mut rematerialized_sections = Vec::new();
+    let mut local_symbol_cohorts = Vec::new();
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for text relocation replay")?;
     if output_file.format() != object::BinaryFormat::MachO {
         return Ok(Ok(MachOTextRelocationReplays {
             replays,
             rematerialized_sections,
+            local_symbol_cohorts,
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         }));
@@ -18632,11 +19692,14 @@ fn macho_text_relocation_replays_for_input(
                 let matched_local_target_ownership = if previous_target != current_target {
                     match matched_macho_local_text_target_ownership(
                         relocations,
+                        resolutions,
                         relocation_index,
                         records_complete,
                         input,
                         patch_section,
                         matched_sections,
+                        previous_resolver,
+                        current_resolver,
                         previous_input_bytes,
                         current_input_bytes,
                         &previous_file,
@@ -18645,6 +19708,7 @@ fn macho_text_relocation_replays_for_input(
                         current_index,
                         previous_context,
                         current_context,
+                        previous_output,
                         &output_symbols,
                         &output_file,
                         normalize_rust_archive_patch_inputs,
@@ -18667,6 +19731,26 @@ fn macho_text_relocation_replays_for_input(
                 } else {
                     None
                 };
+                if let Some(cohort) = matched_local_target_ownership
+                    .as_ref()
+                    .and_then(|ownership| ownership.local_symbol_cohort.as_ref())
+                {
+                    if let Some(existing) = local_symbol_cohorts.iter().find(
+                        |existing: &&MachOLocalSymbolCohortPlan| {
+                            existing.previous_input == cohort.previous_input
+                                && existing.current_input == cohort.current_input
+                        },
+                    ) {
+                        if *existing != *cohort {
+                            return Ok(Err(
+                                "published local Mach-O cohort produced conflicting plans"
+                                    .to_owned(),
+                            ));
+                        }
+                    } else {
+                        local_symbol_cohorts.push(cohort.clone());
+                    }
+                }
                 if previous_target.is_none()
                     || (previous_target != current_target
                         && renamed_local_target_name.is_none()
@@ -19071,6 +20155,7 @@ fn macho_text_relocation_replays_for_input(
     Ok(Ok(MachOTextRelocationReplays {
         replays,
         rematerialized_sections,
+        local_symbol_cohorts,
         normalize_rust_archive_patch_inputs,
         symbol_resolutions_changed,
     }))
@@ -20183,6 +21268,7 @@ fn apply_macho_text_relocation_replays(
     resolutions: &mut [MachOSymbolResolutionRecord],
     reserved_ranges: &mut Vec<ReservedRangeRecord>,
     reserved_thunk_patches: &mut Vec<SectionPatch>,
+    local_symbol_cohort_patches: &mut Vec<SectionPatch>,
 ) -> std::result::Result<bool, String> {
     let output_file = object::File::parse(previous_output)
         .map_err(|error| format!("failed to parse previous Mach-O output: {error}"))?;
@@ -20563,6 +21649,11 @@ fn apply_macho_text_relocation_replays(
         relocations.sort_unstable();
         relocations.dedup();
     }
+    local_symbol_cohort_patches.extend(apply_macho_local_symbol_cohort_plans(
+        &replays.local_symbol_cohorts,
+        previous_output,
+        reserved_ranges,
+    )?);
     Ok(records_changed)
 }
 
@@ -26538,6 +27629,363 @@ fn added_macho_symbol_entry(
     entry.extend_from_slice(&definition.desc.to_le_bytes());
     entry.extend_from_slice(&value.to_le_bytes());
     entry
+}
+
+fn macho_local_symbol_cohort_entry(
+    symbol: &MachOLocalSymbolCohortEntry,
+    string_index: u32,
+) -> [u8; 16] {
+    let mut entry = [0; 16];
+    entry[..4].copy_from_slice(&string_index.to_le_bytes());
+    entry[4] = object::macho::N_SECT;
+    entry[5] = symbol.output_section_index;
+    entry[6..8].copy_from_slice(&symbol.n_desc.to_le_bytes());
+    entry[8..16].copy_from_slice(&symbol.output_value.to_le_bytes());
+    entry
+}
+
+fn macho_symbol_and_string_table_ranges(
+    bytes: &[u8],
+) -> std::result::Result<(std::ops::Range<u64>, std::ops::Range<u64>), String> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0)
+        .map_err(|_| "failed to parse Mach-O output for local symbol cohort".to_owned())?;
+    let endian = header
+        .endian()
+        .map_err(|_| "unsupported Mach-O local symbol cohort endianness".to_owned())?;
+    if endian != object::Endianness::Little {
+        return Err("unsupported Mach-O local symbol cohort endianness".to_owned());
+    }
+    let mut commands = header
+        .load_commands(endian, bytes, 0)
+        .map_err(|_| "failed to parse Mach-O local symbol cohort load commands".to_owned())?;
+    let mut ranges = None;
+    while let Some(command) = commands
+        .next()
+        .map_err(|_| "failed to parse Mach-O local symbol cohort load command".to_owned())?
+    {
+        let Some(symtab) = command
+            .symtab()
+            .map_err(|_| "failed to parse Mach-O local symbol cohort symtab".to_owned())?
+        else {
+            continue;
+        };
+        if ranges.is_some() {
+            return Err("Mach-O local symbol cohort has multiple symbol tables".to_owned());
+        }
+        let symbol_start = u64::from(symtab.symoff.get(endian));
+        let symbol_size = u64::from(symtab.nsyms.get(endian))
+            .checked_mul(16)
+            .ok_or_else(|| "Mach-O local symbol table range overflowed".to_owned())?;
+        let symbol_end = symbol_start
+            .checked_add(symbol_size)
+            .ok_or_else(|| "Mach-O local symbol table range overflowed".to_owned())?;
+        let string_start = u64::from(symtab.stroff.get(endian));
+        let string_end = string_start
+            .checked_add(u64::from(symtab.strsize.get(endian)))
+            .ok_or_else(|| "Mach-O local string table range overflowed".to_owned())?;
+        if usize::try_from(symbol_end).map_or(true, |end| end > bytes.len())
+            || usize::try_from(string_end).map_or(true, |end| end > bytes.len())
+        {
+            return Err("Mach-O local symbol tables are outside the output".to_owned());
+        }
+        ranges = Some((symbol_start..symbol_end, string_start..string_end));
+    }
+    ranges.ok_or_else(|| "Mach-O local symbol cohort has no symbol table".to_owned())
+}
+
+fn return_macho_local_symbol_reserved_range(
+    ranges: &mut Vec<ReservedRangeRecord>,
+    output_section_id: u32,
+    alignment_exponent: u8,
+    output_offset: u64,
+    size: u64,
+) -> std::result::Result<(), String> {
+    ranges.push(ReservedRangeRecord {
+        output_section_id,
+        alignment_exponent,
+        output_offset,
+        size,
+    });
+    ranges.sort_unstable_by_key(|range| range.output_offset);
+    let mut merged = Vec::<ReservedRangeRecord>::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut() {
+            let previous_end = previous
+                .output_offset
+                .checked_add(previous.size)
+                .ok_or_else(|| "Mach-O local symbol reserve range overflowed".to_owned())?;
+            if previous_end > range.output_offset {
+                return Err("Mach-O local symbol reserve overlaps existing ownership".to_owned());
+            }
+            if previous_end == range.output_offset
+                && previous.output_section_id == range.output_section_id
+                && previous.alignment_exponent == range.alignment_exponent
+            {
+                previous.size = previous
+                    .size
+                    .checked_add(range.size)
+                    .ok_or_else(|| "Mach-O local symbol reserve size overflowed".to_owned())?;
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    validate_reserved_ranges(&merged)
+        .map_err(|error| format!("invalid Mach-O local symbol reserves: {error:#?}"))?;
+    *ranges = merged;
+    Ok(())
+}
+
+fn select_macho_local_symbol_cohort_reserved_ranges<'a>(
+    changed_unwind: Option<&'a mut Vec<ReservedRangeRecord>>,
+    added_archive_text: Option<&'a mut Vec<ReservedRangeRecord>>,
+    changed_definition: Option<&'a mut Vec<ReservedRangeRecord>>,
+    text_section: Option<&'a mut Vec<ReservedRangeRecord>>,
+    base: &'a mut Vec<ReservedRangeRecord>,
+) -> &'a mut Vec<ReservedRangeRecord> {
+    changed_unwind
+        .or(added_archive_text)
+        .or(changed_definition)
+        .or(text_section)
+        .unwrap_or(base)
+}
+
+fn apply_macho_local_symbol_cohort_plans(
+    plans: &[MachOLocalSymbolCohortPlan],
+    previous_output: &[u8],
+    reserved_ranges: &mut Vec<ReservedRangeRecord>,
+) -> std::result::Result<Vec<SectionPatch>, String> {
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _ = macho_symbol_table_offset_for_recycling(previous_output)?;
+    let (symbol_table, string_table) = macho_symbol_and_string_table_ranges(previous_output)?;
+    let symbol_output_section_id =
+        u32::try_from(crate::output_section_id::SYMTAB_GLOBAL.as_usize())
+            .map_err(|_| "Mach-O local symbol table output section exceeds u32".to_owned())?;
+    let string_output_section_id = u32::try_from(crate::output_section_id::STRTAB.as_usize())
+        .map_err(|_| "Mach-O local string table output section exceeds u32".to_owned())?;
+    let symbol_alignment = crate::alignment::SYMTAB_ENTRY.exponent;
+    let mut staged_ranges = reserved_ranges.clone();
+    let mut desired = previous_output.to_vec();
+    let mut modified = Vec::<std::ops::Range<usize>>::new();
+    let mut planned_previous_nlists = HashSet::<u64>::new();
+    let mut planned_current_names = HashSet::<Vec<u8>>::new();
+    let mut planned_current_sites = HashSet::<(u8, u64)>::new();
+
+    for plan in plans {
+        let previous_by_name = plan
+            .previous
+            .iter()
+            .map(|entry| (entry.name.as_slice(), entry))
+            .collect::<HashMap<_, _>>();
+        let current_by_name = plan
+            .current
+            .iter()
+            .map(|entry| (entry.name.as_slice(), entry))
+            .collect::<HashMap<_, _>>();
+        for entry in &plan.previous {
+            let entry_offset = entry
+                .output_entry_offset
+                .ok_or_else(|| "published local Mach-O cohort has no owned nlist".to_owned())?;
+            if !planned_previous_nlists.insert(entry_offset) {
+                return Err("published local Mach-O cohorts share an output nlist".to_owned());
+            }
+        }
+        for entry in &plan.current {
+            if !planned_current_names.insert(entry.name.clone()) {
+                return Err("published local Mach-O cohorts collide by name".to_owned());
+            }
+            if !planned_current_sites.insert((entry.output_section_index, entry.output_value)) {
+                return Err("published local Mach-O cohorts alias an output site".to_owned());
+            }
+        }
+
+        for previous in plan
+            .previous
+            .iter()
+            .filter(|entry| !current_by_name.contains_key(entry.name.as_slice()))
+        {
+            let entry_offset = previous.output_entry_offset.ok_or_else(|| {
+                "published local Mach-O cohort removal has no owned nlist".to_owned()
+            })?;
+            let entry_start = usize::try_from(entry_offset)
+                .map_err(|_| "published local Mach-O nlist offset exceeds usize".to_owned())?;
+            let entry_end = entry_start
+                .checked_add(16)
+                .ok_or_else(|| "published local Mach-O nlist range overflowed".to_owned())?;
+            let entry_end_u64 = entry_offset
+                .checked_add(16)
+                .ok_or_else(|| "published local Mach-O nlist range overflowed".to_owned())?;
+            if entry_offset < symbol_table.start || entry_end_u64 > symbol_table.end {
+                return Err("published local Mach-O nlist is outside the symbol table".to_owned());
+            }
+            let string_index = previous.string_index.ok_or_else(|| {
+                "published local Mach-O cohort removal has no string index".to_owned()
+            })?;
+            let string_start_u64 = string_table
+                .start
+                .checked_add(u64::from(string_index))
+                .ok_or_else(|| "published local Mach-O string offset overflowed".to_owned())?;
+            let string_size = u64::try_from(previous.name.len() + 1)
+                .map_err(|_| "published local Mach-O name is too large".to_owned())?;
+            let string_end_u64 = string_start_u64
+                .checked_add(string_size)
+                .ok_or_else(|| "published local Mach-O string range overflowed".to_owned())?;
+            if string_start_u64 < string_table.start || string_end_u64 > string_table.end {
+                return Err("published local Mach-O name is outside the string table".to_owned());
+            }
+            let string_start = usize::try_from(string_start_u64)
+                .map_err(|_| "published local Mach-O string offset exceeds usize".to_owned())?;
+            let string_end = usize::try_from(string_end_u64)
+                .map_err(|_| "published local Mach-O string end exceeds usize".to_owned())?;
+            let mut expected_name = previous.name.clone();
+            expected_name.push(0);
+            if desired.get(string_start..string_end) != Some(expected_name.as_slice()) {
+                return Err("published local Mach-O string ownership changed".to_owned());
+            }
+            desired[entry_start..entry_end].fill(0);
+            desired[string_start..string_end].fill(0);
+            modified.push(entry_start..entry_end);
+            modified.push(string_start..string_end);
+            return_macho_local_symbol_reserved_range(
+                &mut staged_ranges,
+                symbol_output_section_id,
+                symbol_alignment,
+                entry_offset,
+                16,
+            )?;
+            return_macho_local_symbol_reserved_range(
+                &mut staged_ranges,
+                string_output_section_id,
+                0,
+                string_start_u64,
+                string_size,
+            )?;
+        }
+
+        for current in &plan.current {
+            if let Some(previous) = previous_by_name.get(current.name.as_slice()) {
+                let entry_offset = previous.output_entry_offset.ok_or_else(|| {
+                    "published local Mach-O cohort update has no owned nlist".to_owned()
+                })?;
+                let string_index = previous.string_index.ok_or_else(|| {
+                    "published local Mach-O cohort update has no string index".to_owned()
+                })?;
+                let start = usize::try_from(entry_offset)
+                    .map_err(|_| "published local Mach-O nlist offset exceeds usize".to_owned())?;
+                let end = start
+                    .checked_add(16)
+                    .ok_or_else(|| "published local Mach-O nlist range overflowed".to_owned())?;
+                desired
+                    .get_mut(start..end)
+                    .ok_or_else(|| "published local Mach-O nlist is outside output".to_owned())?
+                    .copy_from_slice(&macho_local_symbol_cohort_entry(current, string_index));
+                modified.push(start..end);
+                continue;
+            }
+
+            let symbol_allocation = allocate_reserved_range(
+                &mut staged_ranges,
+                symbol_output_section_id,
+                symbol_alignment,
+                16,
+            )
+            .map_err(|error| format!("failed to allocate Mach-O local nlist: {error:#?}"))?
+            .ok_or_else(|| "insufficient incremental reserve for Mach-O local nlist".to_owned())?;
+            let string_size = u64::try_from(current.name.len() + 1)
+                .map_err(|_| "published local Mach-O name is too large".to_owned())?;
+            let string_allocation = allocate_reserved_range(
+                &mut staged_ranges,
+                string_output_section_id,
+                0,
+                string_size,
+            )
+            .map_err(|error| format!("failed to allocate Mach-O local string: {error:#?}"))?
+            .ok_or_else(|| "insufficient incremental reserve for Mach-O local string".to_owned())?;
+            let symbol_allocation_end = symbol_allocation
+                .output_offset
+                .checked_add(16)
+                .ok_or_else(|| "Mach-O local nlist allocation overflowed".to_owned())?;
+            let string_allocation_end = string_allocation
+                .output_offset
+                .checked_add(string_size)
+                .ok_or_else(|| "Mach-O local string allocation overflowed".to_owned())?;
+            if symbol_allocation.size != 16
+                || symbol_allocation.output_offset < symbol_table.start
+                || symbol_allocation_end > symbol_table.end
+                || string_allocation.size != string_size
+                || string_allocation.output_offset < string_table.start
+                || string_allocation_end > string_table.end
+            {
+                return Err(
+                    "Mach-O local symbol allocation is outside explicit table reserves".to_owned(),
+                );
+            }
+            let symbol_start = usize::try_from(symbol_allocation.output_offset)
+                .map_err(|_| "Mach-O local nlist allocation exceeds usize".to_owned())?;
+            let symbol_end = symbol_start
+                .checked_add(16)
+                .ok_or_else(|| "Mach-O local nlist allocation exceeds usize".to_owned())?;
+            let string_start = usize::try_from(string_allocation.output_offset)
+                .map_err(|_| "Mach-O local string allocation exceeds usize".to_owned())?;
+            let string_end = string_start
+                .checked_add(current.name.len())
+                .and_then(|end| end.checked_add(1))
+                .ok_or_else(|| "Mach-O local string allocation exceeds usize".to_owned())?;
+            let symbol_bytes = desired
+                .get(symbol_start..symbol_end)
+                .ok_or_else(|| "Mach-O local nlist allocation is outside output".to_owned())?;
+            let string_bytes = desired
+                .get(string_start..string_end)
+                .ok_or_else(|| "Mach-O local string allocation is outside output".to_owned())?;
+            if symbol_bytes
+                .iter()
+                .chain(string_bytes)
+                .any(|byte| *byte != 0)
+            {
+                return Err("Mach-O local symbol allocation is not zero-filled".to_owned());
+            }
+            let string_index = string_allocation
+                .output_offset
+                .checked_sub(string_table.start)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or_else(|| "Mach-O local string index overflowed".to_owned())?;
+            desired[symbol_start..symbol_end]
+                .copy_from_slice(&macho_local_symbol_cohort_entry(current, string_index));
+            desired[string_start..string_end - 1].copy_from_slice(&current.name);
+            desired[string_end - 1] = 0;
+            modified.push(symbol_start..symbol_end);
+            modified.push(string_start..string_end);
+        }
+    }
+
+    modified.sort_by_key(|range| range.start);
+    let mut merged = Vec::<std::ops::Range<usize>>::new();
+    for range in modified {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let patches = merged
+        .into_iter()
+        .map(|range| SectionPatch {
+            output_offset: range.start as u64,
+            size: range.len() as u64,
+            data: desired[range].to_vec(),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        })
+        .collect();
+    *reserved_ranges = staged_ranges;
+    Ok(patches)
 }
 
 fn recycled_macho_symbol_table_patches(
@@ -48822,6 +50270,732 @@ mod tests {
         assert_eq!(patches[0].data, 8_u64.to_le_bytes());
     }
 
+    fn add_test_macho_symbol_table_reserves(
+        mut output: Vec<u8>,
+        symbol_slots: usize,
+        string_bytes: usize,
+    ) -> (Vec<u8>, Vec<ReservedRangeRecord>) {
+        let command_count = read_u32_le(&output[16..20]).unwrap();
+        let mut command_offset = 32;
+        let mut symtab = None;
+        for _ in 0..command_count {
+            let command = read_u32_le(&output[command_offset..command_offset + 4]).unwrap();
+            let command_size =
+                read_u32_le(&output[command_offset + 4..command_offset + 8]).unwrap() as usize;
+            if command == object::macho::LC_SYMTAB {
+                symtab = Some(command_offset);
+                break;
+            }
+            command_offset += command_size;
+        }
+        let symtab = symtab.unwrap();
+        let symbol_count = read_u32_le(&output[symtab + 12..symtab + 16]).unwrap();
+        let old_string_offset = read_u32_le(&output[symtab + 16..symtab + 20]).unwrap() as usize;
+        let old_string_size = read_u32_le(&output[symtab + 20..symtab + 24]).unwrap() as usize;
+        assert_eq!(old_string_offset + old_string_size, output.len());
+        let symbol_reserve_size = symbol_slots * 16;
+        output.splice(
+            old_string_offset..old_string_offset,
+            std::iter::repeat_n(0, symbol_reserve_size),
+        );
+        let string_offset = old_string_offset + symbol_reserve_size;
+        output.resize(output.len() + string_bytes, 0);
+        output[symtab + 12..symtab + 16]
+            .copy_from_slice(&(symbol_count + symbol_slots as u32).to_le_bytes());
+        output[symtab + 16..symtab + 20].copy_from_slice(&(string_offset as u32).to_le_bytes());
+        output[symtab + 20..symtab + 24]
+            .copy_from_slice(&((old_string_size + string_bytes) as u32).to_le_bytes());
+        (
+            output,
+            vec![
+                ReservedRangeRecord {
+                    output_section_id: crate::output_section_id::SYMTAB_GLOBAL.as_usize() as u32,
+                    alignment_exponent: crate::alignment::SYMTAB_ENTRY.exponent,
+                    output_offset: old_string_offset as u64,
+                    size: symbol_reserve_size as u64,
+                },
+                ReservedRangeRecord {
+                    output_section_id: crate::output_section_id::STRTAB.as_usize() as u32,
+                    alignment_exponent: 0,
+                    output_offset: (string_offset + old_string_size) as u64,
+                    size: string_bytes as u64,
+                },
+            ],
+        )
+    }
+
+    fn test_macho_local_cohort_entry(output: &[u8], name: &[u8]) -> MachOLocalSymbolCohortEntry {
+        let file = object::File::parse(output).unwrap();
+        let symbol = file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(name))
+            .unwrap();
+        let range = macho_symbol_entry_range(
+            output,
+            macho_symbol_table_offset_for_recycling(output).unwrap(),
+            symbol.index().0,
+        )
+        .unwrap();
+        let raw = &output[range.clone()];
+        MachOLocalSymbolCohortEntry {
+            name: name.to_vec(),
+            n_desc: read_u16_le(&raw[6..8]).unwrap(),
+            output_section_index: raw[5],
+            output_value: read_u64_le(&raw[8..16]).unwrap(),
+            output_entry_offset: Some(range.start as u64),
+            string_index: read_u32_le(&raw[..4]),
+        }
+    }
+
+    fn apply_test_output_patches(output: &mut [u8], patches: &[SectionPatch]) {
+        for patch in patches {
+            let start = patch.output_offset as usize;
+            let end = start + patch.data.len();
+            output[start..end].copy_from_slice(&patch.data);
+        }
+    }
+
+    fn round_trip_test_reserved_ranges(
+        ranges: &[ReservedRangeRecord],
+        output_len: usize,
+    ) -> Vec<ReservedRangeRecord> {
+        let mut rendered = String::new();
+        render_required_reserved_range_table(&mut rendered, ranges);
+        parse_reserved_range_table(&mut rendered.lines(), output_len as u64).unwrap()
+    }
+
+    #[test]
+    fn published_local_macho_cohort_permutation_and_growth_round_trips_without_leaks() {
+        let mut output_a = test_macho_object(&[0; 16], &[0; 16], 0);
+        let text_entry = test_macho_symbol_entry_offset(&output_a, b"_text");
+        let data_entry = test_macho_symbol_entry_offset(&output_a, b"_data");
+        output_a[text_entry + 4] = object::macho::N_SECT;
+        output_a[data_entry + 4] = object::macho::N_SECT;
+        let (output_a, reserves_a) = add_test_macho_symbol_table_reserves(output_a, 2, 96);
+        let previous_a = vec![
+            test_macho_local_cohort_entry(&output_a, b"_data"),
+            test_macho_local_cohort_entry(&output_a, b"_text"),
+        ];
+        let mut current_b = previous_a
+            .iter()
+            .map(|entry| MachOLocalSymbolCohortEntry {
+                output_entry_offset: None,
+                string_index: None,
+                ..entry.clone()
+            })
+            .collect::<Vec<_>>();
+        current_b[0].output_section_index = previous_a[1].output_section_index;
+        current_b[0].output_value = previous_a[1].output_value + 4;
+        current_b[1].output_section_index = previous_a[0].output_section_index;
+        current_b[1].output_value = previous_a[0].output_value + 4;
+        current_b.push(MachOLocalSymbolCohortEntry {
+            name: b"local.150".to_vec(),
+            n_desc: 0,
+            output_section_index: previous_a[0].output_section_index,
+            output_value: previous_a[0].output_value + 8,
+            output_entry_offset: None,
+            string_index: None,
+        });
+        current_b.sort_by(|left, right| left.name.cmp(&right.name));
+        let forward = MachOLocalSymbolCohortPlan {
+            previous_input: "member-a".to_owned(),
+            current_input: "member-b".to_owned(),
+            previous: previous_a.clone(),
+            current: current_b,
+        };
+        let mut reserves_b = reserves_a.clone();
+        let forward_patches =
+            apply_macho_local_symbol_cohort_plans(&[forward], &output_a, &mut reserves_b).unwrap();
+        let mut output_b = output_a.clone();
+        apply_test_output_patches(&mut output_b, &forward_patches);
+        let reserves_b = round_trip_test_reserved_ranges(&reserves_b, output_b.len());
+        let parsed_b = object::File::parse(output_b.as_slice()).unwrap();
+        assert_eq!(
+            parsed_b
+                .symbols()
+                .filter(|symbol| !symbol.is_global())
+                .map(|symbol| symbol.name().unwrap().to_owned())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "_data".to_owned(),
+                "_text".to_owned(),
+                "local.150".to_owned()
+            ]),
+        );
+
+        let previous_b = vec![
+            test_macho_local_cohort_entry(&output_b, b"_data"),
+            test_macho_local_cohort_entry(&output_b, b"_text"),
+            test_macho_local_cohort_entry(&output_b, b"local.150"),
+        ];
+        let current_a = previous_a
+            .iter()
+            .map(|entry| MachOLocalSymbolCohortEntry {
+                output_entry_offset: None,
+                string_index: None,
+                ..entry.clone()
+            })
+            .collect();
+        let reverse = MachOLocalSymbolCohortPlan {
+            previous_input: "member-b".to_owned(),
+            current_input: "member-a".to_owned(),
+            previous: previous_b,
+            current: current_a,
+        };
+        let mut restored_reserves_a = reserves_b.clone();
+        let reverse_patches =
+            apply_macho_local_symbol_cohort_plans(&[reverse], &output_b, &mut restored_reserves_a)
+                .unwrap();
+        let mut restored_a = output_b.clone();
+        apply_test_output_patches(&mut restored_a, &reverse_patches);
+        let restored_reserves_a =
+            round_trip_test_reserved_ranges(&restored_reserves_a, restored_a.len());
+        assert_eq!(restored_a, output_a);
+        assert_eq!(restored_reserves_a, reserves_a);
+
+        let previous_a2 = vec![
+            test_macho_local_cohort_entry(&restored_a, b"_data"),
+            test_macho_local_cohort_entry(&restored_a, b"_text"),
+        ];
+        let mut current_b2 = previous_a2
+            .iter()
+            .map(|entry| MachOLocalSymbolCohortEntry {
+                output_entry_offset: None,
+                string_index: None,
+                ..entry.clone()
+            })
+            .collect::<Vec<_>>();
+        current_b2[0].output_section_index = previous_a2[1].output_section_index;
+        current_b2[0].output_value = previous_a2[1].output_value + 4;
+        current_b2[1].output_section_index = previous_a2[0].output_section_index;
+        current_b2[1].output_value = previous_a2[0].output_value + 4;
+        current_b2.push(MachOLocalSymbolCohortEntry {
+            name: b"local.150".to_vec(),
+            n_desc: 0,
+            output_section_index: previous_a2[0].output_section_index,
+            output_value: previous_a2[0].output_value + 8,
+            output_entry_offset: None,
+            string_index: None,
+        });
+        current_b2.sort_by(|left, right| left.name.cmp(&right.name));
+        let reapply = MachOLocalSymbolCohortPlan {
+            previous_input: "member-a".to_owned(),
+            current_input: "member-b".to_owned(),
+            previous: previous_a2,
+            current: current_b2,
+        };
+        let mut reserves_b2 = restored_reserves_a;
+        let reapply_patches =
+            apply_macho_local_symbol_cohort_plans(&[reapply], &restored_a, &mut reserves_b2)
+                .unwrap();
+        let mut reapplied_b = restored_a;
+        apply_test_output_patches(&mut reapplied_b, &reapply_patches);
+        assert_eq!(reapplied_b, output_b);
+        assert_eq!(reserves_b2, reserves_b);
+    }
+
+    #[test]
+    fn published_local_macho_large_renumbered_cohort_grows_atomically() {
+        let mut output_a = test_macho_object(&[0; 16], &[0; 128], 0);
+        for name in [b"_text".as_slice(), b"_data".as_slice()] {
+            let entry = test_macho_symbol_entry_offset(&output_a, name);
+            output_a[entry + 4] = object::macho::N_SECT;
+        }
+        for index in 200..208 {
+            output_a = add_test_macho_local_alias(
+                output_a,
+                format!("l_anon.ty.{index}").as_bytes(),
+                2,
+                24 + (index - 200) * 8,
+            );
+        }
+        let (output_a, reserves_a) = add_test_macho_symbol_table_reserves(output_a, 1, 64);
+        let mut previous = ["_data".to_owned(), "_text".to_owned()]
+            .into_iter()
+            .chain((200..208).map(|index| format!("l_anon.ty.{index}")))
+            .map(|name| test_macho_local_cohort_entry(&output_a, name.as_bytes()))
+            .collect::<Vec<_>>();
+        previous.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut current = previous
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let destination = &previous[(index + 1) % previous.len()];
+                MachOLocalSymbolCohortEntry {
+                    output_section_index: destination.output_section_index,
+                    output_value: destination.output_value,
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..entry.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let data = previous
+            .iter()
+            .find(|entry| entry.name == b"_data")
+            .unwrap();
+        current.push(MachOLocalSymbolCohortEntry {
+            name: b"l_anon.ty.232".to_vec(),
+            n_desc: 0,
+            output_section_index: data.output_section_index,
+            output_value: data.output_value + 96,
+            output_entry_offset: None,
+            string_index: None,
+        });
+        current.sort_by(|left, right| left.name.cmp(&right.name));
+        let forward = MachOLocalSymbolCohortPlan {
+            previous_input: "ty-member.old".to_owned(),
+            current_input: "ty-member.new".to_owned(),
+            previous: previous.clone(),
+            current: current.clone(),
+        };
+        let mut reserves_b = reserves_a.clone();
+        let forward_patches =
+            apply_macho_local_symbol_cohort_plans(&[forward], &output_a, &mut reserves_b).unwrap();
+        let mut output_b = output_a.clone();
+        apply_test_output_patches(&mut output_b, &forward_patches);
+        for expected in &current {
+            let actual = test_macho_local_cohort_entry(&output_b, &expected.name);
+            assert_eq!(actual.output_section_index, expected.output_section_index);
+            assert_eq!(actual.output_value, expected.output_value);
+        }
+
+        let reverse = MachOLocalSymbolCohortPlan {
+            previous_input: "ty-member.new".to_owned(),
+            current_input: "ty-member.old".to_owned(),
+            previous: current
+                .iter()
+                .map(|entry| test_macho_local_cohort_entry(&output_b, &entry.name))
+                .collect(),
+            current: previous
+                .iter()
+                .map(|entry| MachOLocalSymbolCohortEntry {
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..entry.clone()
+                })
+                .collect(),
+        };
+        let reverse_patches =
+            apply_macho_local_symbol_cohort_plans(&[reverse], &output_b, &mut reserves_b).unwrap();
+        apply_test_output_patches(&mut output_b, &reverse_patches);
+        assert_eq!(output_b, output_a);
+        assert_eq!(reserves_b, reserves_a);
+    }
+
+    #[test]
+    fn published_local_macho_same_count_remap_matches_independent_output_and_round_trips() {
+        let mut output_a = test_macho_object(&[0; 16], &[0; 16], 0);
+        for name in [b"_text".as_slice(), b"_data".as_slice()] {
+            let entry = test_macho_symbol_entry_offset(&output_a, name);
+            output_a[entry + 4] = object::macho::N_SECT;
+        }
+        let previous_a = vec![
+            test_macho_local_cohort_entry(&output_a, b"_data"),
+            test_macho_local_cohort_entry(&output_a, b"_text"),
+        ];
+        let mut current_b = previous_a
+            .iter()
+            .map(|entry| MachOLocalSymbolCohortEntry {
+                output_entry_offset: None,
+                string_index: None,
+                ..entry.clone()
+            })
+            .collect::<Vec<_>>();
+        current_b[0].output_section_index = previous_a[1].output_section_index;
+        current_b[0].output_value = previous_a[1].output_value;
+        current_b[1].output_section_index = previous_a[0].output_section_index;
+        current_b[1].output_value = previous_a[0].output_value;
+        let mut expected_b = output_a.clone();
+        for entry in &current_b {
+            let offset = previous_a
+                .iter()
+                .find(|previous| previous.name == entry.name)
+                .unwrap()
+                .output_entry_offset
+                .unwrap() as usize;
+            expected_b[offset + 5] = entry.output_section_index;
+            expected_b[offset + 8..offset + 16].copy_from_slice(&entry.output_value.to_le_bytes());
+        }
+        let forward = MachOLocalSymbolCohortPlan {
+            previous_input: "normalized-member.old".to_owned(),
+            current_input: "normalized-member.new".to_owned(),
+            previous: previous_a.clone(),
+            current: current_b,
+        };
+        let mut reserves = Vec::new();
+        let patches =
+            apply_macho_local_symbol_cohort_plans(&[forward], &output_a, &mut reserves).unwrap();
+        let mut output_b = output_a.clone();
+        apply_test_output_patches(&mut output_b, &patches);
+        assert_eq!(output_b, expected_b);
+        assert!(reserves.is_empty());
+
+        let reverse = MachOLocalSymbolCohortPlan {
+            previous_input: "normalized-member.new".to_owned(),
+            current_input: "normalized-member.old".to_owned(),
+            previous: vec![
+                test_macho_local_cohort_entry(&output_b, b"_data"),
+                test_macho_local_cohort_entry(&output_b, b"_text"),
+            ],
+            current: previous_a
+                .iter()
+                .map(|entry| MachOLocalSymbolCohortEntry {
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..entry.clone()
+                })
+                .collect(),
+        };
+        let reverse_patches =
+            apply_macho_local_symbol_cohort_plans(&[reverse], &output_b, &mut reserves).unwrap();
+        apply_test_output_patches(&mut output_b, &reverse_patches);
+        assert_eq!(output_b, output_a);
+        assert!(reserves.is_empty());
+    }
+
+    fn test_macho_patch_section(output: &[u8], section_name: &str) -> PatchSection {
+        let file = object::File::parse(output).unwrap();
+        let section = file.section_by_name(section_name).unwrap();
+        let (output_offset, size) = section.file_range().unwrap();
+        PatchSection {
+            input: "member".to_owned(),
+            section_index: patch_section_record_index(&file, section.index()).unwrap(),
+            section_name: Some(section_name.to_owned()),
+            input_size: size,
+            output_offset,
+            output_size: size,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        }
+    }
+
+    #[test]
+    fn published_local_macho_cohort_rejects_shared_stab_string_suffix() {
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let text_entry = test_macho_symbol_entry_offset(&output, b"_text");
+        let data_entry = test_macho_symbol_entry_offset(&output, b"_data");
+        output[text_entry + 4] = object::macho::N_SECT;
+        let text_string_index = read_u32_le(&output[text_entry..text_entry + 4]).unwrap();
+        output[data_entry..data_entry + 4].copy_from_slice(&(text_string_index + 1).to_le_bytes());
+        output[data_entry + 4] = object::macho::N_STAB;
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let mut entries = vec![test_macho_local_cohort_entry(&output, b"_text")];
+        assert_eq!(
+            verify_previous_macho_local_symbol_cohort(
+                &output,
+                &output_file,
+                &[test_macho_patch_section(&output, "__text")],
+                &mut entries,
+            )
+            .unwrap_err(),
+            "published local Mach-O cohort string ownership is shared"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_requires_rooted_atom_reachability() {
+        assert!(macho_local_cohort_symbol_is_root(
+            object::macho::N_NO_DEAD_STRIP,
+        ));
+        assert!(!macho_local_cohort_symbol_is_root(
+            object::macho::N_NO_DEAD_STRIP | object::macho::N_ALT_ENTRY,
+        ));
+        assert!(!macho_local_cohort_relocation_follows_target(
+            object::macho::ARM64_RELOC_SUBTRACTOR,
+        ));
+        assert!(!macho_local_cohort_relocation_follows_target(
+            object::macho::ARM64_RELOC_ADDEND,
+        ));
+        assert!(macho_local_cohort_relocation_follows_target(
+            object::macho::ARM64_RELOC_UNSIGNED,
+        ));
+        let previous_member = PatchInputBytes {
+            bytes: b"same",
+            file_offset: 0,
+            archive_identifier: Some(b"old"),
+        };
+        let current_member = PatchInputBytes {
+            bytes: b"same",
+            file_offset: 32,
+            archive_identifier: Some(b"new"),
+        };
+        assert!(macho_local_cohort_source_member_is_unchanged(
+            Some(previous_member),
+            Some(current_member),
+        ));
+        let changed_member = PatchInputBytes {
+            bytes: b"changed",
+            ..current_member
+        };
+        assert!(!macho_local_cohort_source_member_is_unchanged(
+            Some(previous_member),
+            Some(changed_member),
+        ));
+
+        let section = object::SectionIndex(1);
+        let boundaries = HashMap::from([(section, vec![0, 4, 8])]);
+        let roots = HashSet::from([(section, 0)]);
+        let disconnected_cycle = HashMap::from([
+            ((section, 4), vec![(section, 8)]),
+            ((section, 8), vec![(section, 4)]),
+        ]);
+        assert!(!macho_local_cohort_atom_graph_is_complete(
+            &boundaries,
+            &roots,
+            &disconnected_cycle,
+        ));
+
+        let unreferenced_temporary_boundary = HashMap::from([((section, 0), Vec::new())]);
+        assert!(!macho_local_cohort_atom_graph_is_complete(
+            &HashMap::from([(section, vec![0, 4])]),
+            &roots,
+            &unreferenced_temporary_boundary,
+        ));
+
+        let rooted = HashMap::from([
+            ((section, 0), vec![(section, 4)]),
+            ((section, 4), vec![(section, 8)]),
+        ]);
+        assert!(macho_local_cohort_atom_graph_is_complete(
+            &boundaries,
+            &roots,
+            &rooted,
+        ));
+    }
+
+    #[test]
+    fn published_local_macho_cohort_rejects_occupied_or_exhausted_reserves() {
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let entry = test_macho_symbol_entry_offset(&output, b"_text");
+        output[entry + 4] = object::macho::N_SECT;
+        let (mut output, reserves) = add_test_macho_symbol_table_reserves(output, 1, 32);
+        let previous = vec![test_macho_local_cohort_entry(&output, b"_text")];
+        let added = MachOLocalSymbolCohortEntry {
+            name: b"local.added".to_vec(),
+            n_desc: 0,
+            output_section_index: previous[0].output_section_index,
+            output_value: previous[0].output_value + 4,
+            output_entry_offset: None,
+            string_index: None,
+        };
+        let plan = MachOLocalSymbolCohortPlan {
+            previous_input: "a".to_owned(),
+            current_input: "b".to_owned(),
+            previous: previous.clone(),
+            current: [
+                MachOLocalSymbolCohortEntry {
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous[0].clone()
+                },
+                added,
+            ]
+            .into(),
+        };
+
+        let mut exhausted = reserves
+            .iter()
+            .filter(|range| {
+                range.output_section_id == crate::output_section_id::STRTAB.as_usize() as u32
+            })
+            .cloned()
+            .collect();
+        assert!(
+            apply_macho_local_symbol_cohort_plans(&[plan.clone()], &output, &mut exhausted)
+                .err()
+                .unwrap()
+                .contains("insufficient incremental reserve for Mach-O local nlist")
+        );
+
+        let symbol_reserve = reserves
+            .iter()
+            .find(|range| {
+                range.output_section_id == crate::output_section_id::SYMTAB_GLOBAL.as_usize() as u32
+            })
+            .unwrap();
+        output[symbol_reserve.output_offset as usize] = 1;
+        let mut occupied = reserves.clone();
+        assert_eq!(
+            apply_macho_local_symbol_cohort_plans(&[plan], &output, &mut occupied)
+                .err()
+                .unwrap(),
+            "Mach-O local symbol allocation is not zero-filled"
+        );
+        assert_eq!(occupied, reserves);
+    }
+
+    #[test]
+    fn published_local_macho_cohorts_reject_cross_plan_name_collisions() {
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        for name in [b"_text".as_slice(), b"_data".as_slice()] {
+            let entry = test_macho_symbol_entry_offset(&output, name);
+            output[entry + 4] = object::macho::N_SECT;
+        }
+        let (output, mut reserves) = add_test_macho_symbol_table_reserves(output, 2, 64);
+        let previous_text = test_macho_local_cohort_entry(&output, b"_text");
+        let previous_data = test_macho_local_cohort_entry(&output, b"_data");
+        let current = |previous: &MachOLocalSymbolCohortEntry| MachOLocalSymbolCohortEntry {
+            name: b"local.same".to_vec(),
+            output_entry_offset: None,
+            string_index: None,
+            ..previous.clone()
+        };
+        let plans = [
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a1".to_owned(),
+                current_input: "b1".to_owned(),
+                previous: vec![previous_text.clone()],
+                current: vec![current(&previous_text)],
+            },
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a2".to_owned(),
+                current_input: "b2".to_owned(),
+                previous: vec![previous_data.clone()],
+                current: vec![current(&previous_data)],
+            },
+        ];
+        assert_eq!(
+            apply_macho_local_symbol_cohort_plans(&plans, &output, &mut reserves)
+                .err()
+                .unwrap(),
+            "published local Mach-O cohorts collide by name"
+        );
+
+        let shared_previous = [
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a1".to_owned(),
+                current_input: "b1".to_owned(),
+                previous: vec![previous_text.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"local.one".to_vec(),
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_text.clone()
+                }],
+            },
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a2".to_owned(),
+                current_input: "b2".to_owned(),
+                previous: vec![previous_text.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"local.two".to_vec(),
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_text.clone()
+                }],
+            },
+        ];
+        assert_eq!(
+            apply_macho_local_symbol_cohort_plans(&shared_previous, &output, &mut reserves)
+                .err()
+                .unwrap(),
+            "published local Mach-O cohorts share an output nlist"
+        );
+
+        let shared_site = [
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a1".to_owned(),
+                current_input: "b1".to_owned(),
+                previous: vec![previous_text.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"local.one".to_vec(),
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_text.clone()
+                }],
+            },
+            MachOLocalSymbolCohortPlan {
+                previous_input: "a2".to_owned(),
+                current_input: "b2".to_owned(),
+                previous: vec![previous_data.clone()],
+                current: vec![MachOLocalSymbolCohortEntry {
+                    name: b"local.two".to_vec(),
+                    output_section_index: previous_text.output_section_index,
+                    output_value: previous_text.output_value,
+                    output_entry_offset: None,
+                    string_index: None,
+                    ..previous_data
+                }],
+            },
+        ];
+        assert_eq!(
+            apply_macho_local_symbol_cohort_plans(&shared_site, &output, &mut reserves)
+                .err()
+                .unwrap(),
+            "published local Mach-O cohorts alias an output site"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_validates_owned_output_symbol_patches() {
+        let entry = |name: &[u8], value| MachOLocalSymbolCohortEntry {
+            name: name.to_vec(),
+            n_desc: 0,
+            output_section_index: 1,
+            output_value: value,
+            output_entry_offset: None,
+            string_index: None,
+        };
+        let cohort = MachOLocalSymbolCohortPlan {
+            previous_input: "a".to_owned(),
+            current_input: "b".to_owned(),
+            previous: vec![entry(b"old", 10)],
+            current: vec![entry(b"new", 20)],
+        };
+        let owned = RelocationTargetSymbolPatch {
+            target_name: hex::encode(b"old"),
+            previous_target_value: 10,
+            target_value: 20,
+            allow_missing: true,
+            source: "test",
+        };
+        assert!(
+            macho_local_symbol_cohort_owns_output_symbol_patch(
+                std::slice::from_ref(&cohort),
+                &owned,
+            )
+            .unwrap()
+        );
+        let conflicting = RelocationTargetSymbolPatch {
+            target_value: 24,
+            ..owned
+        };
+        assert_eq!(
+            macho_local_symbol_cohort_owns_output_symbol_patch(&[cohort], &conflicting)
+                .unwrap_err(),
+            "published local Mach-O output-symbol patch conflicts with its cohort"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_updates_the_final_reserved_range_owner() {
+        let range = |offset| ReservedRangeRecord {
+            output_section_id: crate::output_section_id::STRTAB.as_usize() as u32,
+            alignment_exponent: 0,
+            output_offset: offset,
+            size: 1,
+        };
+        let mut changed_unwind = vec![range(1)];
+        let mut added = vec![range(2)];
+        let mut definition = vec![range(3)];
+        let mut text = vec![range(4)];
+        let mut base = vec![range(5)];
+        select_macho_local_symbol_cohort_reserved_ranges(
+            Some(&mut changed_unwind),
+            Some(&mut added),
+            Some(&mut definition),
+            Some(&mut text),
+            &mut base,
+        )
+        .push(range(6));
+        assert_eq!(changed_unwind, vec![range(1), range(6)]);
+        assert_eq!(added, vec![range(2)]);
+        assert_eq!(definition, vec![range(3)]);
+        assert_eq!(text, vec![range(4)]);
+        assert_eq!(base, vec![range(5)]);
+    }
+
     fn test_macho_chained_fixup_table(page_start: u16) -> Vec<u8> {
         let mut table = vec![0; 128];
         let starts_offset = 32;
@@ -53167,18 +55341,20 @@ mod tests {
             archive_member_patch_identifier(previous_member_identifier),
             archive_member_patch_identifier(current_member_identifier),
         );
-        let previous_object = test_macho_local_text_target_object_with_alias(
+        let mut previous_object = test_macho_local_text_target_object_with_alias(
             previous_name,
             previous_data,
             previous_target_offset,
             alias_offsets.map(|(previous, _)| previous),
         );
-        let current_object = test_macho_local_text_target_object_with_alias(
+        let mut current_object = test_macho_local_text_target_object_with_alias(
             current_name,
             current_data,
             current_target_offset,
             alias_offsets.map(|(_, current)| current),
         );
+        previous_object[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        current_object[24..28].copy_from_slice(&0_u32.to_le_bytes());
         let archive = |identifier: &[u8], object: &[u8]| {
             let mut builder = ar::Builder::new(Vec::new());
             builder
@@ -53466,6 +55642,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
+        let mut local_symbol_cohort_patches = Vec::new();
         apply_macho_text_relocation_replays(
             &mut patches,
             &replays,
@@ -53474,6 +55651,7 @@ mod tests {
             &mut resolutions,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut local_symbol_cohort_patches,
         )?;
         let mut output = fixture.previous_output.clone();
         for patch in patches {
@@ -53481,6 +55659,7 @@ mod tests {
             let end = start + patch.patch.data.len();
             output[start..end].copy_from_slice(&patch.patch.data);
         }
+        apply_test_output_patches(&mut output, &local_symbol_cohort_patches);
         Ok((
             output,
             relocations,
@@ -53647,14 +55826,22 @@ mod tests {
             4,
         );
         publish_local_transition_symbols(&mut one_sided, &[(b"l_a.1", 0)]);
-        assert_eq!(
-            apply_local_text_target_transition(
-                &one_sided,
-                vec![one_sided.relocation.clone()],
-                true,
-            )
-            .unwrap_err(),
-            expected,
+        let (one_sided_output, _, _) = apply_local_text_target_transition(
+            &one_sided,
+            vec![one_sided.relocation.clone()],
+            true,
+        )
+        .unwrap();
+        let one_sided_file = object::File::parse(one_sided_output.as_slice()).unwrap();
+        assert!(
+            one_sided_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"l_b.2"))
+        );
+        assert!(
+            !one_sided_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"l_a.1"))
         );
 
         let mut external = local_text_target_transition_fixture(
@@ -59006,6 +61193,7 @@ mod tests {
         let mut replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59079,6 +61267,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59133,6 +61322,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap()
         );
@@ -59172,6 +61362,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: true,
             symbol_resolutions_changed: false,
         };
@@ -59236,6 +61427,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap()
         );
@@ -59263,6 +61455,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59291,6 +61484,7 @@ mod tests {
             &mut patches,
             &replays,
             &previous_output,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -59353,6 +61547,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59383,6 +61578,7 @@ mod tests {
             &replays,
             &previous_output,
             &mut relocations,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -59419,6 +61615,7 @@ mod tests {
         let next_replays = MachOTextRelocationReplays {
             replays: vec![next_replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59442,6 +61639,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -59456,6 +61654,7 @@ mod tests {
         let grown_replays = MachOTextRelocationReplays {
             replays: vec![grown_replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59479,6 +61678,7 @@ mod tests {
             &grown_replays,
             &next_previous_output,
             &mut relocations,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -59533,6 +61733,7 @@ mod tests {
         let replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59582,6 +61783,7 @@ mod tests {
             &mut resolutions,
             &mut reserved_ranges,
             &mut reserved_thunk_patches,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -59622,6 +61824,7 @@ mod tests {
         let next_replays = MachOTextRelocationReplays {
             replays: vec![next_replay],
             rematerialized_sections: Vec::new(),
+            local_symbol_cohorts: Vec::new(),
             normalize_rust_archive_patch_inputs: false,
             symbol_resolutions_changed: false,
         };
@@ -59646,6 +61849,7 @@ mod tests {
             &mut resolutions,
             &mut reserved_ranges,
             &mut next_reserved_thunk_patches,
+            &mut Vec::new(),
         )
         .unwrap();
 
