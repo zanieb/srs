@@ -30346,6 +30346,10 @@ fn reactivated_macho_archive_indirect_target_is_current(
     }
 }
 
+fn macho_patch_section_relocation_target_index(section_index: u32) -> Option<u32> {
+    section_index.checked_add(1)
+}
+
 fn reactivated_macho_archive_owned_target_value(
     input_file_path: &str,
     states: &[MachOArchiveActivationState],
@@ -30378,7 +30382,9 @@ fn reactivated_macho_archive_owned_target_value(
         .iter()
         .flat_map(|state| &state.sections)
         .filter(|section| {
-            section.input == target.input.as_str() && section.section_index == target.section_index
+            section.input == target.input.as_str()
+                && macho_patch_section_relocation_target_index(section.section_index)
+                    == Some(target.section_index)
         })
         .collect::<Vec<_>>();
     let [owner] = owners.as_slice() else {
@@ -75512,7 +75518,7 @@ mod tests {
             target: Some(RelocationTargetRecord {
                 input_file: input_file.clone().into(),
                 input: previous_input.clone().into(),
-                section_index: 1,
+                section_index: 2,
                 section_offset: 4,
             }),
         };
@@ -75706,7 +75712,7 @@ mod tests {
             target: Some(RelocationTargetRecord {
                 input_file: input_file.clone().into(),
                 input: second_previous_input.clone().into(),
-                section_index: 2,
+                section_index: 3,
                 section_offset: 8,
             }),
             ..dormant.symbol_resolutions[0].clone()
@@ -76696,6 +76702,105 @@ mod tests {
     }
 
     #[test]
+    fn dormant_macho_archive_reactivation_converts_owned_target_section_index_atomically() {
+        assert_eq!(macho_patch_section_relocation_target_index(0), Some(1));
+        assert_eq!(macho_patch_section_relocation_target_index(1), Some(2));
+        assert_eq!(macho_patch_section_relocation_target_index(u32::MAX), None);
+        let output = test_macho_unwind_output(0x1000);
+        let previous_target = RelocationTargetRecord {
+            input_file: "external.o".into(),
+            input: "external.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        };
+        let mut state =
+            dormant_external_relocation_state(output.text_offset, 0x2000, previous_target);
+        state.sections[0].section_index = 0;
+        state.relocations[0].section_index = 0;
+        state.sections.push(FilePatchSectionState {
+            input: "target-member.o".to_owned(),
+            section_index: 1,
+            section_name: Some("__TEXT,__const".to_owned()),
+            input_size: 32,
+            output_offset: output.text_offset + 64,
+            output_size: 32,
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        });
+        let owned_target = RelocationTargetRecord {
+            input_file: "archive.rlib".into(),
+            input: "target-member.o".into(),
+            section_index: 2,
+            section_offset: 0,
+        };
+        state.relocations[0].target = Some(owned_target.clone());
+        let output_file = object::File::parse(&*output.bytes).unwrap();
+        let expected_target =
+            macho_output_address_for_file_offset(&output_file, output.text_offset + 64).unwrap();
+
+        let mut states = vec![state.clone()];
+        rematerialize_reactivated_macho_archive_relocations(
+            "archive.rlib",
+            &mut states,
+            &[],
+            &output.bytes,
+        )
+        .unwrap();
+        let relocation = &states[0].relocations[0];
+        assert_eq!(relocation.target.as_ref(), Some(&owned_target));
+        assert_eq!(relocation.target_value, expected_target);
+        assert_eq!(relocation.applied_target_value, Some(expected_target));
+        assert_eq!(relocation.written_value, Some(expected_target + 0x10));
+
+        let mut zero_target = state.clone();
+        zero_target.relocations[0]
+            .target
+            .as_mut()
+            .unwrap()
+            .section_index = 0;
+        let mut raw_equal_target = state.clone();
+        raw_equal_target.relocations[0]
+            .target
+            .as_mut()
+            .unwrap()
+            .section_index = 1;
+        let mut wrong_target = state.clone();
+        wrong_target.relocations[0]
+            .target
+            .as_mut()
+            .unwrap()
+            .section_index = 3;
+        let mut overflow_owner = state.clone();
+        overflow_owner.sections[1].section_index = u32::MAX;
+        let mut duplicate_owner = state;
+        duplicate_owner
+            .sections
+            .push(duplicate_owner.sections[1].clone());
+        for invalid in [
+            zero_target,
+            raw_equal_target,
+            wrong_target,
+            overflow_owner,
+            duplicate_owner,
+        ] {
+            let mut states = vec![invalid];
+            let unchanged = states.clone();
+            let reason = rematerialize_reactivated_macho_archive_relocations(
+                "archive.rlib",
+                &mut states,
+                &[],
+                &output.bytes,
+            )
+            .unwrap_err();
+            assert!(
+                reason.contains("incomplete current target ownership"),
+                "unexpected reason: {reason}"
+            );
+            assert_eq!(states, unchanged);
+        }
+    }
+
+    #[test]
     fn dormant_macho_archive_reactivation_rematerializes_external_target_across_abab() {
         let output = test_macho_unwind_output(0x1000);
         let target_a = RelocationTargetRecord {
@@ -77096,7 +77201,7 @@ mod tests {
         incomplete_owner[0].relocations[0].target = Some(RelocationTargetRecord {
             input_file: "archive.rlib".into(),
             input: "member.o".into(),
-            section_index: 2,
+            section_index: 3,
             section_offset: 0,
         });
         let unchanged = incomplete_owner.clone();
