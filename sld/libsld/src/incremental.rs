@@ -550,6 +550,12 @@ struct ArchiveMemberPatchFingerprint {
     fingerprint: String,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ArchiveMemberFingerprintProof<'a> {
+    previous: Option<&'a [ArchiveMemberPatchFingerprint]>,
+    current: Option<&'a [ArchiveMemberPatchFingerprint]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArchiveMemberSetProof {
     raw_ordered_hash: String,
@@ -9378,6 +9384,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &restored_names,
                             &retiring_names,
                             &relocation_target_patches.validated_macho_local_retargets,
+                            ArchiveMemberFingerprintProof {
+                                previous: previous_patch
+                                    .archive_member_patch_fingerprints
+                                    .as_deref(),
+                                current: archive_member_patch_fingerprints.as_deref(),
+                            },
                             &previous_unwind_input_ranges,
                             &current_unwind_input_ranges,
                         )?
@@ -9605,6 +9617,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &restored_names,
                         &retiring_names,
                         &relocation_target_patches.validated_macho_local_retargets,
+                        ArchiveMemberFingerprintProof {
+                            previous: previous_patch.archive_member_patch_fingerprints.as_deref(),
+                            current: archive_member_patch_fingerprints.as_deref(),
+                        },
                         &previous_unwind_input_ranges,
                         &current_unwind_input_ranges,
                     )?
@@ -31255,9 +31271,108 @@ fn archive_diff_allows_owned_macho_member_removal(
         restored_names,
         &[],
         &[],
+        ArchiveMemberFingerprintProof::default(),
         previous_extra_ranges,
         current_extra_ranges,
     )
+}
+
+fn archive_normalized_member_identifiers(bytes: &[u8]) -> Result<Option<Vec<Vec<u8>>>> {
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut identifiers = Vec::new();
+    for entry in archive {
+        let ArchiveEntry::Regular(content) = entry? else {
+            return Ok(None);
+        };
+        identifiers.push(archive_member_patch_identifier(content.ident.as_slice()));
+    }
+    Ok(Some(identifiers))
+}
+
+fn unique_archive_member_patch_fingerprints(
+    fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+) -> HashMap<&[u8], Option<&ArchiveMemberPatchFingerprint>> {
+    let mut unique = HashMap::new();
+    for fingerprint in fingerprints.unwrap_or_default() {
+        let valid = !fingerprint.identifier.is_empty()
+            && archive_member_patch_identifier(&fingerprint.identifier) == fingerprint.identifier
+            && fingerprint.data_len != 0
+            && is_blake3_hex_digest(&fingerprint.ranges_hash)
+            && is_blake3_hex_digest(&fingerprint.rustc_object_digest)
+            && is_blake3_hex_digest(&fingerprint.fingerprint);
+        if let Some(existing) = unique.get_mut(fingerprint.identifier.as_slice()) {
+            *existing = None;
+        } else {
+            unique.insert(
+                fingerprint.identifier.as_slice(),
+                valid.then_some(fingerprint),
+            );
+        }
+    }
+    unique
+}
+
+fn remaining_archive_local_retargets_after_exact_unchanged_members(
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    previous_member_identifiers: &[Vec<u8>],
+    current_member_identifiers: &[Vec<u8>],
+    removed_identifiers: &[Vec<u8>],
+    added_identifiers: &[Vec<u8>],
+    fingerprint_proof: ArchiveMemberFingerprintProof<'_>,
+) -> (
+    Vec<ValidatedMachOLocalRelocationSite>,
+    Vec<ValidatedMachOLocalRelocationSite>,
+) {
+    let previous_fingerprints =
+        unique_archive_member_patch_fingerprints(fingerprint_proof.previous);
+    let current_fingerprints = unique_archive_member_patch_fingerprints(fingerprint_proof.current);
+    let is_exact_unchanged_member = |identifier: &[u8]| {
+        if removed_identifiers
+            .iter()
+            .chain(added_identifiers)
+            .any(|exchanged| exchanged.as_slice() == identifier)
+            || previous_member_identifiers
+                .iter()
+                .filter(|member| member.as_slice() == identifier)
+                .count()
+                != 1
+            || current_member_identifiers
+                .iter()
+                .filter(|member| member.as_slice() == identifier)
+                .count()
+                != 1
+        {
+            return false;
+        }
+        let Some(Some(previous)) = previous_fingerprints.get(identifier) else {
+            return false;
+        };
+        let Some(Some(current)) = current_fingerprints.get(identifier) else {
+            return false;
+        };
+        previous_member_identifiers
+            .get(previous.archive_member_index)
+            .is_some_and(|member| member.as_slice() == identifier)
+            && current_member_identifiers
+                .get(current.archive_member_index)
+                .is_some_and(|member| member.as_slice() == identifier)
+            && previous.identifier == current.identifier
+            && previous.data_len == current.data_len
+            && previous.ranges_hash == current.ranges_hash
+            && previous.rustc_object_digest == current.rustc_object_digest
+            && previous.fingerprint == current.fingerprint
+    };
+
+    validated_local_retargets
+        .iter()
+        .filter(|retarget| {
+            retarget.previous.archive_identifier != retarget.current.archive_identifier
+                || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
+        })
+        .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
+        .unzip()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -31272,6 +31387,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
     restored_names: &[SharedText],
     retiring_names: &[SharedText],
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    member_fingerprint_proof: ArchiveMemberFingerprintProof<'_>,
     previous_extra_ranges: &[std::ops::Range<usize>],
     current_extra_ranges: &[std::ops::Range<usize>],
 ) -> Result<bool> {
@@ -31349,14 +31465,21 @@ fn archive_diff_allows_owned_macho_member_exchange(
     };
     previous_ranges.extend(previous_extra_ranges.iter().cloned());
     current_ranges.extend(current_extra_ranges.iter().cloned());
-    let previous_local_retargets = validated_local_retargets
-        .iter()
-        .map(|retarget| retarget.previous.clone())
-        .collect::<Vec<_>>();
-    let current_local_retargets = validated_local_retargets
-        .iter()
-        .map(|retarget| retarget.current.clone())
-        .collect::<Vec<_>>();
+    let (Some(previous_member_identifiers), Some(current_member_identifiers)) = (
+        archive_normalized_member_identifiers(previous_bytes)?,
+        archive_normalized_member_identifiers(current_bytes)?,
+    ) else {
+        return Ok(false);
+    };
+    let (previous_local_retargets, current_local_retargets) =
+        remaining_archive_local_retargets_after_exact_unchanged_members(
+            validated_local_retargets,
+            &previous_member_identifiers,
+            &current_member_identifiers,
+            removed_identifiers,
+            added_identifiers,
+            member_fingerprint_proof,
+        );
     let previous_fingerprint = archive_macho_masked_local_semantic_fingerprint_with_retargets(
         previous_bytes,
         &previous_ranges,
@@ -31435,6 +31558,7 @@ fn archive_diff_allows_owned_macho_member_addition(
         &[],
         &[],
         &[],
+        ArchiveMemberFingerprintProof::default(),
         previous_extra_ranges,
         current_extra_ranges,
     )
@@ -57031,6 +57155,7 @@ mod tests {
                 &restored_names,
                 &activation.recycled_symbol_resolution_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -57049,6 +57174,7 @@ mod tests {
                 &restored_names,
                 &exchange_retiring_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -57075,6 +57201,7 @@ mod tests {
                 &restored_names,
                 &exchange_retiring_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58049,6 +58176,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58141,6 +58269,7 @@ mod tests {
                 &[],
                 &retiring_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58158,6 +58287,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58181,6 +58311,7 @@ mod tests {
                 &[],
                 &retiring_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58207,11 +58338,387 @@ mod tests {
                 &[],
                 &retiring_names,
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
             .unwrap(),
             "aggregate ownership must not mask unrelated member changes",
+        );
+    }
+
+    #[test]
+    fn exact_unchanged_archive_member_consumes_retargets_across_index_movement() {
+        fn fingerprint(index: usize, identifier: &[u8]) -> ArchiveMemberPatchFingerprint {
+            ArchiveMemberPatchFingerprint {
+                archive_member_index: index,
+                identifier: identifier.to_vec(),
+                data_len: 91_384,
+                ranges_hash: "a".repeat(blake3::OUT_LEN * 2),
+                rustc_object_digest: "b".repeat(blake3::OUT_LEN * 2),
+                fingerprint: "c".repeat(blake3::OUT_LEN * 2),
+            }
+        }
+
+        fn site(identifier: &[u8], section_index: usize) -> ValidatedMachOLocalRelocationSite {
+            ValidatedMachOLocalRelocationSite {
+                archive_identifier: identifier.to_vec(),
+                section_index,
+                relocation_offset: 8,
+                normalize_relocation_offset: false,
+                target_symbol_index: 3,
+                hash_target_symbol: false,
+                hash_unmasked_target_offset: false,
+                exact_symbol_indices: Vec::new(),
+            }
+        }
+
+        fn remaining(
+            retargets: &[ValidatedMachOLocalRelocationRetarget],
+            previous_members: &[Vec<u8>],
+            current_members: &[Vec<u8>],
+            removed: &[Vec<u8>],
+            added: &[Vec<u8>],
+            previous: Option<&[ArchiveMemberPatchFingerprint]>,
+            current: Option<&[ArchiveMemberPatchFingerprint]>,
+        ) -> usize {
+            let (previous, current) =
+                remaining_archive_local_retargets_after_exact_unchanged_members(
+                    retargets,
+                    previous_members,
+                    current_members,
+                    removed,
+                    added,
+                    ArchiveMemberFingerprintProof { previous, current },
+                );
+            assert_eq!(previous.len(), current.len());
+            previous.len()
+        }
+
+        let identifier = b"crate-hash.common.rcgu.o";
+        let mut previous_members = (0..11)
+            .map(|index| format!("previous-{index}.o").into_bytes())
+            .collect::<Vec<_>>();
+        previous_members.push(identifier.to_vec());
+        let mut current_members = (0..10)
+            .map(|index| format!("current-{index}.o").into_bytes())
+            .collect::<Vec<_>>();
+        current_members.push(identifier.to_vec());
+        let previous = fingerprint(11, identifier);
+        let current = fingerprint(10, identifier);
+        let retargets = [
+            ValidatedMachOLocalRelocationRetarget {
+                previous: site(identifier, 2),
+                current: site(identifier, 2),
+            },
+            ValidatedMachOLocalRelocationRetarget {
+                previous: site(identifier, 4),
+                current: site(identifier, 4),
+            },
+        ];
+        assert_eq!(
+            remaining(
+                &retargets,
+                &previous_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                Some(std::slice::from_ref(&current)),
+            ),
+            0,
+            "archive index movement alone must preserve the exact member witness",
+        );
+
+        let mut duplicate_members = previous_members.clone();
+        duplicate_members.push(identifier.to_vec());
+        assert_eq!(
+            remaining(
+                &retargets,
+                &duplicate_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                Some(std::slice::from_ref(&current)),
+            ),
+            retargets.len(),
+            "a duplicate normalized archive member must keep every site",
+        );
+        let duplicate_fingerprints = [current.clone(), current.clone()];
+        assert_eq!(
+            remaining(
+                &retargets,
+                &previous_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                Some(&duplicate_fingerprints),
+            ),
+            retargets.len(),
+            "duplicate per-member records must not prove a common member",
+        );
+        assert_eq!(
+            remaining(
+                &retargets,
+                &previous_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                None,
+            ),
+            retargets.len(),
+            "missing current per-member proof must keep every site",
+        );
+
+        let mut mismatches = Vec::new();
+        let mut mismatch = current.clone();
+        mismatch.data_len += 1;
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.ranges_hash = "d".repeat(blake3::OUT_LEN * 2);
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.rustc_object_digest = "e".repeat(blake3::OUT_LEN * 2);
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.fingerprint = "f".repeat(blake3::OUT_LEN * 2);
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.fingerprint.clear();
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.identifier = b"other.o".to_vec();
+        mismatches.push(mismatch);
+        let mut mismatch = current.clone();
+        mismatch.archive_member_index = 9;
+        mismatches.push(mismatch);
+        for mismatch in &mismatches {
+            assert_eq!(
+                remaining(
+                    &retargets,
+                    &previous_members,
+                    &current_members,
+                    &[],
+                    &[],
+                    Some(std::slice::from_ref(&previous)),
+                    Some(std::slice::from_ref(mismatch)),
+                ),
+                retargets.len(),
+                "every missing or mismatched proof field must keep every site",
+            );
+        }
+
+        let mut wrong_member = retargets[0].clone();
+        wrong_member.current.archive_identifier = b"other.o".to_vec();
+        assert_eq!(
+            remaining(
+                &[wrong_member],
+                &previous_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                Some(std::slice::from_ref(&current)),
+            ),
+            1,
+            "a cross-member retarget pair must remain exact-consumption work",
+        );
+        let orphan = ValidatedMachOLocalRelocationRetarget {
+            previous: site(b"orphan.o", 2),
+            current: site(b"orphan.o", 2),
+        };
+        assert_eq!(
+            remaining(
+                &[orphan],
+                &previous_members,
+                &current_members,
+                &[],
+                &[],
+                Some(std::slice::from_ref(&previous)),
+                Some(std::slice::from_ref(&current)),
+            ),
+            1,
+            "a site without a uniquely proven member must remain",
+        );
+        for (removed, added) in [
+            (vec![identifier.to_vec()], Vec::new()),
+            (Vec::new(), vec![identifier.to_vec()]),
+        ] {
+            assert_eq!(
+                remaining(
+                    &retargets,
+                    &previous_members,
+                    &current_members,
+                    &removed,
+                    &added,
+                    Some(std::slice::from_ref(&previous)),
+                    Some(std::slice::from_ref(&current)),
+                ),
+                retargets.len(),
+                "added or retired members must never use the common-member allowance",
+            );
+        }
+    }
+
+    #[test]
+    fn owned_macho_exchange_uses_exact_unchanged_member_retarget_proof() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let common = test_macho_local_data_retarget_object(b"l_anon.20", 0x12);
+        let exchanged = test_macho_object(b"text", b"data", 0);
+        let common_identifier = b"crate-hash.common.session.rcgu.o";
+        let removed_identifier = b"crate-hash.removed.session.rcgu.o";
+        let added_identifier = b"crate-hash.added.session.rcgu.o";
+        let previous = archive(&[
+            (removed_identifier, exchanged.as_slice()),
+            (common_identifier, common.as_slice()),
+        ]);
+        let current = archive(&[
+            (common_identifier, common.as_slice()),
+            (added_identifier, exchanged.as_slice()),
+        ]);
+        let normalized_common = archive_member_patch_identifier(common_identifier);
+        let common_file = object::File::parse(common.as_slice()).unwrap();
+        let source = common_file
+            .sections()
+            .find(|section| {
+                section.name_bytes().ok() == Some(b"__const".as_slice())
+                    && section.segment_name_bytes().ok().flatten() == Some(b"__DATA".as_slice())
+            })
+            .unwrap();
+        let site = ValidatedMachOLocalRelocationSite {
+            archive_identifier: normalized_common.clone(),
+            section_index: source.index().0,
+            relocation_offset: 0,
+            normalize_relocation_offset: false,
+            target_symbol_index: 0,
+            hash_target_symbol: false,
+            hash_unmasked_target_offset: false,
+            exact_symbol_indices: Vec::new(),
+        };
+        let retarget = ValidatedMachOLocalRelocationRetarget {
+            previous: site.clone(),
+            current: site,
+        };
+        let member_fingerprint = |archive_member_index| ArchiveMemberPatchFingerprint {
+            archive_member_index,
+            identifier: normalized_common.clone(),
+            data_len: common.len(),
+            ranges_hash: "a".repeat(blake3::OUT_LEN * 2),
+            rustc_object_digest: "b".repeat(blake3::OUT_LEN * 2),
+            fingerprint: "c".repeat(blake3::OUT_LEN * 2),
+        };
+        let previous_fingerprint = [member_fingerprint(1)];
+        let current_fingerprint = [member_fingerprint(0)];
+        let input_file = hex::encode("lib.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, common_identifier).unwrap()
+        else {
+            panic!("expected unique previous common member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current, common_identifier).unwrap()
+        else {
+            panic!("expected unique current common member");
+        };
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_target = previous_file
+            .sections()
+            .find(|section| {
+                section.name_bytes().ok() == Some(b"__const".as_slice())
+                    && section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+            })
+            .unwrap();
+        let current_target = current_file
+            .sections()
+            .find(|section| {
+                section.name_bytes().ok() == Some(b"__const".as_slice())
+                    && section.segment_name_bytes().ok().flatten() == Some(b"__TEXT".as_slice())
+            })
+            .unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap(),
+                section_index: patch_section_record_index(&previous_file, previous_target.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__const".to_owned()),
+                input_size: previous_target.size(),
+                output_offset: 0,
+                output_size: previous_target.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap(),
+                section_index: patch_section_record_index(&current_file, current_target.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__const".to_owned()),
+                input_size: current_target.size(),
+                output_offset: 0,
+                output_size: current_target.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+        let removed = [archive_member_patch_identifier(removed_identifier)];
+        let added = [archive_member_patch_identifier(added_identifier)];
+
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed,
+                &added,
+                &[],
+                &[],
+                std::slice::from_ref(&retarget),
+                ArchiveMemberFingerprintProof::default(),
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "an unconsumed site in an unmasked common member must reject",
+        );
+        assert!(
+            archive_diff_allows_owned_macho_member_exchange(
+                &previous,
+                &current,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed,
+                &added,
+                &[],
+                &[],
+                std::slice::from_ref(&retarget),
+                ArchiveMemberFingerprintProof {
+                    previous: Some(&previous_fingerprint),
+                    current: Some(&current_fingerprint),
+                },
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "an exact common-member witness may consume its otherwise unmasked sites",
         );
     }
 
@@ -58379,6 +58886,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58396,6 +58904,7 @@ mod tests {
                 &[],
                 &[],
                 std::slice::from_ref(&retarget),
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58453,6 +58962,7 @@ mod tests {
                 &[],
                 &[],
                 &[wrong_site],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
@@ -58479,6 +58989,7 @@ mod tests {
                 &[],
                 &[],
                 &[retarget],
+                ArchiveMemberFingerprintProof::default(),
                 &[],
                 &[],
             )
