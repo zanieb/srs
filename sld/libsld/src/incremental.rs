@@ -18168,13 +18168,109 @@ fn macho_local_symbol_cohort_retains_published_population(
     previous: &[MachOLocalSymbolCohortEntry],
     current: &[MachOLocalSymbolCohortEntry],
 ) -> bool {
-    let retains_named_population = previous.len() == current.len()
-        && previous.iter().zip(current).all(|(previous, current)| {
-            previous.name == current.name
-                && previous.n_desc == current.n_desc
-                && previous.output_section_index == current.output_section_index
-        });
-    retains_named_population || macho_local_symbol_cohort_retains_published_sites(previous, current)
+    fn entries_are_unique(entries: &[MachOLocalSymbolCohortEntry]) -> bool {
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.as_slice())
+            .collect::<HashSet<_>>();
+        let sites = entries
+            .iter()
+            .map(|entry| (entry.output_section_index, entry.output_value))
+            .collect::<HashSet<_>>();
+        names.len() == entries.len() && sites.len() == entries.len()
+    }
+
+    fn entries_match(
+        previous: &MachOLocalSymbolCohortEntry,
+        current: &MachOLocalSymbolCohortEntry,
+    ) -> bool {
+        previous.n_desc == current.n_desc
+            && previous.output_section_index == current.output_section_index
+            && (previous.name == current.name || previous.output_value == current.output_value)
+    }
+
+    fn perfect_matching(candidates: &[Vec<usize>], current_len: usize) -> Option<Vec<usize>> {
+        fn assign(
+            previous_index: usize,
+            candidates: &[Vec<usize>],
+            current_to_previous: &mut [Option<usize>],
+            visited: &mut [bool],
+        ) -> bool {
+            for &current_index in &candidates[previous_index] {
+                if visited[current_index] {
+                    continue;
+                }
+                visited[current_index] = true;
+                if current_to_previous[current_index].is_none_or(|assigned| {
+                    assign(assigned, candidates, current_to_previous, visited)
+                }) {
+                    current_to_previous[current_index] = Some(previous_index);
+                    return true;
+                }
+            }
+            false
+        }
+
+        let mut current_to_previous = vec![None; current_len];
+        for previous_index in 0..candidates.len() {
+            let mut visited = vec![false; current_len];
+            if !assign(
+                previous_index,
+                candidates,
+                &mut current_to_previous,
+                &mut visited,
+            ) {
+                return None;
+            }
+        }
+        current_to_previous.into_iter().collect()
+    }
+
+    fn has_cycle(node: usize, edges: &[Vec<usize>], state: &mut [u8]) -> bool {
+        if state[node] != 0 {
+            return state[node] == 1;
+        }
+        state[node] = 1;
+        if edges[node]
+            .iter()
+            .any(|target| has_cycle(*target, edges, state))
+        {
+            return true;
+        }
+        state[node] = 2;
+        false
+    }
+
+    if previous.len() != current.len()
+        || !entries_are_unique(previous)
+        || !entries_are_unique(current)
+    {
+        return false;
+    }
+    let candidates = previous
+        .iter()
+        .map(|previous| {
+            current
+                .iter()
+                .enumerate()
+                .filter_map(|(index, current)| entries_match(previous, current).then_some(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let Some(current_to_previous) = perfect_matching(&candidates, current.len()) else {
+        return false;
+    };
+    let mut alternating_edges = vec![Vec::new(); previous.len()];
+    for (previous_index, candidates) in candidates.iter().enumerate() {
+        for current_index in candidates {
+            let matched_previous = current_to_previous[*current_index];
+            if matched_previous != previous_index {
+                alternating_edges[previous_index].push(matched_previous);
+            }
+        }
+    }
+    let mut state = vec![0; previous.len()];
+    !(0..previous.len()).any(|node| has_cycle(node, &alternating_edges, &mut state))
 }
 
 fn verify_previous_macho_local_symbol_cohort(
@@ -52633,7 +52729,7 @@ mod tests {
     }
 
     #[test]
-    fn published_local_macho_cohort_retains_exact_renamed_sites() {
+    fn published_local_macho_cohort_retains_unique_mixed_population() {
         let entry = |name: &[u8], section, value, n_desc| MachOLocalSymbolCohortEntry {
             name: name.to_vec(),
             n_desc,
@@ -52652,6 +52748,33 @@ mod tests {
         assert!(macho_local_symbol_cohort_retains_published_population(
             &previous,
             &moved_named,
+        ));
+
+        let mixed = vec![entry(b"new.0", 1, 0x1000, 0), entry(b"old.1", 1, 0x1030, 0)];
+        assert!(macho_local_symbol_cohort_retains_published_population(
+            &previous, &mixed,
+        ));
+
+        let workload_previous = vec![
+            entry(b"GCC_except_table14", 4, 0x1000, 0),
+            entry(b"GCC_except_table15", 4, 0x1010, 0),
+            entry(b"GCC_except_table16", 4, 0x1020, 0),
+            entry(b"rust.local", 3, 0x2000, 0),
+        ];
+        let workload_current = vec![
+            entry(b"GCC_except_table15", 4, 0x1000, 0),
+            entry(b"GCC_except_table16", 4, 0x1010, 0),
+            entry(b"GCC_except_table17", 4, 0x1020, 0),
+            entry(b"rust.local", 3, 0x202c, 0),
+        ];
+        assert!(macho_local_symbol_cohort_retains_published_population(
+            &workload_previous,
+            &workload_current,
+        ));
+
+        let ambiguous = vec![entry(b"old.0", 1, 0x1010, 0), entry(b"old.1", 1, 0x1000, 0)];
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous, &ambiguous,
         ));
 
         let mut aliased_site = renamed.clone();
