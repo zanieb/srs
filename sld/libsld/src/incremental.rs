@@ -6124,10 +6124,8 @@ fn migrated_macho_archive_definition_names(
         {
             continue;
         }
-        let Some(previous) = parse_patch_input_ref(
-            input_file_path,
-            moved.previous_target.input.as_str(),
-        )?
+        let Some(previous) =
+            parse_patch_input_ref(input_file_path, moved.previous_target.input.as_str())?
         else {
             continue;
         };
@@ -7533,7 +7531,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         indexed_changed_input_macho_definitions =
                             Some(changed_input_macho_definitions(&changed_input_paths)?);
                     }
-                    let replays = {
+                    let mut replays = {
                         timing_phase!("Replay changed Mach-O text relocations");
                         match macho_text_relocation_replays_for_input(
                             &previous.relocations,
@@ -7590,7 +7588,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             previous_output.get()?,
                             &mut relocation_target_patches,
                             &macho_resolution_moves,
-                            &replays.local_symbol_cohorts,
+                            &mut replays.local_symbol_cohorts,
                         )?
                     };
                     match data_relocations_are_stable {
@@ -7655,17 +7653,16 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .to_owned(),
                     ));
                 };
-                let mut migrated_definitions =
-                    migrated_macho_archive_definition_names(
-                        input.path.as_str(),
-                        &macho_resolution_updates.moves,
-                    )?;
+                let mut migrated_definitions = migrated_macho_archive_definition_names(
+                    input.path.as_str(),
+                    &macho_resolution_updates.moves,
+                )?;
                 migrated_definitions.extend(
                     direct_macho_cgu_migration_plan
-                    .migrated_names_by_input
-                    .get(input.path.as_str())
-                    .into_iter()
-                    .flat_map(|names| names.iter().cloned()),
+                        .migrated_names_by_input
+                        .get(input.path.as_str())
+                        .into_iter()
+                        .flat_map(|names| names.iter().cloned()),
                 );
                 match changed_macho_archive_unwind_activation(
                     previous_bytes,
@@ -10316,6 +10313,43 @@ fn macho_local_symbol_cohort_has_target_transition(
         })
         .count()
         == 1
+}
+
+fn merge_macho_local_symbol_cohort_plan(
+    plans: &mut Vec<MachOLocalSymbolCohortPlan>,
+    plan: MachOLocalSymbolCohortPlan,
+) -> std::result::Result<(), String> {
+    if let Some(existing) = plans.iter().find(|existing| {
+        existing.previous_input == plan.previous_input
+            && existing.current_input == plan.current_input
+    }) {
+        if existing != &plan {
+            return Err("published local Mach-O cohort produced conflicting plans".to_owned());
+        }
+    } else {
+        plans.push(plan);
+    }
+    Ok(())
+}
+
+fn macho_local_data_target_requires_cohort_transition(
+    local_target_is_stable: bool,
+    previous_name: &[u8],
+    current_name: &[u8],
+    target_section_is_unmatched: bool,
+    retained_target_cohort_changed: bool,
+) -> bool {
+    local_target_is_stable
+        && previous_name != current_name
+        && (target_section_is_unmatched || retained_target_cohort_changed)
+}
+
+fn macho_local_data_target_needs_cohort_plan(
+    target_name_changed: bool,
+    target_section_is_unmatched: bool,
+    retained_target_cohort_changed: bool,
+) -> bool {
+    retained_target_cohort_changed || (target_section_is_unmatched && target_name_changed)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20832,23 +20866,6 @@ fn changed_macho_local_symbol_cohort_plan(
     )
 }
 
-fn push_macho_local_symbol_cohort_plan(
-    cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
-    cohort: MachOLocalSymbolCohortPlan,
-) -> std::result::Result<(), String> {
-    if let Some(existing) = cohorts.iter().find(|existing| {
-        existing.previous_input == cohort.previous_input
-            && existing.current_input == cohort.current_input
-    }) {
-        if *existing != cohort {
-            return Err("published local Mach-O cohort produced conflicting plans".to_owned());
-        }
-    } else {
-        cohorts.push(cohort);
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn plan_macho_local_symbol_cohort(
     relocations: &[RelocationRecord],
@@ -22992,7 +23009,7 @@ fn macho_text_relocation_replays_for_input(
                     .as_ref()
                     .and_then(|ownership| ownership.local_symbol_cohort.as_ref())
                 {
-                    if let Err(reason) = push_macho_local_symbol_cohort_plan(
+                    if let Err(reason) = merge_macho_local_symbol_cohort_plan(
                         &mut local_symbol_cohorts,
                         cohort.clone(),
                     ) {
@@ -23368,7 +23385,7 @@ fn macho_text_relocation_replays_for_input(
             )? {
                 Ok(Some(cohort)) => {
                     if let Err(reason) =
-                        push_macho_local_symbol_cohort_plan(&mut local_symbol_cohorts, cohort)
+                        merge_macho_local_symbol_cohort_plan(&mut local_symbol_cohorts, cohort)
                     {
                         return Ok(Err(reason));
                     }
@@ -23489,7 +23506,7 @@ fn validate_macho_data_relocations_are_stable(
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
-    local_symbol_cohorts: &[MachOLocalSymbolCohortPlan],
+    local_symbol_cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
 ) -> Result<std::result::Result<bool, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for data relocation validation")?;
@@ -23521,6 +23538,10 @@ fn validate_macho_data_relocations_are_stable(
             .or_default()
             .push(section);
     }
+    let mut planned_local_symbol_cohorts = local_symbol_cohorts
+        .iter()
+        .map(|plan| (plan.previous_input.clone(), plan.current_input.clone()))
+        .collect::<HashSet<_>>();
 
     for ((previous_input_ref, current_input_ref), sections) in sections_by_input {
         let Some(current_input_bytes) = current_resolver.resolve(
@@ -24015,26 +24036,14 @@ fn validate_macho_data_relocations_are_stable(
                         display_hex_path(&input.path)
                     )));
                 }
-                let local_target_transition = if renamed_local_target_is_stable {
-                    let previous_name = previous_identity
-                        .as_ref()
-                        .map(|(name, _)| name.as_slice())
-                        .unwrap_or_default();
-                    let current_name = current_identity
-                        .as_ref()
-                        .map(|(name, _)| name.as_slice())
-                        .unwrap_or_default();
-                    macho_local_symbol_cohort_has_target_transition(
-                        local_symbol_cohorts,
-                        patch_section.previous.input.as_str(),
-                        patch_section.current.input.as_str(),
-                        previous_name,
-                        current_name,
-                        relocation.target_value,
-                    )
-                } else {
-                    false
-                };
+                let previous_local_name = previous_identity
+                    .as_ref()
+                    .map(|(name, _)| name.as_slice())
+                    .unwrap_or_default();
+                let current_local_name = current_identity
+                    .as_ref()
+                    .map(|(name, _)| name.as_slice())
+                    .unwrap_or_default();
                 let target_address = if let Some(target_section) = target_section {
                     let Some(target_address) = macho_output_address_for_file_offset(
                         &output_file,
@@ -24068,8 +24077,67 @@ fn validate_macho_data_relocations_are_stable(
                 } else {
                     false
                 };
-                let requires_target_transition = renamed_local_target_is_stable
-                    && (target_section.is_none() || retained_target_cohort_changed);
+                let target_name_changed =
+                    renamed_local_target_is_stable && previous_local_name != current_local_name;
+                let needs_cohort_plan = macho_local_data_target_needs_cohort_plan(
+                    target_name_changed,
+                    target_section.is_none(),
+                    retained_target_cohort_changed,
+                );
+                let cohort_key = (
+                    patch_section.previous.input.clone(),
+                    patch_section.current.input.clone(),
+                );
+                let relocation_target_value = relocation.target_value;
+                let _ = relocation;
+                if needs_cohort_plan && !planned_local_symbol_cohorts.contains(&cohort_key) {
+                    let plan = match plan_macho_local_symbol_cohort(
+                        relocations,
+                        resolutions,
+                        input.path.as_str(),
+                        patch_section,
+                        matched_sections,
+                        previous_resolver,
+                        current_resolver,
+                        previous_input_bytes,
+                        current_input_bytes,
+                        &previous_file,
+                        &current_file,
+                        previous_output,
+                        &output_file,
+                        normalize_rust_archive_patch_inputs,
+                    )? {
+                        Ok(plan) => plan,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    if let Some(plan) = plan
+                        && let Err(reason) =
+                            merge_macho_local_symbol_cohort_plan(local_symbol_cohorts, plan)
+                    {
+                        return Ok(Err(reason));
+                    }
+                    planned_local_symbol_cohorts.insert(cohort_key);
+                }
+                let relocation = &mut relocations[relocation_index];
+                let local_target_transition = if renamed_local_target_is_stable {
+                    macho_local_symbol_cohort_has_target_transition(
+                        local_symbol_cohorts,
+                        patch_section.previous.input.as_str(),
+                        patch_section.current.input.as_str(),
+                        previous_local_name,
+                        current_local_name,
+                        relocation_target_value,
+                    )
+                } else {
+                    false
+                };
+                let requires_target_transition = macho_local_data_target_requires_cohort_transition(
+                    renamed_local_target_is_stable,
+                    previous_local_name,
+                    current_local_name,
+                    target_section.is_none(),
+                    retained_target_cohort_changed,
+                );
                 if requires_target_transition && !local_target_transition {
                     return Ok(Err(format!(
                         "renamed local Mach-O data relocation target has no complete output-symbol transition in {}",
@@ -30102,9 +30170,9 @@ fn archive_diff_allows_changed_macho_unwind(
             ignored_migrated_definitions,
         )?;
         match (previous_counts, current_counts) {
-            (Some(previous), Some(current)) => ignored_migrated_definitions.iter().all(|name| {
-                previous.get(name) == Some(&1) && current.get(name) == Some(&1)
-            }),
+            (Some(previous), Some(current)) => ignored_migrated_definitions
+                .iter()
+                .all(|name| previous.get(name) == Some(&1) && current.get(name) == Some(&1)),
             _ => false,
         }
     };
@@ -56457,6 +56525,35 @@ mod tests {
     }
 
     #[test]
+    fn macho_data_target_cohort_policy_separates_plan_and_transition_proofs() {
+        assert!(macho_local_data_target_needs_cohort_plan(
+            false, false, true,
+        ));
+        assert!(macho_local_data_target_needs_cohort_plan(true, true, false,));
+        assert!(!macho_local_data_target_needs_cohort_plan(
+            false, true, false,
+        ));
+        assert!(!macho_local_data_target_requires_cohort_transition(
+            true, b"stable", b"stable", false, true,
+        ));
+        assert!(!macho_local_data_target_requires_cohort_transition(
+            true, b"stable", b"stable", true, false,
+        ));
+        assert!(macho_local_data_target_requires_cohort_transition(
+            true, b"old", b"new", false, true,
+        ));
+        assert!(macho_local_data_target_requires_cohort_transition(
+            true, b"old", b"new", true, false,
+        ));
+        assert!(!macho_local_data_target_requires_cohort_transition(
+            true, b"old", b"new", false, false,
+        ));
+        assert!(!macho_local_data_target_requires_cohort_transition(
+            false, b"old", b"new", true, true,
+        ));
+    }
+
+    #[test]
     fn published_local_macho_const_subset_requires_exact_atoms_and_dead_omissions() {
         let retarget_competing_atom = |mut object: Vec<u8>| {
             let competing = (1_u32 | 3 << 25 | 1 << 27).to_le_bytes();
@@ -59220,8 +59317,7 @@ mod tests {
             .sections()
             .find(|section| section.segment_name().unwrap() == Some("__TEXT"))
             .unwrap();
-        let target_section_index =
-            relocation_target_record_index(previous_target.index()).unwrap();
+        let target_section_index = relocation_target_record_index(previous_target.index()).unwrap();
 
         let mut previous_output = previous_member.clone();
         let output_file = object::File::parse(previous_output.as_slice()).unwrap();
@@ -59259,11 +59355,8 @@ mod tests {
         let matched = vec![MatchedPatchSection {
             previous: PatchSection {
                 input: previous_input.clone(),
-                section_index: patch_section_record_index(
-                    &previous_file,
-                    previous_source.index(),
-                )
-                .unwrap(),
+                section_index: patch_section_record_index(&previous_file, previous_source.index())
+                    .unwrap(),
                 section_name: Some("__DATA,__const".to_owned()),
                 input_size: previous_source.size(),
                 output_offset: source_output_offset,
@@ -59363,6 +59456,7 @@ mod tests {
         let validate = |relocations: &mut [RelocationRecord],
                         matched_sections: &[MatchedPatchSection],
                         cohorts: &[MachOLocalSymbolCohortPlan]| {
+            let mut cohorts = cohorts.to_vec();
             let mut target_patches = RelocationTargetPatches {
                 input_ranges: Vec::new(),
                 output_patches: Vec::new(),
@@ -59383,33 +59477,35 @@ mod tests {
                 &previous_output,
                 &mut target_patches,
                 &[],
-                cohorts,
+                &mut cohorts,
             )
             .unwrap();
-            (result, target_patches)
+            (result, target_patches, cohorts)
         };
 
-        let (result, target_patches) = validate(
-            &mut relocations,
-            &matched,
-            std::slice::from_ref(&cohort),
-        );
+        let (result, target_patches, planned_cohorts) =
+            validate(&mut relocations, &matched, std::slice::from_ref(&cohort));
         assert!(result.unwrap());
+        assert_eq!(planned_cohorts, [cohort.clone()]);
         assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
-        assert!(target_patches
-            .validated_macho_local_retargets
-            .iter()
-            .all(|retarget| retarget.previous.hash_unmasked_target_offset
-                && retarget.current.hash_unmasked_target_offset));
-        assert!(matched_macho_local_retarget_fingerprint_matches(
-            &previous,
-            &current,
-            input.path.as_str(),
-            &matched,
-            true,
-            &target_patches.validated_macho_local_retargets,
-        )
-        .unwrap());
+        assert!(
+            target_patches
+                .validated_macho_local_retargets
+                .iter()
+                .all(|retarget| retarget.previous.hash_unmasked_target_offset
+                    && retarget.current.hash_unmasked_target_offset)
+        );
+        assert!(
+            matched_macho_local_retarget_fingerprint_matches(
+                &previous,
+                &current,
+                input.path.as_str(),
+                &matched,
+                true,
+                &target_patches.validated_macho_local_retargets,
+            )
+            .unwrap()
+        );
 
         let mut patched_output = previous_output.clone();
         let mut reserves = Vec::new();
@@ -59421,41 +59517,46 @@ mod tests {
         .unwrap();
         apply_test_output_patches(&mut patched_output, &patches);
         let patched_file = object::File::parse(patched_output.as_slice()).unwrap();
-        assert!(patched_file
-            .symbols()
-            .any(|symbol| symbol.name_bytes().ok() == Some(b"l_anon.22")));
-        assert!(!patched_file
-            .symbols()
-            .any(|symbol| symbol.name_bytes().ok() == Some(b"l_anon.20")));
+        assert!(
+            patched_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"l_anon.22"))
+        );
+        assert!(
+            !patched_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"l_anon.20"))
+        );
 
         let mut without_records = vec![original_relocations[0].clone()];
-        assert!(validate(
-            &mut without_records,
-            &matched,
-            std::slice::from_ref(&cohort),
-        )
+        assert!(
+            validate(
+                &mut without_records,
+                &matched,
+                std::slice::from_ref(&cohort),
+            )
             .0
-            .is_err());
+            .is_err()
+        );
         let mut without_cohort = original_relocations.clone();
         assert!(validate(&mut without_cohort, &matched, &[]).0.is_err());
         let mut duplicate_cohort = original_relocations.clone();
-        assert!(validate(
-            &mut duplicate_cohort,
-            &matched,
-            &[cohort.clone(), cohort.clone()],
-        )
-        .0
-        .is_err());
+        assert!(
+            validate(
+                &mut duplicate_cohort,
+                &matched,
+                &[cohort.clone(), cohort.clone()],
+            )
+            .0
+            .is_err()
+        );
 
         let mut matched_retained_target = matched.clone();
         matched_retained_target.push(MatchedPatchSection {
             previous: PatchSection {
                 input: previous_input,
-                section_index: patch_section_record_index(
-                    &previous_file,
-                    previous_target.index(),
-                )
-                .unwrap(),
+                section_index: patch_section_record_index(&previous_file, previous_target.index())
+                    .unwrap(),
                 section_name: Some("__TEXT,__const".to_owned()),
                 input_size: previous_target.size(),
                 output_offset: output_target_offset,
@@ -59476,13 +59577,10 @@ mod tests {
             },
         });
         let mut retained_without_cohort = original_relocations;
-        assert!(validate(
-            &mut retained_without_cohort,
-            &matched_retained_target,
-            &[],
-        )
-        .0
-        .is_err(), "retained const ownership cannot replace output-symbol cohort proof");
+        let (result, _, planned_cohorts) =
+            validate(&mut retained_without_cohort, &matched_retained_target, &[]);
+        assert!(result.unwrap());
+        assert_eq!(planned_cohorts, [cohort]);
     }
 
     #[test]
@@ -60965,12 +61063,7 @@ mod tests {
             let text_section = u8::try_from(text.index().0).unwrap();
             let text_value = text.address();
             drop(file);
-            object = add_test_macho_local_alias(
-                object,
-                b"_migrated",
-                text_section,
-                text_value,
-            );
+            object = add_test_macho_local_alias(object, b"_migrated", text_section, text_value);
             let entry = test_macho_symbol_entry_offset(&object, b"_migrated");
             object[entry + 4] |= object::macho::N_EXT;
             object
@@ -61117,11 +61210,7 @@ mod tests {
                 current: section(current_source, output.text_offset + 0x100, true),
             },
             MatchedPatchSection {
-                previous: section(
-                    previous_destination,
-                    output.text_offset + 0x200,
-                    false,
-                ),
+                previous: section(previous_destination, output.text_offset + 0x200, false),
                 current: section(
                     current_destination.clone(),
                     output.text_offset + 0x200,
@@ -61134,18 +61223,11 @@ mod tests {
             .map(|section| section.current.clone())
             .collect::<Vec<_>>();
         let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
-        let previous_value = macho_output_address_for_file_offset(
-            &output_file,
-            output.text_offset + 0x100,
-        )
-        .unwrap();
-        let input = state(
-            "args",
-            &output.bytes,
-            &[("input.rlib", &previous_archive)],
-        )
-        .input_files
-        .remove(0);
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, output.text_offset + 0x100).unwrap();
+        let input = state("args", &output.bytes, &[("input.rlib", &previous_archive)])
+            .input_files
+            .remove(0);
         assert_eq!(input.path, input_file_path);
         let mut resolutions = vec![MachOSymbolResolutionRecord {
             name: hex::encode("_migrated").into(),
@@ -65089,8 +65171,7 @@ mod tests {
             previous_target: target(previous_source),
             current_target: target(current_destination),
         };
-        let migrated =
-            migrated_macho_archive_definition_names(&input_file, &[moved]).unwrap();
+        let migrated = migrated_macho_archive_definition_names(&input_file, &[moved]).unwrap();
         let changed = ChangedMachOArchiveUnwindMembers {
             members: Vec::new(),
             retired_entries: Vec::new(),
@@ -70571,6 +70652,7 @@ mod tests {
         assert!(replays.replays.is_empty());
         assert!(replays.rematerialized_sections.is_empty());
 
+        let mut local_symbol_cohorts = Vec::new();
         assert!(
             !validate_macho_data_relocations_are_stable(
                 &mut [],
@@ -70582,7 +70664,7 @@ mod tests {
                 &elf,
                 &mut target_patches,
                 &[],
-                &[],
+                &mut local_symbol_cohorts,
             )
             .unwrap()
             .unwrap()
