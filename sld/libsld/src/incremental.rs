@@ -5554,10 +5554,41 @@ fn normalized_macho_local_target_has_output_witness(
     encoded_name: &str,
     target_value: u64,
 ) -> Result<std::result::Result<bool, String>> {
-    match unique_macho_output_symbol_value_by_name(bytes, file, encoded_name)? {
-        Ok(value) => Ok(Ok(value == Some(target_value))),
-        Err(reason) => Ok(Err(reason)),
+    let name = hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
+    let mut matched = None;
+    for symbol in file.symbols() {
+        if symbol.name_bytes()? != name {
+            continue;
+        }
+        if matched.replace(symbol).is_some() {
+            return Ok(Ok(false));
+        }
     }
+    let Some(symbol) = matched else {
+        return Ok(Ok(false));
+    };
+    let Some(section_index) = symbol.section_index() else {
+        return Ok(Ok(false));
+    };
+    let Some(raw) = macho_symbol_entry(bytes, &symbol) else {
+        return Ok(Ok(false));
+    };
+    let section = file.section_by_index(section_index)?;
+    let value_is_in_section = symbol
+        .address()
+        .checked_sub(section.address())
+        .is_some_and(|offset| offset < section.size());
+    Ok(Ok(raw[4] & object::macho::N_STAB == 0
+        && raw[4] & object::macho::N_TYPE == object::macho::N_SECT
+        && raw[4] & (object::macho::N_EXT | object::macho::N_PEXT)
+            == 0
+        && usize::from(raw[5]) == section_index.0
+        && symbol.scope() == object::SymbolScope::Compilation
+        && !symbol.is_global()
+        && !symbol.is_undefined()
+        && !symbol.is_weak()
+        && symbol.address() == target_value
+        && value_is_in_section))
 }
 
 fn symbol_position_by_name_and_value(
@@ -65265,33 +65296,53 @@ mod tests {
 
     #[test]
     fn normalized_macho_local_target_requires_exact_output_symbol() {
-        let output = test_macho_object(&[0; 4], &[0; 8], 2);
-        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let global = test_macho_object(&[0; 4], &[0; 8], 2);
         let target_value = 6;
-
-        assert!(
+        let has_witness = |output: &[u8], target_value| {
+            let output_file = object::File::parse(output).unwrap();
             normalized_macho_local_target_has_output_witness(
-                &output,
+                output,
                 &output_file,
                 &hex::encode("_data"),
                 target_value,
             )
             .unwrap()
             .unwrap()
-        );
+        };
+
+        assert!(!has_witness(&global, target_value));
+
+        let mut local = global.clone();
+        let data_entry = test_macho_symbol_entry_offset(&local, b"_data");
+        local[data_entry + 4] = object::macho::N_SECT;
+        assert!(has_witness(&local, target_value));
+        assert!(!has_witness(&local, target_value + 1));
+
+        let mut weak = local.clone();
+        weak[data_entry + 6..data_entry + 8]
+            .copy_from_slice(&object::macho::N_WEAK_DEF.to_le_bytes());
+        assert!(!has_witness(&weak, target_value));
+
+        let mut private = local.clone();
+        private[data_entry + 4] |= object::macho::N_PEXT;
+        assert!(!has_witness(&private, target_value));
+
+        let mut undefined = local.clone();
+        undefined[data_entry + 4] = object::macho::N_UNDF;
+        undefined[data_entry + 5] = 0;
+        assert!(!has_witness(&undefined, target_value));
+
+        let mut outside_section = local.clone();
+        outside_section[data_entry + 8..data_entry + 16].copy_from_slice(&12_u64.to_le_bytes());
+        assert!(!has_witness(&outside_section, 12));
+
+        let duplicate = add_test_macho_local_alias(local, b"_data", 2, target_value);
+        assert!(!has_witness(&duplicate, target_value));
+
+        let output_file = object::File::parse(global.as_slice()).unwrap();
         assert!(
             !normalized_macho_local_target_has_output_witness(
-                &output,
-                &output_file,
-                &hex::encode("_data"),
-                target_value + 1,
-            )
-            .unwrap()
-            .unwrap()
-        );
-        assert!(
-            !normalized_macho_local_target_has_output_witness(
-                &output,
+                &global,
                 &output_file,
                 &hex::encode("_missing"),
                 target_value,
