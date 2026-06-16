@@ -32088,6 +32088,69 @@ fn unique_archive_member_patch_fingerprints(
     unique
 }
 
+fn unique_archive_member_bytes_by_normalized_identifier(
+    bytes: &[u8],
+) -> Result<Option<HashMap<Vec<u8>, Option<&[u8]>>>> {
+    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
+        return Ok(None);
+    };
+    let mut unique = HashMap::new();
+    for entry in archive {
+        let Ok(entry) = entry else {
+            return Ok(None);
+        };
+        let ArchiveEntry::Regular(content) = entry else {
+            return Ok(None);
+        };
+        let identifier = archive_member_patch_identifier(content.ident.as_slice());
+        if let Some(existing) = unique.get_mut(&identifier) {
+            *existing = None;
+        } else {
+            unique.insert(identifier, Some(content.entry_data));
+        }
+    }
+    Ok(Some(unique))
+}
+
+fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
+    validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    removed_identifiers: &[Vec<u8>],
+    added_identifiers: &[Vec<u8>],
+) -> Result<(
+    Vec<ValidatedMachOLocalRelocationSite>,
+    Vec<ValidatedMachOLocalRelocationSite>,
+)> {
+    let (Some(previous_members), Some(current_members)) = (
+        unique_archive_member_bytes_by_normalized_identifier(previous_bytes)?,
+        unique_archive_member_bytes_by_normalized_identifier(current_bytes)?,
+    ) else {
+        return Ok(validated_local_retargets
+            .iter()
+            .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
+            .unzip());
+    };
+    let is_exact_unchanged_member = |identifier: &[u8]| {
+        !removed_identifiers
+            .iter()
+            .chain(added_identifiers)
+            .any(|excluded| excluded.as_slice() == identifier)
+            && matches!(
+                (previous_members.get(identifier), current_members.get(identifier)),
+                (Some(Some(previous)), Some(Some(current))) if previous == current
+            )
+    };
+    Ok(validated_local_retargets
+        .iter()
+        .filter(|retarget| {
+            retarget.previous.archive_identifier != retarget.current.archive_identifier
+                || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
+        })
+        .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
+        .unzip())
+}
+
 fn remaining_archive_local_retargets_after_exact_unchanged_members(
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
     previous_member_identifiers: &[Vec<u8>],
@@ -34341,14 +34404,14 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
     if previous_fingerprint.is_some() && previous_fingerprint == current_fingerprint {
         return Ok(true);
     }
-    let previous_local_retargets = validated_local_retargets
-        .iter()
-        .map(|retarget| retarget.previous.clone())
-        .collect::<Vec<_>>();
-    let current_local_retargets = validated_local_retargets
-        .iter()
-        .map(|retarget| retarget.current.clone())
-        .collect::<Vec<_>>();
+    let (previous_local_retargets, current_local_retargets) =
+        remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
+            validated_local_retargets,
+            previous_bytes,
+            current_bytes,
+            ignored_previous_identifiers,
+            ignored_current_identifiers,
+        )?;
     let previous_local_symbol_renames = validated_local_symbol_renames
         .iter()
         .map(|rename| rename.previous.clone())
@@ -59340,6 +59403,110 @@ mod tests {
     }
 
     #[test]
+    fn exact_unchanged_archive_member_bytes_consume_only_common_retargets() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for &(identifier, bytes) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        bytes,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        fn site(
+            identifier: Vec<u8>,
+            target_symbol_index: usize,
+        ) -> ValidatedMachOLocalRelocationSite {
+            ValidatedMachOLocalRelocationSite {
+                archive_identifier: identifier,
+                section_index: 3,
+                relocation_offset: 16,
+                normalize_relocation_offset: false,
+                target_symbol_index,
+                hash_target_symbol: false,
+                hash_unmasked_target_offset: false,
+                exact_symbol_indices: Vec::new(),
+            }
+        }
+
+        fn remaining(
+            retarget: &ValidatedMachOLocalRelocationRetarget,
+            previous: &[u8],
+            current: &[u8],
+            removed: &[Vec<u8>],
+            added: &[Vec<u8>],
+        ) -> usize {
+            let (previous, current) =
+                remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
+                    std::slice::from_ref(retarget),
+                    previous,
+                    current,
+                    removed,
+                    added,
+                )
+                .unwrap();
+            assert_eq!(previous.len(), current.len());
+            previous.len()
+        }
+
+        let raw_identifier = b"crate-hash.common.0.rcgu.o";
+        let normalized = archive_member_patch_identifier(raw_identifier);
+        let retarget = ValidatedMachOLocalRelocationRetarget {
+            previous: site(normalized.clone(), 4),
+            current: site(normalized.clone(), 9),
+        };
+        let previous = archive(&[(raw_identifier, b"identical member")]);
+        let current = archive(&[(raw_identifier, b"identical member")]);
+        assert_eq!(remaining(&retarget, &previous, &current, &[], &[]), 0);
+
+        let missing = archive(&[]);
+        let changed = archive(&[(raw_identifier, b"changed member!!")]);
+        let shorter = archive(&[(raw_identifier, b"short")]);
+        let duplicate = archive(&[
+            (raw_identifier, b"identical member"),
+            (b"crate-hash.common.1.rcgu.o", b"identical member"),
+        ]);
+        for current in [
+            missing.as_slice(),
+            changed.as_slice(),
+            shorter.as_slice(),
+            duplicate.as_slice(),
+            b"malformed",
+        ] {
+            assert_eq!(remaining(&retarget, &previous, current, &[], &[]), 1);
+        }
+        assert_eq!(
+            remaining(
+                &retarget,
+                &previous,
+                &current,
+                std::slice::from_ref(&normalized),
+                &[],
+            ),
+            1
+        );
+        assert_eq!(
+            remaining(
+                &retarget,
+                &previous,
+                &current,
+                &[],
+                std::slice::from_ref(&normalized),
+            ),
+            1
+        );
+        let cross_member = ValidatedMachOLocalRelocationRetarget {
+            current: site(b"other.member.o".to_vec(), 9),
+            ..retarget
+        };
+        assert_eq!(remaining(&cross_member, &previous, &current, &[], &[]), 1);
+    }
+
+    #[test]
     fn exact_unchanged_archive_member_consumes_retargets_across_index_movement() {
         fn fingerprint(index: usize, identifier: &[u8]) -> ArchiveMemberPatchFingerprint {
             ArchiveMemberPatchFingerprint {
@@ -67432,6 +67599,8 @@ mod tests {
         assert_eq!(current_object[local_entry + 4] & object::macho::N_EXT, 0);
         current_object[local_entry + 4] |= object::macho::N_STAB;
         let next_object = replace_unwind_length(current_object.clone(), 0x250_u32, 0x248_u32);
+        let common_identifier = b"crate-hash.common.session.rcgu.o";
+        let common_object = test_macho_local_data_retarget_object(b"l_anon.common", 0x12);
 
         let input_file_path = hex::encode("input.rlib");
         let archive = |identifier: &[u8], object: &[u8]| {
@@ -67440,6 +67609,12 @@ mod tests {
                 .append(
                     &ar::Header::new(identifier.to_vec(), object.len() as u64),
                     object,
+                )
+                .unwrap();
+            builder
+                .append(
+                    &ar::Header::new(common_identifier.to_vec(), common_object.len() as u64),
+                    common_object.as_slice(),
                 )
                 .unwrap();
             let bytes = builder.into_inner().unwrap();
@@ -67532,6 +67707,28 @@ mod tests {
             .map(|section| section.current.clone())
             .collect::<Vec<_>>();
         let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let common_file = object::File::parse(common_object.as_slice()).unwrap();
+        let common_source = common_file
+            .sections()
+            .find(|section| {
+                section.name_bytes().ok() == Some(b"__const".as_slice())
+                    && section.segment_name_bytes().ok().flatten() == Some(b"__DATA".as_slice())
+            })
+            .unwrap();
+        let common_site = |target_symbol_index| ValidatedMachOLocalRelocationSite {
+            archive_identifier: archive_member_patch_identifier(common_identifier),
+            section_index: common_source.index().0,
+            relocation_offset: 0,
+            normalize_relocation_offset: false,
+            target_symbol_index,
+            hash_target_symbol: false,
+            hash_unmasked_target_offset: false,
+            exact_symbol_indices: Vec::new(),
+        };
+        let common_retarget = ValidatedMachOLocalRelocationRetarget {
+            previous: common_site(0),
+            current: common_site(1),
+        };
         let excluded_current = changed_macho_archive_unwind_activation(
             &previous_archive,
             &current_archive,
@@ -67573,7 +67770,7 @@ mod tests {
             &[],
             &[],
             &HashSet::new(),
-            &[],
+            std::slice::from_ref(&common_retarget),
         )
         .unwrap()
         .unwrap()
