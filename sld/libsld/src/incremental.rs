@@ -8153,6 +8153,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .patch
                             .as_ref()
                             .and_then(|patch| patch.archive_member_patch_fingerprints.as_deref()),
+                        PatchInputLookup::CurrentRecordedRange,
                     )?
                 else {
                     return Ok(ChangedInputPatchResult::Unsupported(
@@ -9395,6 +9396,7 @@ fn classify_normalized_rust_archive_record_owner_state(
         fdes,
         dynamic_relocations,
         true,
+        PatchInputLookup::MatchArchiveMember,
     )?
     else {
         return Ok(NormalizedRustArchivePatchState::Unknown);
@@ -11346,6 +11348,9 @@ impl<'data> PatchInputResolver<'data> {
                 ArchiveMemberMatch::Ambiguous => return Ok(None),
                 ArchiveMemberMatch::Unavailable => {}
             }
+        }
+        if self.normalize_rust_archive_patch_inputs && self.archive_members.is_some() {
+            return Ok(None);
         }
 
         let Some(input_bytes) = self.bytes.get(parsed.range.clone()) else {
@@ -15509,6 +15514,7 @@ where
             input_fdes.map(Vec::as_slice).unwrap_or_default(),
             true,
             None,
+            PatchInputLookup::CurrentRecordedRange,
         )?;
         if patch.is_some() && input.content.hash.is_empty() {
             input.content.hash = hash_bytes(input_file.full_data());
@@ -15531,6 +15537,7 @@ fn current_patch_state(
     fdes: &[&FdeRecord],
     normalize_rust_archive_patch_inputs: bool,
     previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+    lookup: PatchInputLookup,
 ) -> Result<Option<FilePatchState>> {
     let archive_member_set_proof = archive_member_set_proof(bytes)?;
     let patch_sections = if sections.is_empty() {
@@ -15543,33 +15550,43 @@ fn current_patch_state(
             sections,
             dynamic_relocations.iter().copied(),
             relocations.iter().copied(),
+            lookup,
         )?
     };
-    let dynamic_relocation_patches = dynamic_relocation_patches_for_current_records(
+    let dynamic_relocation_patches = dynamic_relocation_patches_for_input_with_lookup(
         bytes,
         input_file_path,
         dynamic_relocations.iter().copied(),
+        lookup,
     )?;
-    let relocation_addend_ranges = relocation_addend_ranges_for_current_records(
+    let relocation_addend_ranges = relocation_addend_ranges_for_input_with_lookup(
         bytes,
         input_file_path,
         relocations.iter().copied(),
+        lookup,
     )?;
-    let relocation_target_ranges = relocation_target_ranges_for_current_records(
+    let relocation_target_ranges = relocation_target_ranges_for_input_with_lookup(
         bytes,
         input_file_path,
         relocation_targets.iter().copied(),
+        lookup,
     )?;
-    let Some(macho_symbol_resolution_ranges) = macho_symbol_resolution_ranges_for_current_records(
-        bytes,
-        input_file_path,
-        macho_symbol_resolutions.iter().copied(),
-    )?
+    let Some(macho_symbol_resolution_ranges) =
+        macho_symbol_resolution_ranges_for_records_with_lookup(
+            bytes,
+            input_file_path,
+            macho_symbol_resolutions.iter().copied(),
+            lookup,
+        )?
     else {
         return Ok(None);
     };
-    let fde_relocation_ranges =
-        fde_patch_input_ranges_for_current_records(bytes, input_file_path, fdes.iter().copied())?;
+    let fde_relocation_ranges = fde_patch_input_ranges_for_input_with_lookup(
+        bytes,
+        input_file_path,
+        fdes.iter().copied(),
+        lookup,
+    )?;
     Ok(patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_patch_fingerprints(
         bytes,
         input_file_path,
@@ -15583,6 +15600,7 @@ fn current_patch_state(
             .chain(fde_relocation_ranges),
         normalize_rust_archive_patch_inputs,
         previous_archive_member_patch_fingerprints,
+        lookup,
     )?
     .map(|(fingerprint, archive_member_patch_fingerprints)| FilePatchState {
         fingerprint,
@@ -15662,6 +15680,7 @@ fn current_patch_state_from_snapshot_with_rustc_work_product_provenance(
         fdes,
         dynamic_relocations,
         normalize_rust_archive_patch_inputs,
+        PatchInputLookup::CurrentRecordedRange,
     )
 }
 
@@ -15676,6 +15695,7 @@ fn current_patch_state_for_input(
     fdes: &[FdeRecord],
     dynamic_relocations: &[DynamicRelocationRecord],
     normalize_rust_archive_patch_inputs: bool,
+    lookup: PatchInputLookup,
 ) -> Result<Option<FilePatchState>> {
     let sections = sections
         .iter()
@@ -15726,6 +15746,7 @@ fn current_patch_state_for_input(
             .patch
             .as_ref()
             .and_then(|patch| patch.archive_member_patch_fingerprints.as_deref()),
+        lookup,
     )?;
     Ok(patch.map(|mut patch| {
         patch.macho_archive_members = input
@@ -15783,6 +15804,7 @@ fn direct_copy_patch_sections<'a>(
     sections: &[&'a SectionRecord],
     dynamic_relocations: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
     relocations: impl IntoIterator<Item = &'a RelocationRecord>,
+    lookup: PatchInputLookup,
 ) -> Result<Vec<PatchSection>> {
     let mut patch_sections = Vec::new();
     let dynamic_relocation_offsets =
@@ -15798,17 +15820,14 @@ fn direct_copy_patch_sections<'a>(
     }
 
     for (input_ref, records) in sections_by_input {
-        let Some(input_bytes) = patch_input_bytes_with_lookup(
-            bytes,
-            input_file_path,
-            input_ref,
-            PatchInputLookup::CurrentRecordedRange,
-        )?
+        let Some(input_bytes) =
+            patch_input_bytes_with_lookup(bytes, input_file_path, input_ref, lookup)?
         else {
             continue;
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse incremental patch candidate input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            continue;
+        };
         for record in records {
             let section = file
                 .section_by_index(patch_section_object_index(&file, record.section_index)?)
@@ -22111,10 +22130,14 @@ fn patch_input_bytes_with_lookup<'data>(
         }));
     }
 
+    let is_archive = ArchiveIterator::from_archive_bytes(bytes).is_ok();
     match patch_archive_member_bytes(bytes, &parsed.identifier)? {
         ArchiveMemberMatch::Unique(member) => return Ok(Some(member)),
         ArchiveMemberMatch::Ambiguous => return Ok(None),
         ArchiveMemberMatch::Unavailable => {}
+    }
+    if is_archive && archive_member_patch_identifier(&parsed.identifier) != parsed.identifier {
+        return Ok(None);
     }
 
     let Some(input_bytes) = bytes.get(parsed.range.clone()) else {
@@ -23626,17 +23649,13 @@ fn patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_pa
     extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
     normalize_rust_archive_patch_inputs: bool,
     previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+    lookup: PatchInputLookup,
 ) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
     let sections = sections.into_iter().collect::<Vec<_>>();
     let ranges = if sections.is_empty() {
         Vec::new()
     } else {
-        let Some(ranges) = patch_ranges_with_lookup(
-            bytes,
-            input_file_path,
-            sections,
-            PatchInputLookup::CurrentRecordedRange,
-        )?
+        let Some(ranges) = patch_ranges_with_lookup(bytes, input_file_path, sections, lookup)?
         else {
             return Ok(None);
         };
@@ -32780,8 +32799,9 @@ fn current_patch_sections_for_matching_with_resolver(
         else {
             return Ok(None);
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse changed patch input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            return Ok(None);
+        };
         let current_input_ref = resolved_patch_input_ref(input_file_path, input_ref, input_bytes)?;
         for stored_section_index in section_indices {
             let patch_section = &sections[stored_section_index];
@@ -32874,10 +32894,12 @@ fn match_patch_sections_with_resolvers(
         else {
             return Ok(None);
         };
-        let previous_file = object::File::parse(previous_input_bytes.bytes)
-            .context("Failed to parse previous patch input")?;
-        let current_file = object::File::parse(current_input_bytes.bytes)
-            .context("Failed to parse current patch input")?;
+        let Ok(previous_file) = object::File::parse(previous_input_bytes.bytes) else {
+            return Ok(None);
+        };
+        let Ok(current_file) = object::File::parse(current_input_bytes.bytes) else {
+            return Ok(None);
+        };
         let previous_input_ref = resolved_patch_input_ref(
             previous_input.path.as_str(),
             input_ref,
@@ -33095,10 +33117,12 @@ fn changed_patch_sections_with_resolvers(
         else {
             return Ok(None);
         };
-        let previous_file = object::File::parse(previous_input_bytes.bytes)
-            .context("Failed to parse previous patch input")?;
-        let current_file = object::File::parse(current_input_bytes.bytes)
-            .context("Failed to parse current patch input")?;
+        let Ok(previous_file) = object::File::parse(previous_input_bytes.bytes) else {
+            return Ok(None);
+        };
+        let Ok(current_file) = object::File::parse(current_input_bytes.bytes) else {
+            return Ok(None);
+        };
 
         for patch_section in sections {
             let Some(previous_index) =
@@ -33154,8 +33178,9 @@ fn matched_cstring_literal_boundaries_are_stable(
         else {
             return Ok(false);
         };
-        let current_file = object::File::parse(current_input_bytes.bytes)
-            .context("Failed to parse current cstring patch input")?;
+        let Ok(current_file) = object::File::parse(current_input_bytes.bytes) else {
+            return Ok(false);
+        };
         let previous_file = if let Some(previous_resolver) = previous_resolver {
             let Some(previous_input_bytes) = previous_resolver.resolve(
                 input_file_path,
@@ -33165,10 +33190,10 @@ fn matched_cstring_literal_boundaries_are_stable(
             else {
                 return Ok(false);
             };
-            Some(
-                object::File::parse(previous_input_bytes.bytes)
-                    .context("Failed to parse previous cstring patch input")?,
-            )
+            let Ok(previous_file) = object::File::parse(previous_input_bytes.bytes) else {
+                return Ok(false);
+            };
+            Some(previous_file)
         } else {
             None
         };
@@ -33514,8 +33539,12 @@ fn resolved_patch_sections_for_input_with_resolver_detailed<'a>(
                 display_hex_path(input_ref).replace('\0', "\\0"),
             )));
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse changed incremental input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            return Ok(Err(format!(
+                "changed patch input `{}` is not an object",
+                display_hex_path(input_ref).replace('\0', "\\0"),
+            )));
+        };
         let current_input_ref = resolved_patch_input_ref(input_file_path, input_ref, input_bytes)?;
         for stored_section_index in section_indices {
             let patch_section = &sections[stored_section_index];
@@ -33614,19 +33643,6 @@ fn dynamic_relocation_patches_for_input<'a>(
         input_file_path,
         records,
         PatchInputLookup::MatchArchiveMember,
-    )
-}
-
-fn dynamic_relocation_patches_for_current_records<'a>(
-    bytes: &[u8],
-    input_file_path: &str,
-    records: impl IntoIterator<Item = &'a DynamicRelocationRecord>,
-) -> Result<Vec<DynamicRelocationPatch>> {
-    dynamic_relocation_patches_for_input_with_lookup(
-        bytes,
-        input_file_path,
-        records,
-        PatchInputLookup::CurrentRecordedRange,
     )
 }
 
@@ -33971,19 +33987,6 @@ fn relocation_addend_ranges_for_input<'a>(
     )
 }
 
-fn relocation_addend_ranges_for_current_records<'a>(
-    bytes: &[u8],
-    input_file_path: &str,
-    records: impl IntoIterator<Item = &'a RelocationRecord>,
-) -> Result<Vec<std::ops::Range<usize>>> {
-    relocation_addend_ranges_for_input_with_lookup(
-        bytes,
-        input_file_path,
-        records,
-        PatchInputLookup::CurrentRecordedRange,
-    )
-}
-
 fn relocation_addend_ranges_for_input_with_lookup<'a>(
     bytes: &[u8],
     input_file_path: &str,
@@ -34037,6 +34040,7 @@ fn relocation_addend_ranges_for_input_with_lookup<'a>(
     Ok(ranges)
 }
 
+#[cfg(test)]
 fn relocation_target_ranges_for_current_records<'a>(
     bytes: &[u8],
     input_file_path: &str,
@@ -34050,6 +34054,7 @@ fn relocation_target_ranges_for_current_records<'a>(
     )
 }
 
+#[cfg(test)]
 fn macho_symbol_resolution_ranges_for_current_records<'a>(
     bytes: &[u8],
     input_file_path: &str,
@@ -34083,8 +34088,9 @@ fn macho_symbol_resolution_ranges_for_records_with_lookup<'a>(
         else {
             return Ok(None);
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse incremental Mach-O symbol catalog input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            return Ok(None);
+        };
         let current = match unique_symbol_position_by_name(
             input_bytes.bytes,
             input_bytes.file_offset,
@@ -34126,8 +34132,9 @@ fn relocation_target_ranges_for_input_with_lookup<'a>(
         else {
             continue;
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse incremental relocation target input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            continue;
+        };
         let mut seen_names = HashSet::new();
         for record in records {
             if record.input_file == input_file_path
@@ -34662,19 +34669,6 @@ fn fde_patch_input_ranges_for_input<'a>(
         input_file_path,
         records,
         PatchInputLookup::MatchArchiveMember,
-    )
-}
-
-fn fde_patch_input_ranges_for_current_records<'a>(
-    bytes: &[u8],
-    input_file_path: &str,
-    records: impl IntoIterator<Item = &'a FdeRecord>,
-) -> Result<Vec<std::ops::Range<usize>>> {
-    fde_patch_input_ranges_for_input_with_lookup(
-        bytes,
-        input_file_path,
-        records,
-        PatchInputLookup::CurrentRecordedRange,
     )
 }
 
@@ -36344,8 +36338,9 @@ fn patch_ranges_with_resolution<'data>(
         let Some(input_bytes) = resolve(input_ref)? else {
             return Ok(None);
         };
-        let file = object::File::parse(input_bytes.bytes)
-            .context("Failed to parse incremental patch input")?;
+        let Ok(file) = object::File::parse(input_bytes.bytes) else {
+            return Ok(None);
+        };
         for patch_section in sections {
             let Some(section_index) = patch_section_index(&file, patch_section)? else {
                 return Ok(None);
@@ -46553,6 +46548,46 @@ mod tests {
     }
 
     #[test]
+    fn normalized_archive_member_lookup_does_not_reuse_a_missing_members_range() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"crate-hash.cgu.1.current.rcgu.o".to_vec(), 12),
+                b"current-data".as_slice(),
+            )
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let input_file = hex::encode("libarchive.rlib");
+        let ArchiveMemberMatch::Unique(current) =
+            patch_archive_member_bytes(&archive, b"crate-hash.cgu.1.current.rcgu.o").unwrap()
+        else {
+            panic!("expected current Rust archive member");
+        };
+        let stale_ref = hex::encode(format!(
+            "libarchive.rlib\0crate-hash.cgu.0.previous.rcgu.o\0{}:{}",
+            current.file_offset,
+            current.file_offset + current.bytes.len(),
+        ));
+        let resolver = PatchInputResolver::new(&archive, true).unwrap();
+
+        assert!(
+            patch_input_bytes(&archive, &input_file, &stale_ref)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve(
+                    &input_file,
+                    &stale_ref,
+                    PatchInputLookup::MatchArchiveMember,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn patch_input_resolver_rejects_ambiguous_archive_member_names() {
         let mut builder = ar::Builder::new(Vec::new());
         builder
@@ -47899,6 +47934,7 @@ mod tests {
             &[],
             true,
             None,
+            PatchInputLookup::CurrentRecordedRange,
         )
         .unwrap()
         .unwrap();
@@ -57969,6 +58005,113 @@ mod tests {
     }
 
     #[test]
+    fn normalized_archive_refresh_does_not_reuse_retired_or_malformed_member_ranges() {
+        let archive = |identifier: &[u8], object: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(b"lib.rmeta".to_vec(), 8),
+                    b"metadata".as_slice(),
+                )
+                .unwrap();
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let input_path = hex::encode("libarchive.rlib");
+        let object = growable_data_elf();
+        let a1_identifier = b"crate.cgu.0.a1.rcgu.o";
+        let a2_identifier = b"crate.cgu.0.this-is-a-much-longer-a2-invocation.rcgu.o";
+        let a1 = archive(a1_identifier, &object);
+        let a2 = archive(a2_identifier, &object);
+        let ArchiveMemberMatch::Unique(a1_member) =
+            patch_archive_member_bytes(&a1, a1_identifier).unwrap()
+        else {
+            panic!("expected A1 Rust archive member");
+        };
+        let section = PatchSection {
+            input: resolved_patch_input_ref(&input_path, &input_path, a1_member).unwrap(),
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: Some(hash_bytes(&object[0x40..0x44])),
+            cstring_nul_boundaries_hash: None,
+        };
+        let previous_patch = PreviousPatchState {
+            fingerprint: patch_fingerprint(&a1, input_path.as_str(), [section.clone()])
+                .unwrap()
+                .unwrap(),
+            archive_member_patch_fingerprints: None,
+            sections: vec![section],
+        };
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&a1),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+
+        let NormalizedRustArchivePatchState::Unchanged(a2_patch) =
+            classify_normalized_rust_archive_patch_state(&input, &a2, &previous_patch).unwrap()
+        else {
+            panic!("expected A2 normalized archive match");
+        };
+        let ArchiveMemberMatch::Unique(a2_member) =
+            patch_archive_member_bytes(&a2, a2_identifier).unwrap()
+        else {
+            panic!("expected A2 Rust archive member");
+        };
+        let a2_ref = parse_patch_input_ref(&input_path, &a2_patch.sections[0].input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a2_ref.identifier, a2_identifier);
+        assert_eq!(
+            a2_ref.range,
+            a2_member.file_offset..a2_member.file_offset + a2_member.bytes.len()
+        );
+
+        let a2_previous_patch = PreviousPatchState {
+            fingerprint: a2_patch.fingerprint.clone(),
+            archive_member_patch_fingerprints: a2_patch.archive_member_patch_fingerprints.clone(),
+            sections: a2_patch
+                .sections
+                .iter()
+                .map(|section| PatchSection {
+                    input: section.input.clone(),
+                    section_index: section.section_index,
+                    section_name: section.section_name.clone(),
+                    input_size: section.input_size,
+                    output_offset: section.output_offset,
+                    output_size: section.output_size,
+                    data_hash: section.data_hash.clone(),
+                    cstring_nul_boundaries_hash: section.cstring_nul_boundaries_hash.clone(),
+                })
+                .collect(),
+        };
+        let retired = archive(b"crate.cgu.1.b.rcgu.o", &vec![b'x'; object.len()]);
+        assert!(matches!(
+            classify_normalized_rust_archive_patch_state(&input, &retired, &a2_previous_patch)
+                .unwrap(),
+            NormalizedRustArchivePatchState::Unknown
+        ));
+
+        let malformed = archive(b"crate.cgu.0.b.rcgu.o", b"not an object");
+        assert!(matches!(
+            classify_normalized_rust_archive_patch_state(&input, &malformed, &a2_previous_patch)
+                .unwrap(),
+            NormalizedRustArchivePatchState::Unknown
+        ));
+    }
+
+    #[test]
     fn archive_member_identifiers_track_member_set() {
         let mut builder = ar::Builder::new(Vec::new());
         builder
@@ -60283,7 +60426,9 @@ mod tests {
         let next_digest = "b".repeat(blake3::OUT_LEN * 2);
         let object = growable_data_elf();
         let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, &object);
-        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, &object);
+        let current_invocation = b"this-is-a-much-longer-current-invocation";
+        let current_bytes =
+            rustc_rlib_with_link_content_digest(current_invocation, &digest, &object);
         let mut next_object = object.clone();
         next_object[0x40] ^= 1;
         let next_bytes = rustc_rlib_with_link_content_digest(b"next", &next_digest, &next_object);
@@ -60395,6 +60540,25 @@ mod tests {
         let NormalizedRustArchivePatchState::Unchanged(patch) = normalized else {
             panic!("expected exact normalized archive match");
         };
+        let current_identifier = [
+            b"crate.cgu.0.".as_slice(),
+            current_invocation,
+            b".rcgu.o".as_slice(),
+        ]
+        .concat();
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current_bytes, &current_identifier).unwrap()
+        else {
+            panic!("expected current Rust archive member");
+        };
+        let current_ref = parse_patch_input_ref(&input_path, &patch.sections[0].input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_ref.identifier, current_identifier);
+        assert_eq!(
+            current_ref.range,
+            current_member.file_offset..current_member.file_offset + current_member.bytes.len()
+        );
         previous.input_files[0].content = content_hash_with_path_identity(&input, &current_bytes);
         previous.input_files[0].snapshot_identity = None;
         previous.input_files[0].patch = Some(patch);
@@ -60465,7 +60629,11 @@ mod tests {
         let next_digest = "b".repeat(blake3::OUT_LEN * 2);
         let object = test_macho_object(&[1; 4], &[2; 4], 0);
         let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, &object);
-        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, &object);
+        let current_bytes = rustc_rlib_with_link_content_digest(
+            b"this-is-a-much-longer-current-invocation",
+            &digest,
+            &object,
+        );
         let mut next_object = object.clone();
         next_object[0x100] ^= 1;
         let next_bytes = rustc_rlib_with_link_content_digest(b"next", &next_digest, &next_object);
