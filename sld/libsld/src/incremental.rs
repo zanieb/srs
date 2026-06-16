@@ -38557,9 +38557,19 @@ fn validate_macho_archive_unwind_version_output(
         .checked_add(terminator_offset as u64)
         .and_then(|offset| offset.checked_add(4))
         .ok_or_else(|| "Mach-O unwind transaction terminator overflowed".to_owned())?;
-    let canonical_start = crate::alignment::Alignment { exponent: 3 }.align_up(terminator_end);
-    if reserve.start != canonical_start {
-        return Err("Mach-O unwind transaction reserve start is not canonical".to_owned());
+    let terminator_start = section_start
+        .checked_add(terminator_offset as u64)
+        .ok_or_else(|| "Mach-O unwind transaction terminator overflowed".to_owned())?;
+    let alignment = crate::alignment::Alignment { exponent: 3 };
+    let full_link_start = alignment.align_up(terminator_start);
+    let incremental_start = alignment.align_up(terminator_end);
+    if !reserve.start.is_multiple_of(8)
+        || !reserve.end.is_multiple_of(8)
+        || (reserve.start != full_link_start && reserve.start != incremental_start)
+    {
+        return Err(
+            "Mach-O unwind transaction reserve start does not match a producer state".to_owned(),
+        );
     }
     let reserve_end = usize::try_from(reserve.end - section_start)
         .map_err(|_| "Mach-O unwind transaction reserve exceeds usize".to_owned())?;
@@ -67946,6 +67956,118 @@ mod tests {
             )
             .unwrap_err()
             .contains("overlaps an existing live entry"),
+        );
+    }
+
+    #[test]
+    fn macho_archive_unwind_versions_accept_exact_producer_reserves() {
+        let mut output = test_macho_unwind_output(0x1000);
+        let section_end = output.eh_frame_offset + output.eh_frame_size;
+        let full_link_start = output.eh_frame_offset;
+        let incremental_start = full_link_start + 8;
+        let common_members = vec![MachOArchiveMemberIdentity {
+            normalized_identifier: b"common.rcgu.o".to_vec(),
+            object_hash: "a".repeat(blake3::OUT_LEN * 2),
+        }];
+        let version = |start| MachOArchiveUnwindVersionState {
+            common_members: common_members.clone(),
+            eh_frame_reserve: MachOEhFrameReserveState {
+                start,
+                end: section_end,
+            },
+        };
+
+        validate_macho_archive_unwind_version_output(&output.bytes, &version(full_link_start))
+            .unwrap();
+        validate_macho_archive_unwind_version_output(&output.bytes, &version(incremental_start))
+            .unwrap();
+        let alignment = crate::alignment::Alignment { exponent: 3 };
+        for terminator_offset in [5_u64, 6, 7] {
+            let mut producer_output = output.bytes.clone();
+            let entry_start = output.eh_frame_offset as usize;
+            producer_output[entry_start..entry_start + 4]
+                .copy_from_slice(&u32::try_from(terminator_offset - 4).unwrap().to_le_bytes());
+            producer_output[entry_start + 4..entry_start + terminator_offset as usize].fill(1);
+            let terminator_start = output.eh_frame_offset + terminator_offset;
+            let full_link_start = alignment.align_up(terminator_start);
+            let incremental_start = alignment.align_up(terminator_start + 4);
+            validate_macho_archive_unwind_version_output(
+                &producer_output,
+                &version(full_link_start),
+            )
+            .unwrap();
+            validate_macho_archive_unwind_version_output(
+                &producer_output,
+                &version(incremental_start),
+            )
+            .unwrap();
+        }
+        for invalid_start in [full_link_start + 4, full_link_start + 16] {
+            assert!(
+                validate_macho_archive_unwind_version_output(
+                    &output.bytes,
+                    &version(invalid_start),
+                )
+                .unwrap_err()
+                .contains("producer state")
+            );
+        }
+
+        let target_patches = vec![
+            StoredOutputPatch {
+                output_offset: full_link_start,
+                data: vec![0; 4],
+            },
+            StoredOutputPatch {
+                output_offset: output.unwind_info_offset,
+                data: vec![0; 0x1000],
+            },
+        ];
+        scratch_apply_macho_archive_unwind_transition(
+            &output.bytes,
+            &target_patches,
+            &version(full_link_start),
+            &version(incremental_start),
+        )
+        .unwrap();
+        let full_link_reserve = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+            alignment_exponent: 3,
+            output_offset: full_link_start,
+            size: section_end - full_link_start,
+        }];
+        let incremental_reserve = vec![ReservedRangeRecord {
+            output_offset: incremental_start,
+            size: section_end - incremental_start,
+            ..full_link_reserve[0].clone()
+        }];
+        assert_eq!(
+            transition_macho_eh_frame_reserve(
+                &full_link_reserve,
+                version(full_link_start).eh_frame_reserve,
+                version(incremental_start).eh_frame_reserve,
+            )
+            .unwrap(),
+            incremental_reserve,
+        );
+        assert_eq!(
+            transition_macho_eh_frame_reserve(
+                &incremental_reserve,
+                version(incremental_start).eh_frame_reserve,
+                version(full_link_start).eh_frame_reserve,
+            )
+            .unwrap(),
+            full_link_reserve,
+        );
+
+        output.bytes[full_link_start as usize + 4] = 1;
+        assert!(
+            validate_macho_archive_unwind_version_output(
+                &output.bytes,
+                &version(incremental_start),
+            )
+            .unwrap_err()
+            .contains("suffix is not zero")
         );
     }
 
