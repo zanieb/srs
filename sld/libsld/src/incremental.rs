@@ -4699,6 +4699,56 @@ fn finalize_retired_macho_archive_symbol_resolutions(
     Ok(())
 }
 
+fn validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+    input_files: &[FileState],
+    input: &FileState,
+    bytes: &[u8],
+    output_context: Option<(&[MatchedPatchSection], &[u8])>,
+    reuse_context: Option<(&[u8], &[SectionRecord])>,
+) -> Result<std::result::Result<(), String>> {
+    let mut rollback_symbol_resolutions = input_files
+        .iter()
+        .filter_map(|input| input.patch.as_ref())
+        .flat_map(|patch| &patch.macho_archive_members)
+        .filter(|state| state.active)
+        .flat_map(|state| &state.rollback_symbol_resolutions)
+        .filter(|resolution| {
+            resolution
+                .target
+                .as_ref()
+                .is_some_and(|target| target.input_file == input.path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    rollback_symbol_resolutions.sort_unstable();
+    rollback_symbol_resolutions.dedup();
+
+    for stored in rollback_symbol_resolutions {
+        let mut current = stored.clone();
+        let updates = match update_macho_symbol_resolutions_for_input_with_reuse(
+            std::slice::from_mut(&mut current),
+            input,
+            bytes,
+            false,
+            output_context,
+            reuse_context,
+        )? {
+            Ok(updates) => updates,
+            Err(reason) => {
+                return Ok(Err(format!(
+                    "could not validate Mach-O symbol shadowed by an active rollback transaction: {reason}"
+                )));
+            }
+        };
+        if updates.changed || current != stored {
+            return Ok(Err(
+                "Mach-O symbol shadowed by an active rollback transaction changed".to_owned(),
+            ));
+        }
+    }
+    Ok(Ok(()))
+}
+
 fn reconcile_reactivated_macho_archive_rollback_symbol_resolutions(
     activation: &mut AddedMachOArchiveTextActivations,
     rollback_symbol_resolutions: &[MachOSymbolResolutionRecord],
@@ -8099,6 +8149,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             let mut macho_resolution_updates = {
                 timing_phase!("Refresh changed Mach-O symbol resolutions");
                 let previous_bytes = previous_snapshot_bytes.get()?;
+                if let Err(reason) =
+                    validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+                        &previous.input_files,
+                        input,
+                        &bytes,
+                        Some((&matched_sections, previous_output.get()?)),
+                        previous_bytes.map(|bytes| (bytes, previous.sections.as_slice())),
+                    )?
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(reason));
+                }
                 let owns_active_changed_definitions = retained_macho_archive_members
                     .iter()
                     .any(|state| state.kind.is_changed_definitions() && state.active);
@@ -53827,6 +53888,168 @@ mod tests {
         assert_eq!(updates.moves[0].current_value, current_value);
         assert_eq!(updates.moves[0].previous_target.section_offset, 0);
         assert_eq!(updates.moves[0].current_target.section_offset, 0);
+    }
+
+    #[test]
+    fn changed_shadowed_macho_predecessor_requires_current_rollback_resolution() {
+        let previous = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
+        let current = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 1);
+        let file = object::File::parse(previous.as_slice()).unwrap();
+        let data = file.section_by_name("__data").unwrap();
+        let input_path = hex::encode("input.o");
+        let owner_path = hex::encode("owner.rlib");
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let output_offset = output.text_offset + 0x100;
+        let previous_value =
+            macho_output_address_for_file_offset(&output_file, output_offset).unwrap();
+        let section_index = patch_section_record_index(&file, data.index()).unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__DATA,__data".to_owned()),
+                input_size: data.size(),
+                output_offset,
+                output_size: data.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input_path.clone(),
+                section_index,
+                section_name: Some("__DATA,__data".to_owned()),
+                input_size: data.size(),
+                output_offset,
+                output_size: data.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let rollback = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(previous_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: data.index().0 as u32,
+                section_offset: 0,
+            }),
+        };
+        let replacement = MachOSymbolResolutionRecord {
+            direct_value: Some(previous_value + 0x100),
+            target: Some(RelocationTargetRecord {
+                input_file: owner_path.clone().into(),
+                input: owner_path.clone().into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+            ..rollback.clone()
+        };
+        let active = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: Vec::new(),
+            active: true,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: vec![replacement.clone()],
+            rollback_symbol_resolutions: vec![rollback.clone()],
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 0,
+                data: vec![1],
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 0,
+                data: vec![0],
+            }],
+        };
+        let owner = FileState {
+            path: owner_path,
+            content: FileContentState::from_bytes(&[]),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: vec![active.clone()],
+                sections: Vec::new(),
+                raw_sections: None,
+            }),
+        };
+
+        let reason = validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &[input.clone(), owner.clone()],
+            &input,
+            &current,
+            Some((&matched, &output.bytes)),
+            None,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(reason.contains("shadowed by an active rollback transaction changed"));
+
+        validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &[input.clone(), owner.clone()],
+            &input,
+            &previous,
+            Some((&matched, &output.bytes)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut dormant_owner = owner.clone();
+        dormant_owner.patch.as_mut().unwrap().macho_archive_members[0].active = false;
+        validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &[input.clone(), dormant_owner],
+            &input,
+            &current,
+            Some((&matched, &output.bytes)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &[input, owner],
+            &FileState {
+                path: hex::encode("unrelated.o"),
+                content: FileContentState::from_bytes(&current),
+                snapshot_identity: None,
+                rustc_link_content_digest: None,
+                rustc_raw_object_manifest: None,
+                patch: None,
+            },
+            &current,
+            Some((&matched, &output.bytes)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut resolutions = vec![replacement];
+        finalize_retired_macho_archive_symbol_resolutions(
+            &mut resolutions,
+            &[RetiredMachOArchiveActivation {
+                state: active,
+                newly_tracked: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resolutions, vec![rollback]);
     }
 
     #[test]
