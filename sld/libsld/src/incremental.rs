@@ -17895,24 +17895,6 @@ fn plan_macho_local_symbol_cohort(
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
     };
-    if !current_macho_local_cohort_atoms_are_live(
-        relocations,
-        symbol_resolutions,
-        input_file_path,
-        caller_section,
-        matched_sections,
-        previous_resolver,
-        current_resolver,
-        previous_file,
-        current_file,
-        current_input.bytes,
-        output_file,
-        normalize_rust_archive_patch_inputs,
-    )? {
-        return Ok(Err(
-            "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
-        ));
-    }
     let current = match macho_local_symbol_cohort_entries(
         current_input.bytes,
         current_file,
@@ -17934,6 +17916,34 @@ fn plan_macho_local_symbol_cohort(
         &mut previous,
     ) {
         return Ok(Err(reason));
+    }
+    // Direct patches preserve the previously live atom set. Exact output ownership therefore
+    // carries liveness across value-only migrations, but not population or metadata changes.
+    let retains_published_population = previous.len() == current.len()
+        && previous.iter().zip(&current).all(|(previous, current)| {
+            previous.name == current.name
+                && previous.n_desc == current.n_desc
+                && previous.output_section_index == current.output_section_index
+        });
+    if !retains_published_population
+        && !current_macho_local_cohort_atoms_are_live(
+            relocations,
+            symbol_resolutions,
+            input_file_path,
+            caller_section,
+            matched_sections,
+            previous_resolver,
+            current_resolver,
+            previous_file,
+            current_file,
+            current_input.bytes,
+            output_file,
+            normalize_rust_archive_patch_inputs,
+        )?
+    {
+        return Ok(Err(
+            "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
+        ));
     }
     let previous_names = previous
         .iter()
@@ -55323,6 +55333,27 @@ mod tests {
         bytes
     }
 
+    fn mutate_test_macho_archive_member(
+        archive: &[u8],
+        identifier: &[u8],
+        mutate: impl FnOnce(Vec<u8>) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let ArchiveMemberMatch::Unique(member) =
+            patch_archive_member_bytes(archive, identifier).unwrap()
+        else {
+            panic!("expected unique Mach-O archive member");
+        };
+        let object = mutate(member.bytes.to_vec());
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
     fn publish_local_transition_symbols(
         fixture: &mut LocalTextTargetTransitionFixture,
         targets: &[(&[u8], u64)],
@@ -55927,6 +55958,75 @@ mod tests {
             apply_local_text_target_transition(&reapply, records_a, true).unwrap();
         assert_eq!(reapplied_b, output_b);
         assert_eq!(retargets_b2, retargets_b);
+    }
+
+    #[test]
+    fn local_macho_text_target_ownership_retains_exact_unrooted_symbol_population() {
+        let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
+        let current_identifier = b"uv-hash.cgu.new.rcgu.o";
+        let enable_subsections = |mut object: Vec<u8>| {
+            object[24..28]
+                .copy_from_slice(&object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.to_le_bytes());
+            object
+        };
+
+        let mut fixture = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_stable_local_transition_symbols(&mut fixture, b"l_a.1", 0, b"l_b.2", 4);
+        fixture.previous = mutate_test_macho_archive_member(
+            &fixture.previous,
+            previous_identifier,
+            enable_subsections,
+        );
+        fixture.current =
+            mutate_test_macho_archive_member(&fixture.current, current_identifier, |mut object| {
+                object = enable_subsections(object);
+                let entry = test_macho_symbol_entry_offset(&object, b"l_a.1");
+                object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
+                object
+            });
+        let expected_file = object::File::parse(fixture.expected_output.as_slice()).unwrap();
+        let expected_value = expected_file.section_by_name("__const").unwrap().address() + 6;
+        let entry = test_macho_symbol_entry_offset(&fixture.expected_output, b"l_a.1");
+        fixture.expected_output[entry + 8..entry + 16]
+            .copy_from_slice(&expected_value.to_le_bytes());
+        let (output, _, _) =
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
+                .unwrap();
+        assert_eq!(output, fixture.expected_output);
+
+        let mut added = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        publish_stable_local_transition_symbols(&mut added, b"l_a.1", 0, b"l_b.2", 4);
+        added.previous = mutate_test_macho_archive_member(
+            &added.previous,
+            previous_identifier,
+            enable_subsections,
+        );
+        added.current =
+            mutate_test_macho_archive_member(&added.current, current_identifier, |mut object| {
+                object = enable_subsections(object);
+                let entry = test_macho_symbol_entry_offset(&object, b"l_a.1");
+                object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
+                add_test_macho_local_alias(object, b"new.dead", 2, 11)
+            });
+        assert_eq!(
+            apply_local_text_target_transition(&added, vec![added.relocation.clone()], true)
+                .unwrap_err(),
+            "renamed local Mach-O text target is present in the output symbol table",
+        );
     }
 
     #[test]
