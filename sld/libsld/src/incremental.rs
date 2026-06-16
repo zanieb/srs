@@ -2955,6 +2955,7 @@ fn relocation_target_patches_for_input_with_normalization(
     }))
 }
 
+#[cfg(test)]
 fn matching_macho_symbol_resolution_move<'a>(
     resolution_moves: &'a [MachOSymbolResolutionMove],
     target_name: &str,
