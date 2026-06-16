@@ -16393,10 +16393,26 @@ fn macho_aarch64_data_relocation_contexts<'data>(
     section: &impl object::ObjectSection<'data>,
     section_data: &[u8],
 ) -> Option<Vec<MachODataRelocationContext>> {
+    macho_aarch64_unsigned_data_relocation_contexts(
+        file,
+        section,
+        section_data,
+        b"__DATA",
+        b"__const",
+    )
+}
+
+fn macho_aarch64_unsigned_data_relocation_contexts<'data>(
+    file: &object::File<'data>,
+    section: &impl object::ObjectSection<'data>,
+    section_data: &[u8],
+    expected_segment: &[u8],
+    expected_section: &[u8],
+) -> Option<Vec<MachODataRelocationContext>> {
     if file.architecture() != object::Architecture::Aarch64
         || !matches!(section.flags(), object::SectionFlags::MachO { .. })
-        || section.name().ok() != Some("__const")
-        || section.segment_name().ok().flatten() != Some("__DATA")
+        || section.name_bytes().ok() != Some(expected_section)
+        || section.segment_name_bytes().ok().flatten() != Some(expected_segment)
     {
         return None;
     }
@@ -18684,6 +18700,467 @@ fn macho_local_cohort_section_is_rematerialized(
     )
 }
 
+fn macho_carried_data_section_is_non_gc<'data>(
+    section: &impl object::ObjectSection<'data>,
+) -> bool {
+    section.segment_name_bytes().ok().flatten() == Some(b"__DATA")
+        && section.name_bytes().ok() == Some(b"__data")
+        && section.flags()
+            == object::SectionFlags::MachO {
+                flags: object::macho::S_REGULAR,
+            }
+}
+
+fn macho_carried_data_global_root_base(globals: &[(u64, bool)]) -> Option<u64> {
+    let first = globals.first()?.0;
+    (globals.iter().any(|(_, reachable)| *reachable)
+        && globals.iter().all(|(base, _)| *base == first))
+    .then_some(first)
+}
+
+fn macho_carried_data_incoming_is_proven(
+    exact_record_count: usize,
+    source_is_rematerialized: bool,
+) -> bool {
+    exact_record_count == 1 || source_is_rematerialized
+}
+
+fn macho_carried_data_output_word_is_exact(
+    previous_output: &[u8],
+    output_offset: u64,
+    expected_target: u64,
+) -> bool {
+    match macho_chained_fixup_slot_for_output_offset(previous_output, output_offset) {
+        Ok(Some(slot)) => {
+            migrated_macho_chained_rebase_value(slot.value, expected_target, expected_target)
+                .is_ok()
+        }
+        Ok(None) => {
+            usize::try_from(output_offset)
+                .ok()
+                .and_then(|start| start.checked_add(8).map(|end| (start, end)))
+                .and_then(|(start, end)| previous_output.get(start..end))
+                .and_then(read_u64_le)
+                == Some(expected_target)
+        }
+        Err(_) => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn macho_carried_data_incoming_record_is_exact(
+    record: &RelocationRecord,
+    input_file_path: &str,
+    source_owner: &MatchedPatchSection,
+    source_offset: u64,
+    relocation: &object::Relocation,
+    previous_target_input: &str,
+    previous_target_section: object::SectionIndex,
+    previous_target_offset: u64,
+    target_name: &[u8],
+    target_value: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<bool> {
+    let object::RelocationFlags::MachO {
+        r_type,
+        r_pcrel,
+        r_length,
+    } = relocation.flags()
+    else {
+        return Ok(false);
+    };
+    let Some(raw) = decode_macho_aarch64_relocation_kind(record.kind) else {
+        return Ok(false);
+    };
+    let Some(target) = record.target.as_ref() else {
+        return Ok(false);
+    };
+    let Some(expected_output_offset) = source_owner
+        .previous
+        .output_offset
+        .checked_add(source_offset)
+    else {
+        return Ok(false);
+    };
+    Ok(record.input_file == input_file_path
+        && record.section_index == source_owner.previous.section_index
+        && record.relocation_offset == source_offset
+        && record.output_offset == expected_output_offset
+        && record.size == 1_u64.checked_shl(u32::from(r_length)).unwrap_or(0)
+        && record.addend == relocation.addend()
+        && raw.r_type == r_type
+        && raw.r_pcrel == r_pcrel
+        && raw.r_length == r_length
+        && raw.r_extern
+        && record.target_name.as_deref() == Some(hex::encode(target_name).as_str())
+        && record.target_value == target_value
+        && record.applied_target_value == Some(target_value)
+        && record.written_value.is_some()
+        && target.input_file == input_file_path
+        && target.section_index == relocation_target_record_index(previous_target_section)?
+        && target.section_offset == previous_target_offset
+        && patch_input_refs_match(
+            input_file_path,
+            record.input.as_str(),
+            source_owner.previous.input.as_str(),
+            normalize_rust_archive_patch_inputs,
+        )?
+        && patch_input_refs_match(
+            input_file_path,
+            target.input.as_str(),
+            previous_target_input,
+            normalize_rust_archive_patch_inputs,
+        )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn carried_macho_data_local_target_roots(
+    relocations: &[RelocationRecord],
+    symbol_resolutions: &[MachOSymbolResolutionRecord],
+    input_file_path: &str,
+    caller_section: &MatchedPatchSection,
+    matched_sections: &[MatchedPatchSection],
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    output_file: &object::File<'_>,
+    previous_output: &[u8],
+    owned_sections: &HashMap<object::SectionIndex, &MatchedPatchSection>,
+    fully_recorded_sections: &HashSet<object::SectionIndex>,
+    reachable: &HashSet<(object::SectionIndex, u64)>,
+    atom_for_offset: &impl Fn(object::SectionIndex, u64) -> Option<(object::SectionIndex, u64)>,
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<HashSet<(object::SectionIndex, u64)>> {
+    let current_sources = current_file
+        .sections()
+        .filter(|section| {
+            macho_carried_data_section_is_non_gc(section)
+                && !owned_sections.contains_key(&section.index())
+        })
+        .collect::<Vec<_>>();
+    let [current_source] = current_sources.as_slice() else {
+        return Ok(HashSet::new());
+    };
+    let previous_sources = previous_file
+        .sections()
+        .filter(macho_carried_data_section_is_non_gc)
+        .collect::<Vec<_>>();
+    let [previous_source] = previous_sources.as_slice() else {
+        return Ok(HashSet::new());
+    };
+    if previous_source.size() != current_source.size()
+        || previous_source.align() != current_source.align()
+        || previous_source.data()? != current_source.data()?
+    {
+        return Ok(HashSet::new());
+    }
+    let Some(previous_contexts) = macho_aarch64_unsigned_data_relocation_contexts(
+        previous_file,
+        previous_source,
+        previous_source.data()?,
+        b"__DATA",
+        b"__data",
+    ) else {
+        return Ok(HashSet::new());
+    };
+    let Some(current_contexts) = macho_aarch64_unsigned_data_relocation_contexts(
+        current_file,
+        current_source,
+        current_source.data()?,
+        b"__DATA",
+        b"__data",
+    ) else {
+        return Ok(HashSet::new());
+    };
+    if previous_contexts.is_empty() || previous_contexts.len() != current_contexts.len() {
+        return Ok(HashSet::new());
+    }
+
+    let current_globals = current_file
+        .symbols()
+        .filter(|symbol| {
+            symbol.section_index() == Some(current_source.index())
+                && symbol.is_definition()
+                && symbol.is_global()
+                && !symbol.is_weak()
+                && symbol.scope() == object::SymbolScope::Linkage
+        })
+        .collect::<Vec<_>>();
+    if current_globals.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut global_roots = Vec::with_capacity(current_globals.len());
+    for current_global in current_globals {
+        let name = current_global.name_bytes()?;
+        let Some(current_offset) = current_global
+            .address()
+            .checked_sub(current_source.address())
+        else {
+            return Ok(HashSet::new());
+        };
+        let previous_globals = previous_file
+            .symbols()
+            .filter(|symbol| {
+                symbol.section_index() == Some(previous_source.index())
+                    && symbol.is_definition()
+                    && symbol.is_global()
+                    && !symbol.is_weak()
+                    && symbol.scope() == object::SymbolScope::Linkage
+                    && symbol.name_bytes().is_ok_and(|candidate| candidate == name)
+                    && symbol.address().checked_sub(previous_source.address())
+                        == Some(current_offset)
+            })
+            .collect::<Vec<_>>();
+        let [previous_global] = previous_globals.as_slice() else {
+            return Ok(HashSet::new());
+        };
+        let Some(resolution) = macho_symbol_resolution_for_name(symbol_resolutions, name) else {
+            return Ok(HashSet::new());
+        };
+        let Some(target_value) = resolution.direct_value else {
+            return Ok(HashSet::new());
+        };
+        if !macho_local_cohort_global_resolution_is_exact(
+            symbol_resolutions,
+            name,
+            input_file_path,
+            caller_section.current.input.as_str(),
+            current_source.index(),
+            current_offset,
+            target_value,
+            normalize_rust_archive_patch_inputs,
+        )? {
+            return Ok(HashSet::new());
+        }
+        let Some(output_base) = target_value.checked_sub(current_offset) else {
+            return Ok(HashSet::new());
+        };
+        let mut has_exact_incoming = false;
+        for source_section in current_file.sections() {
+            if source_section.segment_name_bytes()?.unwrap_or_default() != b"__TEXT"
+                || source_section.name_bytes()? != b"__text"
+                || !fully_recorded_sections.contains(&source_section.index())
+            {
+                continue;
+            }
+            let Some(source_owner) = owned_sections.get(&source_section.index()).copied() else {
+                continue;
+            };
+            let source_is_rematerialized = macho_local_cohort_section_is_rematerialized(
+                rematerialized_sections,
+                input_file_path,
+                source_owner,
+            );
+            for (source_offset, relocation) in source_section.relocations() {
+                if relocation.target() != object::RelocationTarget::Symbol(current_global.index()) {
+                    continue;
+                }
+                let Some(source_atom) = atom_for_offset(source_section.index(), source_offset)
+                else {
+                    continue;
+                };
+                if !reachable.contains(&source_atom) {
+                    continue;
+                }
+                let Some(previous_target_offset) = previous_global
+                    .address()
+                    .checked_sub(previous_source.address())
+                else {
+                    return Ok(HashSet::new());
+                };
+                let mut exact_records = 0;
+                for record in relocations {
+                    if macho_carried_data_incoming_record_is_exact(
+                        record,
+                        input_file_path,
+                        source_owner,
+                        source_offset,
+                        &relocation,
+                        caller_section.previous.input.as_str(),
+                        previous_source.index(),
+                        previous_target_offset,
+                        name,
+                        target_value,
+                        normalize_rust_archive_patch_inputs,
+                    )? {
+                        exact_records += 1;
+                    }
+                }
+                if macho_carried_data_incoming_is_proven(exact_records, source_is_rematerialized) {
+                    has_exact_incoming = true;
+                    break;
+                }
+            }
+            if has_exact_incoming {
+                break;
+            }
+        }
+        global_roots.push((output_base, has_exact_incoming));
+    }
+    let Some(source_output_address) = macho_carried_data_global_root_base(&global_roots) else {
+        return Ok(HashSet::new());
+    };
+    let Ok(Some(source_output_offset)) = macho_output_file_offset_for_address(
+        output_file,
+        source_output_address,
+        current_source.size(),
+    ) else {
+        return Ok(HashSet::new());
+    };
+    let output_sources = output_file
+        .sections()
+        .filter(|section| {
+            section.segment_name_bytes().ok().flatten() == Some(b"__DATA")
+                && section.name_bytes().ok() == Some(b"__data")
+                && section.file_range().is_some_and(|(start, size)| {
+                    start <= source_output_offset
+                        && source_output_offset
+                            .checked_add(current_source.size())
+                            .is_some_and(|end| end <= start + size)
+                })
+        })
+        .count();
+    if output_sources != 1 {
+        return Ok(HashSet::new());
+    }
+    let Some(source_output_end) = source_output_offset.checked_add(current_source.size()) else {
+        return Ok(HashSet::new());
+    };
+    for owner in owned_sections.values() {
+        let Some(owner_end) = owner
+            .current
+            .output_offset
+            .checked_add(owner.current.output_size)
+        else {
+            return Ok(HashSet::new());
+        };
+        if source_output_offset < owner_end && owner.current.output_offset < source_output_end {
+            return Ok(HashSet::new());
+        }
+    }
+
+    let mut carried_roots = HashSet::new();
+    for (previous_context, current_context) in previous_contexts.iter().zip(&current_contexts) {
+        if previous_context.range != current_context.range
+            || previous_context.addend != current_context.addend
+        {
+            return Ok(HashSet::new());
+        }
+        let (
+            object::RelocationTarget::Symbol(previous_symbol_index),
+            object::RelocationTarget::Symbol(current_symbol_index),
+        ) = (previous_context.target, current_context.target)
+        else {
+            return Ok(HashSet::new());
+        };
+        let previous_symbol = previous_file.symbol_by_index(previous_symbol_index)?;
+        let current_symbol = current_file.symbol_by_index(current_symbol_index)?;
+        if previous_symbol.is_global()
+            || current_symbol.is_global()
+            || previous_symbol.is_weak()
+            || current_symbol.is_weak()
+            || !previous_symbol.is_definition()
+            || !current_symbol.is_definition()
+            || previous_symbol.scope() != object::SymbolScope::Compilation
+            || current_symbol.scope() != object::SymbolScope::Compilation
+        {
+            return Ok(HashSet::new());
+        }
+        let Some(previous_target) =
+            macho_data_relocation_target_position(previous_file, previous_context.target)?
+        else {
+            return Ok(HashSet::new());
+        };
+        let Some(current_target) =
+            macho_data_relocation_target_position(current_file, current_context.target)?
+        else {
+            return Ok(HashSet::new());
+        };
+        if previous_target.section_offset != current_target.section_offset {
+            return Ok(HashSet::new());
+        }
+        let previous_target_record_index =
+            patch_section_record_index(previous_file, previous_target.section_index)?;
+        let current_target_record_index =
+            patch_section_record_index(current_file, current_target.section_index)?;
+        let target_owners = matched_sections
+            .iter()
+            .filter(|owner| {
+                owner.previous.section_index == previous_target_record_index
+                    && owner.current.section_index == current_target_record_index
+                    && patch_input_refs_match(
+                        input_file_path,
+                        owner.previous.input.as_str(),
+                        caller_section.previous.input.as_str(),
+                        normalize_rust_archive_patch_inputs,
+                    )
+                    .unwrap_or(false)
+                    && patch_input_refs_match(
+                        input_file_path,
+                        owner.current.input.as_str(),
+                        caller_section.current.input.as_str(),
+                        normalize_rust_archive_patch_inputs,
+                    )
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let [target_owner] = target_owners.as_slice() else {
+            return Ok(HashSet::new());
+        };
+        let Some(previous_target_output_offset) = target_owner
+            .previous
+            .output_offset
+            .checked_add(previous_target.section_offset)
+        else {
+            return Ok(HashSet::new());
+        };
+        let Some(current_target_output_offset) = target_owner
+            .current
+            .output_offset
+            .checked_add(current_target.section_offset)
+        else {
+            return Ok(HashSet::new());
+        };
+        let Some(previous_target_value) =
+            macho_output_address_for_file_offset(output_file, previous_target_output_offset)
+        else {
+            return Ok(HashSet::new());
+        };
+        let Some(current_target_value) =
+            macho_output_address_for_file_offset(output_file, current_target_output_offset)
+        else {
+            return Ok(HashSet::new());
+        };
+        if previous_target_value != current_target_value {
+            return Ok(HashSet::new());
+        }
+        let Some(expected_target) =
+            add_signed_delta_u64(current_target_value, i128::from(current_context.addend))
+        else {
+            return Ok(HashSet::new());
+        };
+        let Some(source_field_offset) =
+            source_output_offset.checked_add(current_context.range.start as u64)
+        else {
+            return Ok(HashSet::new());
+        };
+        if !macho_carried_data_output_word_is_exact(
+            previous_output,
+            source_field_offset,
+            expected_target,
+        ) {
+            return Ok(HashSet::new());
+        }
+        let Some(target_atom) =
+            atom_for_offset(current_target.section_index, current_target.section_offset)
+        else {
+            return Ok(HashSet::new());
+        };
+        carried_roots.insert(target_atom);
+    }
+    Ok(carried_roots)
+}
+
 fn current_macho_local_cohort_atoms_are_live(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
@@ -18696,6 +19173,7 @@ fn current_macho_local_cohort_atoms_are_live(
     current_file: &object::File<'_>,
     current_bytes: &[u8],
     output_file: &object::File<'_>,
+    previous_output: &[u8],
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     required_current_entries: &[MachOLocalSymbolCohortEntry],
     normalize_rust_archive_patch_inputs: bool,
@@ -19136,7 +19614,7 @@ fn current_macho_local_cohort_atoms_are_live(
     }
 
     let mut edges = HashMap::<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>::new();
-    for section_index in fully_recorded_sections {
+    for &section_index in &fully_recorded_sections {
         let section = current_file.section_by_index(section_index)?;
         for (offset, relocation) in section.relocations() {
             if offset >= section.size() {
@@ -19173,6 +19651,24 @@ fn current_macho_local_cohort_atoms_are_live(
         }
     }
 
+    let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
+    roots.extend(carried_macho_data_local_target_roots(
+        relocations,
+        symbol_resolutions,
+        input_file_path,
+        caller_section,
+        matched_sections,
+        previous_file,
+        current_file,
+        output_file,
+        previous_output,
+        &owned_sections,
+        &fully_recorded_sections,
+        &reachable,
+        &atom_for_offset,
+        rematerialized_sections,
+        normalize_rust_archive_patch_inputs,
+    )?);
     let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
     let mut required_atoms = Vec::with_capacity(required_current_entries.len());
     for entry in required_current_entries {
@@ -19943,6 +20439,7 @@ fn plan_macho_local_symbol_cohort(
             current_file,
             current_input.bytes,
             output_file,
+            previous_output,
             rematerialized_sections,
             &required_current_entries,
             normalize_rust_archive_patch_inputs,
@@ -55229,6 +55726,267 @@ mod tests {
             &roots,
             &rooted,
         ));
+    }
+
+    #[test]
+    fn carried_macho_data_requires_an_exact_incoming_record() {
+        let bytes = test_macho_object_with_text_relocation(&[0; 4], &[0; 8]);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let text = file.section_by_name("__text").unwrap();
+        let data = file.section_by_name("__data").unwrap();
+        let (source_offset, relocation) = text.relocations().next().unwrap();
+        let object::RelocationFlags::MachO {
+            r_type,
+            r_pcrel,
+            r_length,
+        } = relocation.flags()
+        else {
+            panic!("expected Mach-O relocation");
+        };
+        let input = "input";
+        let owner = MatchedPatchSection {
+            previous: PatchSection {
+                input: input.to_owned(),
+                section_index: patch_section_record_index(&file, text.index()).unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: 0x100,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input.to_owned(),
+                section_index: patch_section_record_index(&file, text.index()).unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text.size(),
+                output_offset: 0x100,
+                output_size: text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        };
+        let target_value = 0x1000;
+        let mut record = RelocationRecord {
+            target_symbol_id: 7,
+            written_value: Some(0),
+            target_value,
+            applied_target_value: Some(target_value),
+            target_name: Some(hex::encode("_data").into()),
+            target: Some(RelocationTargetRecord {
+                input_file: input.into(),
+                input: input.into(),
+                section_index: relocation_target_record_index(data.index()).unwrap(),
+                section_offset: 0,
+            }),
+            input_file: input.into(),
+            input: input.into(),
+            section_index: owner.previous.section_index,
+            relocation_offset: source_offset,
+            output_offset: owner.previous.output_offset + source_offset,
+            size: 4,
+            kind: encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: source_offset as u32,
+                r_symbolnum: 0,
+                r_pcrel,
+                r_length,
+                r_extern: true,
+                r_type,
+            }),
+            addend: relocation.addend(),
+        };
+        let exact = |record: &RelocationRecord| {
+            macho_carried_data_incoming_record_is_exact(
+                record,
+                input,
+                &owner,
+                source_offset,
+                &relocation,
+                input,
+                data.index(),
+                0,
+                b"_data",
+                target_value,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(exact(&record));
+
+        let original = record.clone();
+        let mut rejects = Vec::new();
+        record.input_file = "other".into();
+        rejects.push(record.clone());
+        record = original.clone();
+        record.input = "other".into();
+        rejects.push(record.clone());
+        record = original.clone();
+        record.section_index += 1;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.relocation_offset += 4;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.output_offset += 4;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.size = 8;
+        rejects.push(record.clone());
+        record = original.clone();
+        let raw = decode_macho_aarch64_relocation_kind(record.kind).unwrap();
+        record.kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_extern: false,
+            ..raw
+        });
+        rejects.push(record.clone());
+        record = original.clone();
+        record.addend += 1;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target_name = None;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target_name = Some(hex::encode("_other").into());
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target_value += 1;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.applied_target_value = None;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.applied_target_value = Some(target_value + 1);
+        rejects.push(record.clone());
+        record = original.clone();
+        record.written_value = None;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target = None;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target.as_mut().unwrap().input_file = "other".into();
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target.as_mut().unwrap().section_index += 1;
+        rejects.push(record.clone());
+        record = original.clone();
+        record.target.as_mut().unwrap().section_offset = 1;
+        rejects.push(record.clone());
+        record = original;
+        record.target.as_mut().unwrap().input = "other".into();
+        rejects.push(record);
+        assert!(rejects.iter().all(|record| !exact(record)));
+    }
+
+    #[test]
+    fn carried_macho_data_requires_the_exact_previous_output_word() {
+        let expected = 0x1234_5678_u64;
+        let output = test_macho_object(&[0; 4], &expected.to_le_bytes(), 0);
+        let file = object::File::parse(output.as_slice()).unwrap();
+        let data = file.section_by_name("__data").unwrap();
+        let (output_offset, _) = data.file_range().unwrap();
+        assert!(macho_carried_data_output_word_is_exact(
+            &output,
+            output_offset,
+            expected,
+        ));
+        assert!(!macho_carried_data_output_word_is_exact(
+            &output,
+            output_offset,
+            expected + 1,
+        ));
+        assert!(!macho_carried_data_output_word_is_exact(
+            &output,
+            output.len() as u64,
+            expected,
+        ));
+    }
+
+    #[test]
+    fn carried_macho_data_parser_is_scoped_to_regular_data() {
+        let mut bytes = test_macho_local_data_retarget_object(b"local", 0x12);
+        let mut data_name = [0; 16];
+        data_name[..b"__data".len()].copy_from_slice(b"__data");
+        let mut const_name = [0; 16];
+        const_name[..b"__const".len()].copy_from_slice(b"__const");
+        let mut data_segment = [0; 16];
+        data_segment[..b"__DATA".len()].copy_from_slice(b"__DATA");
+        let section_header = bytes
+            .windows(32)
+            .position(|window| window[..16] == const_name && window[16..] == data_segment)
+            .unwrap();
+        bytes[section_header..section_header + 16].copy_from_slice(&data_name);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let data = file.section_by_name("__data").unwrap();
+        assert!(macho_carried_data_section_is_non_gc(&data));
+        assert_eq!(
+            macho_aarch64_unsigned_data_relocation_contexts(
+                &file,
+                &data,
+                data.data().unwrap(),
+                b"__DATA",
+                b"__data",
+            )
+            .unwrap()
+            .len(),
+            2,
+        );
+        assert!(
+            macho_aarch64_data_relocation_contexts(&file, &data, data.data().unwrap()).is_none()
+        );
+
+        let mut executable = bytes.clone();
+        let flags_offset = section_header + 64;
+        let flags = read_u32_le(&executable[flags_offset..flags_offset + 4]).unwrap();
+        executable[flags_offset..flags_offset + 4]
+            .copy_from_slice(&(flags | object::macho::S_ATTR_SOME_INSTRUCTIONS).to_le_bytes());
+        let executable_file = object::File::parse(executable.as_slice()).unwrap();
+        let executable_data = executable_file.section_by_name("__data").unwrap();
+        assert!(!macho_carried_data_section_is_non_gc(&executable_data));
+
+        let original = test_macho_local_data_retarget_object(b"local", 0x12);
+        let original_file = object::File::parse(original.as_slice()).unwrap();
+        let data_const = original_file
+            .sections()
+            .find(|section| {
+                section.segment_name_bytes().ok().flatten() == Some(b"__DATA")
+                    && section.name_bytes().ok() == Some(b"__const")
+            })
+            .unwrap();
+        assert!(!macho_carried_data_section_is_non_gc(&data_const));
+    }
+
+    #[test]
+    fn carried_macho_data_requires_one_reachable_global_on_one_base() {
+        assert_eq!(macho_carried_data_global_root_base(&[]), None);
+        assert_eq!(
+            macho_carried_data_global_root_base(&[(0x1000, false), (0x1000, false)]),
+            None,
+        );
+        assert_eq!(
+            macho_carried_data_global_root_base(&[(0x1000, true), (0x1000, false)]),
+            Some(0x1000),
+        );
+        assert_eq!(
+            macho_carried_data_global_root_base(
+                &[(0x1000, true), (0x1000, true), (0x1000, false),]
+            ),
+            Some(0x1000),
+            "multiple independent callers are unambiguous",
+        );
+        assert_eq!(
+            macho_carried_data_global_root_base(&[(0x1000, true), (0x2000, false)]),
+            None,
+        );
+    }
+
+    #[test]
+    fn carried_macho_data_requires_an_exact_record_or_complete_rematerialization() {
+        assert!(macho_carried_data_incoming_is_proven(1, false));
+        assert!(macho_carried_data_incoming_is_proven(0, true));
+        assert!(macho_carried_data_incoming_is_proven(2, true));
+        assert!(!macho_carried_data_incoming_is_proven(0, false));
+        assert!(!macho_carried_data_incoming_is_proven(2, false));
     }
 
     #[test]
