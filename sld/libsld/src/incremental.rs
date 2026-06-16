@@ -4507,6 +4507,45 @@ fn restored_macho_archive_resolution_names(
         .collect()
 }
 
+fn macho_archive_exchange_definition_names(
+    retired: &[RetiredMachOArchiveActivation],
+    migrations: &[MachOSymbolResolutionMove],
+    retiring_names: &[SharedText],
+    definition_activation: Option<&ChangedMachODefinitionActivation>,
+) -> (Vec<SharedText>, Vec<SharedText>) {
+    let mut restored_names = restored_macho_archive_resolution_names(retired, migrations);
+    restored_names.extend(
+        definition_activation
+            .into_iter()
+            .flat_map(|activation| activation.added_names.iter().cloned()),
+    );
+    restored_names.sort_unstable();
+    restored_names.dedup();
+
+    let cohort_retiring_names = retired
+        .iter()
+        .flat_map(|state| {
+            state
+                .symbol_resolutions
+                .iter()
+                .map(|resolution| &resolution.name)
+        })
+        .collect::<HashSet<_>>();
+    let mut retiring_names = retiring_names
+        .iter()
+        .filter(|name| !cohort_retiring_names.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    retiring_names.extend(
+        definition_activation
+            .into_iter()
+            .flat_map(|activation| activation.retired_names.iter().cloned()),
+    );
+    retiring_names.sort_unstable();
+    retiring_names.dedup();
+    (restored_names, retiring_names)
+}
+
 fn migrated_macho_archive_rollback_symbol_resolutions(
     retired: &[RetiredMachOArchiveActivation],
     migrations: &[MachOSymbolResolutionMove],
@@ -7536,16 +7575,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     .map(|member| member.normalized_identifier.clone())
                             })
                             .collect::<Vec<_>>();
-                        let restored_names = restored_macho_archive_resolution_names(
-                            &retired_macho_archive_activations,
-                            &migrated_macho_resolution_updates.moves,
-                        );
-                        let retiring_names = added_macho_archive_text_activation
-                            .as_ref()
-                            .map(|activation| {
-                                activation.recycled_symbol_resolution_names.as_slice()
-                            })
-                            .unwrap_or_default();
+                        let (restored_names, retiring_names) =
+                            macho_archive_exchange_definition_names(
+                                &retired_macho_archive_activations,
+                                &migrated_macho_resolution_updates.moves,
+                                &macho_resolution_updates.retiring_names,
+                                changed_macho_definition_activation.as_ref(),
+                            );
                         archive_diff_allows_owned_macho_member_exchange(
                             previous_bytes,
                             &bytes,
@@ -7555,7 +7591,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &removed_identifiers,
                             &ignored_archive_identifiers,
                             &restored_names,
-                            retiring_names,
+                            &retiring_names,
                             &relocation_target_patches.validated_macho_local_retargets,
                             &previous_unwind_input_ranges,
                             &current_unwind_input_ranges,
@@ -7733,9 +7769,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                 .map(|member| member.normalized_identifier.clone())
                         })
                         .collect::<Vec<_>>();
-                    let restored_names = restored_macho_archive_resolution_names(
+                    let (restored_names, retiring_names) = macho_archive_exchange_definition_names(
                         &retired_macho_archive_activations,
                         &migrated_macho_resolution_updates.moves,
+                        &macho_resolution_updates.retiring_names,
+                        changed_macho_definition_activation.as_ref(),
                     );
                     let previous_unwind_input_ranges = added_macho_archive_text_activation
                         .as_ref()
@@ -7771,10 +7809,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .as_ref()
                         .map(|activation| activation.normalized_identifiers.as_slice())
                         .unwrap_or_default();
-                    let retiring_names = added_macho_archive_text_activation
-                        .as_ref()
-                        .map(|activation| activation.recycled_symbol_resolution_names.as_slice())
-                        .unwrap_or_default();
                     archive_diff_allows_owned_macho_member_exchange(
                         previous_bytes,
                         &bytes,
@@ -7784,7 +7818,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &removed_identifiers,
                         added_identifiers,
                         &restored_names,
-                        retiring_names,
+                        &retiring_names,
                         &relocation_target_patches.validated_macho_local_retargets,
                         &previous_unwind_input_ranges,
                         &current_unwind_input_ranges,
@@ -49378,7 +49412,8 @@ mod tests {
             current_unwind_input_ranges: Vec::new(),
             remaining_reserved_ranges: Vec::new(),
         };
-        let mut retiring_names = vec![name.clone()];
+        let unrelated_retiring_name = SharedText::from(hex::encode("_text"));
+        let mut retiring_names = vec![name.clone(), unrelated_retiring_name.clone()];
 
         let updates = reconcile_migrated_added_macho_symbol_resolutions(
             &mut resolutions,
@@ -49390,11 +49425,16 @@ mod tests {
 
         assert_eq!(resolutions, vec![new_resolution.clone()]);
         assert!(activation.symbol_resolutions.is_empty());
-        assert!(retiring_names.is_empty());
+        assert_eq!(retiring_names, vec![unrelated_retiring_name.clone()]);
+        assert_eq!(
+            activation.recycled_symbol_resolution_names,
+            vec![name.clone()],
+            "reconciliation consumes migrations from retiring names, not recycled slot metadata",
+        );
         assert_eq!(
             updates.moves,
             vec![MachOSymbolResolutionMove {
-                name,
+                name: name.clone(),
                 previous_value: 0x2000,
                 current_value: 0x8000,
                 previous_target,
@@ -49427,6 +49467,182 @@ mod tests {
             },
             newly_tracked: true,
         }];
+        let changed_added_name = SharedText::from(hex::encode("_added"));
+        let changed_retired_name = SharedText::from(hex::encode("_retired"));
+        let definition_activation = ChangedMachODefinitionActivation {
+            state_updates: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            output_patches: Vec::new(),
+            added_names: vec![changed_added_name.clone()],
+            retired_names: vec![changed_retired_name.clone()],
+            recycled_names: Vec::new(),
+            remaining_reserved_ranges: Vec::new(),
+        };
+        let (restored_names, exchange_retiring_names) = macho_archive_exchange_definition_names(
+            &retired,
+            &updates.moves,
+            &retiring_names,
+            None,
+        );
+        assert!(restored_names.is_empty());
+        assert_eq!(
+            exchange_retiring_names,
+            vec![unrelated_retiring_name.clone()]
+        );
+        assert!(
+            !exchange_retiring_names.contains(&name),
+            "a migrated cohort definition is neither restored nor retired",
+        );
+        let (changed_restored_names, changed_retiring_names) =
+            macho_archive_exchange_definition_names(
+                &retired,
+                &updates.moves,
+                &retiring_names,
+                Some(&definition_activation),
+            );
+        assert_eq!(changed_restored_names, vec![changed_added_name]);
+        assert_eq!(
+            changed_retiring_names,
+            vec![changed_retired_name, unrelated_retiring_name]
+        );
+
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let previous_retained = test_macho_object(&[1; 4], &[2; 4], 0);
+        let mut current_retained = previous_retained.clone();
+        let retired_symbol =
+            macho_symbol_value_field_range(&current_retained, object::SymbolIndex(0))
+                .unwrap()
+                .start
+                - 8;
+        current_retained[retired_symbol + 4] = object::macho::N_STAB;
+        let exchanged = test_macho_object(&[3; 4], &[4; 4], 0);
+        let retained_identifier = b"crate-hash.retained.session.rcgu.o";
+        let removed_identifier = b"crate-hash.removed.session.rcgu.o";
+        let added_identifier = b"crate-hash.added.session.rcgu.o";
+        let previous_archive = archive(&[
+            (retained_identifier, previous_retained.as_slice()),
+            (removed_identifier, exchanged.as_slice()),
+        ]);
+        let current_archive = archive(&[
+            (retained_identifier, current_retained.as_slice()),
+            (added_identifier, exchanged.as_slice()),
+        ]);
+        let input_file = hex::encode("lib.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous_archive, retained_identifier).unwrap()
+        else {
+            panic!("expected unique previous retained member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current_archive, retained_identifier).unwrap()
+        else {
+            panic!("expected unique current retained member");
+        };
+        let previous_file = object::File::parse(previous_member.bytes).unwrap();
+        let current_file = object::File::parse(current_member.bytes).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap(),
+                section_index: patch_section_record_index(&previous_file, previous_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: 0,
+                output_size: previous_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap(),
+                section_index: patch_section_record_index(&current_file, current_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: 0,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let removed_identifiers = [archive_member_patch_identifier(removed_identifier)];
+        let added_identifiers = [archive_member_patch_identifier(added_identifier)];
+        let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous_archive,
+                &current_archive,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed_identifiers,
+                &added_identifiers,
+                &restored_names,
+                &activation.recycled_symbol_resolution_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "recycled migration metadata is not an independent retirement proof",
+        );
+        assert!(
+            archive_diff_allows_owned_macho_member_exchange(
+                &previous_archive,
+                &current_archive,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &removed_identifiers,
+                &added_identifiers,
+                &restored_names,
+                &exchange_retiring_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "post-reconciliation names should prove the composed exchange",
+        );
+
+        let mut unrelated_retained = current_retained;
+        let data = test_macho_section_range(&unrelated_retained, "__data");
+        unrelated_retained[data.start] ^= 1;
+        let unrelated_archive = archive(&[
+            (retained_identifier, unrelated_retained.as_slice()),
+            (added_identifier, exchanged.as_slice()),
+        ]);
+        assert!(
+            !archive_diff_allows_owned_macho_member_exchange(
+                &previous_archive,
+                &unrelated_archive,
+                &input_file,
+                &matched,
+                &PatchInputResolver::new(&unrelated_archive, true).unwrap(),
+                &removed_identifiers,
+                &added_identifiers,
+                &restored_names,
+                &exchange_retiring_names,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "cohort migration proof must not hide unrelated retained-member changes",
+        );
         finalize_retired_macho_archive_symbol_resolutions(&mut resolutions, &retired).unwrap();
         assert_eq!(resolutions, vec![new_resolution]);
         assert!(
