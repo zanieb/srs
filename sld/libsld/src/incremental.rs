@@ -24768,15 +24768,23 @@ fn macho_object_semantic_patch_fingerprint_with_retargets(
                 symbols_by_position
                     .entry((symbol.section_index()?, symbol.address()))
                     .or_insert_with(Vec::new)
-                    .push(symbol.index());
+                    .push((
+                        symbol.index(),
+                        symbol.scope() == object::SymbolScope::Compilation
+                            && symbol
+                                .name_bytes()
+                                .ok()
+                                .is_some_and(macho_local_symbol_is_default_strippable),
+                    ));
             }
             symbols_by_position
                 .into_iter()
                 .filter(|(position, symbols)| {
                     exact_target_positions.contains(position)
-                        || (hash_masked_local_aliases && symbols.len() > 1)
+                        || (hash_masked_local_aliases
+                            && symbols.iter().filter(|(_, strippable)| !strippable).count() > 1)
                 })
-                .flat_map(|(_, symbols)| symbols)
+                .flat_map(|(_, symbols)| symbols.into_iter().map(|(index, _)| index))
                 .collect::<HashSet<_>>()
         } else {
             HashSet::new()
@@ -46435,6 +46443,39 @@ mod tests {
         let mut retired_external = object.clone();
         retired_external[text_entry + 4] |= object::macho::N_STAB;
         assert_ne!(fingerprint(&object), fingerprint(&retired_external));
+    }
+
+    #[test]
+    fn masked_macho_alias_fingerprint_ignores_only_strippable_local_labels() {
+        let fingerprint = |bytes: &[u8]| {
+            let ranges = [
+                test_macho_section_range(bytes, "__text"),
+                test_macho_section_range(bytes, "__data"),
+            ];
+            macho_object_semantic_patch_fingerprint_with_retargets(
+                bytes,
+                0,
+                &ranges,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                true,
+                true,
+                true,
+                &[],
+            )
+            .unwrap()
+            .0
+        };
+        let previous = test_macho_object(&[0; 4], &[1; 4], 0);
+        let current = test_macho_object(&[0; 8], &[1; 4], 1);
+        let previous_ltmp = add_test_macho_local_alias(previous.clone(), b"ltmp3", 2, 4);
+        let current_ltmp = add_test_macho_local_alias(current.clone(), b"ltmp3", 2, 9);
+        assert_eq!(fingerprint(&previous_ltmp), fingerprint(&current_ltmp));
+
+        let previous_alias = add_test_macho_local_alias(previous, b"alias", 2, 4);
+        let current_alias = add_test_macho_local_alias(current, b"alias", 2, 9);
+        assert_ne!(fingerprint(&previous_alias), fingerprint(&current_alias));
     }
 
     #[test]
