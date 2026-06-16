@@ -63,7 +63,8 @@ use std::time::UNIX_EPOCH;
 )]
 mod macho_ownership;
 
-const STATE_VERSION: &str = "sld-incremental-state-v46";
+const STATE_VERSION: &str = "sld-incremental-state-v47";
+const STATE_VERSION_V46: &str = "sld-incremental-state-v46";
 const STATE_VERSION_V45: &str = "sld-incremental-state-v45";
 const STATE_VERSION_V44: &str = "sld-incremental-state-v44";
 const STATE_VERSION_V43: &str = "sld-incremental-state-v43";
@@ -503,6 +504,7 @@ struct MachOArchiveActivationState {
     sections: Vec<FilePatchSectionState>,
     relocations: Vec<RelocationRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    indirect_dependencies: Vec<MachOSymbolResolutionRecord>,
     rollback_symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
     forward_patches: Vec<StoredOutputPatch>,
     rollback_patches: Vec<StoredOutputPatch>,
@@ -7913,6 +7915,24 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         newly_tracked: true,
                     });
                 }
+                let recorded_relocations = previous.relocations.clone();
+                let retiring_normalized_identifiers = retirements
+                    .iter()
+                    .flat_map(|retirement| retirement.state.members.iter())
+                    .map(|member| member.normalized_identifier.clone())
+                    .collect::<HashSet<_>>();
+                let mut retiring_relocations = Vec::new();
+                for relocation in &recorded_relocations {
+                    if relocation.input_file == input.path
+                        && normalized_archive_input_ref_matches_identifiers(
+                            input.path.as_str(),
+                            relocation.input.as_str(),
+                            &retiring_normalized_identifiers,
+                        )?
+                    {
+                        retiring_relocations.push(relocation.clone());
+                    }
+                }
                 for mut retirement in retirements {
                     let state = &mut retirement.state;
                     let normalized_identifiers = state
@@ -8038,6 +8058,69 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             true
                         }
                     });
+                    let persisted_indirect_dependencies = state.indirect_dependencies.clone();
+                    let current_indirect_dependencies =
+                        match macho_archive_indirect_dependencies_for_relocations(
+                            &state.relocations,
+                            &recorded_relocations,
+                            &retiring_relocations,
+                            &previous.macho_symbol_resolutions,
+                            previous_output.get()?,
+                            record_coverage.has_complete_macho_symbol_resolutions(),
+                        ) {
+                            Ok(dependencies) => dependencies,
+                            Err(reason)
+                                if !record_coverage.has_complete_macho_symbol_resolutions()
+                                    && reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED) =>
+                            {
+                                return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                                    "retired Mach-O archive relocations need the complete resolution catalog"
+                                        .to_owned(),
+                                ));
+                            }
+                            Err(reason) => {
+                                return Ok(ChangedInputPatchResult::Unsupported(reason));
+                            }
+                        };
+                    if !persisted_indirect_dependencies.is_empty()
+                        && persisted_indirect_dependencies != current_indirect_dependencies
+                    {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "active Mach-O archive indirect dependencies changed".to_owned(),
+                        ));
+                    }
+                    state.indirect_dependencies = current_indirect_dependencies;
+                    if state.indirect_dependencies.iter().any(|dependency| {
+                        state
+                            .symbol_resolutions
+                            .iter()
+                            .chain(&state.rollback_symbol_resolutions)
+                            .any(|resolution| resolution.name == dependency.name)
+                    }) {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "indirect Mach-O archive dependency conflicts with owned symbol state"
+                                .to_owned(),
+                        ));
+                    }
+                    let mut merged_resolutions = previous.macho_symbol_resolutions.clone();
+                    let mut inserted_indirect_dependency = false;
+                    for dependency in &state.indirect_dependencies {
+                        match merge_exact_macho_symbol_resolution(
+                            &mut merged_resolutions,
+                            dependency.clone(),
+                            "retired Mach-O archive dependency conflicts with the live resolution catalog",
+                        ) {
+                            Ok(inserted) => inserted_indirect_dependency |= inserted,
+                            Err(reason) => {
+                                return Ok(ChangedInputPatchResult::Unsupported(reason));
+                            }
+                        }
+                    }
+                    previous.macho_symbol_resolutions = merged_resolutions;
+                    if inserted_indirect_dependency {
+                        previous.macho_symbol_resolutions_file = None;
+                        previous.sections_file = None;
+                    }
                     let current_symbol_resolutions = macho_archive_member_symbol_resolutions(
                         &previous.macho_symbol_resolutions,
                         input.path.as_str(),
@@ -8547,6 +8630,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &previous.macho_symbol_resolutions,
                         &reactivation_retiring_names,
                         activation_reserved_ranges,
+                        record_coverage.has_complete_macho_symbol_resolutions(),
                     )? {
                         Ok(activation) => activation,
                         Err(reason)
@@ -8592,8 +8676,18 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         &previous.relocations,
                         &previous.macho_symbol_resolutions,
                         &macho_resolution_updates.retiring_names,
+                        record_coverage.has_complete_macho_symbol_resolutions(),
                     )? {
                         Ok(activation) => Some(activation),
+                        Err(reason)
+                            if !record_coverage.has_complete_macho_symbol_resolutions()
+                                && reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED) =>
+                        {
+                            return Ok(ChangedInputPatchResult::RequiresCompleteMachOResolutions(
+                                "added Mach-O archive imports need the complete resolution catalog"
+                                    .to_owned(),
+                            ));
+                        }
                         Err(reason) => {
                             return Ok(ChangedInputPatchResult::Unsupported(reason));
                         }
@@ -8749,11 +8843,44 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             }
             if let Some(activation) = &added_macho_archive_text_activation {
-                previous
-                    .macho_symbol_resolutions
-                    .extend(activation.symbol_resolutions.iter().cloned());
-                previous.macho_symbol_resolutions.sort_unstable();
-                previous.macho_symbol_resolutions.dedup();
+                if activation
+                    .indirect_dependencies_to_publish
+                    .iter()
+                    .any(|dependency| {
+                        activation
+                            .symbol_resolutions
+                            .iter()
+                            .any(|resolution| resolution.name == dependency.name)
+                    })
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "indirect Mach-O archive dependency conflicts with an owned definition"
+                            .to_owned(),
+                    ));
+                }
+                let mut merged_resolutions = previous.macho_symbol_resolutions.clone();
+                for dependency in &activation.indirect_dependencies_to_publish {
+                    if let Err(reason) = merge_exact_macho_symbol_resolution(
+                        &mut merged_resolutions,
+                        dependency.clone(),
+                        "indirect Mach-O archive dependency conflicts with the live resolution catalog",
+                    ) {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
+                    }
+                }
+                merged_resolutions.extend(activation.symbol_resolutions.iter().cloned());
+                merged_resolutions.sort_unstable();
+                if merged_resolutions
+                    .windows(2)
+                    .any(|pair| pair[0].name == pair[1].name && pair[0] != pair[1])
+                {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "added Mach-O archive resolution conflicts with the live catalog"
+                            .to_owned(),
+                    ));
+                }
+                merged_resolutions.dedup();
+                previous.macho_symbol_resolutions = merged_resolutions;
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
                 current_sections.extend(activation.sections.iter().cloned());
@@ -13138,6 +13265,7 @@ struct AddedMachOArchiveTextActivations {
     sections: Vec<PatchSection>,
     records: Vec<SectionRecord>,
     symbol_resolutions: Vec<MachOSymbolResolutionRecord>,
+    indirect_dependencies_to_publish: Vec<MachOSymbolResolutionRecord>,
     recycled_symbol_resolution_names: Vec<SharedText>,
     symbol_table_patches: Vec<SectionPatch>,
     chained_fixup_patches: Vec<SectionPatch>,
@@ -15405,6 +15533,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V46
             && version != STATE_VERSION_V45
             && version != STATE_VERSION_V44
             && version != STATE_VERSION_V43
@@ -15466,6 +15595,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15489,6 +15619,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15512,6 +15643,7 @@ impl PersistedState {
             None
         };
         if (version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15564,6 +15696,7 @@ impl PersistedState {
                 Some(file.to_owned())
             }
         } else if version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15581,6 +15714,7 @@ impl PersistedState {
             None
         };
         let indexed_macho_symbol_resolutions_file = if (version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45)
             && lines
                 .peek()
@@ -15598,6 +15732,7 @@ impl PersistedState {
         };
 
         let reserved_ranges = if (version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15621,6 +15756,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V46
             || version == STATE_VERSION_V45
             || version == STATE_VERSION_V44
             || version == STATE_VERSION_V43
@@ -15668,6 +15804,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V46
                     && version != STATE_VERSION_V45
                     && version != STATE_VERSION_V44
                     && version != STATE_VERSION_V43
@@ -15686,7 +15823,7 @@ impl PersistedState {
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V44}`, `{STATE_VERSION_V43}`, `{STATE_VERSION_V42}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V46}`, `{STATE_VERSION_V45}`, `{STATE_VERSION_V44}`, `{STATE_VERSION_V43}`, `{STATE_VERSION_V42}`, `{STATE_VERSION_V41}`, `{STATE_VERSION_V40}`, `{STATE_VERSION_V39}`, `{STATE_VERSION_V38}`, `{STATE_VERSION_V37}`, `{STATE_VERSION_V36}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -24506,13 +24643,24 @@ impl<'a> RecordedMachOBranchTargetCandidates<'a> {
         previous_output: &[u8],
         output_file: &object::File<'_>,
     ) -> Vec<u64> {
+        self.import_stubs_excluding(target_name, addend, previous_output, output_file, &[])
+    }
+
+    fn import_stubs_excluding(
+        &self,
+        target_name: &SharedText,
+        addend: i64,
+        previous_output: &[u8],
+        output_file: &object::File<'_>,
+        excluded: &[RelocationRecord],
+    ) -> Vec<u64> {
         self.branch_indices_by_name
             .get(target_name.as_str())
             .into_iter()
             .flatten()
             .filter_map(|index| {
                 let relocation = &self.relocations[*index];
-                (relocation.target.is_none())
+                (relocation.target.is_none() && !excluded.contains(relocation))
                     .then(|| {
                         recorded_macho_branch_target_candidate(
                             relocation,
@@ -28857,6 +29005,7 @@ fn initially_owned_macho_archive_removal_state(
         sections,
         relocations: Vec::new(),
         symbol_resolutions: Vec::new(),
+        indirect_dependencies: Vec::new(),
         rollback_symbol_resolutions: Vec::new(),
         forward_patches: Vec::new(),
         rollback_patches: Vec::new(),
@@ -28878,6 +29027,347 @@ fn macho_archive_member_symbol_resolutions(
         })
         .cloned()
         .collect()
+}
+
+fn merge_exact_macho_symbol_resolution(
+    resolutions: &mut Vec<MachOSymbolResolutionRecord>,
+    candidate: MachOSymbolResolutionRecord,
+    conflict: &str,
+) -> std::result::Result<bool, String> {
+    match macho_symbol_resolution_index_for_name(resolutions, candidate.name.as_str())? {
+        Some(index) if resolutions[index] == candidate => Ok(false),
+        Some(_) => Err(conflict.to_owned()),
+        None => {
+            resolutions.push(candidate);
+            Ok(true)
+        }
+    }
+}
+
+fn recorded_macho_indirect_relocation_matches_output(
+    relocation: &RelocationRecord,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> bool {
+    let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+        return false;
+    };
+    if !matches!(
+        raw.r_type,
+        object::macho::ARM64_RELOC_BRANCH26
+            | object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) || !macho_aarch64_cross_input_relocation_is_supported(raw, relocation.size)
+    {
+        return false;
+    }
+    let (Some(applied), Some(written)) =
+        (relocation.applied_target_value, relocation.written_value)
+    else {
+        return false;
+    };
+    let Ok(start) = usize::try_from(relocation.output_offset) else {
+        return false;
+    };
+    let Ok(size) = usize::try_from(relocation.size) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    let Some(previous) = previous_output.get(start..end) else {
+        return false;
+    };
+    let Ok(rel_info) =
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(raw)
+    else {
+        return false;
+    };
+    let mut replayed = previous.to_vec();
+    if rel_info.write_to_buffer(written, &mut replayed).is_err() || replayed != previous {
+        return false;
+    }
+    let Some(place) = macho_output_address_for_file_offset(output_file, relocation.output_offset)
+    else {
+        return false;
+    };
+    macho_aarch64_relocated_value(
+        raw.r_type,
+        applied,
+        macho_aarch64_applied_target_addend(
+            raw.r_type,
+            relocation.target_value,
+            applied,
+            relocation.addend,
+        ),
+        place,
+    ) == Some(written)
+}
+
+fn recorded_macho_import_stub_got_address(
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    stub_address: u64,
+) -> std::result::Result<u64, String> {
+    let Some(output_offset) = macho_output_file_offset_for_address(
+        output_file,
+        stub_address,
+        crate::macho::MACHO_STUB_SIZE,
+    )?
+    else {
+        return Err("recorded Mach-O import stub has no output range".to_owned());
+    };
+    let start = usize::try_from(output_offset)
+        .map_err(|_| "recorded Mach-O import stub offset is too large".to_owned())?;
+    let end = start
+        .checked_add(crate::macho::MACHO_STUB_SIZE as usize)
+        .ok_or_else(|| "recorded Mach-O import stub range overflowed".to_owned())?;
+    let stub = previous_output
+        .get(start..end)
+        .ok_or_else(|| "recorded Mach-O import stub is outside output".to_owned())?;
+    let adrp = read_u32_le(&stub[0..4])
+        .ok_or_else(|| "recorded Mach-O import stub ADRP is truncated".to_owned())?;
+    let ldr = read_u32_le(&stub[4..8])
+        .ok_or_else(|| "recorded Mach-O import stub LDR is truncated".to_owned())?;
+    let branch = read_u32_le(&stub[8..12])
+        .ok_or_else(|| "recorded Mach-O import stub branch is truncated".to_owned())?;
+    if adrp & 0x9f00_001f != 0x9000_0010
+        || ldr & 0xffc0_03ff != 0xf940_0210
+        || branch != 0xd61f_0200
+    {
+        return Err("recorded Mach-O import stub has an unsupported instruction shape".to_owned());
+    }
+    let immediate = u64::from((adrp >> 29) & 0x3) | (u64::from((adrp >> 5) & 0x7_ffff) << 2);
+    let page_delta = if immediate & (1 << 20) == 0 {
+        i128::from(immediate)
+    } else {
+        i128::from(immediate) - (1_i128 << 21)
+    } << 12;
+    let place_page = stub_address & !linker_utils::elf::PAGE_MASK_4KB;
+    let target_page = i128::from(place_page)
+        .checked_add(page_delta)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| "recorded Mach-O import stub page target overflowed".to_owned())?;
+    let got_address = target_page
+        .checked_add(u64::from((ldr >> 10) & 0xfff) * 8)
+        .ok_or_else(|| "recorded Mach-O import stub GOT address overflowed".to_owned())?;
+    let got_end = got_address
+        .checked_add(crate::macho::MACHO_GOT_ENTRY_SIZE)
+        .ok_or_else(|| "recorded Mach-O import stub GOT range overflowed".to_owned())?;
+    let got_sections = output_file
+        .sections()
+        .filter(|section| {
+            section.name_bytes().ok() == Some(b"__got".as_slice())
+                && section
+                    .address()
+                    .checked_add(section.size())
+                    .is_some_and(|end| got_address >= section.address() && got_end <= end)
+        })
+        .count();
+    if got_sections != 1
+        || macho_output_file_offset_for_address(
+            output_file,
+            got_address,
+            crate::macho::MACHO_GOT_ENTRY_SIZE,
+        )?
+        .is_none()
+    {
+        return Err("recorded Mach-O import stub GOT target is outside __got".to_owned());
+    }
+    validate_migrated_macho_stub(previous_output, stub_address, got_address)
+        .map_err(|_| "recorded Mach-O import stub encoding changed".to_owned())?;
+    Ok(got_address)
+}
+
+fn validate_recorded_macho_import_dependency(
+    dependency: &MachOSymbolResolutionRecord,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> std::result::Result<(), String> {
+    let Some(stub_address) = dependency.stub_address else {
+        if dependency.thunk_addresses.is_empty() {
+            return Ok(());
+        }
+        return Err("recorded Mach-O import thunk dependency has no stub".to_owned());
+    };
+    let Some(got_address) = dependency.got_address else {
+        return Err("recorded Mach-O import stub dependency has no GOT".to_owned());
+    };
+    if recorded_macho_import_stub_got_address(previous_output, output_file, stub_address)?
+        != got_address
+    {
+        return Err("recorded Mach-O import stub dependency changed".to_owned());
+    }
+    recorded_macho_thunk_retargets(
+        dependency.name.as_str(),
+        &dependency.thunk_addresses,
+        stub_address,
+        stub_address,
+        output_file,
+        previous_output,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn added_macho_archive_import_resolution_target(
+    resolution: &MachOSymbolResolutionRecord,
+    symbol_is_undefined: bool,
+    symbol_is_global: bool,
+    symbol_address: u64,
+    r_type: u8,
+    r_pcrel: bool,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> std::result::Result<Option<u64>, String> {
+    if resolution.direct_value.is_some()
+        || resolution.target.is_some()
+        || !symbol_is_undefined
+        || !symbol_is_global
+        || symbol_address != 0
+        || r_type != object::macho::ARM64_RELOC_BRANCH26
+        || !r_pcrel
+    {
+        return Ok(None);
+    }
+    if resolution.stub_address.is_none() || resolution.got_address.is_none() {
+        return Err(
+            "indirect added Mach-O archive import resolution has no stub and GOT".to_owned(),
+        );
+    }
+    if !resolution.thunk_addresses.is_empty() {
+        return Err(
+            "indirect added Mach-O archive import resolution has ambiguous branch targets"
+                .to_owned(),
+        );
+    }
+    validate_recorded_macho_import_dependency(resolution, previous_output, output_file)?;
+    Ok(Some(0))
+}
+
+fn macho_archive_indirect_dependency_for_relocation(
+    relocation: &RelocationRecord,
+    owner_relocations: &[RelocationRecord],
+    recorded_branch_targets: &RecordedMachOBranchTargetCandidates<'_>,
+    resolutions: &[MachOSymbolResolutionRecord],
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    resolutions_complete: bool,
+) -> std::result::Result<Option<MachOSymbolResolutionRecord>, String> {
+    if relocation.target.is_some()
+        || relocation.applied_target_value == Some(relocation.target_value)
+        || !recorded_macho_indirect_relocation_matches_output(
+            relocation,
+            previous_output,
+            output_file,
+        )
+    {
+        return Ok(None);
+    }
+    let Some(target_name) = relocation.target_name.as_ref() else {
+        return Err("indirect Mach-O archive relocation has no target name".to_owned());
+    };
+    if let Some(index) = macho_symbol_resolution_index_for_name(resolutions, target_name.as_str())?
+    {
+        let dependency = &resolutions[index];
+        if dependency.target.is_some()
+            || dependency.direct_value.is_some()
+            || !reactivated_macho_archive_indirect_target_is_current(
+                relocation,
+                dependency,
+                relocation.applied_target_value.unwrap(),
+            )
+        {
+            return Err(
+                "indirect Mach-O archive relocation conflicts with its resolution dependency"
+                    .to_owned(),
+            );
+        }
+        validate_recorded_macho_import_dependency(dependency, previous_output, output_file)?;
+        return Ok(Some(dependency.clone()));
+    }
+    if !resolutions_complete {
+        return Err(format!(
+            "{MACHO_SYMBOL_RESOLUTIONS_REQUIRED} for indirect Mach-O archive dependency"
+        ));
+    }
+    let Some(raw) = decode_macho_aarch64_relocation_kind(relocation.kind) else {
+        return Err("missing indirect Mach-O archive dependency has no relocation kind".to_owned());
+    };
+    if raw.r_type != object::macho::ARM64_RELOC_BRANCH26 || relocation.target_value != 0 {
+        return Err(
+            "missing indirect Mach-O archive dependency is not a zero-valued branch import"
+                .to_owned(),
+        );
+    }
+    let mut candidates = recorded_branch_targets.import_stubs_excluding(
+        target_name,
+        relocation.addend,
+        previous_output,
+        output_file,
+        owner_relocations,
+    );
+    candidates.sort_unstable();
+    candidates.dedup();
+    let [stub_address] = candidates.as_slice() else {
+        return Err(
+            "missing indirect Mach-O archive dependency has no unique recorded target".to_owned(),
+        );
+    };
+    if relocation.applied_target_value != Some(*stub_address) {
+        return Err(
+            "missing indirect Mach-O archive dependency disagrees with its applied target"
+                .to_owned(),
+        );
+    }
+    let got_address =
+        recorded_macho_import_stub_got_address(previous_output, output_file, *stub_address)?;
+    Ok(Some(MachOSymbolResolutionRecord {
+        name: target_name.clone(),
+        direct_value: None,
+        got_address: Some(got_address),
+        stub_address: Some(*stub_address),
+        thunk_addresses: Vec::new(),
+        target: None,
+    }))
+}
+
+fn macho_archive_indirect_dependencies_for_relocations(
+    relocations: &[RelocationRecord],
+    recorded_relocations: &[RelocationRecord],
+    excluded_relocations: &[RelocationRecord],
+    resolutions: &[MachOSymbolResolutionRecord],
+    previous_output: &[u8],
+    resolutions_complete: bool,
+) -> std::result::Result<Vec<MachOSymbolResolutionRecord>, String> {
+    let output_file = object::File::parse(previous_output).map_err(|_| {
+        "failed to parse output for indirect Mach-O archive dependencies".to_owned()
+    })?;
+    let recorded_branch_targets = RecordedMachOBranchTargetCandidates::new(recorded_relocations);
+    let mut dependencies = Vec::new();
+    for relocation in relocations {
+        let Some(dependency) = macho_archive_indirect_dependency_for_relocation(
+            relocation,
+            excluded_relocations,
+            &recorded_branch_targets,
+            resolutions,
+            previous_output,
+            &output_file,
+            resolutions_complete,
+        )?
+        else {
+            continue;
+        };
+        merge_exact_macho_symbol_resolution(
+            &mut dependencies,
+            dependency,
+            "indirect Mach-O archive dependencies conflict",
+        )?;
+    }
+    dependencies.sort_unstable();
+    Ok(dependencies)
 }
 
 fn retain_initial_macho_archive_removal_transaction(
@@ -29084,6 +29574,7 @@ fn reactivated_macho_archive_text_activation(
     resolutions: &[MachOSymbolResolutionRecord],
     retiring_names: &[SharedText],
     reserved_ranges: &[ReservedRangeRecord],
+    resolutions_complete: bool,
 ) -> Result<std::result::Result<Option<AddedMachOArchiveTextActivations>, String>> {
     let mut indices = dormant_macho_archive_reactivation_indices(patch, added_identifiers)?;
     if indices.is_empty() {
@@ -29255,10 +29746,185 @@ fn reactivated_macho_archive_text_activation(
         }
     }
 
+    let mut owned_names = HashSet::new();
+    for resolution in states.iter().flat_map(|state| &state.symbol_resolutions) {
+        if !owned_names.insert(resolution.name.clone()) {
+            return Ok(Err(
+                "dormant Mach-O archive cohorts have conflicting symbol ownership".to_owned(),
+            ));
+        }
+    }
+    let mut indirect_dependencies = Vec::new();
+    for state in &states {
+        for dependency in &state.indirect_dependencies {
+            if dependency.target.is_some()
+                || dependency.direct_value.is_some()
+                || (dependency.got_address.is_none()
+                    && dependency.stub_address.is_none()
+                    && dependency.thunk_addresses.is_empty())
+                || owned_names.contains(&dependency.name)
+                || rollback_names.contains(&dependency.name)
+            {
+                return Ok(Err(
+                    "reactivated Mach-O archive indirect dependency conflicts with symbol ownership"
+                        .to_owned(),
+                ));
+            }
+            if let Err(reason) = merge_exact_macho_symbol_resolution(
+                &mut indirect_dependencies,
+                dependency.clone(),
+                "reactivated Mach-O archive indirect dependencies conflict",
+            ) {
+                return Ok(Err(reason));
+            }
+        }
+    }
+    let mut reactivated_output = current_output.to_vec();
+    for patch in states.iter().flat_map(|state| &state.forward_patches) {
+        let start = match usize::try_from(patch.output_offset) {
+            Ok(start) => start,
+            Err(_) => {
+                return Ok(Err(
+                    "reactivated Mach-O archive forward patch offset is too large".to_owned(),
+                ));
+            }
+        };
+        let Some(end) = start.checked_add(patch.data.len()) else {
+            return Ok(Err(
+                "reactivated Mach-O archive forward patch range overflowed".to_owned(),
+            ));
+        };
+        let Some(output) = reactivated_output.get_mut(start..end) else {
+            return Ok(Err(
+                "reactivated Mach-O archive forward patch is outside output".to_owned(),
+            ));
+        };
+        output.copy_from_slice(&patch.data);
+    }
+    let reactivated_output_file = match object::File::parse(&*reactivated_output) {
+        Ok(output) => output,
+        Err(_) => {
+            return Ok(Err(
+                "failed to parse output for reactivated Mach-O archive dependencies".to_owned(),
+            ));
+        }
+    };
+    for relocation in states.iter().flat_map(|state| &state.relocations) {
+        if relocation.target.is_some()
+            || relocation.applied_target_value == Some(relocation.target_value)
+        {
+            continue;
+        }
+        let Some(target_name) = relocation.target_name.as_ref() else {
+            return Ok(Err(
+                "reactivated indirect Mach-O archive relocation has no target name".to_owned(),
+            ));
+        };
+        let dependency_index = match macho_symbol_resolution_index_for_name(
+            &indirect_dependencies,
+            target_name.as_str(),
+        ) {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                return Ok(Err(
+                    "reactivated indirect Mach-O archive relocation has no persisted dependency"
+                        .to_owned(),
+                ));
+            }
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(applied_target) = relocation.applied_target_value else {
+            return Ok(Err(
+                "reactivated indirect Mach-O archive relocation has no applied target".to_owned(),
+            ));
+        };
+        if !reactivated_macho_archive_indirect_target_is_current(
+            relocation,
+            &indirect_dependencies[dependency_index],
+            applied_target,
+        ) || !recorded_macho_indirect_relocation_matches_output(
+            relocation,
+            &reactivated_output,
+            &reactivated_output_file,
+        ) {
+            return Ok(Err(
+                "reactivated Mach-O archive indirect dependency changed while dormant".to_owned(),
+            ));
+        }
+        let dependency = &indirect_dependencies[dependency_index];
+        if validate_recorded_macho_import_dependency(
+            dependency,
+            &reactivated_output,
+            &reactivated_output_file,
+        )
+        .is_err()
+        {
+            return Ok(Err(
+                "reactivated Mach-O archive import dependency changed while dormant".to_owned(),
+            ));
+        }
+    }
+    for dependency in &indirect_dependencies {
+        if !states
+            .iter()
+            .flat_map(|state| &state.relocations)
+            .any(|relocation| {
+                relocation.target_name.as_ref() == Some(&dependency.name)
+                    && relocation.target.is_none()
+                    && relocation.applied_target_value.is_some_and(|applied| {
+                        reactivated_macho_archive_indirect_target_is_current(
+                            relocation, dependency, applied,
+                        )
+                    })
+            })
+        {
+            return Ok(Err(
+                "reactivated Mach-O archive indirect dependency has no relocation owner".to_owned(),
+            ));
+        }
+    }
+    let mut indirect_dependencies_to_publish = Vec::new();
+    for dependency in &indirect_dependencies {
+        match macho_symbol_resolution_index_for_name(resolutions, dependency.name.as_str()) {
+            Ok(Some(index)) if resolutions[index] == *dependency => {}
+            Ok(Some(_)) => {
+                return Ok(Err(
+                    "reactivated Mach-O archive indirect dependency conflicts with a live resolution"
+                        .to_owned(),
+                ));
+            }
+            Ok(None) if !resolutions_complete => {
+                return Ok(Err(format!(
+                    "{MACHO_SYMBOL_RESOLUTIONS_REQUIRED} for reactivated Mach-O archive indirect dependency"
+                )));
+            }
+            Ok(None) => {
+                if let Err(reason) = merge_exact_macho_symbol_resolution(
+                    &mut indirect_dependencies_to_publish,
+                    dependency.clone(),
+                    "reactivated Mach-O archive indirect dependencies conflict",
+                ) {
+                    return Ok(Err(reason));
+                }
+            }
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    let mut effective_resolutions = resolutions.to_vec();
+    for dependency in &indirect_dependencies_to_publish {
+        if let Err(reason) = merge_exact_macho_symbol_resolution(
+            &mut effective_resolutions,
+            dependency.clone(),
+            "reactivated Mach-O archive indirect dependency conflicts with the effective catalog",
+        ) {
+            return Ok(Err(reason));
+        }
+    }
+
     if let Err(reason) = rematerialize_reactivated_macho_archive_relocations(
         input_file_path,
         &mut states,
-        resolutions,
+        &effective_resolutions,
         current_output,
     ) {
         return Ok(Err(reason));
@@ -29347,6 +30013,7 @@ fn reactivated_macho_archive_text_activation(
         sections,
         records,
         symbol_resolutions,
+        indirect_dependencies_to_publish,
         recycled_symbol_resolution_names,
         symbol_table_patches: Vec::new(),
         chained_fixup_patches: Vec::new(),
@@ -33934,6 +34601,138 @@ fn changed_macho_archive_unwind_activation(
     )
 }
 
+fn added_macho_archive_indirect_dependencies(
+    replays: &[MachOTextRelocationReplay],
+    resolutions: &[MachOSymbolResolutionRecord],
+    resolutions_complete: bool,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+) -> std::result::Result<
+    (
+        Vec<MachOSymbolResolutionRecord>,
+        Vec<MachOSymbolResolutionRecord>,
+    ),
+    String,
+> {
+    let mut dependencies = Vec::new();
+    let mut to_publish = Vec::new();
+    for replay in replays.iter().filter(|replay| {
+        replay.target_is_global
+            && replay.target.is_none()
+            && matches!(
+                replay.r_type,
+                object::macho::ARM64_RELOC_BRANCH26
+                    | object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+                    | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                    | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+                    | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+            )
+    }) {
+        let Some(target_name) = replay.target_name.as_ref() else {
+            return Err("indirect added Mach-O archive relocation has no target name".to_owned());
+        };
+        let dependency = if let Some(index) =
+            macho_symbol_resolution_index_for_name(resolutions, target_name)?
+        {
+            let dependency = resolutions[index].clone();
+            if dependency.target.is_some() || dependency.direct_value.is_some() {
+                return Err(
+                    "indirect added Mach-O archive dependency has direct ownership".to_owned(),
+                );
+            }
+            dependency
+        } else {
+            if !resolutions_complete {
+                return Err(format!(
+                    "{MACHO_SYMBOL_RESOLUTIONS_REQUIRED} for indirect added Mach-O archive dependency"
+                ));
+            }
+            if replay.current_target_value != 0 {
+                return Err(
+                    "missing indirect added Mach-O archive dependency has a nonzero direct target"
+                        .to_owned(),
+                );
+            }
+            let mut candidates = replay.current_relocation_target_candidates.clone();
+            candidates.sort_unstable();
+            candidates.dedup();
+            let [applied] = candidates.as_slice() else {
+                return Err(
+                        "missing indirect added Mach-O archive dependency has no unique recorded target"
+                            .to_owned(),
+                    );
+            };
+            if replay.r_type != object::macho::ARM64_RELOC_BRANCH26 {
+                return Err(
+                        "missing indirect added Mach-O archive GOT dependency has no exact catalog record"
+                            .to_owned(),
+                    );
+            }
+            let got_address =
+                recorded_macho_import_stub_got_address(previous_output, output_file, *applied)?;
+            let dependency = MachOSymbolResolutionRecord {
+                name: target_name.clone(),
+                direct_value: None,
+                got_address: Some(got_address),
+                stub_address: Some(*applied),
+                thunk_addresses: Vec::new(),
+                target: None,
+            };
+            merge_exact_macho_symbol_resolution(
+                &mut to_publish,
+                dependency.clone(),
+                "indirect added Mach-O archive dependencies conflict",
+            )?;
+            dependency
+        };
+        validate_recorded_macho_import_dependency(&dependency, previous_output, output_file)?;
+        let matches_target = match replay.r_type {
+            object::macho::ARM64_RELOC_BRANCH26 => {
+                let Some(stub_address) = dependency.stub_address else {
+                    return Err(
+                        "indirect added Mach-O archive branch dependency has no stub".to_owned(),
+                    );
+                };
+                let Some(got_address) = dependency.got_address else {
+                    return Err(
+                        "indirect added Mach-O archive branch dependency has no GOT".to_owned()
+                    );
+                };
+                recorded_macho_import_stub_got_address(previous_output, output_file, stub_address)?
+                    == got_address
+                    && replay
+                        .current_relocation_target_candidates
+                        .contains(&stub_address)
+            }
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                dependency.got_address.is_some_and(|candidate| {
+                    replay
+                        .current_relocation_target_candidates
+                        .contains(&candidate)
+                })
+            }
+            _ => false,
+        };
+        if !matches_target {
+            return Err(
+                "indirect added Mach-O archive dependency disagrees with its recorded target"
+                    .to_owned(),
+            );
+        }
+        merge_exact_macho_symbol_resolution(
+            &mut dependencies,
+            dependency,
+            "indirect added Mach-O archive dependencies conflict",
+        )?;
+    }
+    dependencies.sort_unstable();
+    to_publish.sort_unstable();
+    Ok((dependencies, to_publish))
+}
+
 fn added_macho_archive_text_activations(
     previous_bytes: &[u8],
     current_bytes: &[u8],
@@ -33950,6 +34749,7 @@ fn added_macho_archive_text_activations(
     relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
     retiring_names: &[SharedText],
+    resolutions_complete: bool,
 ) -> Result<std::result::Result<AddedMachOArchiveTextActivations, String>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(current_bytes) else {
         return Ok(Err(
@@ -34288,6 +35088,27 @@ fn added_macho_archive_text_activations(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
+    let (indirect_dependencies, indirect_dependencies_to_publish) =
+        match added_macho_archive_indirect_dependencies(
+            &relocation_replays,
+            resolutions,
+            resolutions_complete,
+            previous_output,
+            &output_file,
+        ) {
+            Ok(dependencies) => dependencies,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    if indirect_dependencies.iter().any(|dependency| {
+        symbol_resolutions
+            .iter()
+            .any(|resolution| resolution.name == dependency.name)
+    }) {
+        return Ok(Err(
+            "indirect added Mach-O archive dependency conflicts with an owned definition"
+                .to_owned(),
+        ));
+    }
     let mut member_identities = Vec::with_capacity(changed_unwind_member_start);
     for member_index in 0..changed_unwind_member_start {
         let member = &members[member_index];
@@ -34324,6 +35145,7 @@ fn added_macho_archive_text_activations(
         sections: sections.iter().map(file_patch_section_state).collect(),
         relocations: Vec::new(),
         symbol_resolutions: Vec::new(),
+        indirect_dependencies,
         rollback_symbol_resolutions: Vec::new(),
         forward_patches: Vec::new(),
         rollback_patches: Vec::new(),
@@ -34341,6 +35163,7 @@ fn added_macho_archive_text_activations(
         sections,
         records,
         symbol_resolutions,
+        indirect_dependencies_to_publish,
         recycled_symbol_resolution_names,
         symbol_table_patches,
         chained_fixup_patches,
@@ -35092,6 +35915,7 @@ fn changed_macho_definition_activation(
                 sections: Vec::new(),
                 relocations: Vec::new(),
                 symbol_resolutions: current_resolutions,
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: Vec::new(),
                 forward_patches,
                 rollback_patches,
@@ -39329,14 +40153,35 @@ fn added_macho_archive_text_relocation_replays(
                         };
                         if let Some(resolution_index) = resolution_index {
                             let resolution = &resolutions[resolution_index];
-                            let Some(value) = resolution.direct_value else {
-                                return Ok(Err(
-                                    "added Mach-O text relocation target has no direct value"
-                                        .to_owned(),
-                                ));
-                            };
-                            target = resolution.target.clone();
-                            value
+                            if let Some(value) = resolution.direct_value {
+                                target = resolution.target.clone();
+                                value
+                            } else {
+                                match added_macho_archive_import_resolution_target(
+                                    resolution,
+                                    symbol.is_undefined(),
+                                    symbol.is_global(),
+                                    symbol.address(),
+                                    context.r_type,
+                                    context.r_pcrel,
+                                    previous_output,
+                                    &output_file,
+                                ) {
+                                    Ok(Some(value)) => {
+                                        target = None;
+                                        recorded_target_candidates
+                                            .push(resolution.stub_address.unwrap());
+                                        value
+                                    }
+                                    Ok(None) => {
+                                        return Ok(Err(
+                                            "added Mach-O text relocation target has no direct value"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                    Err(reason) => return Ok(Err(reason)),
+                                }
+                            }
                         } else if symbol.is_undefined()
                             && symbol.is_global()
                             && symbol.address() == 0
@@ -45059,8 +45904,14 @@ fn render_macho_archive_member_states(states: &[MachOArchiveActivationState]) ->
                 &state.rollback_symbol_resolutions,
             )
             .expect("writing rollback Mach-O resolutions to String should not fail");
+            let mut indirect_dependencies = String::new();
+            write_rendered_macho_symbol_resolutions(
+                &mut indirect_dependencies,
+                &state.indirect_dependencies,
+            )
+            .expect("writing indirect Mach-O dependencies to String should not fail");
             format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 u8::from(state.active),
                 hex::encode(members),
                 hex::encode(render_patch_section_states(&state.sections)),
@@ -45069,6 +45920,7 @@ fn render_macho_archive_member_states(states: &[MachOArchiveActivationState]) ->
                 hex::encode(rollback_resolutions),
                 hex::encode(render_stored_output_patches(&state.forward_patches)),
                 hex::encode(render_stored_output_patches(&state.rollback_patches)),
+                hex::encode(indirect_dependencies),
             )
         })
         .collect::<Vec<_>>()
@@ -45145,7 +45997,7 @@ fn parse_macho_archive_member_states(
             }
             continue;
         }
-        if parts.len() != 8 {
+        if parts.len() != 8 && parts.len() != 9 {
             return Err(crate::error!(
                 "Malformed incremental Mach-O archive member state"
             ));
@@ -45277,10 +46129,38 @@ fn parse_macho_archive_member_states(
         .context("Invalid UTF-8 in incremental Mach-O archive rollback resolutions")?;
         let rollback_symbol_resolutions =
             parse_macho_symbol_resolutions(rollback_resolution_contents.lines())?;
+        let indirect_dependencies = if let Some(encoded) = parts.get(8) {
+            let contents = String::from_utf8(
+                hex::decode(encoded)
+                    .context("Invalid incremental Mach-O archive indirect dependencies")?,
+            )
+            .context("Invalid UTF-8 in incremental Mach-O archive indirect dependencies")?;
+            parse_macho_symbol_resolutions(contents.lines())?
+        } else {
+            Vec::new()
+        };
+        let mut indirect_names = HashSet::with_capacity(indirect_dependencies.len());
+        if indirect_dependencies.iter().any(|dependency| {
+            dependency.target.is_some()
+                || dependency.direct_value.is_some()
+                || (dependency.got_address.is_none()
+                    && dependency.stub_address.is_none()
+                    && dependency.thunk_addresses.is_empty())
+                || !indirect_names.insert(dependency.name.clone())
+                || symbol_resolutions
+                    .iter()
+                    .chain(&rollback_symbol_resolutions)
+                    .any(|resolution| resolution.name == dependency.name)
+        }) {
+            return Err(crate::error!(
+                "Invalid incremental Mach-O archive indirect dependencies"
+            ));
+        }
         if kind.is_changed_definitions()
             && (members.len() != 1
                 || !relocation_records.relocations.is_empty()
                 || symbol_resolutions.is_empty()
+                || !indirect_dependencies.is_empty()
                 || !rollback_symbol_resolutions.is_empty())
         {
             return Err(crate::error!(
@@ -45319,6 +46199,7 @@ fn parse_macho_archive_member_states(
             sections,
             relocations: relocation_records.relocations,
             symbol_resolutions,
+            indirect_dependencies,
             rollback_symbol_resolutions,
             forward_patches,
             rollback_patches,
@@ -55425,6 +56306,7 @@ mod tests {
             sections: Vec::new(),
             relocations: Vec::new(),
             symbol_resolutions: vec![replacement.clone()],
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: vec![rollback.clone()],
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 0,
@@ -57059,6 +57941,7 @@ mod tests {
             sections: Vec::new(),
             records: Vec::new(),
             symbol_resolutions: vec![new_resolution.clone()],
+            indirect_dependencies_to_publish: Vec::new(),
             recycled_symbol_resolution_names: vec![name.clone()],
             symbol_table_patches: Vec::new(),
             chained_fixup_patches: Vec::new(),
@@ -57115,6 +57998,7 @@ mod tests {
                 sections: Vec::new(),
                 relocations: Vec::new(),
                 symbol_resolutions: vec![old_resolution],
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: vec![rollback_resolution],
                 forward_patches: Vec::new(),
                 rollback_patches: vec![StoredOutputPatch {
@@ -57964,6 +58848,7 @@ mod tests {
                 sections: Vec::new(),
                 relocations: Vec::new(),
                 symbol_resolutions: vec![active],
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: vec![rollback.clone()],
                 forward_patches: vec![StoredOutputPatch {
                     output_offset: symbol_range.start as u64,
@@ -67597,6 +68482,111 @@ mod tests {
         }
     }
 
+    struct TestMachOImportOutput {
+        bytes: Vec<u8>,
+        text_offset: u64,
+        stub_address: u64,
+        got_address: u64,
+    }
+
+    fn test_macho_import_output() -> TestMachOImportOutput {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const SECTION_COUNT: usize = 3;
+        const TEXT_SIZE: usize = 0x100;
+        const STUB_SIZE: usize = 0x30;
+        const GOT_SIZE: usize = 0x40;
+
+        let commands_size = SEGMENT_COMMAND_SIZE + SECTION_COUNT * SECTION_SIZE;
+        let text_offset = HEADER_SIZE + commands_size;
+        let stubs_offset = text_offset + TEXT_SIZE;
+        let got_offset = (stubs_offset + STUB_SIZE + 7) & !7;
+        let file_size = got_offset + GOT_SIZE;
+        let image_start = crate::macho::MACHO_START_MEM_ADDRESS;
+        let stub_address = image_start + stubs_offset as u64;
+        let got_address = image_start + got_offset as u64;
+        let mut bytes = Vec::with_capacity(file_size);
+
+        push_u32(&mut bytes, object::macho::MH_MAGIC_64);
+        push_u32(&mut bytes, object::macho::CPU_TYPE_ARM64 as u32);
+        push_u32(&mut bytes, object::macho::CPU_SUBTYPE_ARM64_ALL as u32);
+        push_u32(&mut bytes, object::macho::MH_EXECUTE);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, commands_size as u32);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
+        push_u32(&mut bytes, commands_size as u32);
+        push_fixed_name(&mut bytes, b"__TEXT");
+        push_u64(&mut bytes, image_start);
+        push_u64(&mut bytes, file_size as u64);
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, file_size as u64);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 5);
+        push_u32(&mut bytes, SECTION_COUNT as u32);
+        push_u32(&mut bytes, 0);
+
+        for (name, segment, offset, size, flags) in [
+            (
+                b"__text".as_slice(),
+                b"__TEXT".as_slice(),
+                text_offset,
+                TEXT_SIZE,
+                object::macho::S_REGULAR
+                    | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                    | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+            ),
+            (
+                b"__stubs".as_slice(),
+                b"__TEXT".as_slice(),
+                stubs_offset,
+                STUB_SIZE,
+                object::macho::S_SYMBOL_STUBS,
+            ),
+            (
+                b"__got".as_slice(),
+                b"__DATA_CONST".as_slice(),
+                got_offset,
+                GOT_SIZE,
+                object::macho::S_NON_LAZY_SYMBOL_POINTERS,
+            ),
+        ] {
+            push_macho_section(
+                &mut bytes,
+                name,
+                segment,
+                image_start + offset as u64,
+                size,
+                offset,
+                flags,
+            );
+        }
+        bytes.resize(file_size, 0);
+        let place_page = stub_address & !linker_utils::elf::PAGE_MASK_4KB;
+        let target_page = got_address & !linker_utils::elf::PAGE_MASK_4KB;
+        let page_delta = ((i128::from(target_page) - i128::from(place_page)) >> 12) as i64;
+        let immediate = (page_delta as u64) & 0x1f_ffff;
+        let adrp = 0x9000_0000
+            | 16
+            | (((immediate & 0x3) as u32) << 29)
+            | ((((immediate >> 2) & 0x7_ffff) as u32) << 5);
+        let page_offset = got_address & linker_utils::elf::PAGE_MASK_4KB;
+        let ldr = 0xf940_0000 | (((page_offset / 8) as u32) << 10) | (16 << 5) | 16;
+        bytes[stubs_offset..stubs_offset + 4].copy_from_slice(&adrp.to_le_bytes());
+        bytes[stubs_offset + 4..stubs_offset + 8].copy_from_slice(&ldr.to_le_bytes());
+        bytes[stubs_offset + 8..stubs_offset + 12].copy_from_slice(&0xd61f_0200_u32.to_le_bytes());
+
+        TestMachOImportOutput {
+            bytes,
+            text_offset: text_offset as u64,
+            stub_address,
+            got_address,
+        }
+    }
+
     fn apply_test_section_patches(output: &mut [u8], patches: &[SectionPatch]) {
         for patch in patches {
             let start = patch.output_offset as usize;
@@ -73363,6 +74353,7 @@ mod tests {
             sections: Vec::new(),
             relocations: Vec::new(),
             symbol_resolutions: Vec::new(),
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 64,
@@ -73625,6 +74616,7 @@ mod tests {
                 }],
                 relocations: Vec::new(),
                 symbol_resolutions: Vec::new(),
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: Vec::new(),
                 forward_patches: vec![StoredOutputPatch {
                     output_offset: 16,
@@ -73761,6 +74753,7 @@ mod tests {
                     section_offset: 0,
                 }),
             }],
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 16,
@@ -73790,6 +74783,7 @@ mod tests {
             }],
             relocations: Vec::new(),
             symbol_resolutions: Vec::new(),
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 16,
@@ -73917,6 +74911,7 @@ mod tests {
                 sections: Vec::new(),
                 relocations: Vec::new(),
                 symbol_resolutions: Vec::new(),
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: Vec::new(),
                 forward_patches: vec![StoredOutputPatch {
                     output_offset: offset,
@@ -74170,6 +75165,7 @@ mod tests {
                 std::slice::from_ref(&live_conflict),
                 &[],
                 &[],
+                true,
             )
             .unwrap()
             .err()
@@ -74187,6 +75183,7 @@ mod tests {
                 std::slice::from_ref(&live_conflict),
                 std::slice::from_ref(&live_conflict.name),
                 &[],
+                true,
             )
             .unwrap()
             .unwrap()
@@ -74206,6 +75203,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                true,
             )
             .unwrap()
             .err()
@@ -74222,6 +75220,7 @@ mod tests {
             &[],
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -74299,6 +75298,7 @@ mod tests {
             &[],
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -74405,6 +75405,7 @@ mod tests {
             }],
             relocations: vec![dormant_relocation],
             symbol_resolutions: vec![dormant_resolution],
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: vec![rollback.clone()],
             forward_patches: vec![StoredOutputPatch {
                 output_offset: first_output_offset,
@@ -74448,6 +75449,7 @@ mod tests {
             std::slice::from_ref(&rollback),
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -74485,6 +75487,7 @@ mod tests {
             std::slice::from_ref(&rollback),
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -74587,6 +75590,7 @@ mod tests {
             }],
             relocations: vec![second_relocation],
             symbol_resolutions: vec![second_resolution],
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: vec![second_rollback.clone()],
             forward_patches: vec![StoredOutputPatch {
                 output_offset: second_output_offset,
@@ -74620,6 +75624,7 @@ mod tests {
             &[rollback.clone(), second_rollback.clone()],
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -74722,6 +75727,7 @@ mod tests {
                 &[rollback.clone(), second_rollback],
                 &[],
                 &[],
+                true,
             )
             .unwrap()
             .err()
@@ -74743,6 +75749,7 @@ mod tests {
                 std::slice::from_ref(&rollback),
                 &[],
                 &[],
+                true,
             )
             .unwrap()
             .err()
@@ -74763,11 +75770,707 @@ mod tests {
                 std::slice::from_ref(&conflicting_rollback),
                 &[],
                 &[],
+                true,
             )
             .unwrap()
             .err()
             .unwrap()
             .contains("rollback symbol changed while dormant")
+        );
+    }
+
+    fn test_macho_import_branch_record(
+        output: &mut TestMachOImportOutput,
+        input_file: &str,
+        input: &str,
+        target_name: SharedText,
+    ) -> RelocationRecord {
+        let raw = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: true,
+            r_length: 2,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_BRANCH26,
+        };
+        let file = object::File::parse(&*output.bytes).unwrap();
+        let place = macho_output_address_for_file_offset(&file, output.text_offset).unwrap();
+        let written_value = macho_aarch64_relocated_value(
+            object::macho::ARM64_RELOC_BRANCH26,
+            output.stub_address,
+            0,
+            place,
+        )
+        .unwrap();
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(raw)
+                .unwrap();
+        rel_info
+            .write_to_buffer(
+                written_value,
+                &mut output.bytes[output.text_offset as usize..output.text_offset as usize + 4],
+            )
+            .unwrap();
+        RelocationRecord {
+            target_symbol_id: 23,
+            written_value: Some(written_value),
+            target_value: 0,
+            applied_target_value: Some(output.stub_address),
+            target_name: Some(target_name),
+            target: None,
+            input_file: input_file.into(),
+            input: input.into(),
+            section_index: 1,
+            relocation_offset: 0,
+            output_offset: output.text_offset,
+            size: 4,
+            kind: encode_macho_aarch64_relocation_kind(raw),
+            addend: 0,
+        }
+    }
+
+    fn test_macho_import_replay(
+        record: &RelocationRecord,
+        candidates: Vec<u64>,
+    ) -> MachOTextRelocationReplay {
+        let raw = decode_macho_aarch64_relocation_kind(record.kind).unwrap();
+        MachOTextRelocationReplay {
+            relocation_index: None,
+            input_file: record.input_file.clone(),
+            input: record.input.to_string(),
+            section_index: record.section_index,
+            previous_output_offset: None,
+            previous_range: None,
+            current_range: 0..record.size as usize,
+            r_type: raw.r_type,
+            kind: record.kind,
+            rel_info:
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw,
+                )
+                .unwrap(),
+            previous_written_value: None,
+            previous_applied_target_value: None,
+            current_target_value: record.target_value,
+            used_normalized_target_alias: false,
+            current_relocation_target_candidates: candidates,
+            relax_pageoff_load_to_direct: false,
+            current_target_section_offset: 0,
+            target_symbol_id: record.target_symbol_id,
+            target_name: record.target_name.clone(),
+            target_is_global: true,
+            target: None,
+            addend: record.addend,
+            chained_rebase_output_offset: None,
+            chained_rebase_value: None,
+        }
+    }
+
+    fn test_macho_import_dependency(
+        name: SharedText,
+        output: &TestMachOImportOutput,
+    ) -> MachOSymbolResolutionRecord {
+        MachOSymbolResolutionRecord {
+            name,
+            direct_value: None,
+            got_address: Some(output.got_address),
+            stub_address: Some(output.stub_address),
+            thunk_addresses: Vec::new(),
+            target: None,
+        }
+    }
+
+    fn test_archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut builder = ar::Builder::new(Vec::new());
+        for &(identifier, data) in members {
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), data.len() as u64),
+                    data,
+                )
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn test_archive_input_ref(input_file: &str, identifier: &[u8]) -> String {
+        let mut bytes = hex::decode(input_file).unwrap();
+        bytes.push(0);
+        bytes.extend_from_slice(identifier);
+        bytes.push(0);
+        bytes.extend_from_slice(b"1:2");
+        hex::encode(bytes)
+    }
+
+    #[test]
+    fn added_macho_archive_import_dependency_requires_complete_validated_stub() {
+        let mut output = test_macho_import_output();
+        let name: SharedText = hex::encode("_memcpy").into();
+        let record = test_macho_import_branch_record(&mut output, "archive.rlib", "member.o", name);
+        let replay =
+            test_macho_import_replay(&record, vec![output.stub_address, output.stub_address]);
+        let output_file = object::File::parse(&*output.bytes).unwrap();
+
+        let reason = added_macho_archive_indirect_dependencies(
+            std::slice::from_ref(&replay),
+            &[],
+            false,
+            &output.bytes,
+            &output_file,
+        )
+        .unwrap_err();
+        assert!(reason.starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED));
+
+        let (dependencies, publish) = added_macho_archive_indirect_dependencies(
+            std::slice::from_ref(&replay),
+            &[],
+            true,
+            &output.bytes,
+            &output_file,
+        )
+        .unwrap();
+        let expected = test_macho_import_dependency(replay.target_name.clone().unwrap(), &output);
+        assert_eq!(dependencies, vec![expected.clone()]);
+        assert_eq!(publish, vec![expected.clone()]);
+        let (dependencies, publish) = added_macho_archive_indirect_dependencies(
+            std::slice::from_ref(&replay),
+            std::slice::from_ref(&expected),
+            true,
+            &output.bytes,
+            &output_file,
+        )
+        .unwrap();
+        assert_eq!(dependencies, vec![expected]);
+        assert!(publish.is_empty());
+    }
+
+    #[test]
+    fn added_macho_archive_replay_accepts_only_exact_import_resolution() {
+        let output = test_macho_import_output();
+        let file = object::File::parse(&*output.bytes).unwrap();
+        let dependency = test_macho_import_dependency(hex::encode("_memcpy").into(), &output);
+        let resolve = |resolution: &MachOSymbolResolutionRecord, r_type, pcrel| {
+            added_macho_archive_import_resolution_target(
+                resolution,
+                true,
+                true,
+                0,
+                r_type,
+                pcrel,
+                &output.bytes,
+                &file,
+            )
+        };
+
+        assert_eq!(
+            resolve(&dependency, object::macho::ARM64_RELOC_BRANCH26, true).unwrap(),
+            Some(0)
+        );
+        let mut direct = dependency.clone();
+        direct.direct_value = Some(output.stub_address);
+        assert_eq!(
+            resolve(&direct, object::macho::ARM64_RELOC_BRANCH26, true).unwrap(),
+            None
+        );
+        let mut owned = dependency.clone();
+        owned.target = Some(RelocationTargetRecord {
+            input_file: "owner.o".into(),
+            input: "owner.o".into(),
+            section_index: 1,
+            section_offset: 0,
+        });
+        assert_eq!(
+            resolve(&owned, object::macho::ARM64_RELOC_BRANCH26, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve(
+                &dependency,
+                object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                true
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve(&dependency, object::macho::ARM64_RELOC_BRANCH26, false).unwrap(),
+            None
+        );
+
+        let mut wrong_stub = dependency.clone();
+        wrong_stub.stub_address = Some(output.stub_address + 4);
+        assert!(resolve(&wrong_stub, object::macho::ARM64_RELOC_BRANCH26, true).is_err());
+        let mut wrong_got = dependency.clone();
+        wrong_got.got_address = Some(output.got_address + 8);
+        assert!(resolve(&wrong_got, object::macho::ARM64_RELOC_BRANCH26, true).is_err());
+        let mut ambiguous = dependency;
+        ambiguous.thunk_addresses.push(output.stub_address + 0x20);
+        assert!(resolve(&ambiguous, object::macho::ARM64_RELOC_BRANCH26, true).is_err());
+    }
+
+    #[test]
+    fn added_macho_archive_import_dependency_rejects_malformed_stub_and_got() {
+        let mut output = test_macho_import_output();
+        let name: SharedText = hex::encode("_memcpy").into();
+        let record = test_macho_import_branch_record(&mut output, "archive.rlib", "member.o", name);
+        let replay = test_macho_import_replay(&record, vec![output.stub_address]);
+
+        for malformed in [0usize, 4, 8] {
+            let mut bytes = output.bytes.clone();
+            let file = object::File::parse(&*bytes).unwrap();
+            let stub_offset = macho_output_file_offset_for_address(
+                &file,
+                output.stub_address,
+                crate::macho::MACHO_STUB_SIZE,
+            )
+            .unwrap()
+            .unwrap() as usize;
+            bytes[stub_offset + malformed] ^= 1;
+            let file = object::File::parse(&*bytes).unwrap();
+            assert!(
+                added_macho_archive_indirect_dependencies(
+                    std::slice::from_ref(&replay),
+                    &[],
+                    true,
+                    &bytes,
+                    &file,
+                )
+                .unwrap_err()
+                .contains("stub")
+            );
+        }
+
+        let mut bytes = output.bytes.clone();
+        let file = object::File::parse(&*bytes).unwrap();
+        let stub_offset = macho_output_file_offset_for_address(
+            &file,
+            output.stub_address,
+            crate::macho::MACHO_STUB_SIZE,
+        )
+        .unwrap()
+        .unwrap() as usize;
+        let bad_ldr: u32 = 0xf940_0000 | (0xfff << 10) | (16 << 5) | 16;
+        bytes[stub_offset + 4..stub_offset + 8].copy_from_slice(&bad_ldr.to_le_bytes());
+        let file = object::File::parse(&*bytes).unwrap();
+        assert!(
+            added_macho_archive_indirect_dependencies(
+                std::slice::from_ref(&replay),
+                &[],
+                true,
+                &bytes,
+                &file,
+            )
+            .unwrap_err()
+            .contains("GOT")
+        );
+
+        let mut bytes = output.bytes.clone();
+        let thunk_address = crate::macho::MACHO_START_MEM_ADDRESS + output.text_offset + 0x80;
+        let config =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config().unwrap();
+        let thunk_size = config.thunk_size as usize;
+        let thunk_offset = (output.text_offset + 0x80) as usize;
+        <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::write_thunk(
+            thunk_address,
+            output.stub_address,
+            &mut bytes[thunk_offset..thunk_offset + thunk_size],
+        );
+        let mut dependency =
+            test_macho_import_dependency(replay.target_name.clone().unwrap(), &output);
+        dependency.thunk_addresses.push(thunk_address);
+        let thunk_replay =
+            test_macho_import_replay(&record, vec![output.stub_address, thunk_address]);
+        let file = object::File::parse(&*bytes).unwrap();
+        added_macho_archive_indirect_dependencies(
+            std::slice::from_ref(&thunk_replay),
+            std::slice::from_ref(&dependency),
+            true,
+            &bytes,
+            &file,
+        )
+        .unwrap();
+        bytes[thunk_offset] ^= 1;
+        let file = object::File::parse(&*bytes).unwrap();
+        assert!(
+            added_macho_archive_indirect_dependencies(
+                std::slice::from_ref(&thunk_replay),
+                std::slice::from_ref(&dependency),
+                true,
+                &bytes,
+                &file,
+            )
+            .unwrap_err()
+            .contains("thunk encoding changed")
+        );
+    }
+
+    #[test]
+    fn initial_macho_archive_retirement_synthesizes_import_dependency() {
+        let mut output = test_macho_import_output();
+        let name: SharedText = hex::encode("_memcpy").into();
+        let record = test_macho_import_branch_record(&mut output, "archive.rlib", "member.o", name);
+        let relocations = vec![record.clone()];
+        let mut witness = record.clone();
+        witness.target_symbol_id += 1;
+        witness.input = "other.o".into();
+        let recorded_relocations = vec![record, witness];
+
+        assert!(
+            macho_archive_indirect_dependencies_for_relocations(
+                &relocations,
+                &recorded_relocations,
+                &relocations,
+                &[],
+                &output.bytes,
+                false,
+            )
+            .unwrap_err()
+            .starts_with(MACHO_SYMBOL_RESOLUTIONS_REQUIRED)
+        );
+        assert!(
+            macho_archive_indirect_dependencies_for_relocations(
+                &relocations,
+                &relocations,
+                &relocations,
+                &[],
+                &output.bytes,
+                true,
+            )
+            .unwrap_err()
+            .contains("no unique recorded target")
+        );
+
+        let dependencies = macho_archive_indirect_dependencies_for_relocations(
+            &relocations,
+            &recorded_relocations,
+            &relocations,
+            &[],
+            &output.bytes,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            dependencies,
+            vec![test_macho_import_dependency(
+                hex::encode("_memcpy").into(),
+                &output,
+            )]
+        );
+    }
+
+    #[test]
+    fn dormant_macho_archive_import_dependency_round_trips_abab() {
+        let mut output = test_macho_import_output();
+        let name: SharedText = hex::encode("_memcpy").into();
+        let input_file = hex::encode("archive.rlib");
+        let identifier = b"member.1.rcgu.o";
+        let member_bytes = b"unchanged import member";
+        let input = test_archive_input_ref(&input_file, identifier);
+        let record =
+            test_macho_import_branch_record(&mut output, &input_file, &input, name.clone());
+        let dependency = test_macho_import_dependency(name, &output);
+        let mut dormant_output = output.bytes.clone();
+        let source_start = output.text_offset as usize;
+        let forward_data = output.bytes[source_start..source_start + 32].to_vec();
+        dormant_output[source_start..source_start + 32].fill(0);
+        let dormant = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: vec![MachOArchiveMemberIdentity {
+                normalized_identifier: archive_member_patch_identifier(identifier),
+                object_hash: hash_bytes(member_bytes),
+            }],
+            active: false,
+            sections: vec![FilePatchSectionState {
+                input: input.clone(),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 32,
+                output_offset: output.text_offset,
+                output_size: 32,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            }],
+            relocations: vec![record],
+            symbol_resolutions: Vec::new(),
+            indirect_dependencies: vec![dependency.clone()],
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: output.text_offset,
+                data: forward_data,
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: output.text_offset,
+                data: vec![0; 32],
+            }],
+        };
+        let dormant = parse_macho_archive_member_states(
+            &input_file,
+            &render_macho_archive_member_states(std::slice::from_ref(&dormant)),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let current_archive = test_archive(&[(identifier, member_bytes)]);
+        let resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+
+        let activation_error =
+            |state: MachOArchiveActivationState,
+             current_output: &[u8],
+             catalog: &[MachOSymbolResolutionRecord]| {
+                let unchanged = state.clone();
+                let patch = FilePatchState {
+                    fingerprint: String::new(),
+                    archive_member_set_proof: None,
+                    archive_member_patch_fingerprints: None,
+                    macho_archive_members: vec![state],
+                    sections: Vec::new(),
+                    raw_sections: None,
+                };
+                let reason = reactivated_macho_archive_text_activation(
+                    &current_archive,
+                    &input_file,
+                    &[identifier.to_vec()],
+                    &resolver,
+                    &patch,
+                    current_output,
+                    catalog,
+                    &[],
+                    &[],
+                    true,
+                )
+                .unwrap()
+                .err()
+                .unwrap();
+                assert_eq!(patch.macho_archive_members, vec![unchanged]);
+                reason
+            };
+
+        let mut old_state = dormant.clone();
+        old_state.indirect_dependencies.clear();
+        assert!(
+            activation_error(old_state, &dormant_output, &[]).contains("no persisted dependency")
+        );
+
+        let mut orphan = dormant.clone();
+        orphan
+            .indirect_dependencies
+            .push(MachOSymbolResolutionRecord {
+                name: hex::encode("_orphan").into(),
+                ..dependency.clone()
+            });
+        assert!(activation_error(orphan, &dormant_output, &[]).contains("no relocation owner"));
+
+        let mut direct = dormant.clone();
+        direct.indirect_dependencies[0].direct_value = Some(1);
+        assert!(activation_error(direct, &dormant_output, &[]).contains("symbol ownership"));
+
+        let mut conflicting = dormant.clone();
+        conflicting
+            .indirect_dependencies
+            .push(MachOSymbolResolutionRecord {
+                got_address: Some(output.got_address + 8),
+                ..dependency.clone()
+            });
+        assert!(
+            activation_error(conflicting, &dormant_output, &[]).contains("dependencies conflict")
+        );
+
+        let mut live_conflict = dependency.clone();
+        live_conflict.got_address = Some(output.got_address + 8);
+        assert!(
+            activation_error(
+                dormant.clone(),
+                &dormant_output,
+                std::slice::from_ref(&live_conflict),
+            )
+            .contains("conflicts with a live resolution")
+        );
+
+        let mut malformed_output = dormant_output.clone();
+        let file = object::File::parse(&*malformed_output).unwrap();
+        let stub_offset = macho_output_file_offset_for_address(
+            &file,
+            output.stub_address,
+            crate::macho::MACHO_STUB_SIZE,
+        )
+        .unwrap()
+        .unwrap() as usize;
+        malformed_output[stub_offset + 8] ^= 1;
+        assert!(
+            activation_error(dormant.clone(), &malformed_output, &[])
+                .contains("import dependency changed")
+        );
+
+        let mut catalog = Vec::new();
+        let mut state = dormant;
+        for cycle in 0..2 {
+            let patch = FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: vec![state],
+                sections: Vec::new(),
+                raw_sections: None,
+            };
+            let activation = reactivated_macho_archive_text_activation(
+                &current_archive,
+                &input_file,
+                &[identifier.to_vec()],
+                &resolver,
+                &patch,
+                &dormant_output,
+                &catalog,
+                &[],
+                &[],
+                true,
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                activation.indirect_dependencies_to_publish.len(),
+                usize::from(cycle == 0)
+            );
+            for dependency in &activation.indirect_dependencies_to_publish {
+                merge_exact_macho_symbol_resolution(
+                    &mut catalog,
+                    dependency.clone(),
+                    "test conflict",
+                )
+                .unwrap();
+            }
+            assert_eq!(catalog, vec![dependency.clone()]);
+            state = activation.member_states[0].clone();
+            assert!(state.active);
+            assert_eq!(state.indirect_dependencies, vec![dependency.clone()]);
+            state.active = false;
+            state.relocations = activation.reactivated_relocations;
+            state = parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(std::slice::from_ref(&state)),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn dormant_macho_archive_shared_import_dependency_is_staged_once() {
+        let mut output = test_macho_import_output();
+        let name: SharedText = hex::encode("_memcpy").into();
+        let input_file = hex::encode("archive.rlib");
+        let identifiers: [&[u8]; 2] = [b"member.1.rcgu.o", b"member.2.rcgu.o"];
+        let member_bytes: [&[u8]; 2] = [b"first import member", b"second import member"];
+        let first_input = test_archive_input_ref(&input_file, identifiers[0]);
+        let first =
+            test_macho_import_branch_record(&mut output, &input_file, &first_input, name.clone());
+        let second_offset = output.text_offset + 64;
+        let first_start = output.text_offset as usize;
+        let second_start = second_offset as usize;
+        output
+            .bytes
+            .copy_within(first_start..first_start + 4, second_start);
+        let raw = decode_macho_aarch64_relocation_kind(first.kind).unwrap();
+        let file = object::File::parse(&*output.bytes).unwrap();
+        let second_place = macho_output_address_for_file_offset(&file, second_offset).unwrap();
+        let second_written =
+            macho_aarch64_relocated_value(raw.r_type, output.stub_address, 0, second_place)
+                .unwrap();
+        let rel_info =
+            <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(raw)
+                .unwrap();
+        rel_info
+            .write_to_buffer(
+                second_written,
+                &mut output.bytes[second_start..second_start + 4],
+            )
+            .unwrap();
+        let mut second = first.clone();
+        second.target_symbol_id += 1;
+        second.input = test_archive_input_ref(&input_file, identifiers[1]).into();
+        second.output_offset = second_offset;
+        second.written_value = Some(second_written);
+        let dependency = test_macho_import_dependency(name, &output);
+        let mut dormant_output = output.bytes.clone();
+        let mut states = Vec::new();
+        for (index, (identifier, bytes, relocation)) in identifiers
+            .into_iter()
+            .zip(member_bytes)
+            .zip([first, second])
+            .enumerate()
+            .map(|(index, ((identifier, bytes), relocation))| {
+                (index, (identifier, bytes, relocation))
+            })
+        {
+            let output_offset = output.text_offset + index as u64 * 64;
+            let start = output_offset as usize;
+            let forward = output.bytes[start..start + 32].to_vec();
+            dormant_output[start..start + 32].fill(0);
+            states.push(MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: vec![MachOArchiveMemberIdentity {
+                    normalized_identifier: archive_member_patch_identifier(identifier),
+                    object_hash: hash_bytes(bytes),
+                }],
+                active: false,
+                sections: vec![FilePatchSectionState {
+                    input: relocation.input.to_string(),
+                    section_index: 1,
+                    section_name: Some("__TEXT,__text".to_owned()),
+                    input_size: 32,
+                    output_offset,
+                    output_size: 32,
+                    data_hash: None,
+                    cstring_nul_boundaries_hash: None,
+                }],
+                relocations: vec![relocation],
+                symbol_resolutions: Vec::new(),
+                indirect_dependencies: vec![dependency.clone()],
+                rollback_symbol_resolutions: Vec::new(),
+                forward_patches: vec![StoredOutputPatch {
+                    output_offset,
+                    data: forward,
+                }],
+                rollback_patches: vec![StoredOutputPatch {
+                    output_offset,
+                    data: vec![0; 32],
+                }],
+            });
+        }
+        let current_archive = test_archive(&[
+            (identifiers[0], member_bytes[0]),
+            (identifiers[1], member_bytes[1]),
+        ]);
+        let resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let patch = FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: states,
+            sections: Vec::new(),
+            raw_sections: None,
+        };
+        let activation = reactivated_macho_archive_text_activation(
+            &current_archive,
+            &input_file,
+            &[identifiers[0].to_vec(), identifiers[1].to_vec()],
+            &resolver,
+            &patch,
+            &dormant_output,
+            &[],
+            &[],
+            &[],
+            true,
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(activation.member_states.len(), 2);
+        assert_eq!(activation.reactivated_relocations.len(), 2);
+        assert_eq!(
+            activation.indirect_dependencies_to_publish,
+            vec![dependency]
         );
     }
 
@@ -74819,6 +76522,7 @@ mod tests {
                 addend: 0,
             }],
             symbol_resolutions: Vec::new(),
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset,
@@ -74988,6 +76692,7 @@ mod tests {
             )],
             &[],
             &[],
+            true,
         )
         .unwrap()
         .unwrap()
@@ -81602,6 +83307,14 @@ mod tests {
                 .replace(&hex::encode(identifier), &hex::encode("dormant.member.o")),
             ..section.clone()
         };
+        let indirect_dependency = MachOSymbolResolutionRecord {
+            name: hex::encode("_memcpy").into(),
+            direct_value: None,
+            got_address: Some(0x3000),
+            stub_address: Some(0x4000),
+            thunk_addresses: Vec::new(),
+            target: None,
+        };
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
@@ -81617,6 +83330,7 @@ mod tests {
                     sections: vec![section.clone()],
                     relocations: Vec::new(),
                     symbol_resolutions: Vec::new(),
+                    indirect_dependencies: vec![indirect_dependency.clone()],
                     rollback_symbol_resolutions: vec![dormant_resolution.clone()],
                     forward_patches: vec![StoredOutputPatch {
                         output_offset: 256,
@@ -81637,6 +83351,7 @@ mod tests {
                     sections: vec![dormant_section],
                     relocations: vec![dormant_relocation],
                     symbol_resolutions: vec![dormant_resolution.clone()],
+                    indirect_dependencies: vec![indirect_dependency],
                     rollback_symbol_resolutions: vec![dormant_resolution],
                     forward_patches: vec![StoredOutputPatch {
                         output_offset: 512,
@@ -81679,11 +83394,49 @@ mod tests {
             .to_string()
             .contains("transaction is incomplete")
         );
+        let v46_members = current_members
+            .split(';')
+            .map(|member| {
+                let parts = member.split(':').collect::<Vec<_>>();
+                assert_eq!(parts.len(), 9);
+                parts[..8].join(":")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let indexed_sections_file = format!(
+            "{COMPRESSED_SECTIONS_FILE_PREFIX}{}",
+            "a".repeat(blake3::OUT_LEN * 2)
+        );
+        let indexed_rendered = state.render_index(
+            &indexed_sections_file,
+            Some(&indexed_sections_file),
+            &[],
+            None,
+            state.macho_symbol_resolutions_file.as_deref(),
+            state.indexed_macho_symbol_resolutions_file.as_deref(),
+        );
+        assert!(indexed_rendered.contains("\nindexed-sections-file\t"));
+        let v46_rendered = indexed_rendered
+            .replacen(STATE_VERSION, STATE_VERSION_V46, 1)
+            .replacen(&current_members, &v46_members, 1);
+        let mut expected_v46 = state.clone();
+        expected_v46.sections_file = Some(indexed_sections_file.clone());
+        expected_v46.patch_records_file = Some(indexed_sections_file);
+        for member in &mut expected_v46.input_files[0]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members
+        {
+            member.indirect_dependencies.clear();
+        }
+        assert_eq!(PersistedState::parse(&v46_rendered).unwrap(), expected_v46);
+
         let legacy_members = current_members
             .split(';')
             .map(|member| {
                 let parts = member.split(':').collect::<Vec<_>>();
-                assert_eq!(parts.len(), 8);
+                assert_eq!(parts.len(), 9);
                 [
                     parts[0], parts[1], parts[2], parts[3], parts[4], parts[6], parts[7],
                 ]
@@ -81699,6 +83452,7 @@ mod tests {
             .clone();
         for member in &mut expected_v43_members {
             member.rollback_symbol_resolutions.clear();
+            member.indirect_dependencies.clear();
         }
         assert_eq!(
             parse_macho_archive_member_states(state.input_files[0].path.as_str(), &legacy_members,)
@@ -81750,6 +83504,7 @@ mod tests {
             sections: Vec::new(),
             relocations: Vec::new(),
             symbol_resolutions: vec![resolution],
+            indirect_dependencies: Vec::new(),
             rollback_symbol_resolutions: Vec::new(),
             forward_patches: vec![StoredOutputPatch {
                 output_offset: 256,
@@ -81809,6 +83564,7 @@ mod tests {
                 sections: Vec::new(),
                 relocations: Vec::new(),
                 symbol_resolutions: vec![resolution],
+                indirect_dependencies: Vec::new(),
                 rollback_symbol_resolutions: Vec::new(),
                 forward_patches: vec![StoredOutputPatch {
                     output_offset: 256,
