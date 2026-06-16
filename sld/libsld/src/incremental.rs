@@ -38694,6 +38694,102 @@ fn output_macho_archive_fde_address(
     Ok((address, width))
 }
 
+#[derive(Clone, Copy)]
+struct OutputMachOArchiveFde {
+    entry_offset: usize,
+    identity: MachOUnwindFunctionIdentity,
+    range_field_offset: usize,
+    range_field_width: u8,
+}
+
+fn output_macho_archive_fdes(
+    data: &[u8],
+    eh_frame_address: u64,
+    entries: &HashMap<usize, std::ops::Range<usize>>,
+) -> std::result::Result<Vec<OutputMachOArchiveFde>, String> {
+    let mut entry_offsets = entries.keys().copied().collect::<Vec<_>>();
+    entry_offsets.sort_unstable();
+    let mut cies = HashMap::<usize, OutputMachOArchiveCie>::new();
+    let mut fdes = Vec::new();
+    for entry_offset in entry_offsets {
+        let entry_range = &entries[&entry_offset];
+        let cie_pointer = read_u32_le(
+            data.get(entry_range.start + 4..entry_range.start + 8)
+                .expect("validated EH-frame entry header"),
+        )
+        .unwrap() as usize;
+        if cie_pointer == 0 {
+            continue;
+        }
+        let cie_start = entry_range
+            .start
+            .checked_add(4)
+            .and_then(|offset| offset.checked_sub(cie_pointer));
+        let Some(cie_range) = cie_start.and_then(|start| entries.get(&start)) else {
+            return Err("retired Mach-O FDE references a missing CIE".to_owned());
+        };
+        if read_u32_le(
+            data.get(cie_range.start + 4..cie_range.start + 8)
+                .expect("validated EH-frame entry header"),
+        ) != Some(0)
+        {
+            return Err("retired Mach-O FDE references a non-CIE entry".to_owned());
+        }
+        let cie = if let Some(cie) = cies.get(&cie_range.start) {
+            *cie
+        } else {
+            let cie = output_macho_archive_cie(data, cie_range.clone())?;
+            cies.insert(cie_range.start, cie);
+            cie
+        };
+        let pc_offset = entry_range.start + 8;
+        let pc_address = eh_frame_address
+            .checked_add(pc_offset as u64)
+            .ok_or_else(|| "retired Mach-O FDE PC-begin address overflowed".to_owned())?;
+        let (function_address, pc_width) = output_macho_archive_fde_address(
+            data,
+            pc_offset,
+            pc_address,
+            cie.fde_pointer_encoding,
+            cie.address_size,
+        )?;
+        let range_field_offset = pc_offset + usize::from(pc_width);
+        let range_field_width = added_macho_archive_dwarf_pointer_width(
+            cie.fde_pointer_encoding & 0x0f,
+            cie.address_size,
+        )
+        .map_err(|_| "retired Mach-O FDE range encoding is unsupported".to_owned())?;
+        range_field_offset
+            .checked_add(usize::from(range_field_width))
+            .filter(|end| *end <= entry_range.end)
+            .ok_or_else(|| "retired Mach-O FDE range is truncated".to_owned())?;
+        let function_length =
+            read_added_macho_unwind_pointer(data, range_field_offset, range_field_width)
+                .expect("validated retired Mach-O FDE range");
+        if function_length == 0 {
+            continue;
+        }
+        let function_length = u32::try_from(function_length)
+            .map_err(|_| "retired Mach-O FDE range exceeds u32".to_owned())?;
+        let function_offset = function_address
+            .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or_else(|| {
+                "retired Mach-O FDE PC-begin is outside the image-offset range".to_owned()
+            })?;
+        fdes.push(OutputMachOArchiveFde {
+            entry_offset,
+            identity: MachOUnwindFunctionIdentity {
+                function_offset,
+                length: function_length,
+            },
+            range_field_offset,
+            range_field_width,
+        });
+    }
+    Ok(fdes)
+}
+
 fn validate_zero_hint_macho_archive_fde_retirement(
     added_entries: &[crate::macho_writer::UnwindInfoEntry],
     retired_entries: &[MachOUnwindFunctionIdentity],
@@ -38753,6 +38849,10 @@ fn retired_macho_archive_fde_range_patches(
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
     };
+    let physical_fdes = match output_macho_archive_fdes(data, eh_frame.address(), &entries) {
+        Ok(fdes) => fdes,
+        Err(reason) => return Ok(Err(reason)),
+    };
     let mut claimed_hints = HashSet::with_capacity(retired_entries.len());
     let mut patches = Vec::with_capacity(retired_entries.len());
     for retired in retired_entries {
@@ -38784,90 +38884,38 @@ fn retired_macho_archive_fde_range_patches(
                 "retired Mach-O FDE unwind-info hint is duplicated".to_owned()
             ));
         }
-        let Some(fde_range) = entries.get(&hint) else {
+        let overlapping = physical_fdes
+            .iter()
+            .filter(|fde| {
+                added_macho_archive_unwind_ranges_overlap(
+                    fde.identity.function_offset,
+                    fde.identity.length,
+                    retired.function_offset,
+                    retired.length,
+                )
+            })
+            .collect::<Vec<_>>();
+        let [physical_fde] = overlapping.as_slice() else {
             return Ok(Err(
-                "retired Mach-O FDE unwind-info hint does not locate an entry".to_owned(),
+                "retired Mach-O FDE does not have one unique nonzero physical output range"
+                    .to_owned(),
             ));
         };
-        let cie_pointer = read_u32_le(
-            data.get(fde_range.start + 4..fde_range.start + 8)
-                .expect("validated EH-frame entry header"),
-        )
-        .unwrap() as usize;
-        if cie_pointer == 0 {
+        if physical_fde.entry_offset != hint {
             return Ok(Err(
-                "retired Mach-O FDE unwind-info hint locates a CIE".to_owned()
-            ));
-        }
-        let cie_start = fde_range
-            .start
-            .checked_add(4)
-            .and_then(|offset| offset.checked_sub(cie_pointer));
-        let Some(cie_range) = cie_start.and_then(|start| entries.get(&start)) else {
-            return Ok(Err("retired Mach-O FDE references a missing CIE".to_owned()));
-        };
-        if read_u32_le(
-            data.get(cie_range.start + 4..cie_range.start + 8)
-                .expect("validated EH-frame entry header"),
-        ) != Some(0)
-        {
-            return Ok(Err(
-                "retired Mach-O FDE references a non-CIE entry".to_owned()
+                "retired Mach-O FDE unwind-info hint does not locate its unique physical range"
+                    .to_owned(),
             ));
         }
-        let cie = match output_macho_archive_cie(data, cie_range.clone()) {
-            Ok(cie) => cie,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        let pc_offset = fde_range.start + 8;
-        let Some(pc_address) = eh_frame.address().checked_add(pc_offset as u64) else {
-            return Ok(Err(
-                "retired Mach-O FDE PC-begin address overflowed".to_owned()
-            ));
-        };
-        let (function_address, pc_width) = match output_macho_archive_fde_address(
-            data,
-            pc_offset,
-            pc_address,
-            cie.fde_pointer_encoding,
-            cie.address_size,
-        ) {
-            Ok(value) => value,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        let range_offset = pc_offset + usize::from(pc_width);
-        let range_width = match added_macho_archive_dwarf_pointer_width(
-            cie.fde_pointer_encoding & 0x0f,
-            cie.address_size,
-        ) {
-            Ok(width) => width,
-            Err(_) => {
-                return Ok(Err(
-                    "retired Mach-O FDE range encoding is unsupported".to_owned()
-                ));
-            }
-        };
-        let function_length = read_added_macho_unwind_pointer(data, range_offset, range_width)
-            .and_then(|length| u32::try_from(length).ok())
-            .filter(|length| *length != 0);
-        let function_offset = function_address
-            .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
-            .and_then(|offset| u32::try_from(offset).ok());
-        if function_offset != Some(retired.function_offset)
-            || function_length != Some(retired.length)
-        {
+        if physical_fde.identity != *retired {
             return Ok(Err(
                 "retired Mach-O FDE does not match its unwind-info identity".to_owned(),
             ));
         }
-        let range_end = range_offset + usize::from(range_width);
-        if range_end > fde_range.end {
-            return Ok(Err("retired Mach-O FDE range is truncated".to_owned()));
-        }
         patches.push(SectionPatch {
-            output_offset: eh_frame_file_offset + range_offset as u64,
-            size: u64::from(range_width),
-            data: vec![0; usize::from(range_width)],
+            output_offset: eh_frame_file_offset + physical_fde.range_field_offset as u64,
+            size: u64::from(physical_fde.range_field_width),
+            data: vec![0; usize::from(physical_fde.range_field_width)],
             deferred_relocation: None,
             preserve_ranges: Vec::new(),
             adjustments: Vec::new(),
@@ -39060,6 +39108,25 @@ fn validate_macho_archive_unwind_version_output(
         .is_none_or(|suffix| suffix.iter().any(|byte| *byte != 0))
     {
         return Err("Mach-O unwind transaction reserve suffix is not zero".to_owned());
+    }
+    let entries = output_macho_archive_eh_frame_entries(data)?;
+    let mut physical_fdes = output_macho_archive_fdes(data, eh_frame.address(), &entries)?;
+    physical_fdes.sort_by_key(|fde| {
+        (
+            fde.identity.function_offset,
+            fde.identity.length,
+            fde.entry_offset,
+        )
+    });
+    if physical_fdes.windows(2).any(|pair| {
+        added_macho_archive_unwind_ranges_overlap(
+            pair[0].identity.function_offset,
+            pair[0].identity.length,
+            pair[1].identity.function_offset,
+            pair[1].identity.length,
+        )
+    }) {
+        return Err("Mach-O unwind transaction has overlapping nonzero physical FDEs".to_owned());
     }
 
     let unwind_info_index =
@@ -68502,12 +68569,12 @@ mod tests {
         .unwrap();
         validate_macho_archive_unwind_version_output(&output.bytes, &version(section_end)).unwrap();
         let alignment = crate::alignment::Alignment { exponent: 3 };
-        for terminator_offset in [5_u64, 6, 7] {
+        for terminator_offset in [9_u64, 10, 11] {
             let mut producer_output = output.bytes.clone();
             let entry_start = output.eh_frame_offset as usize;
             producer_output[entry_start..entry_start + 4]
                 .copy_from_slice(&u32::try_from(terminator_offset - 4).unwrap().to_le_bytes());
-            producer_output[entry_start + 4..entry_start + terminator_offset as usize].fill(1);
+            producer_output[entry_start + 8..entry_start + terminator_offset as usize].fill(1);
             let terminator_start = output.eh_frame_offset + terminator_offset;
             let full_link_start = alignment.align_up(terminator_start);
             let incremental_start = alignment.align_up(terminator_start + 4);
@@ -68763,6 +68830,78 @@ mod tests {
             macho_unwind_fde_identities(member.input.as_str(), &unwind, &sections, &output_file)
                 .unwrap_err();
         assert!(failure.contains("duplicate physical FDE identities"));
+    }
+
+    #[test]
+    fn stale_output_fde_rejects_zero_hint_replacement_and_transaction_reuse() {
+        let (mut output, entries, identities, range_offsets) =
+            test_macho_retirable_fdes(4, &[0x40, 0x50]);
+        let second_pc_offset = range_offsets[1] - 4;
+        let second_pc_address = crate::macho::MACHO_START_MEM_ADDRESS
+            + output.eh_frame_offset
+            + second_pc_offset as u64;
+        let retired_address =
+            crate::macho::MACHO_START_MEM_ADDRESS + u64::from(identities[0].function_offset);
+        let delta =
+            i32::try_from(i128::from(retired_address) - i128::from(second_pc_address)).unwrap();
+        let second_pc = output.eh_frame_offset as usize + second_pc_offset;
+        output.bytes[second_pc..second_pc + 4].copy_from_slice(&delta.to_le_bytes());
+        let second_range = output.eh_frame_offset as usize + range_offsets[1];
+        output.bytes[second_range..second_range + 4]
+            .copy_from_slice(&identities[0].length.to_le_bytes());
+
+        let mut one_unwind_entry = vec![0; 0x1000];
+        crate::macho_writer::serialize_macho_unwind_info(
+            &mut one_unwind_entry,
+            vec![entries[0]],
+            output.text_offset as u32 + 0x800,
+        )
+        .unwrap();
+        let unwind_start = output.unwind_info_offset as usize;
+        output.bytes[unwind_start..unwind_start + one_unwind_entry.len()]
+            .copy_from_slice(&one_unwind_entry);
+
+        let zero_hint_replacement = crate::macho_writer::UnwindInfoEntry {
+            function_offset: identities[0].function_offset,
+            length: identities[0].length,
+            encoding: ADDED_MACHO_UNWIND_MODE_DWARF,
+            personality_offset: None,
+            lsda_offset: None,
+        };
+        validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&zero_hint_replacement),
+            &identities[..1],
+            &identities[..1],
+        )
+        .unwrap();
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let retirement = retired_macho_archive_fde_range_patches(
+            &output_file,
+            &entries[..1],
+            &identities[..1],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            retirement,
+            Err(reason) if reason.contains("unique nonzero physical output range")
+        ));
+
+        let eh_frame = output_file.section_by_name("__eh_frame").unwrap();
+        let terminator = eh_frame_terminator_offset(eh_frame.data().unwrap()).unwrap() as u64;
+        let section_end = output.eh_frame_offset + output.eh_frame_size;
+        let reserve_start = crate::alignment::Alignment { exponent: 3 }
+            .align_up(output.eh_frame_offset + terminator);
+        let version = MachOArchiveUnwindVersionState {
+            common_members: Vec::new(),
+            eh_frame_reserve: MachOEhFrameReserveState {
+                start: reserve_start,
+                end: section_end,
+            },
+        };
+        let failure =
+            validate_macho_archive_unwind_version_output(&output.bytes, &version).unwrap_err();
+        assert!(failure.contains("overlapping nonzero physical FDEs"));
     }
 
     #[test]
