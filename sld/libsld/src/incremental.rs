@@ -18198,6 +18198,7 @@ fn macho_local_symbol_cohort_retains_published_sites(
         && previous_sites == current_sites
 }
 
+#[cfg(test)]
 fn macho_local_symbol_cohort_retains_published_population(
     previous: &[MachOLocalSymbolCohortEntry],
     current: &[MachOLocalSymbolCohortEntry],
@@ -18592,6 +18593,15 @@ fn required_macho_local_cohort_atoms_are_reachable(
     reachable: &HashSet<(object::SectionIndex, u64)>,
 ) -> bool {
     required.iter().all(|atom| reachable.contains(atom))
+}
+
+fn macho_local_cohort_entry_liveness_is_proven(
+    supplement_retains_published_sites: bool,
+    required_current_entries: usize,
+    required_atoms_are_reachable: bool,
+) -> bool {
+    supplement_retains_published_sites
+        && (required_current_entries == 0 || required_atoms_are_reachable)
 }
 
 fn macho_local_cohort_atom_graph_is_complete(
@@ -19883,8 +19893,6 @@ fn plan_macho_local_symbol_cohort(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let standard_retains_published_population =
-        macho_local_symbol_cohort_retains_published_population(&previous, &current);
     let supplement_retains_published_sites = supplement.as_ref().is_none_or(|supplement| {
         macho_local_symbol_cohort_retains_published_sites(&supplement.previous, &supplement.current)
     });
@@ -19920,10 +19928,10 @@ fn plan_macho_local_symbol_cohort(
     }
     // Direct patches preserve the liveness of exact previously published entries. Entries that
     // are added, moved, renamed, or metadata-changed still require a current graph proof.
-    let retained_atoms_are_live =
-        standard_retains_published_population && supplement_retains_published_sites;
-    let current_atoms_are_live = retained_atoms_are_live
-        || current_macho_local_cohort_atoms_are_live(
+    let required_atoms_are_reachable = if required_current_entries.is_empty() {
+        true
+    } else {
+        current_macho_local_cohort_atoms_are_live(
             relocations,
             symbol_resolutions,
             input_file_path,
@@ -19938,7 +19946,13 @@ fn plan_macho_local_symbol_cohort(
             rematerialized_sections,
             &required_current_entries,
             normalize_rust_archive_patch_inputs,
-        )?;
+        )?
+    };
+    let current_atoms_are_live = macho_local_cohort_entry_liveness_is_proven(
+        supplement_retains_published_sites,
+        required_current_entries.len(),
+        required_atoms_are_reachable,
+    );
     if !current_atoms_are_live {
         return Ok(Err(
             "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
@@ -54330,6 +54344,18 @@ mod tests {
             &previous,
             &moved_named,
         ));
+        assert!(macho_local_cohort_entry_liveness_is_proven(true, 0, false));
+        assert!(!macho_local_cohort_entry_liveness_is_proven(
+            true,
+            moved_named.len(),
+            false,
+        ));
+        assert!(macho_local_cohort_entry_liveness_is_proven(
+            true,
+            moved_named.len(),
+            true,
+        ));
+        assert!(!macho_local_cohort_entry_liveness_is_proven(false, 0, true,));
 
         let mixed = vec![entry(b"new.0", 1, 0x1000, 0), entry(b"old.1", 1, 0x1030, 0)];
         assert!(macho_local_symbol_cohort_retains_published_population(
