@@ -5877,6 +5877,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut deferred_loaded_input_content_hashes = Vec::new();
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
+    let mut dormant_macho_archive_states = Vec::new();
     let mut record_override_input_files = HashSet::new();
     let changed_input_files = changed_inputs
         .iter()
@@ -8826,6 +8827,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             update_fde_records(&mut previous.fdes, updated_fdes);
             record_override_input_files.insert(previous.input_files[*input_index].path.clone());
         }
+        dormant_macho_archive_states.extend(dormant_macho_archive_state_refs(
+            *input_index,
+            &macho_archive_members,
+        ));
         previous.input_files[*input_index].content = input_content;
         previous.input_files[*input_index].snapshot_identity = None;
         previous.input_files[*input_index].rustc_link_content_digest = rustc_provenance
@@ -9207,10 +9212,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         &mut expected_changed_inputs,
         deferred_loaded_input_content_hashes,
     )?;
-    let dormant_macho_archive_states = dormant_macho_archive_state_refs_for_inputs(
-        &previous.input_files,
-        changed_inputs.iter().map(|(input_index, _)| *input_index),
-    );
     let refreshed_macho_archive_rollback_patch_count =
         match refresh_dormant_macho_archive_rollback_patches(
             &mut previous.input_files,
@@ -25227,35 +25228,19 @@ fn stored_output_patches_match(patches: &[StoredOutputPatch], output: &[u8]) -> 
     })
 }
 
-fn dormant_macho_archive_state_refs_for_inputs(
-    input_files: &[FileState],
-    input_indices: impl IntoIterator<Item = usize>,
+fn dormant_macho_archive_state_refs(
+    input_index: usize,
+    states: &[MachOArchiveActivationState],
 ) -> Vec<RetiredMachOArchiveStateRef> {
-    let mut seen_inputs = HashSet::new();
-    let mut refs = Vec::new();
-    for input_index in input_indices {
-        if !seen_inputs.insert(input_index) {
-            continue;
-        }
-        let Some(patch) = input_files
-            .get(input_index)
-            .and_then(|input| input.patch.as_ref())
-        else {
-            continue;
-        };
-        refs.extend(
-            patch
-                .macho_archive_members
-                .iter()
-                .enumerate()
-                .filter(|(_, state)| !state.active)
-                .map(|(state_index, _)| RetiredMachOArchiveStateRef {
-                    input_index,
-                    state_index,
-                }),
-        );
-    }
-    refs
+    states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| !state.active)
+        .map(|(state_index, _)| RetiredMachOArchiveStateRef {
+            input_index,
+            state_index,
+        })
+        .collect()
 }
 
 fn refresh_dormant_macho_archive_rollback_patches(
@@ -63836,14 +63821,21 @@ mod tests {
             raw_sections: None,
         });
         assert!(
-            dormant_macho_archive_state_refs_for_inputs(&inputs, [0]).is_empty(),
+            dormant_macho_archive_state_refs(
+                0,
+                &inputs[0].patch.as_ref().unwrap().macho_archive_members,
+            )
+            .is_empty(),
             "the full-link seed unexpectedly has archive ownership state",
         );
         inputs[0].patch.as_mut().unwrap().macho_archive_members = vec![dormant, active];
         let mut output = vec![0; 48];
         output[16..32].copy_from_slice(&new_forward);
 
-        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        let dormant = dormant_macho_archive_state_refs(
+            0,
+            &inputs[0].patch.as_ref().unwrap().macho_archive_members,
+        );
         assert_eq!(
             dormant,
             vec![RetiredMachOArchiveStateRef {
@@ -63894,7 +63886,10 @@ mod tests {
         states[0].active = true;
         states[1].active = false;
         output[16..32].copy_from_slice(&old_forward);
-        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        let dormant = dormant_macho_archive_state_refs(
+            0,
+            &inputs[0].patch.as_ref().unwrap().macho_archive_members,
+        );
         refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
@@ -63907,7 +63902,10 @@ mod tests {
         states[0].active = false;
         states[1].active = true;
         output[16..32].copy_from_slice(&new_forward);
-        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        let dormant = dormant_macho_archive_state_refs(
+            0,
+            &inputs[0].patch.as_ref().unwrap().macho_archive_members,
+        );
         refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
