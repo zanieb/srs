@@ -379,6 +379,7 @@ use object::LittleEndian;
 use object::Object as _;
 use object::ObjectKind;
 use object::ObjectSection;
+use object::ObjectSegment as _;
 use object::ObjectSymbol as _;
 use object::read::elf::ProgramHeader;
 use object::read::elf::SectionHeader as _;
@@ -6629,6 +6630,7 @@ impl Assertions {
                 self.verify_section_types(&elf_obj, linker_used)?;
             }
             object::File::MachO64(macho_obj) => {
+                verify_sld_macho_chained_fixups(&macho_obj, &bytes, linker_used)?;
                 self.verify_macho_build_version(&macho_obj)?;
                 self.verify_sld_macho_unwind_info(&macho_obj, linker_used)?;
                 if !self.expected_comments.is_empty() {
@@ -7066,6 +7068,153 @@ fn verify_no_overlapping_sections(obj: &object::File) -> Result {
     }
 
     Ok(())
+}
+
+fn verify_sld_macho_chained_fixups(
+    obj: &object::read::macho::MachOFile64<'_>,
+    bytes: &[u8],
+    linker_used: &Linker,
+) -> Result {
+    use object::read::macho::MachHeader as _;
+
+    if !linker_used.is_sld() {
+        return Ok(());
+    }
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0)?;
+    let endian = header.endian()?;
+    let mut commands = header.load_commands(endian, bytes, 0)?;
+    let mut payload = None;
+    while let Some(command) = commands.next()? {
+        if command.cmd() != object::macho::LC_DYLD_CHAINED_FIXUPS {
+            continue;
+        }
+        let command = command.data::<object::macho::LinkeditDataCommand<object::Endianness>>()?;
+        let start = usize::try_from(command.dataoff.get(endian))?;
+        let size = usize::try_from(command.datasize.get(endian))?;
+        let end = start
+            .checked_add(size)
+            .context("Mach-O chained-fixup payload range overflowed")?;
+        let command_payload = bytes
+            .get(start..end)
+            .context("Mach-O chained-fixup payload extends past the output")?;
+        ensure!(
+            payload.replace(command_payload).is_none(),
+            "Mach-O output has multiple chained-fixup commands"
+        );
+    }
+    let payload = payload.context("SLD Mach-O output has no chained-fixup command")?;
+    let starts_offset = read_macho_u32(payload, 4)? as usize;
+    let segment_count = read_macho_u32(payload, starts_offset)? as usize;
+
+    let data_segment = obj
+        .segments()
+        .find(|segment| segment.name().ok().flatten() == Some("__DATA"))
+        .context("SLD Mach-O output has no __DATA segment")?;
+    let (data_file_offset, data_file_size) = data_segment.file_range();
+
+    let mut saw_segment_fixups = false;
+    for segment_index in 0..segment_count {
+        let segment_info_offset = read_macho_u32(
+            payload,
+            starts_offset + size_of::<u32>() * (segment_index + 1),
+        )? as usize;
+        if segment_info_offset == 0 {
+            continue;
+        }
+        ensure!(
+            !saw_segment_fixups,
+            "SLD Mach-O output has chained fixups in multiple segments"
+        );
+        saw_segment_fixups = true;
+
+        let segment_info_start = starts_offset
+            .checked_add(segment_info_offset)
+            .context("Mach-O chained-fixup segment-info offset overflowed")?;
+        let segment_info_size = read_macho_u32(payload, segment_info_start)? as usize;
+        let page_size = u64::from(read_macho_u16(payload, segment_info_start + 4)?);
+        let page_count = usize::from(read_macho_u16(payload, segment_info_start + 20)?);
+        ensure!(page_size != 0, "Mach-O chained-fixup page size is zero");
+        let page_starts_offset = segment_info_start + 22;
+        let page_starts_size = page_count
+            .checked_mul(size_of::<u16>())
+            .context("Mach-O chained-fixup page-start array overflowed")?;
+        ensure!(
+            22 + page_starts_size <= segment_info_size,
+            "Mach-O chained-fixup page-start array exceeds its segment info"
+        );
+
+        let mut last_fixup_page = None;
+        for page_index in 0..page_count {
+            let page_start =
+                read_macho_u16(payload, page_starts_offset + page_index * size_of::<u16>())?;
+            if page_start == 0xffff {
+                continue;
+            }
+            last_fixup_page = Some(page_index);
+
+            let mut slot_offset = (page_index as u64)
+                .checked_mul(page_size)
+                .and_then(|offset| offset.checked_add(u64::from(page_start)))
+                .context("Mach-O chained-fixup slot offset overflowed")?;
+            let page_end = (page_index as u64 + 1)
+                .checked_mul(page_size)
+                .context("Mach-O chained-fixup page end overflowed")?;
+            loop {
+                let slot_end = slot_offset
+                    .checked_add(size_of::<u64>() as u64)
+                    .context("Mach-O chained-fixup slot range overflowed")?;
+                ensure!(
+                    slot_end <= data_file_size,
+                    "Mach-O chained-fixup slot {slot_offset:#x} is outside file-backed __DATA ending at {data_file_size:#x}"
+                );
+                ensure!(
+                    slot_end <= page_end,
+                    "Mach-O chained-fixup slot {slot_offset:#x} crosses its page boundary"
+                );
+
+                let file_offset = data_file_offset
+                    .checked_add(slot_offset)
+                    .context("Mach-O chained-fixup file offset overflowed")?;
+                let value = read_macho_u64(bytes, usize::try_from(file_offset)?)?;
+                let next = (value >> 51) & 0xfff;
+                if next == 0 {
+                    break;
+                }
+                slot_offset = slot_offset
+                    .checked_add(next * 4)
+                    .context("Mach-O chained-fixup next offset overflowed")?;
+            }
+        }
+
+        ensure!(
+            last_fixup_page.map(|page| page + 1) == Some(page_count),
+            "Mach-O chained-fixup table has trailing pages without fixups"
+        );
+    }
+
+    Ok(())
+}
+
+fn read_macho_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let bytes = bytes
+        .get(offset..offset + size_of::<u16>())
+        .context("Read past end of Mach-O data")?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_macho_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let bytes = bytes
+        .get(offset..offset + size_of::<u32>())
+        .context("Read past end of Mach-O data")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_macho_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let bytes = bytes
+        .get(offset..offset + size_of::<u64>())
+        .context("Read past end of Mach-O data")?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 fn dynamic_tag_name(tag: i64) -> Option<&'static str> {
