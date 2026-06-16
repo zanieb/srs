@@ -38566,19 +38566,14 @@ fn validate_macho_archive_unwind_version_output(
     let Some(terminator_offset) = eh_frame_terminator_offset(data) else {
         return Err("Mach-O unwind transaction has no __eh_frame terminator".to_owned());
     };
-    let terminator_end = section_start
-        .checked_add(terminator_offset as u64)
-        .and_then(|offset| offset.checked_add(4))
-        .ok_or_else(|| "Mach-O unwind transaction terminator overflowed".to_owned())?;
     let terminator_start = section_start
         .checked_add(terminator_offset as u64)
         .ok_or_else(|| "Mach-O unwind transaction terminator overflowed".to_owned())?;
     let alignment = crate::alignment::Alignment { exponent: 3 };
-    let full_link_start = alignment.align_up(terminator_start);
-    let incremental_start = alignment.align_up(terminator_end);
+    let minimum_reserve_start = alignment.align_up(terminator_start);
     if !reserve.start.is_multiple_of(8)
         || !reserve.end.is_multiple_of(8)
-        || (reserve.start != full_link_start && reserve.start != incremental_start)
+        || reserve.start < minimum_reserve_start
     {
         return Err(
             "Mach-O unwind transaction reserve start does not match a producer state".to_owned(),
@@ -67994,6 +67989,12 @@ mod tests {
             .unwrap();
         validate_macho_archive_unwind_version_output(&output.bytes, &version(incremental_start))
             .unwrap();
+        validate_macho_archive_unwind_version_output(
+            &output.bytes,
+            &version(incremental_start + 16),
+        )
+        .unwrap();
+        validate_macho_archive_unwind_version_output(&output.bytes, &version(section_end)).unwrap();
         let alignment = crate::alignment::Alignment { exponent: 3 };
         for terminator_offset in [5_u64, 6, 7] {
             let mut producer_output = output.bytes.clone();
@@ -68014,17 +68015,23 @@ mod tests {
                 &version(incremental_start),
             )
             .unwrap();
-        }
-        for invalid_start in [full_link_start + 4, full_link_start + 16] {
             assert!(
                 validate_macho_archive_unwind_version_output(
-                    &output.bytes,
-                    &version(invalid_start),
+                    &producer_output,
+                    &version(full_link_start - 8),
                 )
                 .unwrap_err()
                 .contains("producer state")
             );
         }
+        assert!(
+            validate_macho_archive_unwind_version_output(
+                &output.bytes,
+                &version(full_link_start + 4),
+            )
+            .unwrap_err()
+            .contains("producer state")
+        );
 
         let target_patches = vec![
             StoredOutputPatch {
@@ -68077,7 +68084,7 @@ mod tests {
         assert!(
             validate_macho_archive_unwind_version_output(
                 &output.bytes,
-                &version(incremental_start),
+                &version(incremental_start + 16),
             )
             .unwrap_err()
             .contains("suffix is not zero")
@@ -69587,15 +69594,15 @@ mod tests {
             .unwrap() = 1;
         reject(nonzero_suffix);
 
-        let mut noncanonical_start = historical_state.clone();
-        noncanonical_start
+        let mut unaligned_start = historical_state.clone();
+        unaligned_start
             .unwind_transaction
             .as_mut()
             .unwrap()
             .rollback
             .eh_frame_reserve
-            .start += 8;
-        reject(noncanonical_start);
+            .start += 4;
+        reject(unaligned_start);
 
         let mut wrong_end = historical_state.clone();
         wrong_end
