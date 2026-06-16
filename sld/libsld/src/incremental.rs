@@ -9048,6 +9048,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             &macho_resolution_moves,
                             &macho_resolution_updates.moves,
                             &macho_resolution_updates.output_symbols,
+                            &replays.rematerialized_sections,
                             &direct_macho_cgu_liveness_proof,
                             &mut replays.local_symbol_cohorts,
                         )?
@@ -26449,6 +26450,7 @@ fn validate_macho_data_relocations_are_stable(
     resolution_moves: &[MachOSymbolResolutionMove],
     liveness_resolution_moves: &[MachOSymbolResolutionMove],
     liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
+    rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     local_symbol_cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
 ) -> Result<std::result::Result<bool, String>> {
@@ -27051,7 +27053,7 @@ fn validate_macho_data_relocations_are_stable(
                         &current_file,
                         previous_output,
                         &output_file,
-                        &[],
+                        rematerialized_sections,
                         &[],
                         direct_macho_cgu_liveness_proof,
                         normalize_rust_archive_patch_inputs,
@@ -65394,6 +65396,7 @@ mod tests {
                 &resolution_moves,
                 &[],
                 &[],
+                &[],
                 &DirectMachOCguLivenessProof::default(),
                 &mut local_symbol_cohorts,
             )
@@ -65443,6 +65446,7 @@ mod tests {
             &previous_output,
             &mut target_patches,
             std::slice::from_ref(&resolution_move),
+            &[],
             &[],
             &[],
             &DirectMachOCguLivenessProof::default(),
@@ -66137,10 +66141,20 @@ mod tests {
 
     #[test]
     fn archived_data_const_retarget_requires_and_applies_local_cohort() {
-        let previous_member = test_macho_local_data_retarget_object(b"l_anon.20", 0x10);
-        let current_member = test_macho_local_data_retarget_object(b"l_anon.22", 0x10);
-        let previous_identifier = b"crate.codegen.rcgu.o";
-        let current_identifier = b"crate.codegen.rcgu.o";
+        let previous_member = test_macho_local_data_retarget_object_with_text_graph(
+            b"l_anon.20",
+            0x10,
+            b"l_live.1",
+            4,
+        );
+        let current_member = test_macho_local_data_retarget_object_with_text_graph(
+            b"l_anon.22",
+            0x10,
+            b"l_live.2",
+            8,
+        );
+        let previous_identifier = b"crate.cgu.old.rcgu.o";
+        let current_identifier = b"crate.cgu.new.rcgu.o";
         let archive = |identifier: &[u8], member: &[u8]| {
             let mut builder = ar::Builder::new(Vec::new());
             builder
@@ -66162,12 +66176,20 @@ mod tests {
         assert_eq!(current_source.segment_name().unwrap(), Some("__DATA"));
         let previous_target = previous_file
             .sections()
-            .find(|section| section.segment_name().unwrap() == Some("__TEXT"))
+            .find(|section| {
+                section.segment_name().unwrap() == Some("__TEXT")
+                    && section.name().unwrap() == "__const"
+            })
             .unwrap();
         let current_target = current_file
             .sections()
-            .find(|section| section.segment_name().unwrap() == Some("__TEXT"))
+            .find(|section| {
+                section.segment_name().unwrap() == Some("__TEXT")
+                    && section.name().unwrap() == "__const"
+            })
             .unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
         let target_section_index = relocation_target_record_index(previous_target.index()).unwrap();
 
         let mut previous_output = previous_member.clone();
@@ -66178,11 +66200,18 @@ mod tests {
             .unwrap();
         let output_target = output_file
             .sections()
-            .find(|section| section.segment_name().unwrap() == Some("__TEXT"))
+            .find(|section| {
+                section.segment_name().unwrap() == Some("__TEXT")
+                    && section.name().unwrap() == "__const"
+            })
             .unwrap();
+        let output_text = output_file.section_by_name("__text").unwrap();
         let source_output_offset = output_source.file_range().unwrap().0;
         let output_target_address = output_target.address();
         let output_target_offset = output_target.file_range().unwrap().0;
+        let output_text_offset = output_text.file_range().unwrap().0;
+        let previous_live_value = output_text.address() + 4;
+        let current_live_value = output_text.address() + 8;
         let target_values = [output_target_address + 0x10, output_target_address + 0x30];
         drop(output_file);
         previous_output[source_output_offset as usize..source_output_offset as usize + 8]
@@ -66203,30 +66232,65 @@ mod tests {
         };
         let previous_input = input_ref(&previous, previous_identifier);
         let current_input = input_ref(&current, current_identifier);
-        let matched = vec![MatchedPatchSection {
-            previous: PatchSection {
-                input: previous_input.clone(),
-                section_index: patch_section_record_index(&previous_file, previous_source.index())
+        let matched = vec![
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_source.index(),
+                    )
                     .unwrap(),
-                section_name: Some("__DATA,__const".to_owned()),
-                input_size: previous_source.size(),
-                output_offset: source_output_offset,
-                output_size: previous_source.size(),
-                data_hash: Some(hash_bytes(previous_source.data().unwrap())),
-                cstring_nul_boundaries_hash: None,
-            },
-            current: PatchSection {
-                input: current_input.clone(),
-                section_index: patch_section_record_index(&current_file, current_source.index())
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: previous_source.size(),
+                    output_offset: source_output_offset,
+                    output_size: previous_source.size(),
+                    data_hash: Some(hash_bytes(previous_source.data().unwrap())),
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input.clone(),
+                    section_index: patch_section_record_index(
+                        &current_file,
+                        current_source.index(),
+                    )
                     .unwrap(),
-                section_name: Some("__DATA,__const".to_owned()),
-                input_size: current_source.size(),
-                output_offset: source_output_offset,
-                output_size: current_source.size(),
-                data_hash: Some(hash_bytes(current_source.data().unwrap())),
-                cstring_nul_boundaries_hash: None,
+                    section_name: Some("__DATA,__const".to_owned()),
+                    input_size: current_source.size(),
+                    output_offset: source_output_offset,
+                    output_size: current_source.size(),
+                    data_hash: Some(hash_bytes(current_source.data().unwrap())),
+                    cstring_nul_boundaries_hash: None,
+                },
             },
-        }];
+            MatchedPatchSection {
+                previous: PatchSection {
+                    input: previous_input.clone(),
+                    section_index: patch_section_record_index(
+                        &previous_file,
+                        previous_text.index(),
+                    )
+                    .unwrap(),
+                    section_name: Some("__TEXT,__text".to_owned()),
+                    input_size: previous_text.size(),
+                    output_offset: output_text_offset,
+                    output_size: previous_text.size(),
+                    data_hash: Some(hash_bytes(previous_text.data().unwrap())),
+                    cstring_nul_boundaries_hash: None,
+                },
+                current: PatchSection {
+                    input: current_input.clone(),
+                    section_index: patch_section_record_index(&current_file, current_text.index())
+                        .unwrap(),
+                    section_name: Some("__TEXT,__text".to_owned()),
+                    input_size: current_text.size(),
+                    output_offset: output_text_offset,
+                    output_size: current_text.size(),
+                    data_hash: Some(hash_bytes(current_text.data().unwrap())),
+                    cstring_nul_boundaries_hash: None,
+                },
+            },
+        ];
         let raw_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
             r_address: 0,
             r_symbolnum: 0,
@@ -66305,41 +66369,48 @@ mod tests {
         let previous_resolver = PatchInputResolver::new(&previous, true).unwrap();
         let current_resolver = PatchInputResolver::new(&current, true).unwrap();
         let original_relocations = relocations.clone();
-        let validate = |relocations: &mut [RelocationRecord],
-                        matched_sections: &[MatchedPatchSection],
-                        cohorts: &[MachOLocalSymbolCohortPlan]| {
-            let mut cohorts = cohorts.to_vec();
-            let mut target_patches = RelocationTargetPatches {
-                input_ranges: Vec::new(),
-                output_patches: Vec::new(),
-                output_symbols: Vec::new(),
-                macho_target_moves: Vec::new(),
-                macho_cross_input_target_moves: Vec::new(),
-                validated_macho_local_retargets: Vec::new(),
-                validated_macho_local_text_retargets: Vec::new(),
-                changed_relocation_indices: Vec::new(),
+        let validate =
+            |relocations: &mut [RelocationRecord],
+             matched_sections: &[MatchedPatchSection],
+             cohorts: &[MachOLocalSymbolCohortPlan],
+             rematerialized_sections: &[(SharedText, String, u32, String, u32)]| {
+                let mut cohorts = cohorts.to_vec();
+                let mut target_patches = RelocationTargetPatches {
+                    input_ranges: Vec::new(),
+                    output_patches: Vec::new(),
+                    output_symbols: Vec::new(),
+                    macho_target_moves: Vec::new(),
+                    macho_cross_input_target_moves: Vec::new(),
+                    validated_macho_local_retargets: Vec::new(),
+                    validated_macho_local_text_retargets: Vec::new(),
+                    changed_relocation_indices: Vec::new(),
+                };
+                let result = validate_macho_data_relocations_are_stable(
+                    relocations,
+                    &[],
+                    &input,
+                    matched_sections,
+                    &previous_resolver,
+                    &current_resolver,
+                    &previous_output,
+                    &mut target_patches,
+                    &[],
+                    &[],
+                    &[],
+                    rematerialized_sections,
+                    &DirectMachOCguLivenessProof::default(),
+                    &mut cohorts,
+                )
+                .unwrap();
+                (result, target_patches, cohorts)
             };
-            let result = validate_macho_data_relocations_are_stable(
-                relocations,
-                &[],
-                &input,
-                matched_sections,
-                &previous_resolver,
-                &current_resolver,
-                &previous_output,
-                &mut target_patches,
-                &[],
-                &[],
-                &[],
-                &DirectMachOCguLivenessProof::default(),
-                &mut cohorts,
-            )
-            .unwrap();
-            (result, target_patches, cohorts)
-        };
 
-        let (result, target_patches, planned_cohorts) =
-            validate(&mut relocations, &matched, std::slice::from_ref(&cohort));
+        let (result, target_patches, planned_cohorts) = validate(
+            &mut relocations,
+            &matched,
+            std::slice::from_ref(&cohort),
+            &[],
+        );
         assert!(result.unwrap());
         assert_eq!(planned_cohorts, [cohort.clone()]);
         assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
@@ -66389,29 +66460,108 @@ mod tests {
                 &mut without_records,
                 &matched,
                 std::slice::from_ref(&cohort),
+                &[],
             )
             .0
             .is_err()
         );
         let mut without_preplanned_cohort = original_relocations.clone();
-        let (result, target_patches, planned_cohorts) =
-            validate(&mut without_preplanned_cohort, &matched, &[]);
+        let exact_rematerialized_text = [(
+            input.path.clone().into(),
+            matched[1].previous.input.clone(),
+            matched[1].previous.section_index,
+            matched[1].current.input.clone(),
+            matched[1].current.section_index,
+        )];
+        assert!(
+            validate(&mut without_preplanned_cohort, &matched, &[], &[])
+                .0
+                .is_err()
+        );
+        let mut without_preplanned_cohort = original_relocations.clone();
+        let (result, target_patches, planned_cohorts) = validate(
+            &mut without_preplanned_cohort,
+            &matched,
+            &[],
+            &exact_rematerialized_text,
+        );
         assert!(result.unwrap());
         let [planned] = planned_cohorts.as_slice() else {
             panic!("expected one derived local symbol cohort");
         };
         assert_eq!(planned.previous_input, cohort.previous_input);
         assert_eq!(planned.current_input, cohort.current_input);
-        assert_eq!(planned.previous, cohort.previous);
-        assert_eq!(planned.current, cohort.current);
+        assert!(
+            cohort
+                .previous
+                .iter()
+                .all(|entry| planned.previous.contains(entry))
+        );
+        assert!(
+            cohort
+                .current
+                .iter()
+                .all(|entry| planned.current.contains(entry))
+        );
+        assert!(planned.previous.iter().any(|entry| {
+            entry.name == b"l_live.1" && entry.output_value == previous_live_value
+        }));
+        assert!(planned.current.iter().any(|entry| {
+            entry.name == b"l_live.2" && entry.output_value == current_live_value
+        }));
         assert_eq!(planned.validated_local_symbol_renames.len(), 1);
         assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
+        let mut unrelated_rematerialized_text = exact_rematerialized_text.clone();
+        unrelated_rematerialized_text[0].0 = "other.rlib".into();
+        let mut unrelated_records = original_relocations.clone();
+        assert!(
+            validate(
+                &mut unrelated_records,
+                &matched,
+                &[],
+                &unrelated_rematerialized_text,
+            )
+            .0
+            .is_err()
+        );
+        let archive_alias = |input_ref: &str| {
+            let input_ref = String::from_utf8(hex::decode(input_ref).unwrap()).unwrap();
+            hex::encode(
+                input_ref
+                    .replace("crate.cgu.old.rcgu.o", "crate.cgu.alias.rcgu.o")
+                    .replace("crate.cgu.new.rcgu.o", "crate.cgu.alias.rcgu.o"),
+            )
+        };
+        let mut aliased_rematerialized_text = exact_rematerialized_text.clone();
+        aliased_rematerialized_text[0].1 = archive_alias(&aliased_rematerialized_text[0].1);
+        aliased_rematerialized_text[0].3 = archive_alias(&aliased_rematerialized_text[0].3);
+        assert!(
+            patch_input_refs_match(
+                input.path.as_str(),
+                &exact_rematerialized_text[0].1,
+                &aliased_rematerialized_text[0].1,
+                true,
+            )
+            .unwrap()
+        );
+        let mut aliased_records = original_relocations.clone();
+        assert!(
+            validate(
+                &mut aliased_records,
+                &matched,
+                &[],
+                &aliased_rematerialized_text,
+            )
+            .0
+            .is_err()
+        );
         let mut duplicate_cohort = original_relocations.clone();
         assert!(
             validate(
                 &mut duplicate_cohort,
                 &matched,
                 &[cohort.clone(), cohort.clone()],
+                &[],
             )
             .0
             .is_err()
@@ -66443,10 +66593,17 @@ mod tests {
             },
         });
         let mut retained_without_cohort = original_relocations;
-        let (result, _, planned_cohorts) =
-            validate(&mut retained_without_cohort, &matched_retained_target, &[]);
+        let (result, _, planned_cohorts) = validate(
+            &mut retained_without_cohort,
+            &matched_retained_target,
+            &[],
+            &exact_rematerialized_text,
+        );
         assert!(result.unwrap());
-        assert_eq!(planned_cohorts, [cohort]);
+        let [planned] = planned_cohorts.as_slice() else {
+            panic!("expected one retained-target local symbol cohort");
+        };
+        assert!(planned.validated_local_symbol_renames.is_empty());
     }
 
     #[test]
@@ -69733,19 +69890,56 @@ mod tests {
         primary_offset: u64,
         source: &[u8],
     ) -> Vec<u8> {
+        test_macho_local_data_retarget_object_with_source_and_text(
+            primary_name,
+            primary_offset,
+            source,
+            None,
+        )
+    }
+
+    fn test_macho_local_data_retarget_object_with_text_graph(
+        primary_name: &[u8],
+        primary_offset: u64,
+        text_local_name: &[u8],
+        text_local_offset: u64,
+    ) -> Vec<u8> {
+        test_macho_local_data_retarget_object_with_source_and_text(
+            primary_name,
+            primary_offset,
+            &[0; 16],
+            Some((text_local_name, text_local_offset)),
+        )
+    }
+
+    fn test_macho_local_data_retarget_object_with_source_and_text(
+        primary_name: &[u8],
+        primary_offset: u64,
+        source: &[u8],
+        text_local: Option<(&[u8], u64)>,
+    ) -> Vec<u8> {
         const HEADER_SIZE: usize = 32;
         const SEGMENT_COMMAND_SIZE: usize = 72;
         const SECTION_SIZE: usize = 80;
         const SYMTAB_COMMAND_SIZE: usize = 24;
         const NLIST_64_SIZE: usize = 16;
 
-        let commands_size = SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
+        let section_count = 2 + usize::from(text_local.is_some());
+        let commands_size =
+            SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE + SYMTAB_COMMAND_SIZE;
         let target = [0; 64];
+        let text = [
+            0x00, 0x00, 0x00, 0x14, 0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5,
+        ];
+        let text_len = text_local.map_or(0, |_| text.len());
         let source_offset = HEADER_SIZE + commands_size;
         let target_offset = source_offset + source.len();
-        let relocation_offset = target_offset + target.len();
-        let symoff = relocation_offset + 2 * 8;
-        let stroff = symoff + 3 * NLIST_64_SIZE;
+        let text_offset = target_offset + target.len();
+        let relocation_offset = text_offset + text_len;
+        let relocation_count = 2 + usize::from(text_local.is_some());
+        let symbol_count = 3 + 2 * usize::from(text_local.is_some());
+        let symoff = (relocation_offset + relocation_count * 8).next_multiple_of(NLIST_64_SIZE);
+        let stroff = symoff + symbol_count * NLIST_64_SIZE;
         let mut strings = vec![0];
         let mut add_string = |name: &[u8]| {
             let offset = strings.len() as u32;
@@ -69756,6 +69950,8 @@ mod tests {
         let primary_name = add_string(primary_name);
         let competing_name = add_string(b"l_anon.21");
         let source_name = add_string(b"_source");
+        let text_name =
+            text_local.map(|(name, offset)| (add_string(b"_text"), add_string(name), offset));
 
         let mut bytes = Vec::new();
         push_u32(&mut bytes, object::macho::MH_MAGIC_64);
@@ -69768,15 +69964,18 @@ mod tests {
         push_u32(&mut bytes, 0);
 
         push_u32(&mut bytes, object::macho::LC_SEGMENT_64);
-        push_u32(&mut bytes, (SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE) as u32);
+        push_u32(
+            &mut bytes,
+            (SEGMENT_COMMAND_SIZE + section_count * SECTION_SIZE) as u32,
+        );
         push_fixed_name(&mut bytes, b"");
         push_u64(&mut bytes, 0);
-        push_u64(&mut bytes, (source.len() + target.len()) as u64);
+        push_u64(&mut bytes, (source.len() + target.len() + text_len) as u64);
         push_u64(&mut bytes, source_offset as u64);
-        push_u64(&mut bytes, (source.len() + target.len()) as u64);
+        push_u64(&mut bytes, (source.len() + target.len() + text_len) as u64);
         push_u32(&mut bytes, 7);
         push_u32(&mut bytes, 7);
-        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, section_count as u32);
         push_u32(&mut bytes, 0);
 
         push_macho_section_with_relocations(
@@ -69799,17 +69998,35 @@ mod tests {
             target_offset,
             object::macho::S_REGULAR,
         );
+        if text_local.is_some() {
+            push_macho_section_with_relocations(
+                &mut bytes,
+                b"__text",
+                b"__TEXT",
+                (source.len() + target.len()) as u64,
+                text.len(),
+                text_offset,
+                relocation_offset + 2 * 8,
+                1,
+                object::macho::S_REGULAR
+                    | object::macho::S_ATTR_PURE_INSTRUCTIONS
+                    | object::macho::S_ATTR_SOME_INSTRUCTIONS,
+            );
+        }
 
         push_u32(&mut bytes, object::macho::LC_SYMTAB);
         push_u32(&mut bytes, SYMTAB_COMMAND_SIZE as u32);
         push_u32(&mut bytes, symoff as u32);
-        push_u32(&mut bytes, 3);
+        push_u32(&mut bytes, symbol_count as u32);
         push_u32(&mut bytes, stroff as u32);
         push_u32(&mut bytes, strings.len() as u32);
 
         assert_eq!(bytes.len(), source_offset);
         bytes.extend_from_slice(source);
         bytes.extend_from_slice(&target);
+        if text_local.is_some() {
+            bytes.extend_from_slice(&text);
+        }
         push_test_macho_relocation(
             &mut bytes,
             TestMachORelocation {
@@ -69832,7 +70049,20 @@ mod tests {
                 r_type: object::macho::ARM64_RELOC_UNSIGNED,
             },
         );
-        assert_eq!(bytes.len(), symoff);
+        if text_local.is_some() {
+            push_test_macho_relocation(
+                &mut bytes,
+                TestMachORelocation {
+                    offset: 0,
+                    symbol: 4,
+                    pcrel: true,
+                    length: 2,
+                    external: true,
+                    r_type: object::macho::ARM64_RELOC_BRANCH26,
+                },
+            );
+        }
+        bytes.resize(symoff, 0);
         push_macho_local_symbol(
             &mut bytes,
             primary_name,
@@ -69841,7 +70071,20 @@ mod tests {
         );
         push_macho_local_symbol(&mut bytes, competing_name, 2, source.len() as u64 + 0x30);
         push_macho_symbol(&mut bytes, source_name, 1, 0);
+        if let Some((text_name, text_local_name, text_local_offset)) = text_name {
+            let text_address = (source.len() + target.len()) as u64;
+            push_macho_symbol(&mut bytes, text_name, 3, text_address);
+            push_macho_local_symbol(
+                &mut bytes,
+                text_local_name,
+                3,
+                text_address + text_local_offset,
+            );
+        }
         bytes.extend_from_slice(&strings);
+        if text_local.is_some() {
+            set_test_macho_symbol_desc(&mut bytes, b"_text", object::macho::N_NO_DEAD_STRIP);
+        }
         bytes
     }
 
@@ -81211,6 +81454,7 @@ mod tests {
                 &current_resolver,
                 &elf,
                 &mut target_patches,
+                &[],
                 &[],
                 &[],
                 &[],
