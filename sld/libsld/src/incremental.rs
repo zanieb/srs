@@ -7427,6 +7427,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut dormant_macho_archive_states = Vec::new();
+    let mut retired_macho_archive_patch_compositions = Vec::new();
     let mut record_override_input_files = HashSet::new();
     let changed_input_files = changed_inputs
         .iter()
@@ -10275,12 +10276,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             ) {
                 return Ok(ChangedInputPatchResult::Unsupported(reason));
             }
-            if let Err(reason) = compose_historical_plain_patches_with_current(
+            let compositions = match compose_historical_plain_patches_with_current(
                 &mut retired_macho_archive_output_patches,
                 &mut changed_macho_archive_unwind_patches,
             ) {
-                return Ok(ChangedInputPatchResult::Unsupported(reason));
-            }
+                Ok(compositions) => compositions,
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            };
+            retired_macho_archive_patch_compositions.extend(compositions);
             for current in [
                 changed_macho_definition_patches.as_slice(),
                 migrated_macho_resolution_updates.patches.as_slice(),
@@ -11085,6 +11088,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             &mut previous.input_files,
             &dormant_macho_archive_states,
             &output,
+            &retired_macho_archive_patch_compositions,
         ) {
             Ok(count) => count,
             Err(reason) => return Ok(ChangedInputPatchResult::StartedUnsupported(reason)),
@@ -12333,10 +12337,17 @@ fn merge_compatible_overlapping_section_patches(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoricalPlainPatchComposition {
+    original: StoredOutputPatch,
+    finalized: StoredOutputPatch,
+}
+
 fn compose_historical_plain_patches_with_current(
     historical: &mut Vec<SectionPatch>,
     current: &mut [SectionPatch],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Vec<HistoricalPlainPatchComposition>, String> {
+    let mut compositions = Vec::new();
     let mut remaining = Vec::with_capacity(historical.len());
     for historical_patch in historical.drain(..) {
         let historical_end = historical_patch
@@ -12395,6 +12406,17 @@ fn compose_historical_plain_patches_with_current(
             .copy_from_slice(&historical_patch.data);
         data[current_offset..current_offset + current_patch.data.len()]
             .copy_from_slice(&current_patch.data);
+        compositions.push(HistoricalPlainPatchComposition {
+            original: StoredOutputPatch {
+                output_offset: historical_patch.output_offset,
+                data: historical_patch.data.clone(),
+            },
+            finalized: StoredOutputPatch {
+                output_offset: historical_patch.output_offset,
+                data: data[historical_offset..historical_offset + historical_patch.data.len()]
+                    .to_vec(),
+            },
+        });
         *current_patch = SectionPatch {
             output_offset,
             size: end - output_offset,
@@ -12405,7 +12427,7 @@ fn compose_historical_plain_patches_with_current(
         };
     }
     *historical = remaining;
-    Ok(())
+    Ok(compositions)
 }
 
 fn remove_plain_patches_shadowed_by_exact_current_ranges(
@@ -28847,6 +28869,7 @@ fn refresh_dormant_macho_archive_rollback_patches(
     input_files: &mut [FileState],
     retired_states: &[RetiredMachOArchiveStateRef],
     current_output: &[u8],
+    retired_patch_compositions: &[HistoricalPlainPatchComposition],
 ) -> std::result::Result<usize, String> {
     let mut seen = HashSet::with_capacity(retired_states.len());
     let mut updates = Vec::new();
@@ -28913,6 +28936,40 @@ fn refresh_dormant_macho_archive_rollback_patches(
                         );
                     }
                 }
+            }
+
+            let mut compositions = retired_patch_compositions.iter().filter(|composition| {
+                composition.original.output_offset == rollback.output_offset
+                    && composition.original.data == rollback.data
+            });
+            let composition = compositions.next();
+            if compositions.next().is_some() {
+                return Err(
+                    "newly retired Mach-O rollback has ambiguous composition provenance".to_owned(),
+                );
+            }
+            if let Some(composition) = composition {
+                if composition.finalized.output_offset != rollback.output_offset
+                    || composition.finalized.data.len() != rollback.data.len()
+                {
+                    return Err(
+                        "newly retired Mach-O rollback composition provenance is incomplete"
+                            .to_owned(),
+                    );
+                }
+                if actual != composition.finalized.data {
+                    return Err(
+                        "newly retired Mach-O rollback composition differs from finalized output"
+                            .to_owned(),
+                    );
+                }
+                updates.push((
+                    retired_ref.input_index,
+                    retired_ref.state_index,
+                    rollback_index,
+                    actual.to_vec(),
+                ));
+                continue;
             }
 
             match exact_replacement {
@@ -75056,7 +75113,8 @@ mod tests {
         let mut output = vec![0; 48];
         output[16..32].copy_from_slice(&b);
 
-        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output).unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output, &[])
+            .unwrap();
         round_trip(&mut inputs);
         let members = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
         assert_eq!(members[0].rollback_patches[0].data, b);
@@ -75072,6 +75130,7 @@ mod tests {
                 state_index: 1,
             }],
             &output,
+            &[],
         )
         .unwrap();
         round_trip(&mut inputs);
@@ -75081,7 +75140,8 @@ mod tests {
         members[0].active = false;
         members[1].active = true;
         output[16..32].copy_from_slice(&b);
-        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output).unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output, &[])
+            .unwrap();
         round_trip(&mut inputs);
         assert_eq!(
             inputs[0].patch.as_ref().unwrap().macho_archive_members[0].rollback_patches[0].data,
@@ -75212,7 +75272,8 @@ mod tests {
                 state_index: 0,
             }],
         );
-        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output, &[])
+            .unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -75259,7 +75320,8 @@ mod tests {
             0,
             &inputs[0].patch.as_ref().unwrap().macho_archive_members,
         );
-        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output, &[])
+            .unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -75275,7 +75337,8 @@ mod tests {
             0,
             &inputs[0].patch.as_ref().unwrap().macho_archive_members,
         );
-        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output, &[])
+            .unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -75286,6 +75349,25 @@ mod tests {
 
     #[test]
     fn newly_retired_macho_archive_rollback_refresh_is_atomic_and_exact() {
+        let unwind_patch = |offset, data: &[u8]| SectionPatch {
+            output_offset: offset,
+            size: data.len() as u64,
+            data: data.to_vec(),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let composition =
+            |historical_offset, historical_data: &[u8], current_offset, current_data: &[u8]| {
+                let mut historical = vec![unwind_patch(historical_offset, historical_data)];
+                let mut current = [unwind_patch(current_offset, current_data)];
+                let compositions =
+                    compose_historical_plain_patches_with_current(&mut historical, &mut current)
+                        .unwrap();
+                assert!(historical.is_empty());
+                assert_eq!(compositions.len(), 1);
+                compositions
+            };
         let archive_state = |active, member: &[u8], offset, forward: &[u8], rollback: &[u8]| {
             MachOArchiveActivationState {
                 kind: MachOArchiveActivationKind::AddedMembers,
@@ -75341,21 +75423,211 @@ mod tests {
         let mut output = vec![0; 32];
         output[16..20].copy_from_slice(&[5, 6, 7, 9]);
         assert!(
-            refresh_dormant_macho_archive_rollback_patches(&mut tampered, &retired_ref, &output,)
-                .unwrap_err()
-                .contains("differs from finalized output")
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut tampered,
+                &retired_ref,
+                &output,
+                &[],
+            )
+            .unwrap_err()
+            .contains("differs from finalized output")
         );
         assert_eq!(
             tampered, original,
             "a failed refresh changed persisted state"
         );
 
+        let partial_composition = composition(16, &[0; 4], 18, &[9, 10]);
+        let mut partial_unwind = input_files(24);
+        output[16..20].copy_from_slice(&[0, 0, 9, 10]);
+        assert_eq!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut partial_unwind,
+                &retired_ref,
+                &output,
+                &partial_composition,
+            )
+            .unwrap(),
+            1,
+        );
+        assert_eq!(
+            partial_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members[0]
+                .rollback_patches[0]
+                .data,
+            [0, 0, 9, 10],
+        );
+
+        let mut uncovered = input_files(24);
+        let original = uncovered.clone();
+        output[16..20].copy_from_slice(&[1, 0, 9, 10]);
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut uncovered,
+                &retired_ref,
+                &output,
+                &partial_composition,
+            )
+            .unwrap_err()
+            .contains("composition differs")
+        );
+        assert_eq!(uncovered, original, "an uncovered byte changed state");
+
+        let mut mismatched = input_files(24);
+        let original = mismatched.clone();
+        output[16..20].copy_from_slice(&[0, 0, 9, 11]);
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut mismatched,
+                &retired_ref,
+                &output,
+                &partial_composition,
+            )
+            .unwrap_err()
+            .contains("composition differs")
+        );
+        assert_eq!(mismatched, original, "a mismatched witness changed state");
+
+        let mut conflicting = partial_composition.clone();
+        let mut conflicting_replacement = conflicting[0].clone();
+        conflicting_replacement.finalized.data[3] ^= 1;
+        conflicting.push(conflicting_replacement);
+        let mut conflict = input_files(24);
+        let original = conflict.clone();
+        output[16..20].copy_from_slice(&[0, 8, 9, 11]);
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut conflict,
+                &retired_ref,
+                &output,
+                &conflicting,
+            )
+            .unwrap_err()
+            .contains("ambiguous composition provenance")
+        );
+        assert_eq!(conflict, original, "conflicting witnesses changed state");
+
+        let partial_provenance = composition(17, &[0; 3], 18, &[9, 10]);
+        let mut incomplete = input_files(24);
+        let original = incomplete.clone();
+        output[16..20].copy_from_slice(&[0, 0, 9, 10]);
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut incomplete,
+                &retired_ref,
+                &output,
+                &partial_provenance,
+            )
+            .unwrap_err()
+            .contains("without an exact replacement")
+        );
+        assert_eq!(incomplete, original, "partial provenance changed state");
+
+        let mut active_and_unwind = input_files(16);
+        output[16..20].copy_from_slice(&[5, 6, 9, 10]);
+        let b_composition = composition(16, &[0; 4], 16, &[5, 6, 9, 10]);
+        refresh_dormant_macho_archive_rollback_patches(
+            &mut active_and_unwind,
+            &retired_ref,
+            &output,
+            &b_composition,
+        )
+        .unwrap();
+        assert_eq!(
+            active_and_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members[0]
+                .rollback_patches[0]
+                .data,
+            [5, 6, 9, 10],
+        );
+
+        let states = &mut active_and_unwind[0]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members;
+        states[0].active = true;
+        states[1].active = false;
+        output[16..20].copy_from_slice(&[1, 11, 12, 4]);
+        let a_composition = composition(16, &[0; 4], 16, &[1, 11, 12, 4]);
+        let retired_b = dormant_macho_archive_state_refs(
+            0,
+            &active_and_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members,
+        );
+        refresh_dormant_macho_archive_rollback_patches(
+            &mut active_and_unwind,
+            &retired_b,
+            &output,
+            &a_composition,
+        )
+        .unwrap();
+        assert_eq!(
+            active_and_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members[1]
+                .rollback_patches[0]
+                .data,
+            [1, 11, 12, 4],
+        );
+
+        let states = &mut active_and_unwind[0]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members;
+        states[0].active = false;
+        states[1].active = true;
+        output[16..20].copy_from_slice(&[5, 6, 9, 10]);
+        let b_composition = composition(16, &[5, 6, 9, 10], 16, &[5, 6, 9, 10]);
+        let retired_a = dormant_macho_archive_state_refs(
+            0,
+            &active_and_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members,
+        );
+        refresh_dormant_macho_archive_rollback_patches(
+            &mut active_and_unwind,
+            &retired_a,
+            &output,
+            &b_composition,
+        )
+        .unwrap();
+        assert_eq!(
+            active_and_unwind[0]
+                .patch
+                .as_ref()
+                .unwrap()
+                .macho_archive_members[0]
+                .rollback_patches[0]
+                .data,
+            [5, 6, 9, 10],
+        );
+
         let mut partial = input_files(18);
         let original = partial.clone();
         assert!(
-            refresh_dormant_macho_archive_rollback_patches(&mut partial, &retired_ref, &output,)
-                .unwrap_err()
-                .contains("partially shadows")
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut partial,
+                &retired_ref,
+                &output,
+                &[],
+            )
+            .unwrap_err()
+            .contains("partially shadows")
         );
         assert_eq!(
             partial, original,
@@ -75365,7 +75637,7 @@ mod tests {
         let mut stale = input_files(24);
         let original = stale.clone();
         assert!(
-            refresh_dormant_macho_archive_rollback_patches(&mut stale, &retired_ref, &output,)
+            refresh_dormant_macho_archive_rollback_patches(&mut stale, &retired_ref, &output, &[],)
                 .unwrap_err()
                 .contains("without an exact replacement")
         );
@@ -90159,9 +90431,23 @@ mod tests {
         let mut historical = vec![patch(16, vec![1, 2, 3, 0])];
         let mut current = vec![patch(19, vec![0x10, 4, 5, 6])];
 
-        compose_historical_plain_patches_with_current(&mut historical, &mut current).unwrap();
+        let compositions =
+            compose_historical_plain_patches_with_current(&mut historical, &mut current).unwrap();
 
         assert!(historical.is_empty());
+        assert_eq!(
+            compositions,
+            vec![HistoricalPlainPatchComposition {
+                original: StoredOutputPatch {
+                    output_offset: 16,
+                    data: vec![1, 2, 3, 0],
+                },
+                finalized: StoredOutputPatch {
+                    output_offset: 16,
+                    data: vec![1, 2, 3, 0x10],
+                },
+            }]
+        );
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].output_offset, 16);
         assert_eq!(current[0].size, 7);
