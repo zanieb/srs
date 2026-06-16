@@ -34099,7 +34099,7 @@ fn changed_macho_archive_unwind_members(
     section_records: &[SectionRecord],
     current_resolver: &PatchInputResolver<'_>,
     output_file: &object::File<'_>,
-    excluded_identifiers: &[Vec<u8>],
+    excluded_current_identifiers: &[Vec<u8>],
 ) -> Result<std::result::Result<ChangedMachOArchiveUnwindMembers, String>> {
     let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let mut input_pairs = matched_sections
@@ -34149,7 +34149,7 @@ fn changed_macho_archive_unwind_members(
         };
         if current_input.archive_identifier.is_some_and(|identifier| {
             let identifier = archive_member_patch_identifier(identifier);
-            excluded_identifiers
+            excluded_current_identifiers
                 .iter()
                 .any(|excluded| excluded == &identifier)
         }) {
@@ -34487,7 +34487,7 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         section_records,
         current_resolver,
         &output_file,
-        ignored_previous_identifiers,
+        ignored_current_identifiers,
     )? {
         Ok(changed) => changed,
         Err(reason) => return Ok(Err(reason)),
@@ -66930,8 +66930,8 @@ mod tests {
             .unwrap();
             (bytes, input_ref)
         };
-        let previous_identifier = b"crate-hash.codegen.previous.rcgu.o";
-        let current_identifier = b"crate-hash.codegen.current.rcgu.o";
+        let previous_identifier = b"crate-hash.previous.previous.rcgu.o";
+        let current_identifier = b"crate-hash.current.current.rcgu.o";
         let (previous_archive, previous_input) = archive(previous_identifier, &previous_object);
         let (current_archive, current_input) = archive(current_identifier, &current_object);
 
@@ -67003,6 +67003,19 @@ mod tests {
         assert!(excluded.retired_entries.is_empty());
         assert!(excluded.previous_input_ranges.is_empty());
         assert!(excluded.current_input_ranges.is_empty());
+
+        let previous_only_excluded = changed_macho_archive_unwind_members(
+            &previous_archive,
+            &input_file_path,
+            &matched,
+            &[],
+            &current_resolver,
+            &output_file,
+            &[archive_member_patch_identifier(previous_identifier)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(previous_only_excluded.members.len(), 1);
     }
 
     #[test]
@@ -67519,6 +67532,30 @@ mod tests {
             .map(|section| section.current.clone())
             .collect::<Vec<_>>();
         let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let excluded_current = changed_macho_archive_unwind_activation(
+            &previous_archive,
+            &current_archive,
+            &input_file_path,
+            &matched,
+            &[],
+            &current_sections,
+            &current_resolver,
+            &output.bytes,
+            &[],
+            &reserves,
+            &[],
+            &[],
+            false,
+            &[],
+            &[archive_member_patch_identifier(
+                b"crate-hash.codegen.current.rcgu.o",
+            )],
+            &HashSet::new(),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(excluded_current.is_none());
         let activation = changed_macho_archive_unwind_activation(
             &previous_archive,
             &current_archive,
