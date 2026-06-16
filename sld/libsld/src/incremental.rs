@@ -5286,7 +5286,9 @@ fn direct_macho_cgu_definitions(
                 kind: macho_symbol_kind_tag(symbol.kind()),
                 scope: macho_symbol_scope_tag(symbol.scope()),
                 n_desc,
-                eligible: symbol.is_global() && !symbol.is_weak(),
+                eligible: symbol.is_global()
+                    && symbol.scope() == object::SymbolScope::Linkage
+                    && !symbol.is_weak(),
             });
     }
     Ok(definitions)
@@ -67822,15 +67824,33 @@ mod tests {
         bytes
     }
 
+    fn set_test_macho_symbol_private_external(
+        bytes: &mut [u8],
+        symbol_index: usize,
+        private_external: bool,
+    ) {
+        let value_range =
+            macho_symbol_value_field_range(bytes, object::SymbolIndex(symbol_index)).unwrap();
+        let symbol_type = &mut bytes[value_range.start - 4];
+        if private_external {
+            *symbol_type |= object::macho::N_PEXT;
+        } else {
+            *symbol_type &= !object::macho::N_PEXT;
+        }
+    }
+
     fn direct_macho_cgu_migration_fixture() -> (
         Vec<DirectMachOCguMigrationInput>,
         Vec<SectionRecord>,
         Vec<MachOSymbolResolutionRecord>,
         Vec<u8>,
     ) {
-        let source_previous = test_macho_object(b"\x01\x02\x03\x04", b"\x11\x12\x13\x14", 0);
+        let mut source_previous = test_macho_object(b"\x01\x02\x03\x04", b"\x11\x12\x13\x14", 0);
+        set_test_macho_symbol_private_external(&mut source_previous, 0, true);
         let source_current = retire_test_macho_symbol(source_previous.clone(), 0);
-        let destination_current = test_macho_object(b"\x05\x06\x07\x08", b"\x21\x22\x23\x24", 0);
+        let mut destination_current =
+            test_macho_object(b"\x05\x06\x07\x08", b"\x21\x22\x23\x24", 0);
+        set_test_macho_symbol_private_external(&mut destination_current, 0, true);
         let destination_previous = retire_test_macho_symbol(destination_current.clone(), 0);
         let output = test_macho_unwind_output(0x1000);
         let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
@@ -68865,6 +68885,60 @@ mod tests {
             forward.migrated_names_by_input,
             reversed.migrated_names_by_input
         );
+    }
+
+    #[test]
+    fn direct_macho_cgu_migration_requires_private_linkage_symbols() {
+        let (inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        let private = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(private.moves.len(), 1);
+
+        let (mut inputs, sections, resolutions, output) = direct_macho_cgu_migration_fixture();
+        set_test_macho_symbol_private_external(&mut inputs[0].previous_bytes, 0, false);
+        set_test_macho_symbol_private_external(&mut inputs[1].current_bytes, 0, false);
+        inputs[1].current_hash = hash_bytes(&inputs[1].current_bytes);
+        let source = object::File::parse(inputs[0].previous_bytes.as_slice()).unwrap();
+        let destination = object::File::parse(inputs[1].current_bytes.as_slice()).unwrap();
+        assert_eq!(
+            source
+                .symbol_by_index(object::SymbolIndex(0))
+                .unwrap()
+                .scope(),
+            object::SymbolScope::Dynamic
+        );
+        assert_eq!(
+            destination
+                .symbol_by_index(object::SymbolIndex(0))
+                .unwrap()
+                .scope(),
+            object::SymbolScope::Dynamic
+        );
+        let exported_definition = plan_direct_macho_cgu_migrations(
+            &inputs,
+            &[],
+            &direct_macho_changed_input_files(&inputs),
+            &sections,
+            &resolutions,
+            &output,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(exported_definition.moves.is_empty());
     }
 
     #[test]
