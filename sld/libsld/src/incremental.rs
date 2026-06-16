@@ -18838,11 +18838,21 @@ fn verify_previous_macho_local_symbol_cohort(
     {
         return Err("published local Mach-O owned output ranges overlap".to_owned());
     }
-    let expected_names = entries
+    let expected_entries = entries
         .iter()
-        .map(|entry| entry.name.clone())
-        .collect::<HashSet<_>>();
+        .map(|entry| {
+            (
+                entry.name.clone(),
+                (entry.output_section_index, entry.output_value, entry.n_desc),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    if expected_entries.len() != entries.len() {
+        return Err("published local Mach-O cohort contains duplicate names".to_owned());
+    }
     let mut observed_names = HashSet::new();
+    // Validate the complete owned population and bind exact nlists in one output-symbol scan.
+    let mut exact_symbols = HashMap::<Vec<u8>, Vec<object::SymbolIndex>>::new();
     for symbol in output_file.symbols() {
         if symbol.is_global() || symbol.is_undefined() {
             continue;
@@ -18868,37 +18878,40 @@ fn verify_previous_macho_local_symbol_cohort(
         if in_owned_range && !observed_names.insert(name.to_vec()) {
             return Err("published local Mach-O output contains duplicate cohort names".to_owned());
         }
+        if let Some(&(section_index, value, n_desc)) = expected_entries.get(name)
+            && !symbol.is_weak()
+            && symbol.scope() == object::SymbolScope::Compilation
+            && symbol.section_index().map(|index| index.0) == Some(usize::from(section_index))
+            && symbol.address() == value
+            && matches!(
+                symbol.flags(),
+                object::SymbolFlags::MachO { n_desc: actual } if actual == n_desc
+            )
+        {
+            exact_symbols
+                .entry(name.to_vec())
+                .or_default()
+                .push(symbol.index());
+        }
     }
-    if observed_names.len() != expected_names.len()
+    if observed_names.len() != expected_entries.len()
         || observed_names
             .iter()
-            .any(|name| !expected_names.contains(name))
+            .any(|name| !expected_entries.contains_key(name))
     {
         return Err("published local Mach-O output population is incomplete or aliased".to_owned());
     }
 
     for entry in entries.iter_mut() {
-        let matches = output_file
-            .symbols()
-            .filter(|symbol| {
-                symbol
-                    .name_bytes()
-                    .is_ok_and(|candidate| candidate == entry.name)
-                    && !symbol.is_global()
-                    && !symbol.is_weak()
-                    && symbol.scope() == object::SymbolScope::Compilation
-                    && symbol.section_index().map(|index| index.0)
-                        == Some(usize::from(entry.output_section_index))
-                    && symbol.address() == entry.output_value
-                    && matches!(
-                        symbol.flags(),
-                        object::SymbolFlags::MachO { n_desc } if n_desc == entry.n_desc
-                    )
-            })
-            .collect::<Vec<_>>();
-        let [symbol] = matches.as_slice() else {
+        let Some(matches) = exact_symbols.remove(entry.name.as_slice()) else {
             return Err("published local Mach-O cohort has no unique output nlist".to_owned());
         };
+        let [symbol_index] = matches.as_slice() else {
+            return Err("published local Mach-O cohort has no unique output nlist".to_owned());
+        };
+        let symbol = output_file
+            .symbol_by_index(*symbol_index)
+            .map_err(|_| "published local Mach-O cohort output nlist is unavailable".to_owned())?;
         let object::SymbolFlags::MachO { n_desc } = symbol.flags() else {
             return Err("published local Mach-O output has non-Mach-O metadata".to_owned());
         };
@@ -55785,6 +55798,79 @@ mod tests {
             &output,
             &[&collision],
         ));
+    }
+
+    #[test]
+    fn published_local_macho_cohort_indexes_large_exact_population() {
+        let mut output = test_macho_object(&[0; 4096], &[0; 16], 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let text = output_file.section_by_name("__text").unwrap();
+        let text_section = u8::try_from(text.index().0).unwrap();
+        let text_address = text.address();
+        drop(output_file);
+        let mut entries = Vec::new();
+        for index in 0..512 {
+            let name = format!("local{index}").into_bytes();
+            let value = text_address + index * 8;
+            output = add_test_macho_local_alias(output, &name, text_section, value);
+            entries.push(MachOLocalSymbolCohortEntry {
+                name,
+                n_desc: 0,
+                output_section_index: text_section,
+                output_value: value,
+                output_entry_offset: None,
+                string_index: None,
+            });
+        }
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        verify_previous_macho_local_symbol_cohort(
+            &output,
+            &output_file,
+            &[test_macho_patch_section(&output, "__text")],
+            &mut entries,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.output_entry_offset.is_some() && entry.string_index.is_some())
+        );
+
+        let mut duplicate_entries = vec![entries[0].clone(), entries[0].clone()];
+        assert_eq!(
+            verify_previous_macho_local_symbol_cohort(
+                &output,
+                &output_file,
+                &[test_macho_patch_section(&output, "__text")],
+                &mut duplicate_entries,
+                &HashSet::new(),
+            )
+            .unwrap_err(),
+            "published local Mach-O cohort contains duplicate names",
+        );
+
+        for changed in ["section", "value", "metadata"] {
+            let mut changed_entries = entries.clone();
+            match changed {
+                "section" => changed_entries[0].output_section_index += 1,
+                "value" => changed_entries[0].output_value += 1,
+                "metadata" => changed_entries[0].n_desc = object::macho::N_NO_DEAD_STRIP,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verify_previous_macho_local_symbol_cohort(
+                    &output,
+                    &output_file,
+                    &[test_macho_patch_section(&output, "__text")],
+                    &mut changed_entries,
+                    &HashSet::new(),
+                )
+                .unwrap_err(),
+                "published local Mach-O cohort has no unique output nlist",
+                "accepted mismatched {changed}",
+            );
+        }
     }
 
     #[test]
