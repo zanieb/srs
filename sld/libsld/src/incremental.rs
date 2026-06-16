@@ -1232,6 +1232,9 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             )?;
             return Ok(false);
         }
+        if !materialize_patch_record_locations_for_fast_path(&state_dir, &mut previous)? {
+            return Ok(false);
+        }
         let preclassified_unchanged_inputs =
             preclassify_unchanged_rustc_rlibs_by_link_content_digest(
                 args,
@@ -2459,6 +2462,22 @@ fn metadata_update_indices_for_inputs(
     indices
 }
 
+fn materialize_patch_record_locations_for_fast_path(
+    state_dir: &Path,
+    previous: &mut PersistedState,
+) -> Result<bool> {
+    if let Err(error) = previous.materialize_patch_record_locations() {
+        append_log(
+            state_dir,
+            &format!(
+                "incremental fast path unavailable before loading inputs: invalid patch record locations ({error:?})"
+            ),
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn preclassify_unchanged_rustc_rlibs_by_link_content_digest(
     args: &impl platform::Args,
     previous: &PersistedState,
@@ -2477,6 +2496,9 @@ fn preclassify_unchanged_rustc_rlibs_by_link_content_digest(
                     return None;
                 }
                 let input = previous.input_files.get(*input_index)?;
+                if can_normalize_rust_archive_patch(args, previous, *input_index, path) {
+                    return None;
+                }
                 previous_rustc_rlib_link_content_digest(input)?;
                 rustc_rlib_link_content_digest_matches_previous_path(input, path)
                     .map(|content| (*input_index, content))
@@ -5730,7 +5752,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut rustc_link_content_digest_unchanged_input_count = 0;
     let mut rustc_link_content_digest_unchanged_input_indices = HashSet::new();
     let mut deferred_loaded_input_content_hashes = Vec::new();
-    let mut hashless_atomic_replacement_snapshot_count = 0;
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut record_override_input_files = HashSet::new();
@@ -5817,6 +5838,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             can_normalize_rust_archive_patch(args, &previous, *input_index, path);
         if can_reuse_rustc_link_content_digest
             && trust_rustc_link_content_digests
+            && !can_normalize_rust_archive_patch
             && previous_rustc_rlib_link_content_digest(&previous.input_files[*input_index])
                 .is_some()
             && let Some(input_content) = ({
@@ -5875,10 +5897,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             .is_none_or(|patch| {
                 patch.sections.is_empty() && patch.raw_sections.as_deref().is_none_or(str::is_empty)
             })
-            && previous
+            && (previous
                 .sections
                 .iter()
                 .any(|section| section.input_file == previous.input_files[*input_index].path)
+                || input_has_direct_macho_resolution_owner(
+                    &previous,
+                    &previous.input_files[*input_index],
+                ))
         {
             let patch = current_patch_state_from_snapshot_with_rustc_work_product_provenance(
                 state_dir,
@@ -5901,6 +5927,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             }
         };
+        if previous_patch.sections.is_empty() && !can_normalize_rust_archive_patch {
+            return Ok(ChangedInputPatchResult::Unsupported(format!(
+                "no patchable sections recorded for `{}`",
+                path.display()
+            )));
+        }
         let (bytes, mut input_content) = if let Some(loaded_input) = loaded_input {
             loaded_input
         } else {
@@ -5937,6 +5969,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         let input = &previous.input_files[*input_index];
         if can_reuse_rustc_link_content_digest
             && trust_rustc_link_content_digests
+            && !can_normalize_rust_archive_patch
             && rustc_provenance.as_ref().is_some_and(|provenance| {
                 rustc_rlib_link_content_digest_value_matches_previous(
                     input,
@@ -5957,12 +5990,31 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             continue;
         }
         let normalized_rust_archive_patch_state = if can_normalize_rust_archive_patch {
-            classify_normalized_rust_archive_patch_state(input, &bytes, &previous_patch)?
+            if previous_patch.sections.is_empty()
+                && input_has_direct_macho_resolution_owner(&previous, input)
+            {
+                classify_normalized_rust_archive_record_owner_state(
+                    input,
+                    &bytes,
+                    &previous_patch,
+                    previous_output.get()?,
+                    &previous.sections,
+                    &previous.relocations,
+                    &previous.macho_symbol_resolutions,
+                    &previous.fdes,
+                    &previous.dynamic_relocations,
+                )?
+            } else if !previous_patch.sections.is_empty() {
+                classify_normalized_rust_archive_patch_state(input, &bytes, &previous_patch)?
+            } else {
+                NormalizedRustArchivePatchState::Unknown
+            }
         } else {
             NormalizedRustArchivePatchState::Unknown
         };
         let normalized_rust_archive_matched_sections = match normalized_rust_archive_patch_state {
             NormalizedRustArchivePatchState::Unchanged(patch) => {
+                ensure_loaded_input_content_hash(&bytes, &mut input_content);
                 expected_changed_inputs
                     .push(ExpectedInputContent::from_content(path, &input_content));
                 previous.input_files[*input_index].content = input_content;
@@ -5980,19 +6032,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             NormalizedRustArchivePatchState::MatchedButNotUnchanged(matched) => Some(matched),
             NormalizedRustArchivePatchState::Unknown => None,
         };
-        let retain_hashless_atomic_replacement_snapshot =
-            can_retain_hashless_atomic_replacement_snapshot(
-                path,
-                normalized_rust_archive_matched_sections.is_some(),
-                trust_rustc_link_content_digests,
-            ) && input_content.hash.is_empty();
-        if retain_hashless_atomic_replacement_snapshot {
-            hashless_atomic_replacement_snapshot_count += 1;
-        }
-        let defer_loaded_input_content_hash = normalized_rust_archive_matched_sections.is_some()
-            && input_content.hash.is_empty()
-            && !retain_hashless_atomic_replacement_snapshot;
-        if !defer_loaded_input_content_hash && !retain_hashless_atomic_replacement_snapshot {
+        let defer_loaded_input_content_hash =
+            normalized_rust_archive_matched_sections.is_some() && input_content.hash.is_empty();
+        if !defer_loaded_input_content_hash {
             ensure_loaded_input_content_hash(&bytes, &mut input_content);
         }
         let expected_changed_input_index = expected_changed_inputs.len();
@@ -8107,6 +8149,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                                     }),
                             ),
                         normalize_rust_archive_patch_inputs,
+                        input
+                            .patch
+                            .as_ref()
+                            .and_then(|patch| patch.archive_member_patch_fingerprints.as_deref()),
                     )?
                 else {
                     return Ok(ChangedInputPatchResult::Unsupported(
@@ -8698,7 +8744,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         if let Some(reason) = input_identity_mismatch_reason(&previous.input_files)? {
             return Ok(ChangedInputPatchResult::Unsupported(reason));
         }
-        snapshot_input_paths(
+        snapshot_exact_input_paths(
             state_dir,
             changed_inputs_requiring_snapshot(
                 changed_inputs,
@@ -8973,7 +9019,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         .spawn_scoped(scope, || {
                             let snapshot_result = {
                                 timing_phase!("Snapshot changed incremental inputs");
-                                snapshot_input_paths(
+                                snapshot_exact_input_paths(
                                     state_dir,
                                     changed_inputs_requiring_snapshot(
                                         changed_inputs,
@@ -9061,7 +9107,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     {
         changed_input_snapshot_result.unwrap_or_else(|| {
             timing_phase!("Snapshot changed incremental inputs");
-            snapshot_input_paths(
+            snapshot_exact_input_paths(
                 state_dir,
                 changed_inputs_requiring_snapshot(
                     changed_inputs,
@@ -9172,19 +9218,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             ),
         )?;
     }
-    if hashless_atomic_replacement_snapshot_count > 0 {
-        append_log(
-            state_dir,
-            &format!(
-                "retained {hashless_atomic_replacement_snapshot_count} hashless atomic-replacement input snapshot{} before loading inputs",
-                if hashless_atomic_replacement_snapshot_count == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ),
-        )?;
-    }
     append_log(
         state_dir,
         &format!("patched {patched_section_count} changed input sections before loading inputs"),
@@ -9215,11 +9248,24 @@ fn can_normalize_rust_archive_patch(
     input_index: usize,
     path: &Path,
 ) -> bool {
+    // Exact output owners need the archive classifier so a link-equivalent rebuild refreshes both
+    // the patch inputs and the snapshot used by the next archive transition.
+    let Some(input) = previous.input_files.get(input_index) else {
+        return false;
+    };
     can_reuse_rustc_link_content_digest(args, path)
-        && previous
-            .input_files
-            .get(input_index)
-            .is_some_and(|input| !input_has_records_requiring_previous_bytes(previous, input))
+        && (input.patch.as_ref().is_some_and(|patch| {
+            !patch.sections.is_empty()
+                || patch
+                    .raw_sections
+                    .as_deref()
+                    .is_some_and(|sections| !sections.is_empty())
+                || !patch.macho_archive_members.is_empty()
+        }) || previous
+            .patch_record_locations
+            .iter()
+            .any(|location| location.input_file == input.path)
+            || input_has_direct_macho_resolution_owner(previous, input))
 }
 
 fn can_reuse_rustc_link_content_digest(args: &impl platform::Args, path: &Path) -> bool {
@@ -9227,16 +9273,6 @@ fn can_reuse_rustc_link_content_digest(args: &impl platform::Args, path: &Path) 
         && path
             .extension()
             .is_some_and(|extension| extension == "rlib")
-}
-
-fn can_retain_hashless_atomic_replacement_snapshot(
-    path: &Path,
-    normalized_rust_archive_matched_sections: bool,
-    trust_rustc_link_content_digests: bool,
-) -> bool {
-    normalized_rust_archive_matched_sections
-        && trust_rustc_link_content_digests
-        && is_atomic_replacement_rust_input(path)
 }
 
 fn input_has_records_requiring_previous_bytes(
@@ -9257,6 +9293,16 @@ fn input_has_records_requiring_previous_bytes(
             .fdes
             .iter()
             .any(|record| record.input_file == input.path)
+        || input_has_direct_macho_resolution_owner(previous, input)
+}
+
+fn input_has_direct_macho_resolution_owner(previous: &PersistedState, input: &FileState) -> bool {
+    previous.macho_symbol_resolutions.iter().any(|resolution| {
+        resolution
+            .target
+            .as_ref()
+            .is_some_and(|target| target.input_file == input.path)
+    })
 }
 
 fn classify_normalized_rust_archive_patch_state(
@@ -9327,6 +9373,38 @@ fn classify_normalized_rust_archive_patch_state(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn classify_normalized_rust_archive_record_owner_state(
+    input: &FileState,
+    bytes: &[u8],
+    previous_patch: &PreviousPatchState,
+    output: &[u8],
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    macho_symbol_resolutions: &[MachOSymbolResolutionRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+) -> Result<NormalizedRustArchivePatchState> {
+    let Some(patch) = current_patch_state_for_input(
+        bytes,
+        input,
+        output,
+        sections,
+        relocations,
+        macho_symbol_resolutions,
+        fdes,
+        dynamic_relocations,
+        true,
+    )?
+    else {
+        return Ok(NormalizedRustArchivePatchState::Unknown);
+    };
+    if patch.fingerprint != previous_patch.fingerprint {
+        return Ok(NormalizedRustArchivePatchState::Unknown);
+    }
+    Ok(NormalizedRustArchivePatchState::Unchanged(patch))
+}
+
 fn patch_sections_from_previous_state(
     input: &FileState,
     path: &Path,
@@ -9345,12 +9423,6 @@ fn patch_sections_from_previous_state(
     } else {
         previous_patch.sections.clone()
     };
-    if sections.is_empty() {
-        return Err(format!(
-            "no patchable sections recorded for `{}`",
-            path.display()
-        ));
-    }
     let patch_section_keys = sections
         .iter()
         .map(|section| (section.input.as_str(), section.section_index))
@@ -12079,6 +12151,7 @@ impl<'data> PreparedState<'data> {
                 &file_loader.loaded_files,
                 &mut input_files,
                 &sections,
+                &macho_symbol_resolutions,
                 false,
             )?;
             timing_phase!("Refresh incremental input identities");
@@ -12092,6 +12165,7 @@ impl<'data> PreparedState<'data> {
                     file_loader,
                     &mut input_files,
                     &sections,
+                    &macho_symbol_resolutions,
                 )?;
             }
             {
@@ -15434,6 +15508,7 @@ where
             &[],
             input_fdes.map(Vec::as_slice).unwrap_or_default(),
             true,
+            None,
         )?;
         if patch.is_some() && input.content.hash.is_empty() {
             input.content.hash = hash_bytes(input_file.full_data());
@@ -15455,16 +15530,21 @@ fn current_patch_state(
     macho_symbol_resolutions: &[&MachOSymbolResolutionRecord],
     fdes: &[&FdeRecord],
     normalize_rust_archive_patch_inputs: bool,
+    previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
 ) -> Result<Option<FilePatchState>> {
     let archive_member_set_proof = archive_member_set_proof(bytes)?;
-    let patch_sections = direct_copy_patch_sections(
-        bytes,
-        input_file_path,
-        output,
-        sections,
-        dynamic_relocations.iter().copied(),
-        relocations.iter().copied(),
-    )?;
+    let patch_sections = if sections.is_empty() {
+        Vec::new()
+    } else {
+        direct_copy_patch_sections(
+            bytes,
+            input_file_path,
+            output,
+            sections,
+            dynamic_relocations.iter().copied(),
+            relocations.iter().copied(),
+        )?
+    };
     let dynamic_relocation_patches = dynamic_relocation_patches_for_current_records(
         bytes,
         input_file_path,
@@ -15502,6 +15582,7 @@ fn current_patch_state(
             .chain(macho_symbol_resolution_ranges)
             .chain(fde_relocation_ranges),
         normalize_rust_archive_patch_inputs,
+        previous_archive_member_patch_fingerprints,
     )?
     .map(|(fingerprint, archive_member_patch_fingerprints)| FilePatchState {
         fingerprint,
@@ -15571,6 +15652,31 @@ fn current_patch_state_from_snapshot_with_rustc_work_product_provenance(
     else {
         return Ok(None);
     };
+    current_patch_state_for_input(
+        &bytes,
+        input,
+        output,
+        sections,
+        relocations,
+        macho_symbol_resolutions,
+        fdes,
+        dynamic_relocations,
+        normalize_rust_archive_patch_inputs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn current_patch_state_for_input(
+    bytes: &[u8],
+    input: &FileState,
+    output: &[u8],
+    sections: &[SectionRecord],
+    relocations: &[RelocationRecord],
+    macho_symbol_resolutions: &[MachOSymbolResolutionRecord],
+    fdes: &[FdeRecord],
+    dynamic_relocations: &[DynamicRelocationRecord],
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<Option<FilePatchState>> {
     let sections = sections
         .iter()
         .filter(|section| section.input_file == input.path)
@@ -15605,8 +15711,8 @@ fn current_patch_state_from_snapshot_with_rustc_work_product_provenance(
         .iter()
         .filter(|record| record.input_file == input.path)
         .collect::<Vec<_>>();
-    current_patch_state(
-        &bytes,
+    let patch = current_patch_state(
+        bytes,
         input.path.as_str(),
         output,
         &sections,
@@ -15616,7 +15722,19 @@ fn current_patch_state_from_snapshot_with_rustc_work_product_provenance(
         &macho_symbol_resolutions,
         &fdes,
         normalize_rust_archive_patch_inputs,
-    )
+        input
+            .patch
+            .as_ref()
+            .and_then(|patch| patch.archive_member_patch_fingerprints.as_deref()),
+    )?;
+    Ok(patch.map(|mut patch| {
+        patch.macho_archive_members = input
+            .patch
+            .as_ref()
+            .map(|previous| previous.macho_archive_members.clone())
+            .unwrap_or_default();
+        patch
+    }))
 }
 
 #[cfg(test)]
@@ -23507,22 +23625,29 @@ fn patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_pa
     sections: impl IntoIterator<Item = PatchSection>,
     extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
     normalize_rust_archive_patch_inputs: bool,
+    previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
 ) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
-    let Some(ranges) = patch_ranges_with_lookup(
-        bytes,
-        input_file_path,
-        sections,
-        PatchInputLookup::CurrentRecordedRange,
-    )?
-    else {
-        return Ok(None);
+    let sections = sections.into_iter().collect::<Vec<_>>();
+    let ranges = if sections.is_empty() {
+        Vec::new()
+    } else {
+        let Some(ranges) = patch_ranges_with_lookup(
+            bytes,
+            input_file_path,
+            sections,
+            PatchInputLookup::CurrentRecordedRange,
+        )?
+        else {
+            return Ok(None);
+        };
+        ranges
     };
     patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
         bytes,
         ranges,
         extra_ranges,
         normalize_rust_archive_patch_inputs,
-        None,
+        previous_archive_member_patch_fingerprints,
     )
 }
 
@@ -38828,12 +38953,14 @@ fn snapshot_loaded_files(
     file_loader: &FileLoader<'_>,
     input_files: &mut [FileState],
     sections: &[SectionRecord],
+    macho_symbol_resolutions: &[MachOSymbolResolutionRecord],
 ) -> Result<usize> {
     snapshot_loaded_input_files(
         state_dir,
         &file_loader.loaded_files,
         input_files,
         sections,
+        macho_symbol_resolutions,
         true,
     )
 }
@@ -38843,9 +38970,10 @@ fn snapshot_loaded_input_files(
     loaded_files: &[&InputFile],
     input_files: &mut [FileState],
     sections: &[SectionRecord],
+    macho_symbol_resolutions: &[MachOSymbolResolutionRecord],
     hash_inputs: bool,
 ) -> Result<usize> {
-    let patchable_inputs = sections
+    let mut patchable_inputs = sections
         .par_iter()
         .fold(HashSet::new, |mut inputs, section| {
             inputs.insert(section.input_file.as_str());
@@ -38855,6 +38983,12 @@ fn snapshot_loaded_input_files(
             inputs.extend(shard);
             inputs
         });
+    patchable_inputs.extend(macho_symbol_resolutions.iter().filter_map(|resolution| {
+        resolution
+            .target
+            .as_ref()
+            .map(|target| target.input_file.as_str())
+    }));
     let input_indices = input_files
         .iter()
         .enumerate()
@@ -39344,18 +39478,23 @@ fn read_verified_input_snapshot_with_rustc_work_product_provenance(
         }
         Err(error) => return Err(error.into()),
     };
-    if !snapshot_bytes_match_previous_content(previous_input, &bytes)
-        && !snapshot_identity_matches_previous_atomic_replacement_input(
+    // Once exact snapshot evidence exists, do not let a stale producer digest override it.
+    let matches = if !previous_input.content.hash.is_empty() {
+        snapshot_bytes_match_previous_content(previous_input, &bytes)
+    } else if previous_input.snapshot_identity.is_some() {
+        snapshot_identity_matches_previous_atomic_replacement_input(
             previous_input,
             &snapshot,
             trust_rustc_work_product_provenance,
         )
-        && !snapshot_rustc_rlib_link_content_digest_matches_previous(
+    } else {
+        snapshot_rustc_rlib_link_content_digest_matches_previous(
             previous_input,
             &bytes,
             trust_rustc_work_product_provenance,
         )
-    {
+    };
+    if !matches {
         return Ok(None);
     }
     Ok(Some(
@@ -39405,7 +39544,8 @@ fn snapshot_identity_matches_previous_atomic_replacement_input(
         .zip(previous_input.content.identity.as_ref())
         .zip(FileIdentity::from_path(snapshot).ok().flatten().as_ref())
         .is_some_and(|((expected, input), current)| {
-            expected == current && expected.matches_same_data_ignoring_change_time(input)
+            expected.matches_same_data_ignoring_change_time(current)
+                && expected.matches_same_data_ignoring_change_time(input)
         })
 }
 
@@ -39621,13 +39761,28 @@ fn snapshot_input_paths<'a>(
     state_dir: &Path,
     paths: impl IntoIterator<Item = &'a Path>,
 ) -> Result<usize> {
+    snapshot_input_paths_with_isolation(state_dir, paths, false)
+}
+
+fn snapshot_exact_input_paths<'a>(
+    state_dir: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<usize> {
+    snapshot_input_paths_with_isolation(state_dir, paths, true)
+}
+
+fn snapshot_input_paths_with_isolation<'a>(
+    state_dir: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+    isolate: bool,
+) -> Result<usize> {
     let mut seen = HashSet::new();
     let mut snapshotted = 0;
     for path in paths {
         if !seen.insert(encode_path(path)) {
             continue;
         }
-        if snapshot_input_path(state_dir, path)? {
+        if snapshot_input_path(state_dir, path, isolate)? {
             snapshotted += 1;
         }
     }
@@ -39646,7 +39801,7 @@ fn changed_inputs_requiring_snapshot<'a>(
     })
 }
 
-fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
+fn snapshot_input_path(state_dir: &Path, path: &Path, isolate: bool) -> Result<bool> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(false),
@@ -39676,7 +39831,11 @@ fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
     ));
     let _ = std::fs::remove_file(&tmp);
 
-    copy_snapshot_bytes(path, &tmp)?;
+    if isolate {
+        copy_isolated_snapshot_bytes(path, &tmp)?;
+    } else {
+        copy_snapshot_bytes(path, &tmp)?;
+    }
 
     let _ = std::fs::remove_file(&target);
     std::fs::rename(&tmp, &target).with_context(|| {
@@ -42576,6 +42735,63 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn full_link_snapshots_direct_macho_resolution_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        std::fs::write(&input, b"archive").unwrap();
+        let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
+        let input_path = encode_path(&input);
+        let mut input_files = vec![FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_path_identity_only(&input).unwrap(),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        }];
+        let resolutions = vec![MachOSymbolResolutionRecord {
+            name: hex::encode("_owned").into(),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: input_path.into(),
+                section_index: 1,
+                section_offset: 0,
+            }),
+        }];
+        let mut previous = state("args", b"output", &[(input.to_str().unwrap(), b"archive")]);
+        previous.macho_symbol_resolutions = resolutions.clone();
+        assert!(input_has_records_requiring_previous_bytes(
+            &previous,
+            &previous.input_files[0],
+        ));
+
+        assert_eq!(
+            snapshot_loaded_input_files(
+                &state_dir,
+                &[&input_file],
+                &mut input_files,
+                &[],
+                &resolutions,
+                true,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &input)).unwrap(),
+            b"archive"
+        );
+        assert!(input_files[0].snapshot_identity.is_some());
+        assert_eq!(input_files[0].content.hash, hash_bytes(b"archive"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn changed_input_snapshots_accept_readonly_atomic_rust_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
@@ -42622,30 +42838,6 @@ mod tests {
             "crate.0123456789abcdef.rcgu.o"
         )));
         assert!(!is_atomic_replacement_rust_input(Path::new("member.o")));
-    }
-
-    #[test]
-    fn hashless_atomic_replacement_snapshots_require_matched_trusted_inputs() {
-        assert!(can_retain_hashless_atomic_replacement_snapshot(
-            Path::new("libcrate.rlib"),
-            true,
-            true,
-        ));
-        assert!(!can_retain_hashless_atomic_replacement_snapshot(
-            Path::new("libcrate.rlib"),
-            false,
-            true,
-        ));
-        assert!(!can_retain_hashless_atomic_replacement_snapshot(
-            Path::new("libcrate.rlib"),
-            true,
-            false,
-        ));
-        assert!(!can_retain_hashless_atomic_replacement_snapshot(
-            Path::new("libcrate.a"),
-            true,
-            true,
-        ));
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -42700,6 +42892,7 @@ mod tests {
                 &[&input_file],
                 &mut input_files,
                 &sections,
+                &[],
                 false,
             )
             .unwrap(),
@@ -47705,6 +47898,7 @@ mod tests {
             &[&resolution],
             &[],
             true,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -60081,7 +60275,356 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
-    fn preloading_preclassifies_recordful_rustc_rlib_before_reading_records() {
+    fn normalized_archive_refreshes_exact_snapshot_for_next_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let next_digest = "b".repeat(blake3::OUT_LEN * 2);
+        let object = growable_data_elf();
+        let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, &object);
+        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, &object);
+        let mut next_object = object.clone();
+        next_object[0x40] ^= 1;
+        let next_bytes = rustc_rlib_with_link_content_digest(b"next", &next_digest, &next_object);
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let input_path = encode_path(&input);
+        let member_identifier = b"crate.cgu.0.old.rcgu.o";
+        let member = match patch_archive_member_bytes(&previous_bytes, member_identifier).unwrap() {
+            ArchiveMemberMatch::Unique(member) => member,
+            _ => panic!("expected unique Rust archive member"),
+        };
+        let member_input = resolved_patch_input_ref(&input_path, &input_path, member).unwrap();
+        let section = PatchSection {
+            input: member_input,
+            section_index: 1,
+            section_name: Some(".data".to_owned()),
+            input_size: 4,
+            output_offset: 64,
+            output_size: 8,
+            data_hash: Some(hash_bytes(&object[0x40..0x44])),
+            cstring_nul_boundaries_hash: None,
+        };
+        let previous_patch = PreviousPatchState {
+            fingerprint: patch_fingerprint(&previous_bytes, input_path.as_str(), [section.clone()])
+                .unwrap()
+                .unwrap(),
+            archive_member_patch_fingerprints: None,
+            sections: vec![section.clone()],
+        };
+        let mut previous = state(
+            "args",
+            b"output",
+            &[(input.to_str().unwrap(), &previous_bytes)],
+        );
+        previous.input_files[0].content =
+            FileContentState::from_path_identity_only(&input).unwrap();
+        let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
+        let section_record = SectionRecord {
+            input_file: input_path.clone().into(),
+            input: section.input.clone().into(),
+            section_index: section.section_index,
+            output_offset: section.output_offset,
+            size: section.output_size,
+        };
+        snapshot_loaded_input_files(
+            &state_dir,
+            &[&input_file],
+            &mut previous.input_files,
+            &[section_record],
+            &[],
+            true,
+        )
+        .unwrap();
+        previous.input_files[0].rustc_link_content_digest = Some(digest.clone());
+        previous.input_files[0].patch = Some(FilePatchState {
+            fingerprint: previous_patch.fingerprint.clone(),
+            archive_member_set_proof: archive_member_set_proof(&previous_bytes).unwrap(),
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: vec![file_patch_section_state(&section)],
+            raw_sections: None,
+        });
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, &current_bytes).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        let args = crate::args::macho::MachOArgs::default();
+        assert!(can_normalize_rust_archive_patch(
+            &args, &previous, 0, &input
+        ));
+        let mut deferred_patch = previous.clone();
+        deferred_patch.input_files[0].patch = None;
+        deferred_patch.patch_record_locations = vec![PatchRecordLocation {
+            input_file: input_path.clone(),
+            offset: 0,
+            len: 1,
+            hash: hash_bytes(b"x"),
+        }];
+        assert!(can_normalize_rust_archive_patch(
+            &args,
+            &deferred_patch,
+            0,
+            &input,
+        ));
+        assert!(
+            preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+                &args,
+                &deferred_patch,
+                &[(0, input.clone())],
+                true,
+            )
+            .is_empty()
+        );
+        assert!(
+            preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+                &args,
+                &previous,
+                &[(0, input.clone())],
+                true,
+            )
+            .is_empty()
+        );
+        let normalized = classify_normalized_rust_archive_patch_state(
+            &previous.input_files[0],
+            &current_bytes,
+            &previous_patch,
+        )
+        .unwrap();
+        let NormalizedRustArchivePatchState::Unchanged(patch) = normalized else {
+            panic!("expected exact normalized archive match");
+        };
+        previous.input_files[0].content = content_hash_with_path_identity(&input, &current_bytes);
+        previous.input_files[0].snapshot_identity = None;
+        previous.input_files[0].patch = Some(patch);
+        snapshot_exact_input_paths(&state_dir, [input.as_path()]).unwrap();
+        refresh_input_snapshot_identities_at_indices(&state_dir, &mut previous.input_files, [0]);
+        refresh_input_file_identities_at_indices(&mut previous.input_files, [0]);
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &input)).unwrap(),
+            current_bytes
+        );
+
+        let replacement = dir.path().join("next.rlib");
+        std::fs::write(&replacement, next_bytes).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        assert_eq!(
+            read_verified_input_snapshot_with_rustc_work_product_provenance(
+                &state_dir,
+                &previous.input_files[0],
+                true,
+            )
+            .unwrap(),
+            Some(current_bytes.clone())
+        );
+
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let mut damaged = current_bytes.clone();
+        damaged[0] ^= 1;
+        let mut permissions = std::fs::metadata(&snapshot).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&snapshot, permissions).unwrap();
+        std::fs::write(&snapshot, damaged).unwrap();
+        assert_eq!(
+            read_verified_input_snapshot_with_rustc_work_product_provenance(
+                &state_dir,
+                &previous.input_files[0],
+                true,
+            )
+            .unwrap(),
+            None
+        );
+
+        let stale = dir.path().join("stale-snapshot");
+        let mut stale_bytes = current_bytes.clone();
+        stale_bytes[1] ^= 1;
+        std::fs::write(&stale, stale_bytes).unwrap();
+        let mut permissions = std::fs::metadata(&stale).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&stale, permissions).unwrap();
+        std::fs::rename(stale, &snapshot).unwrap();
+        assert_eq!(
+            read_verified_input_snapshot_with_rustc_work_product_provenance(
+                &state_dir,
+                &previous.input_files[0],
+                true,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn normalized_symbol_owner_refreshes_exact_snapshot_for_next_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let next_digest = "b".repeat(blake3::OUT_LEN * 2);
+        let object = test_macho_object(&[1; 4], &[2; 4], 0);
+        let previous_bytes = rustc_rlib_with_link_content_digest(b"old", &digest, &object);
+        let current_bytes = rustc_rlib_with_link_content_digest(b"new", &digest, &object);
+        let mut next_object = object.clone();
+        next_object[0x100] ^= 1;
+        let next_bytes = rustc_rlib_with_link_content_digest(b"next", &next_digest, &next_object);
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let input_path = encode_path(&input);
+        let member =
+            match patch_archive_member_bytes(&previous_bytes, b"crate.cgu.0.old.rcgu.o").unwrap() {
+                ArchiveMemberMatch::Unique(member) => member,
+                _ => panic!("expected unique Rust archive member"),
+            };
+        let member_input = resolved_patch_input_ref(&input_path, &input_path, member).unwrap();
+        let resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_data").into(),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: member_input.into(),
+                section_index: 2,
+                section_offset: 0,
+            }),
+        };
+        let mut previous = state(
+            "args",
+            &object,
+            &[(input.to_str().unwrap(), &previous_bytes)],
+        );
+        previous.input_files[0].content = content_hash_with_path_identity(&input, &previous_bytes);
+        previous.macho_symbol_resolutions = vec![resolution];
+        let resolution_ranges = macho_symbol_resolution_ranges_for_current_records(
+            &previous_bytes,
+            input_path.as_str(),
+            &previous.macho_symbol_resolutions,
+        )
+        .unwrap();
+        assert!(resolution_ranges.is_some_and(|ranges| !ranges.is_empty()));
+        let input_file = crate::input_data::InputFile::from_path_for_testing(&input);
+        snapshot_loaded_input_files(
+            &state_dir,
+            &[&input_file],
+            &mut previous.input_files,
+            &[],
+            &previous.macho_symbol_resolutions,
+            true,
+        )
+        .unwrap();
+        assert!(previous.input_files[0].patch.is_none());
+        previous.input_files[0].rustc_link_content_digest = Some(digest.clone());
+        previous.write(&state_dir).unwrap();
+        let previous = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        assert!(previous.input_files[0].patch.is_none());
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, &current_bytes).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        let output = dir.path().join("app");
+        std::fs::write(&output, &object).unwrap();
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.output = Arc::from(output.as_path());
+        let mut routed = previous.clone();
+        routed.materialize_patch_record_locations().unwrap();
+        assert!(can_normalize_rust_archive_patch(&args, &routed, 0, &input));
+        assert!(
+            preclassify_unchanged_rustc_rlibs_by_link_content_digest(
+                &args,
+                &routed,
+                &[(0, input.clone())],
+                true,
+            )
+            .is_empty()
+        );
+        let result = patch_changed_inputs_with_rustc_link_content_digest_trust(
+            &args,
+            &state_dir,
+            &output,
+            None,
+            false,
+            previous,
+            None,
+            ChangedInputRecordCoverage::Complete,
+            &[(0, input.clone())],
+            &[0],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(result, ChangedInputPatchResult::Patched));
+        let mut updated = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        updated.load_macho_symbol_resolutions(&state_dir).unwrap();
+        let patch = updated.input_files[0].patch.as_ref().unwrap();
+        assert!(patch.sections.is_empty());
+        assert_eq!(
+            updated.input_files[0].content.hash,
+            hash_bytes(&current_bytes)
+        );
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &input)).unwrap(),
+            current_bytes
+        );
+
+        let replacement = dir.path().join("next.rlib");
+        std::fs::write(&replacement, &next_bytes).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        assert_eq!(
+            read_verified_input_snapshot_with_rustc_work_product_provenance(
+                &state_dir,
+                &updated.input_files[0],
+                true,
+            )
+            .unwrap(),
+            Some(current_bytes.clone())
+        );
+        let previous_patch =
+            patch_sections_from_previous_state(&updated.input_files[0], &input).unwrap();
+        assert!(matches!(
+            classify_normalized_rust_archive_record_owner_state(
+                &updated.input_files[0],
+                &next_bytes,
+                &previous_patch,
+                &object,
+                &[],
+                &[],
+                &updated.macho_symbol_resolutions,
+                &[],
+                &[],
+            )
+            .unwrap(),
+            NormalizedRustArchivePatchState::Unknown
+        ));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn normalized_archive_snapshot_rejects_replacement_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        let expected_bytes = b"expected archive";
+        std::fs::write(&input, expected_bytes).unwrap();
+        let expected = FileContentState::from_path_identity_only(&input).unwrap();
+        let expected = ExpectedInputContent::from_content(&input, &expected);
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"raced archive...").unwrap();
+        std::fs::rename(replacement, &input).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+
+        assert!(
+            input_content_mismatch_reason(&[expected], Some(&state_dir))
+                .unwrap()
+                .contains("changed while incremental fast path was running")
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_preclassifies_producer_only_rustc_rlib() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("app");
         let input = dir.path().join("libcrate.rlib");
@@ -60098,16 +60641,7 @@ mod tests {
         let state_dir = state_dir_for_output(&output);
         let mut previous = publishing_metadata_state(&args, &output, &input);
         previous.input_files[0].rustc_link_content_digest = Some(digest.clone());
-        previous
-            .sections
-            .push(section_record(input.to_str().unwrap(), 1, 64, 8));
         previous.write(&state_dir).unwrap();
-        let sections_file = PersistedState::read_metadata(&state_dir)
-            .unwrap()
-            .unwrap()
-            .sections_file
-            .unwrap();
-        let previous_sections = std::fs::read(state_dir.join(&sections_file)).unwrap();
 
         let replacement = dir.path().join("libcrate.replacement.rlib");
         std::fs::write(&replacement, current_bytes).unwrap();
@@ -60129,17 +60663,12 @@ mod tests {
                 .identity_matches_path(&input)
                 .unwrap()
         );
-        assert_eq!(
-            std::fs::read(state_dir.join(&sections_file)).unwrap(),
-            previous_sections
-        );
         let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
         assert!(log.contains(
             "classified 1 unchanged Rust archive input file by rustc link-content digest before loading indexed records"
         ));
         assert!(log.contains("reused existing output before loading inputs"));
         assert!(!log.contains("loaded records for"));
-        assert!(!log.contains("missing patch metadata"));
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -64747,7 +65276,14 @@ mod tests {
             }),
         }];
 
-        snapshot_loaded_files(Path::new("unused"), &file_loader, &mut input_files, &[]).unwrap();
+        snapshot_loaded_files(
+            Path::new("unused"),
+            &file_loader,
+            &mut input_files,
+            &[],
+            &[],
+        )
+        .unwrap();
 
         assert!(input_files[0].patch.is_none());
     }
@@ -66544,6 +67080,26 @@ mod tests {
         metadata.materialize_patch_record_locations().unwrap();
         assert_eq!(metadata.patch_record_locations, vec![location]);
         assert!(metadata.raw_patch_record_locations.is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn invalid_deferred_patch_record_locations_reject_only_the_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut previous = state("args", b"output", &[("a.o", b"a")]);
+        previous.raw_patch_record_locations =
+            Some("patch-records\t1\npatch-record\tmalformed\n".to_owned());
+
+        assert!(
+            !materialize_patch_record_locations_for_fast_path(dir.path(), &mut previous).unwrap()
+        );
+        assert!(previous.patch_record_locations.is_empty());
+        assert!(previous.raw_patch_record_locations.is_some());
+        assert!(
+            std::fs::read_to_string(dir.path().join(LOG_FILE))
+                .unwrap()
+                .contains("invalid patch record locations")
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
