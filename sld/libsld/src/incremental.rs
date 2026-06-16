@@ -7846,6 +7846,10 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         ) {
                             return Ok(ChangedInputPatchResult::Unsupported(reason));
                         }
+                    } else if let Err(reason) =
+                        refresh_active_macho_archive_forward_patches(state, previous_output.get()?)
+                    {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
                     }
                     previous_patch
                         .sections
@@ -28014,6 +28018,38 @@ fn retain_initial_macho_archive_removal_transaction(
     }
     state.forward_patches = forward_patches;
     state.rollback_patches = rollback_patches;
+    Ok(())
+}
+
+fn refresh_active_macho_archive_forward_patches(
+    state: &mut MachOArchiveActivationState,
+    current_output: &[u8],
+) -> std::result::Result<(), String> {
+    if !state.active {
+        return Err("cannot refresh dormant Mach-O archive transaction".to_owned());
+    }
+    if !macho_archive_transaction_patches_match(state) {
+        return Err("active Mach-O archive transaction is incomplete".to_owned());
+    }
+    let refreshed = state
+        .forward_patches
+        .iter()
+        .map(|patch| {
+            let start = usize::try_from(patch.output_offset).map_err(|_| {
+                "active Mach-O archive forward patch offset is too large".to_owned()
+            })?;
+            let end = start
+                .checked_add(patch.data.len())
+                .ok_or_else(|| "active Mach-O archive forward patch range overflowed".to_owned())?;
+            current_output
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "active Mach-O archive forward patch is outside output".to_owned())
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    for (patch, data) in state.forward_patches.iter_mut().zip(refreshed) {
+        patch.data = data;
+    }
     Ok(())
 }
 
@@ -70582,6 +70618,55 @@ mod tests {
             raw_sections: None,
         };
         let dormant_output = vec![0; 516];
+
+        let mut refreshed_dormant = dormant.clone();
+        refreshed_dormant.active = true;
+        let mut live_output = dormant_output.clone();
+        live_output[256..260].copy_from_slice(&[9, 10, 11, 12]);
+        refresh_active_macho_archive_forward_patches(&mut refreshed_dormant, &live_output).unwrap();
+        assert_eq!(refreshed_dormant.forward_patches[0].data, [9, 10, 11, 12]);
+        assert_eq!(refreshed_dormant.rollback_patches[0].data, [0; 4]);
+        refreshed_dormant.active = false;
+        let refreshed_patch = FilePatchState {
+            macho_archive_members: vec![refreshed_dormant],
+            ..patch.clone()
+        };
+        let refreshed_activation = reactivated_macho_archive_text_activation(
+            &current,
+            &input_file,
+            &[current_identifier.to_vec()],
+            &resolver,
+            &refreshed_patch,
+            &dormant_output,
+            std::slice::from_ref(&rollback),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            refreshed_activation.reactivated_output_patches[0].data,
+            [9, 10, 11, 12],
+        );
+
+        let mut invalid = dormant.clone();
+        invalid.active = true;
+        invalid.forward_patches.push(StoredOutputPatch {
+            output_offset: 514,
+            data: vec![5, 6, 7, 8],
+        });
+        invalid.rollback_patches.push(StoredOutputPatch {
+            output_offset: 514,
+            data: vec![0; 4],
+        });
+        let unchanged = invalid.clone();
+        assert!(
+            refresh_active_macho_archive_forward_patches(&mut invalid, &live_output)
+                .unwrap_err()
+                .contains("outside output")
+        );
+        assert_eq!(invalid, unchanged, "a failed refresh must be transactional");
 
         let activation = reactivated_macho_archive_text_activation(
             &current,
