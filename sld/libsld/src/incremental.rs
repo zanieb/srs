@@ -5877,7 +5877,6 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut deferred_loaded_input_content_hashes = Vec::new();
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
-    let mut newly_retired_macho_archive_states = Vec::new();
     let mut record_override_input_files = HashSet::new();
     let changed_input_files = changed_inputs
         .iter()
@@ -8572,22 +8571,17 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             for update in &activation.state_updates {
                 match update {
                     MachOArchiveActivationStateUpdate::Replace(index, state) => {
-                        match replace_changed_macho_definition_activation_state(
-                            &mut macho_archive_members,
-                            *index,
-                            state,
-                        ) {
-                            Ok(true) => newly_retired_macho_archive_states.push(
-                                RetiredMachOArchiveStateRef {
-                                    input_index: *input_index,
-                                    state_index: *index,
-                                },
-                            ),
-                            Ok(false) => {}
-                            Err(reason) => {
-                                return Ok(ChangedInputPatchResult::Unsupported(reason));
-                            }
+                        let Some(stored) = macho_archive_members.get_mut(*index) else {
+                            return Ok(ChangedInputPatchResult::Unsupported(
+                                "changed Mach-O definition ownership moved".to_owned(),
+                            ));
+                        };
+                        if !stored.kind.is_changed_definitions() {
+                            return Ok(ChangedInputPatchResult::Unsupported(
+                                "changed Mach-O definition ownership changed kind".to_owned(),
+                            ));
                         }
+                        *stored = state.clone();
                     }
                     MachOArchiveActivationStateUpdate::Add(state) => {
                         if macho_archive_members.iter().any(|stored| {
@@ -8615,9 +8609,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             .iter()
                             .map(|member| member.normalized_identifier.as_slice()))
             });
-            let state_index = if let Some(stored_index) = stored_index {
+            if let Some(stored_index) = stored_index {
                 macho_archive_members[stored_index] = retired.state.clone();
-                stored_index
             } else if retired.newly_tracked
                 && !macho_archive_members.iter().any(|stored| {
                     stored.members.iter().any(|stored_member| {
@@ -8629,16 +8622,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 })
             {
                 macho_archive_members.push(retired.state.clone());
-                macho_archive_members.len() - 1
             } else {
                 return Ok(ChangedInputPatchResult::Unsupported(
                     "removed Mach-O archive activation ownership changed".to_owned(),
                 ));
-            };
-            newly_retired_macho_archive_states.push(RetiredMachOArchiveStateRef {
-                input_index: *input_index,
-                state_index,
-            });
+            }
         }
         if let Some(activation) = &added_macho_archive_text_activation {
             for member in &activation.member_states {
@@ -9219,10 +9207,14 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
         &mut expected_changed_inputs,
         deferred_loaded_input_content_hashes,
     )?;
+    let dormant_macho_archive_states = dormant_macho_archive_state_refs_for_inputs(
+        &previous.input_files,
+        changed_inputs.iter().map(|(input_index, _)| *input_index),
+    );
     let refreshed_macho_archive_rollback_patch_count =
-        match refresh_newly_retired_macho_archive_rollback_patches(
+        match refresh_dormant_macho_archive_rollback_patches(
             &mut previous.input_files,
-            &newly_retired_macho_archive_states,
+            &dormant_macho_archive_states,
             &output,
         ) {
             Ok(count) => count,
@@ -9338,12 +9330,12 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     }
     clear_incremental_update_marker(state_dir)?;
 
-    if !newly_retired_macho_archive_states.is_empty() {
+    if !dormant_macho_archive_states.is_empty() {
         append_log(
             state_dir,
             &format!(
-                "refreshed {refreshed_macho_archive_rollback_patch_count} rollback patches for {} newly retired Mach-O archive ownership states",
-                newly_retired_macho_archive_states.len(),
+                "refreshed {refreshed_macho_archive_rollback_patch_count} rollback patches for {} dormant Mach-O archive ownership states",
+                dormant_macho_archive_states.len(),
             ),
         )?;
     }
@@ -11177,22 +11169,6 @@ impl ChangedMachODefinitionActivation {
 enum MachOArchiveActivationStateUpdate {
     Replace(usize, MachOArchiveActivationState),
     Add(MachOArchiveActivationState),
-}
-
-fn replace_changed_macho_definition_activation_state(
-    states: &mut [MachOArchiveActivationState],
-    index: usize,
-    state: &MachOArchiveActivationState,
-) -> std::result::Result<bool, String> {
-    let stored = states
-        .get_mut(index)
-        .ok_or_else(|| "changed Mach-O definition ownership moved".to_owned())?;
-    if !stored.kind.is_changed_definitions() {
-        return Err("changed Mach-O definition ownership changed kind".to_owned());
-    }
-    let newly_retired = stored.active && !state.active;
-    *stored = state.clone();
-    Ok(newly_retired)
 }
 
 struct AddedMachOArchiveTextActivations {
@@ -25251,7 +25227,38 @@ fn stored_output_patches_match(patches: &[StoredOutputPatch], output: &[u8]) -> 
     })
 }
 
-fn refresh_newly_retired_macho_archive_rollback_patches(
+fn dormant_macho_archive_state_refs_for_inputs(
+    input_files: &[FileState],
+    input_indices: impl IntoIterator<Item = usize>,
+) -> Vec<RetiredMachOArchiveStateRef> {
+    let mut seen_inputs = HashSet::new();
+    let mut refs = Vec::new();
+    for input_index in input_indices {
+        if !seen_inputs.insert(input_index) {
+            continue;
+        }
+        let Some(patch) = input_files
+            .get(input_index)
+            .and_then(|input| input.patch.as_ref())
+        else {
+            continue;
+        };
+        refs.extend(
+            patch
+                .macho_archive_members
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| !state.active)
+                .map(|(state_index, _)| RetiredMachOArchiveStateRef {
+                    input_index,
+                    state_index,
+                }),
+        );
+    }
+    refs
+}
+
+fn refresh_dormant_macho_archive_rollback_patches(
     input_files: &mut [FileState],
     retired_states: &[RetiredMachOArchiveStateRef],
     current_output: &[u8],
@@ -63697,8 +63704,7 @@ mod tests {
         let mut output = vec![0; 48];
         output[16..32].copy_from_slice(&b);
 
-        refresh_newly_retired_macho_archive_rollback_patches(&mut inputs, &retired_a, &output)
-            .unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output).unwrap();
         round_trip(&mut inputs);
         let members = &mut inputs[0].patch.as_mut().unwrap().macho_archive_members;
         assert_eq!(members[0].rollback_patches[0].data, b);
@@ -63707,7 +63713,7 @@ mod tests {
         members[0].active = true;
         members[1].active = false;
         output[16..32].copy_from_slice(&a);
-        refresh_newly_retired_macho_archive_rollback_patches(
+        refresh_dormant_macho_archive_rollback_patches(
             &mut inputs,
             &[RetiredMachOArchiveStateRef {
                 input_index: 0,
@@ -63723,49 +63729,11 @@ mod tests {
         members[0].active = false;
         members[1].active = true;
         output[16..32].copy_from_slice(&b);
-        refresh_newly_retired_macho_archive_rollback_patches(&mut inputs, &retired_a, &output)
-            .unwrap();
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &retired_a, &output).unwrap();
         round_trip(&mut inputs);
         assert_eq!(
             inputs[0].patch.as_ref().unwrap().macho_archive_members[0].rollback_patches[0].data,
             b,
-        );
-    }
-
-    #[test]
-    fn changed_macho_definition_replacement_reports_new_retirement() {
-        let state = |kind, active| MachOArchiveActivationState {
-            kind,
-            members: Vec::new(),
-            active,
-            sections: Vec::new(),
-            relocations: Vec::new(),
-            symbol_resolutions: Vec::new(),
-            rollback_symbol_resolutions: Vec::new(),
-            forward_patches: Vec::new(),
-            rollback_patches: Vec::new(),
-        };
-        let mut states = vec![state(MachOArchiveActivationKind::ChangedDefinitions, true)];
-        let dormant = state(MachOArchiveActivationKind::ChangedDefinitions, false);
-        assert!(
-            replace_changed_macho_definition_activation_state(&mut states, 0, &dormant).unwrap()
-        );
-
-        let active = state(MachOArchiveActivationKind::ChangedDefinitions, true);
-        assert!(
-            !replace_changed_macho_definition_activation_state(&mut states, 0, &active).unwrap()
-        );
-        assert!(
-            replace_changed_macho_definition_activation_state(&mut states, 1, &dormant)
-                .unwrap_err()
-                .contains("ownership moved")
-        );
-
-        states[0] = state(MachOArchiveActivationKind::AddedMembers, true);
-        assert!(
-            replace_changed_macho_definition_activation_state(&mut states, 0, &dormant)
-                .unwrap_err()
-                .contains("changed kind")
         );
     }
 
@@ -63863,22 +63831,27 @@ mod tests {
             fingerprint: String::new(),
             archive_member_set_proof: None,
             archive_member_patch_fingerprints: None,
-            macho_archive_members: vec![dormant, active],
+            macho_archive_members: Vec::new(),
             sections: Vec::new(),
             raw_sections: None,
         });
+        assert!(
+            dormant_macho_archive_state_refs_for_inputs(&inputs, [0]).is_empty(),
+            "the full-link seed unexpectedly has archive ownership state",
+        );
+        inputs[0].patch.as_mut().unwrap().macho_archive_members = vec![dormant, active];
         let mut output = vec![0; 48];
         output[16..32].copy_from_slice(&new_forward);
 
-        refresh_newly_retired_macho_archive_rollback_patches(
-            &mut inputs,
-            &[RetiredMachOArchiveStateRef {
+        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        assert_eq!(
+            dormant,
+            vec![RetiredMachOArchiveStateRef {
                 input_index: 0,
                 state_index: 0,
             }],
-            &output,
-        )
-        .unwrap();
+        );
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -63921,15 +63894,8 @@ mod tests {
         states[0].active = true;
         states[1].active = false;
         output[16..32].copy_from_slice(&old_forward);
-        refresh_newly_retired_macho_archive_rollback_patches(
-            &mut inputs,
-            &[RetiredMachOArchiveStateRef {
-                input_index: 0,
-                state_index: 1,
-            }],
-            &output,
-        )
-        .unwrap();
+        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -63941,15 +63907,8 @@ mod tests {
         states[0].active = false;
         states[1].active = true;
         output[16..32].copy_from_slice(&new_forward);
-        refresh_newly_retired_macho_archive_rollback_patches(
-            &mut inputs,
-            &[RetiredMachOArchiveStateRef {
-                input_index: 0,
-                state_index: 0,
-            }],
-            &output,
-        )
-        .unwrap();
+        let dormant = dormant_macho_archive_state_refs_for_inputs(&inputs, [0]);
+        refresh_dormant_macho_archive_rollback_patches(&mut inputs, &dormant, &output).unwrap();
         let states = &inputs[0].patch.as_ref().unwrap().macho_archive_members;
         let rendered = render_macho_archive_member_states(states);
         assert_eq!(
@@ -64014,13 +63973,9 @@ mod tests {
         let mut output = vec![0; 32];
         output[16..20].copy_from_slice(&[5, 6, 7, 9]);
         assert!(
-            refresh_newly_retired_macho_archive_rollback_patches(
-                &mut tampered,
-                &retired_ref,
-                &output,
-            )
-            .unwrap_err()
-            .contains("differs from finalized output")
+            refresh_dormant_macho_archive_rollback_patches(&mut tampered, &retired_ref, &output,)
+                .unwrap_err()
+                .contains("differs from finalized output")
         );
         assert_eq!(
             tampered, original,
@@ -64030,13 +63985,9 @@ mod tests {
         let mut partial = input_files(18);
         let original = partial.clone();
         assert!(
-            refresh_newly_retired_macho_archive_rollback_patches(
-                &mut partial,
-                &retired_ref,
-                &output,
-            )
-            .unwrap_err()
-            .contains("partially shadows")
+            refresh_dormant_macho_archive_rollback_patches(&mut partial, &retired_ref, &output,)
+                .unwrap_err()
+                .contains("partially shadows")
         );
         assert_eq!(
             partial, original,
@@ -64046,13 +63997,9 @@ mod tests {
         let mut stale = input_files(24);
         let original = stale.clone();
         assert!(
-            refresh_newly_retired_macho_archive_rollback_patches(
-                &mut stale,
-                &retired_ref,
-                &output,
-            )
-            .unwrap_err()
-            .contains("without an exact replacement")
+            refresh_dormant_macho_archive_rollback_patches(&mut stale, &retired_ref, &output,)
+                .unwrap_err()
+                .contains("without an exact replacement")
         );
         assert_eq!(
             stale, original,
