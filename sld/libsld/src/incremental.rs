@@ -18727,11 +18727,24 @@ fn macho_local_symbol_name_is_repeatable(name: &[u8]) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
 }
 
-fn macho_local_symbol_cohort_addition_collides(
+fn macho_local_symbol_cohort_additions_collide(
     previous_output: &[u8],
-    entry: &MachOLocalSymbolCohortEntry,
+    entries: &[&MachOLocalSymbolCohortEntry],
 ) -> bool {
-    let repeatable_local_name = macho_local_symbol_name_is_repeatable(&entry.name);
+    if entries.is_empty() {
+        return false;
+    }
+    // Large Mach-O outputs can contain hundreds of thousands of symbols. Index the proposed
+    // names so every nlist is validated exactly once instead of rescanning it per addition.
+    let mut entries_by_name = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        if entries_by_name
+            .insert(entry.name.as_slice(), *entry)
+            .is_some()
+        {
+            return true;
+        }
+    }
     let Ok((symbol_table, string_table)) = macho_symbol_and_string_table_ranges(previous_output)
     else {
         return true;
@@ -18748,8 +18761,13 @@ fn macho_local_symbol_cohort_addition_collides(
     let Ok(string_end) = usize::try_from(string_table.end) else {
         return true;
     };
+    if symbol_start > symbol_end || (symbol_end - symbol_start) % 16 != 0 {
+        return true;
+    }
     for entry_start in (symbol_start..symbol_end).step_by(16) {
-        let raw = &previous_output[entry_start..entry_start + 16];
+        let Some(raw) = previous_output.get(entry_start..entry_start + 16) else {
+            return true;
+        };
         let Some(string_index) = read_u32_le(&raw[..4]) else {
             return true;
         };
@@ -18766,9 +18784,14 @@ fn macho_local_symbol_cohort_addition_collides(
         else {
             return true;
         };
-        if previous_output.get(name_start..name_end) != Some(entry.name.as_slice()) {
+        let Some(entry) = previous_output
+            .get(name_start..name_end)
+            .and_then(|name| entries_by_name.get(name))
+            .copied()
+        else {
             continue;
-        }
+        };
+        let repeatable_local_name = macho_local_symbol_name_is_repeatable(&entry.name);
         let same_site = raw[5] == entry.output_section_index
             && read_u64_le(&raw[8..16]) == Some(entry.output_value);
         let ordinary_local = raw[4] == object::macho::N_SECT
@@ -20857,15 +20880,14 @@ fn plan_macho_local_symbol_cohort(
         .iter()
         .map(|entry| entry.name.clone())
         .collect::<HashSet<_>>();
-    for entry in &current {
-        if previous_names.contains(&entry.name) {
-            continue;
-        }
-        if macho_local_symbol_cohort_addition_collides(previous_output, entry) {
-            return Ok(Err(
-                "published local Mach-O cohort addition collides with an output symbol".to_owned(),
-            ));
-        }
+    let additions = current
+        .iter()
+        .filter(|entry| !previous_names.contains(&entry.name))
+        .collect::<Vec<_>>();
+    if macho_local_symbol_cohort_additions_collide(previous_output, &additions) {
+        return Ok(Err(
+            "published local Mach-O cohort addition collides with an output symbol".to_owned(),
+        ));
     }
     let unchanged = previous.len() == current.len()
         && previous.iter().zip(&current).all(|(previous, current)| {
@@ -55641,15 +55663,37 @@ mod tests {
             text_section,
             text.address() + 8,
         );
-        assert!(!macho_local_symbol_cohort_addition_collides(
-            &outside, &entry
+        assert!(!macho_local_symbol_cohort_additions_collide(
+            &outside,
+            &[&entry],
+        ));
+        let repeated = add_test_macho_local_alias(
+            outside.clone(),
+            &entry.name,
+            text_section,
+            text.address() + 12,
+        );
+        assert!(!macho_local_symbol_cohort_additions_collide(
+            &repeated,
+            &[&entry],
+        ));
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &outside,
+            &[&entry, &entry],
+        ));
+        let mut malformed = outside.clone();
+        let malformed_entry = test_macho_symbol_entry_offset(&malformed, &entry.name);
+        malformed[malformed_entry..malformed_entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &malformed,
+            &[&entry],
         ));
 
         let wrong_section =
             add_test_macho_local_alias(output.clone(), &entry.name, data_section, data.address());
-        assert!(macho_local_symbol_cohort_addition_collides(
+        assert!(macho_local_symbol_cohort_additions_collide(
             &wrong_section,
-            &entry,
+            &[&entry],
         ));
 
         let nonrepeatable_entry = MachOLocalSymbolCohortEntry {
@@ -55662,35 +55706,85 @@ mod tests {
             text_section,
             text.address() + 8,
         );
-        assert!(macho_local_symbol_cohort_addition_collides(
+        assert!(macho_local_symbol_cohort_additions_collide(
             &nonrepeatable,
-            &nonrepeatable_entry,
+            &[&nonrepeatable_entry],
         ));
 
         let same_site =
             add_test_macho_local_alias(output.clone(), &entry.name, text_section, text.address());
-        assert!(macho_local_symbol_cohort_addition_collides(
-            &same_site, &entry
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &same_site,
+            &[&entry],
         ));
 
         let mut stab = outside.clone();
         let stab_entry = test_macho_symbol_entry_offset(&stab, &entry.name);
         stab[stab_entry + 4] |= object::macho::N_STAB;
-        assert!(macho_local_symbol_cohort_addition_collides(&stab, &entry));
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &stab,
+            &[&entry],
+        ));
 
         for n_desc in [object::macho::N_ALT_ENTRY, object::macho::N_NO_DEAD_STRIP] {
             let mut metadata = outside.clone();
             let metadata_entry = test_macho_symbol_entry_offset(&metadata, &entry.name);
             metadata[metadata_entry + 6..metadata_entry + 8].copy_from_slice(&n_desc.to_le_bytes());
-            assert!(macho_local_symbol_cohort_addition_collides(
-                &metadata, &entry,
+            assert!(macho_local_symbol_cohort_additions_collide(
+                &metadata,
+                &[&entry],
             ));
         }
 
         let mut global = outside;
         let global_entry = test_macho_symbol_entry_offset(&global, &entry.name);
         global[global_entry + 4] |= object::macho::N_EXT;
-        assert!(macho_local_symbol_cohort_addition_collides(&global, &entry));
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &global,
+            &[&entry],
+        ));
+    }
+
+    #[test]
+    fn published_local_macho_cohort_batches_large_collision_checks() {
+        let mut output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let text = output_file.section_by_name("__text").unwrap();
+        let text_section = u8::try_from(text.index().0).unwrap();
+        let text_address = text.address();
+        drop(output_file);
+        for index in 0..512 {
+            output = add_test_macho_local_alias(
+                output,
+                format!("unrelated{index}").as_bytes(),
+                text_section,
+                text_address + 0x1000 + index,
+            );
+        }
+        let additions = (0..2048)
+            .map(|index| MachOLocalSymbolCohortEntry {
+                name: format!("added{index}").into_bytes(),
+                n_desc: 0,
+                output_section_index: text_section,
+                output_value: text_address + 0x4000 + index,
+                output_entry_offset: None,
+                string_index: None,
+            })
+            .collect::<Vec<_>>();
+        let addition_refs = additions.iter().collect::<Vec<_>>();
+        assert!(!macho_local_symbol_cohort_additions_collide(
+            &output,
+            &addition_refs,
+        ));
+
+        let collision = MachOLocalSymbolCohortEntry {
+            name: b"unrelated511".to_vec(),
+            ..additions[0].clone()
+        };
+        assert!(macho_local_symbol_cohort_additions_collide(
+            &output,
+            &[&collision],
+        ));
     }
 
     #[test]
