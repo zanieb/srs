@@ -7359,19 +7359,21 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .flat_map(|activation| activation.normalized_identifiers.iter().cloned())
                 .collect::<Vec<_>>();
             let stable_relocation_count = previous.relocations.len();
+            let mut reactivated_relocation_records_changed = false;
             if let Some(activation) = &mut added_macho_archive_text_activation {
                 if !records_complete {
                     return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
                         "added Mach-O archive member needs complete relocation records".to_owned(),
                     ));
                 }
-                let reactivated_relocations = !activation.reactivated_relocations.is_empty();
-                previous
-                    .relocations
-                    .append(&mut activation.reactivated_relocations);
-                if reactivated_relocations {
-                    previous.relocations.sort_unstable();
-                    previous.relocations.dedup();
+                reactivated_relocation_records_changed =
+                    append_reactivated_macho_relocations_preserving_indices(
+                        &mut previous.relocations,
+                        &mut activation.reactivated_relocations,
+                    );
+                if reactivated_relocation_records_changed {
+                    // Target moves retain indices into the stable prefix. Keep that prefix in
+                    // place until all relocation replays have consumed their indices.
                     previous.sections_file = None;
                 }
                 for (replay_index, record) in
@@ -8384,7 +8386,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 previous.macho_symbol_resolutions_file = None;
                 previous.sections_file = None;
             }
-            if relocation_records_changed {
+            if relocation_records_changed || reactivated_relocation_records_changed {
                 previous.relocations.sort_unstable();
                 previous.relocations.dedup();
                 if filtered_records_cover_macho_text_replays {
@@ -26121,6 +26123,15 @@ fn reactivated_macho_archive_text_activation(
         current_unwind_input_ranges: Vec::new(),
         remaining_reserved_ranges: reserved_ranges.to_vec(),
     })))
+}
+
+fn append_reactivated_macho_relocations_preserving_indices(
+    relocations: &mut Vec<RelocationRecord>,
+    reactivated: &mut Vec<RelocationRecord>,
+) -> bool {
+    let changed = !reactivated.is_empty();
+    relocations.append(reactivated);
+    changed
 }
 
 fn archive_member_set_proof_matches_current(
@@ -64878,6 +64889,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(refreshed.identifier, current_identifier);
+
+        let mut reactivated = activation.reactivated_relocations.clone();
+        reactivated[0].target_symbol_id = 0;
+        let stable = RelocationRecord {
+            target_symbol_id: u32::MAX,
+            ..reactivated[0].clone()
+        };
+        assert!(reactivated[0] < stable);
+        let mut persisted = vec![stable.clone()];
+        assert!(append_reactivated_macho_relocations_preserving_indices(
+            &mut persisted,
+            &mut reactivated,
+        ));
+        assert_eq!(persisted[0], stable);
+        assert!(reactivated.is_empty());
 
         let second_previous_identifier = b"c.2.old.rcgu.o";
         let second_current_identifier = b"c.2.new.rcgu.o";
