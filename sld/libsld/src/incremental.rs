@@ -18569,11 +18569,10 @@ fn verify_previous_macho_local_symbol_cohort(
     Ok(())
 }
 
-fn macho_local_cohort_atom_graph_is_complete(
-    boundaries: &HashMap<object::SectionIndex, Vec<u64>>,
+fn reachable_macho_local_cohort_atoms(
     roots: &HashSet<(object::SectionIndex, u64)>,
     edges: &HashMap<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>,
-) -> bool {
+) -> HashSet<(object::SectionIndex, u64)> {
     let mut reachable = roots.clone();
     let mut queue = roots.iter().copied().collect::<Vec<_>>();
     let mut index = 0;
@@ -18585,6 +18584,22 @@ fn macho_local_cohort_atom_graph_is_complete(
             }
         }
     }
+    reachable
+}
+
+fn required_macho_local_cohort_atoms_are_reachable(
+    required: &[(object::SectionIndex, u64)],
+    reachable: &HashSet<(object::SectionIndex, u64)>,
+) -> bool {
+    required.iter().all(|atom| reachable.contains(atom))
+}
+
+fn macho_local_cohort_atom_graph_is_complete(
+    boundaries: &HashMap<object::SectionIndex, Vec<u64>>,
+    roots: &HashSet<(object::SectionIndex, u64)>,
+    edges: &HashMap<(object::SectionIndex, u64), Vec<(object::SectionIndex, u64)>>,
+) -> bool {
+    let reachable = reachable_macho_local_cohort_atoms(roots, edges);
     boundaries
         .iter()
         .all(|(section_index, section_boundaries)| {
@@ -18672,6 +18687,7 @@ fn current_macho_local_cohort_atoms_are_live(
     current_bytes: &[u8],
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    required_current_entries: &[MachOLocalSymbolCohortEntry],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
     use object::read::macho::MachHeader as _;
@@ -19147,10 +19163,46 @@ fn current_macho_local_cohort_atoms_are_live(
         }
     }
 
-    Ok(macho_local_cohort_atom_graph_is_complete(
-        &boundaries,
-        &roots,
-        &edges,
+    let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
+    let mut required_atoms = Vec::with_capacity(required_current_entries.len());
+    for entry in required_current_entries {
+        let mut matching_atoms = Vec::new();
+        for (&section_index, owner) in &owned_sections {
+            let Some(output_section_index) = macho_output_section_index_for_file_offset(
+                output_file,
+                owner.current.output_offset,
+            ) else {
+                continue;
+            };
+            if output_section_index != entry.output_section_index {
+                continue;
+            }
+            let Some(start) =
+                macho_output_address_for_file_offset(output_file, owner.current.output_offset)
+            else {
+                continue;
+            };
+            let Some(end) = start.checked_add(owner.current.input_size) else {
+                continue;
+            };
+            if !(start..end).contains(&entry.output_value) {
+                continue;
+            }
+            let Some(offset) = entry.output_value.checked_sub(start) else {
+                continue;
+            };
+            if let Some(atom) = atom_for_offset(section_index, offset) {
+                matching_atoms.push(atom);
+            }
+        }
+        let [atom] = matching_atoms.as_slice() else {
+            return Ok(false);
+        };
+        required_atoms.push(*atom);
+    }
+    Ok(required_macho_local_cohort_atoms_are_reachable(
+        &required_atoms,
+        &reachable,
     ))
 }
 
@@ -19819,6 +19871,18 @@ fn plan_macho_local_symbol_cohort(
         Err(reason) => return Ok(Err(reason)),
     };
     let mut current = current;
+    let required_current_entries = current
+        .iter()
+        .filter(|entry| {
+            !previous.iter().any(|previous| {
+                previous.name == entry.name
+                    && previous.n_desc == entry.n_desc
+                    && previous.output_section_index == entry.output_section_index
+                    && previous.output_value == entry.output_value
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let standard_retains_published_population =
         macho_local_symbol_cohort_retains_published_population(&previous, &current);
     let supplement_retains_published_sites = supplement.as_ref().is_none_or(|supplement| {
@@ -19854,9 +19918,8 @@ fn plan_macho_local_symbol_cohort(
     ) {
         return Ok(Err(reason));
     }
-    // Direct patches preserve the previously live atom set. Exact output ownership therefore
-    // carries liveness across stable-name moves or same-site renames, but not population or
-    // metadata changes.
+    // Direct patches preserve the liveness of exact previously published entries. Entries that
+    // are added, moved, renamed, or metadata-changed still require a current graph proof.
     let retained_atoms_are_live =
         standard_retains_published_population && supplement_retains_published_sites;
     let current_atoms_are_live = retained_atoms_are_live
@@ -19873,6 +19936,7 @@ fn plan_macho_local_symbol_cohort(
             current_input.bytes,
             output_file,
             rematerialized_sections,
+            &required_current_entries,
             normalize_rust_archive_patch_inputs,
         )?;
     if !current_atoms_are_live {
@@ -55080,6 +55144,19 @@ mod tests {
             &roots,
             &disconnected_cycle,
         ));
+        let reachable = reachable_macho_local_cohort_atoms(&roots, &disconnected_cycle);
+        assert!(required_macho_local_cohort_atoms_are_reachable(
+            &[],
+            &reachable,
+        ));
+        assert!(required_macho_local_cohort_atoms_are_reachable(
+            &[(section, 0)],
+            &reachable,
+        ));
+        assert!(
+            !required_macho_local_cohort_atoms_are_reachable(&[(section, 4)], &reachable),
+            "a changed current entry must not inherit liveness when its atom is unreachable",
+        );
 
         let unreferenced_temporary_boundary = HashMap::from([((section, 0), Vec::new())]);
         assert!(!macho_local_cohort_atom_graph_is_complete(
