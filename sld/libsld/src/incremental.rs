@@ -2962,33 +2962,69 @@ fn matching_macho_symbol_resolution_move<'a>(
     previous_target_value: u64,
     current_section_offset: u64,
 ) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, ()> {
-    let mut matching_moves = resolution_moves.iter().filter(|moved| {
-        moved.name.as_str() == target_name
-            && moved.previous_target == *previous_target
-            && moved.previous_value == previous_target_value
-            && moved.current_target.section_offset == current_section_offset
-    });
-    let matching_move = matching_moves.next();
-    if matching_moves.next().is_some() {
-        return Err(());
-    }
-    Ok(matching_move)
+    matching_macho_symbol_resolution_move_with_normalization(
+        resolution_moves,
+        target_name,
+        previous_target,
+        previous_target_value,
+        current_section_offset,
+        false,
+    )
+    .map_err(|_| ())
 }
 
-fn matching_macho_symbol_resolution_move_for_previous<'a>(
+fn matching_macho_symbol_resolution_move_with_normalization<'a>(
     resolution_moves: &'a [MachOSymbolResolutionMove],
     target_name: &str,
     previous_target: &RelocationTargetRecord,
     previous_target_value: u64,
-) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, ()> {
-    let mut matching_moves = resolution_moves.iter().filter(|moved| {
-        moved.name.as_str() == target_name
-            && moved.previous_target == *previous_target
-            && moved.previous_value == previous_target_value
-    });
-    let matching_move = matching_moves.next();
-    if matching_moves.next().is_some() {
-        return Err(());
+    current_section_offset: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
+    let mut matching_move = None;
+    for moved in resolution_moves {
+        if moved.name.as_str() != target_name
+            || moved.previous_value != previous_target_value
+            || moved.current_target.section_offset != current_section_offset
+            || !macho_relocation_target_records_are_stable(
+                Some(&moved.previous_target),
+                Some(previous_target),
+                normalize_rust_archive_patch_inputs,
+            )?
+        {
+            continue;
+        }
+        if matching_move.is_some() {
+            return Err("ambiguous moved Mach-O symbol resolution".to_owned());
+        }
+        matching_move = Some(moved);
+    }
+    Ok(matching_move)
+}
+
+fn matching_macho_symbol_resolution_move_for_previous_with_normalization<'a>(
+    resolution_moves: &'a [MachOSymbolResolutionMove],
+    target_name: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_target_value: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
+    let mut matching_move = None;
+    for moved in resolution_moves {
+        if moved.name.as_str() != target_name
+            || moved.previous_value != previous_target_value
+            || !macho_relocation_target_records_are_stable(
+                Some(&moved.previous_target),
+                Some(previous_target),
+                normalize_rust_archive_patch_inputs,
+            )?
+        {
+            continue;
+        }
+        if matching_move.is_some() {
+            return Err("ambiguous moved Mach-O symbol resolution".to_owned());
+        }
+        matching_move = Some(moved);
     }
     Ok(matching_move)
 }
@@ -3043,6 +3079,7 @@ fn finish_macho_cross_input_target_moves(
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
     reusable_branch_targets: &[MachOReusableBranchTarget],
+    normalize_rust_archive_patch_inputs: bool,
     reuse_previous_target: bool,
     finish_unmatched: bool,
     input: &FileState,
@@ -3085,18 +3122,19 @@ fn finish_macho_cross_input_target_moves(
             )));
         };
 
-        let forwarding_move = match matching_macho_symbol_resolution_move(
+        let forwarding_move = match matching_macho_symbol_resolution_move_with_normalization(
             resolution_moves,
             target_name.as_str(),
             &previous_target,
             previous_target_value,
             target_move.current_section_offset,
+            normalize_rust_archive_patch_inputs,
         ) {
             Ok(moved) => moved,
-            Err(()) => {
+            Err(reason) => {
                 return Ok(Err(format!(
-                    "ambiguous moved Mach-O symbol for cross-input relocation in {}",
-                    display_hex_path(&input.path)
+                    "{reason} for cross-input relocation in {}",
+                    display_hex_path(&input.path),
                 )));
             }
         };
@@ -3130,6 +3168,12 @@ fn finish_macho_cross_input_target_moves(
             remaining_moves.push(target_move);
             continue;
         }
+        let Some(forwarding_move) = forwarding_move else {
+            return Ok(Err(format!(
+                "moved cross-input Mach-O relocation target has no matching symbol resolution in {}",
+                display_hex_path(&input.path)
+            )));
+        };
 
         if previous_applied_target_value != previous_target_value {
             return Ok(Err(format!(
@@ -3137,10 +3181,7 @@ fn finish_macho_cross_input_target_moves(
                 display_hex_path(&input.path)
             )));
         }
-        let current_target_value = forwarding_move
-            .map_or(target_move.current_target_value, |moved| {
-                moved.current_value
-            });
+        let current_target_value = forwarding_move.current_value;
         let Ok(size) = usize::try_from(relocation.size) else {
             return Ok(Err(format!(
                 "unsupported cross-input Mach-O relocation size in {}",
@@ -3204,14 +3245,7 @@ fn finish_macho_cross_input_target_moves(
         relocation.written_value = Some(written_value);
         relocation.target_value = current_target_value;
         relocation.applied_target_value = Some(current_target_value);
-        if let Some(moved) = forwarding_move {
-            relocation.target = Some(moved.current_target.clone());
-        } else if let Some(target) = relocation.target.as_mut() {
-            target.section_offset = target_move.current_section_offset;
-            if let Some(current_input) = target_move.current_input {
-                target.input = current_input;
-            }
-        }
+        relocation.target = Some(forwarding_move.current_target.clone());
         target_patches
             .output_symbols
             .push(RelocationTargetSymbolPatch {
@@ -6703,6 +6737,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &mut relocation_target_patches,
                 &macho_resolution_updates.moves,
                 &reusable_macho_branch_targets,
+                normalize_rust_archive_patch_inputs,
                 true,
                 false,
                 input,
@@ -6987,6 +7022,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &mut relocation_target_patches,
                 &migrated_macho_resolution_updates.moves,
                 &migrated_macho_resolution_updates.reusable_branch_targets,
+                normalize_rust_archive_patch_inputs,
                 true,
                 true,
                 input,
@@ -20338,6 +20374,8 @@ fn macho_text_relocation_replays_for_input(
             symbol_resolutions_changed: false,
         }));
     }
+    let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
+        && current_resolver.normalize_rust_archive_patch_inputs;
     let output_symbols = MachOLocalOutputSymbolLookup::new(previous_output)?;
     let target_moves = target_patches
         .macho_target_moves
@@ -20364,21 +20402,22 @@ fn macho_text_relocation_replays_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        match matching_macho_symbol_resolution_move(
+        match matching_macho_symbol_resolution_move_with_normalization(
             resolution_moves,
             target_name,
             previous_target,
             relocation.target_value,
             target_move.current_section_offset,
+            normalize_rust_archive_patch_inputs,
         ) {
             Ok(Some(moved)) => {
                 target_resolution_moves.insert(target_move.relocation_index, moved.clone());
             }
             Ok(None) => {}
-            Err(()) => {
+            Err(reason) => {
                 return Ok(Err(format!(
-                    "ambiguous moved Mach-O symbol for text relocation in {}",
-                    display_hex_path(&input.path)
+                    "{reason} for text relocation in {}",
+                    display_hex_path(&input.path),
                 )));
             }
         }
@@ -20391,8 +20430,6 @@ fn macho_text_relocation_replays_for_input(
         timing_phase!("Index previous Mach-O output text definitions");
         MachOOutputTextDefinitionLookup::new(&output_file)
     };
-    let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
-        && current_resolver.normalize_rust_archive_patch_inputs;
     let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
     let matched_current_sections = MatchedCurrentSectionLookup::new(matched_sections);
     let relocation_section_index = {
@@ -20978,17 +21015,18 @@ fn macho_text_relocation_replays_for_input(
                     relocation.target_name.as_deref(),
                     relocation.target.as_ref(),
                 ) {
-                    match matching_macho_symbol_resolution_move_for_previous(
+                    match matching_macho_symbol_resolution_move_for_previous_with_normalization(
                         resolution_moves,
                         target_name,
                         previous_target,
                         relocation.target_value,
+                        normalize_rust_archive_patch_inputs,
                     ) {
                         Ok(moved) => moved,
-                        Err(()) => {
+                        Err(reason) => {
                             return Ok(Err(format!(
-                                "ambiguous moved Mach-O symbol for text relocation in {}",
-                                display_hex_path(&input.path)
+                                "{reason} for text relocation in {}",
+                                display_hex_path(&input.path),
                             )));
                         }
                     }
@@ -21510,17 +21548,18 @@ fn validate_macho_data_relocations_are_stable(
                     relocation.target_name.as_deref(),
                     relocation.target.as_ref(),
                 ) {
-                    match matching_macho_symbol_resolution_move_for_previous(
+                    match matching_macho_symbol_resolution_move_for_previous_with_normalization(
                         resolution_moves,
                         target_name,
                         previous_target,
                         relocation.target_value,
+                        normalize_rust_archive_patch_inputs,
                     ) {
                         Ok(moved) => moved,
-                        Err(()) => {
+                        Err(reason) => {
                             return Ok(Err(format!(
-                                "ambiguous moved Mach-O symbol for data relocation in {}",
-                                display_hex_path(&input.path)
+                                "{reason} for data relocation in {}",
+                                display_hex_path(&input.path),
                             )));
                         }
                     }
@@ -21557,26 +21596,33 @@ fn validate_macho_data_relocations_are_stable(
                     let resolution_move = if let Some(moved) = planned_resolution_move {
                         Some(moved)
                     } else {
-                        match matching_macho_symbol_resolution_move(
+                        match matching_macho_symbol_resolution_move_with_normalization(
                             resolution_moves,
                             target_name,
                             previous_target,
                             relocation.target_value,
                             target_move.current_section_offset,
+                            normalize_rust_archive_patch_inputs,
                         ) {
                             Ok(moved) => moved,
-                            Err(()) => {
+                            Err(reason) => {
                                 return Ok(Err(format!(
-                                    "ambiguous moved Mach-O symbol for data relocation in {}",
-                                    display_hex_path(&input.path)
+                                    "{reason} for data relocation in {}",
+                                    display_hex_path(&input.path),
                                 )));
                             }
                         }
                     };
+                    let Some(resolution_move) = resolution_move else {
+                        return Ok(Err(format!(
+                            "moved Mach-O data relocation target has no matching symbol resolution in {}",
+                            display_hex_path(&input.path)
+                        )));
+                    };
                     let (patch, symbol_patch) = match moved_macho_data_relocation_patch(
                         relocation,
                         target_move,
-                        resolution_move,
+                        Some(resolution_move),
                     ) {
                         Ok(patches) => patches,
                         Err(reason) => return Ok(Err(reason)),
@@ -71548,6 +71594,129 @@ mod tests {
     }
 
     #[test]
+    fn normalized_macho_data_target_move_uses_migrated_resolution() {
+        let input_file = SharedText::from(hex::encode("libcrate.rlib"));
+        let relocation_owner = SharedText::from(hex::encode(
+            b"libcrate.rlib\0crate-hash.target-cgu.relocation-invocation.rcgu.o\x008:16",
+        ));
+        let catalog_owner = SharedText::from(hex::encode(
+            b"libcrate.rlib\0crate-hash.target-cgu.catalog-invocation.rcgu.o\x0016:24",
+        ));
+        let current_owner = SharedText::from(hex::encode(
+            b"libcrate.rlib\0crate-hash.current-cgu.current-invocation.rcgu.o\x0024:32",
+        ));
+        let name = SharedText::from(hex::encode("_target"));
+        let previous_value = 0x1001_f74e4;
+        let provisional_value = 0x1001_f7188;
+        let current_value = 0x1025_9f5d0;
+        let relocation_target = RelocationTargetRecord {
+            input_file: input_file.clone(),
+            input: relocation_owner,
+            section_index: 1,
+            section_offset: 0x554,
+        };
+        let moved = MachOSymbolResolutionMove {
+            name: name.clone(),
+            previous_value,
+            current_value,
+            previous_target: RelocationTargetRecord {
+                input: catalog_owner,
+                ..relocation_target.clone()
+            },
+            current_target: RelocationTargetRecord {
+                input: current_owner,
+                section_offset: 0x1f8,
+                ..relocation_target.clone()
+            },
+        };
+
+        assert!(
+            matching_macho_symbol_resolution_move(
+                std::slice::from_ref(&moved),
+                name.as_str(),
+                &relocation_target,
+                previous_value,
+                0x1f8,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let matched = matching_macho_symbol_resolution_move_with_normalization(
+            std::slice::from_ref(&moved),
+            name.as_str(),
+            &relocation_target,
+            previous_value,
+            0x1f8,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let mut wrong_owner = moved.clone();
+        wrong_owner.previous_target.section_offset += 1;
+        assert!(
+            matching_macho_symbol_resolution_move_with_normalization(
+                std::slice::from_ref(&wrong_owner),
+                name.as_str(),
+                &relocation_target,
+                previous_value,
+                0x1f8,
+                true,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            matching_macho_symbol_resolution_move_with_normalization(
+                &[moved.clone(), moved.clone()],
+                name.as_str(),
+                &relocation_target,
+                previous_value,
+                0x1f8,
+                true,
+            )
+            .is_err()
+        );
+
+        let raw_relocation = object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 3,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        };
+        let mut relocation = relocation_record(
+            "libcrate.rlib",
+            3,
+            42,
+            Some(previous_value),
+            previous_value,
+            Some("_target"),
+            Some(("libcrate.rlib", 1, 0x554)),
+            0,
+            300,
+            8,
+            encode_macho_aarch64_relocation_kind(raw_relocation),
+            0,
+        );
+        relocation.applied_target_value = Some(previous_value);
+        relocation.target = Some(relocation_target);
+        let target_move = MachORelocationTargetMove {
+            relocation_index: 0,
+            current_section_offset: 0x1f8,
+            current_target_value: provisional_value,
+            current_input: Some(moved.current_target.input.clone()),
+        };
+        let (patch, symbol_patch) =
+            moved_macho_data_relocation_patch(&mut relocation, target_move, Some(matched)).unwrap();
+
+        assert_eq!(patch.data, current_value.to_le_bytes());
+        assert_eq!(symbol_patch.target_value, current_value);
+        assert_eq!(relocation.target_value, current_value);
+        assert_eq!(relocation.target, Some(moved.current_target.clone()));
+    }
+
+    #[test]
     fn macho_cross_input_branch_reuses_forwarding_target() {
         let previous = test_macho_object(&[0; 4], &[0; 8], 0);
         let current = test_macho_object(&[0; 4], &[0; 8], 4);
@@ -71610,6 +71779,7 @@ mod tests {
                 moved: moved.clone(),
                 applied_target_value: previous_target_value,
             }],
+            false,
             true,
             true,
             &input,
@@ -71644,6 +71814,7 @@ mod tests {
                 moved: moved.clone(),
                 applied_target_value: recorded_thunk,
             }],
+            false,
             true,
             true,
             &input,
@@ -71683,6 +71854,7 @@ mod tests {
                 moved: moved.clone(),
                 applied_target_value: got_address,
             }],
+            false,
             true,
             true,
             &input,
@@ -71700,27 +71872,22 @@ mod tests {
             relocation_target_patches_for_input(&mut direct_relocations, &input, &current)
                 .unwrap()
                 .unwrap();
-        finish_macho_cross_input_target_moves(
+        let reason = finish_macho_cross_input_target_moves(
             &mut direct_relocations,
             &mut direct_patches,
             &[],
             &[],
+            false,
             false,
             true,
             &input,
             &[],
         )
         .unwrap()
-        .unwrap();
-        assert_eq!(direct_patches.output_patches.len(), 1);
-        assert_eq!(
-            direct_relocations[0].target_value,
-            previous_target_value + 4
-        );
-        assert_eq!(
-            direct_relocations[0].applied_target_value,
-            Some(previous_target_value + 4)
-        );
+        .unwrap_err();
+        assert!(reason.contains("no matching symbol resolution"));
+        assert!(direct_patches.output_patches.is_empty());
+        assert_eq!(direct_relocations[0].target_value, previous_target_value);
     }
 
     #[test]
