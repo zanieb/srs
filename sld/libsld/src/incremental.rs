@@ -17266,11 +17266,571 @@ fn macho_local_symbol_is_default_strippable(
         && read_u16_le(&raw[6..8]) == Some(0)
 }
 
+#[derive(Clone)]
+struct MachOLocalConstAtom {
+    name: Vec<u8>,
+    n_desc: u16,
+    section_offset: u64,
+    atom_end: u64,
+    symbols_at_site: usize,
+}
+
+#[derive(Debug)]
+struct MachOLocalSymbolCohortSupplement {
+    previous_section: object::SectionIndex,
+    current_section: object::SectionIndex,
+    previous: Vec<MachOLocalSymbolCohortEntry>,
+    current: Vec<MachOLocalSymbolCohortEntry>,
+    output_sites: HashSet<(u8, u64)>,
+}
+
+fn macho_local_const_atoms(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    section_index: object::SectionIndex,
+) -> Result<std::result::Result<Vec<MachOLocalConstAtom>, String>> {
+    let section = file.section_by_index(section_index)?;
+    let mut boundaries = vec![section.size()];
+    let mut candidates = Vec::new();
+    let mut site_counts = HashMap::<u64, usize>::new();
+    for symbol in file.symbols() {
+        if symbol.section_index() != Some(section_index) {
+            continue;
+        }
+        let Some(raw) = macho_symbol_entry(bytes, &symbol) else {
+            return Ok(Err(
+                "published local Mach-O const atom has a truncated symbol".to_owned(),
+            ));
+        };
+        if raw[4] & object::macho::N_STAB != 0
+            || raw[4] & object::macho::N_TYPE != object::macho::N_SECT
+            || usize::from(raw[5]) != section_index.0
+        {
+            return Ok(Err(
+                "published local Mach-O const atom has unsupported metadata".to_owned(),
+            ));
+        }
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            return Ok(Err(
+                "published local Mach-O const atom precedes its section".to_owned(),
+            ));
+        };
+        if offset >= section.size() {
+            return Ok(Err(
+                "published local Mach-O const atom is outside its section".to_owned(),
+            ));
+        }
+        let Some(n_desc) = read_u16_le(&raw[6..8]) else {
+            return Ok(Err(
+                "published local Mach-O const atom metadata is truncated".to_owned(),
+            ));
+        };
+        if n_desc & object::macho::N_ALT_ENTRY == 0 {
+            boundaries.push(offset);
+        }
+        *site_counts.entry(offset).or_default() += 1;
+        if symbol.is_global() {
+            continue;
+        }
+        let name = symbol.name_bytes()?;
+        if name.is_empty() || macho_local_symbol_is_default_strippable(&symbol, raw, name) {
+            continue;
+        }
+        if symbol.is_undefined()
+            || symbol.is_weak()
+            || symbol.scope() != object::SymbolScope::Compilation
+            || n_desc != 0
+        {
+            return Ok(Err(
+                "published local Mach-O const atom is unsupported or liveness-significant"
+                    .to_owned(),
+            ));
+        }
+        candidates.push(MachOLocalConstAtom {
+            name: name.to_vec(),
+            n_desc,
+            section_offset: offset,
+            atom_end: 0,
+            symbols_at_site: 0,
+        });
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    candidates.sort_by_key(|atom| atom.section_offset);
+    let mut names = HashSet::new();
+    let mut sites = HashSet::new();
+    if candidates
+        .iter()
+        .any(|atom| !names.insert(atom.name.clone()) || !sites.insert(atom.section_offset))
+    {
+        return Ok(Err(
+            "published local Mach-O const atoms have duplicate names or sites".to_owned(),
+        ));
+    }
+    for atom in &mut candidates {
+        let Some(end) = boundaries
+            .iter()
+            .copied()
+            .find(|boundary| *boundary > atom.section_offset)
+        else {
+            return Ok(Err(
+                "published local Mach-O const atom has no finite boundary".to_owned(),
+            ));
+        };
+        atom.atom_end = end;
+        atom.symbols_at_site = site_counts.get(&atom.section_offset).copied().unwrap_or(0);
+    }
+    Ok(Ok(candidates))
+}
+
+fn macho_atom_has_incoming_relocation(
+    file: &object::File<'_>,
+    target_section: object::SectionIndex,
+    target_range: std::ops::Range<u64>,
+) -> Result<bool> {
+    Ok(
+        macho_atom_incoming_relocation_from_sections(file, None, target_section, target_range)?
+            != MachOAtomIncomingRelocation::Absent,
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MachOAtomIncomingRelocation {
+    Absent,
+    Exact,
+    Unknown,
+}
+
+fn macho_atom_incoming_relocation_from_sections(
+    file: &object::File<'_>,
+    source_sections: Option<&HashSet<object::SectionIndex>>,
+    target_section: object::SectionIndex,
+    target_range: std::ops::Range<u64>,
+) -> Result<MachOAtomIncomingRelocation> {
+    let mut unknown = false;
+    for section in file.sections() {
+        if source_sections.is_some_and(|sections| !sections.contains(&section.index())) {
+            continue;
+        }
+        for (_, relocation) in section.relocations() {
+            if let Some(subtractor) = relocation.subtractor() {
+                let symbol = file.symbol_by_index(subtractor)?;
+                if symbol.section_index() == Some(target_section) {
+                    return Ok(MachOAtomIncomingRelocation::Exact);
+                }
+            }
+            match relocation.target() {
+                object::RelocationTarget::Section(index) if index == target_section => {
+                    return Ok(MachOAtomIncomingRelocation::Exact);
+                }
+                object::RelocationTarget::Symbol(index) => {
+                    let symbol = file.symbol_by_index(index)?;
+                    if symbol.section_index() != Some(target_section) {
+                        continue;
+                    }
+                    let target = file.section_by_index(target_section)?;
+                    let Some(base) = symbol.address().checked_sub(target.address()) else {
+                        unknown = true;
+                        continue;
+                    };
+                    if target_range.contains(&base) {
+                        return Ok(MachOAtomIncomingRelocation::Exact);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(if unknown {
+        MachOAtomIncomingRelocation::Unknown
+    } else {
+        MachOAtomIncomingRelocation::Absent
+    })
+}
+
+fn macho_atom_has_liveness_symbol(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    target_section: object::SectionIndex,
+    target_range: std::ops::Range<u64>,
+) -> Result<bool> {
+    let section = file.section_by_index(target_section)?;
+    for symbol in file
+        .symbols()
+        .filter(|symbol| symbol.section_index() == Some(target_section))
+    {
+        let Some(offset) = symbol.address().checked_sub(section.address()) else {
+            return Ok(true);
+        };
+        if !target_range.contains(&offset) {
+            continue;
+        }
+        let Some(raw) = macho_symbol_entry(bytes, &symbol) else {
+            return Ok(true);
+        };
+        let Some(n_desc) = read_u16_le(&raw[6..8]) else {
+            return Ok(true);
+        };
+        if symbol.is_global()
+            || symbol.is_weak()
+            || symbol.scope() != object::SymbolScope::Compilation
+            || macho_local_cohort_symbol_is_root(n_desc)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn macho_local_const_atom_has_recorded_output_owner(
+    relocations: &[RelocationRecord],
+    input_file_path: &str,
+    previous_input_ref: &str,
+    target_section_index: u32,
+    target_section_offset: u64,
+    target_name: &[u8],
+    output_value: u64,
+) -> bool {
+    let expected_name = hex::encode(target_name);
+    relocations.iter().any(|relocation| {
+        let Some(target) = &relocation.target else {
+            return false;
+        };
+        target.input_file.as_str() == input_file_path
+            && target.input.as_str() == previous_input_ref
+            && target.section_index == target_section_index
+            && target.section_offset == target_section_offset
+            && relocation.target_name.as_deref() == Some(expected_name.as_str())
+            && relocation
+                .applied_target_value
+                .unwrap_or(relocation.target_value)
+                == output_value
+    })
+}
+
+fn macho_subsections_via_symbols(bytes: &[u8]) -> Result<bool> {
+    use object::read::macho::MachHeader as _;
+
+    let header = object::macho::MachHeader64::<object::Endianness>::parse(bytes, 0)
+        .context("Failed to parse supplemental Mach-O local cohort header")?;
+    let endian = header
+        .endian()
+        .context("Failed to read supplemental Mach-O local cohort endianness")?;
+    Ok(header.flags(endian) & object::macho::MH_SUBSECTIONS_VIA_SYMBOLS != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supplemental_macho_local_const_cohort(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    previous_file: &object::File<'_>,
+    current_file: &object::File<'_>,
+    previous_output: &[u8],
+    output_file: &object::File<'_>,
+    previous_sections: &[PatchSection],
+    current_sections: &[PatchSection],
+    relocations: &[RelocationRecord],
+    input_file_path: &str,
+    previous_input_ref: &str,
+) -> Result<std::result::Result<Option<MachOLocalSymbolCohortSupplement>, String>> {
+    if previous_file.architecture() != object::Architecture::Aarch64
+        || current_file.architecture() != object::Architecture::Aarch64
+        || !previous_file.is_64()
+        || !current_file.is_64()
+    {
+        return Ok(Ok(None));
+    }
+    let previous_owned = previous_sections
+        .iter()
+        .map(|section| patch_section_object_index(previous_file, section.section_index))
+        .collect::<Result<HashSet<_>>>()?;
+    let current_owned = current_sections
+        .iter()
+        .map(|section| patch_section_object_index(current_file, section.section_index))
+        .collect::<Result<HashSet<_>>>()?;
+    let matching_sections = |file: &object::File<'_>, owned: &HashSet<object::SectionIndex>| {
+        file.sections()
+            .filter(|section| {
+                !owned.contains(&section.index())
+                    && section.segment_name_bytes().ok().flatten() == Some(b"__TEXT")
+                    && section.name_bytes().ok() == Some(b"__const")
+                    && section.flags()
+                        == object::SectionFlags::MachO {
+                            flags: object::macho::S_REGULAR,
+                        }
+            })
+            .map(|section| section.index())
+            .collect::<Vec<_>>()
+    };
+    let previous_matches = matching_sections(previous_file, &previous_owned);
+    let current_matches = matching_sections(current_file, &current_owned);
+    let (previous_index, current_index) =
+        match (previous_matches.as_slice(), current_matches.as_slice()) {
+            ([previous], [current]) => (*previous, *current),
+            _ => {
+                for index in previous_matches {
+                    let atoms = match macho_local_const_atoms(previous_bytes, previous_file, index)?
+                    {
+                        Ok(atoms) => atoms,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    if !atoms.is_empty() {
+                        return Ok(Err(
+                        "published local Mach-O const cohort has ambiguous supplemental sections"
+                            .to_owned(),
+                    ));
+                    }
+                }
+                for index in current_matches {
+                    let atoms = match macho_local_const_atoms(current_bytes, current_file, index)? {
+                        Ok(atoms) => atoms,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    if !atoms.is_empty() {
+                        return Ok(Err(
+                        "published local Mach-O const cohort has ambiguous supplemental sections"
+                            .to_owned(),
+                    ));
+                    }
+                }
+                return Ok(Ok(None));
+            }
+        };
+    let previous_atoms =
+        match macho_local_const_atoms(previous_bytes, previous_file, previous_index)? {
+            Ok(atoms) => atoms,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let current_atoms = match macho_local_const_atoms(current_bytes, current_file, current_index)? {
+        Ok(atoms) => atoms,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if previous_atoms.is_empty() && current_atoms.is_empty() {
+        return Ok(Ok(None));
+    }
+    let previous_section = previous_file.section_by_index(previous_index)?;
+    let current_section = current_file.section_by_index(current_index)?;
+    let previous_record_index = relocation_target_record_index(previous_index)?;
+    // A missing SectionRecord means there is no contiguous output owner. Recover only
+    // relocation-free atoms whose bytes and symbol-defined boundaries are unchanged.
+    if previous_section.align() != current_section.align()
+        || previous_section.size() != current_section.size()
+        || previous_section.data()? != current_section.data()?
+        || previous_section.relocations().next().is_some()
+        || current_section.relocations().next().is_some()
+    {
+        return Ok(Err(
+            "published local Mach-O const cohort is not byte-identical and relocation-free"
+                .to_owned(),
+        ));
+    }
+    if previous_atoms.len() != current_atoms.len()
+        || previous_atoms
+            .iter()
+            .zip(&current_atoms)
+            .any(|(previous, current)| {
+                previous.section_offset != current.section_offset
+                    || previous.atom_end != current.atom_end
+                    || previous.n_desc != current.n_desc
+                    || previous.symbols_at_site != current.symbols_at_site
+            })
+    {
+        return Ok(Err(
+            "published local Mach-O const cohort changed atom boundaries or metadata".to_owned(),
+        ));
+    }
+
+    let mut output_symbols_by_name = HashMap::<Vec<u8>, Vec<object::SymbolIndex>>::new();
+    for symbol in output_file.symbols() {
+        let Ok(name) = symbol.name_bytes() else {
+            return Ok(Err(
+                "published local Mach-O const cohort output has a malformed symbol name".to_owned(),
+            ));
+        };
+        output_symbols_by_name
+            .entry(name.to_vec())
+            .or_default()
+            .push(symbol.index());
+    }
+
+    let previous_data = previous_section.data()?;
+    let mut previous_entries = Vec::new();
+    let mut current_entries = Vec::new();
+    let mut output_sites = HashSet::new();
+    let mut output_ranges = Vec::new();
+    let mut has_unpublished_atoms = false;
+    for (previous, current) in previous_atoms.iter().zip(&current_atoms) {
+        let output_matches = output_symbols_by_name
+            .get(previous.name.as_slice())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if output_matches.is_empty() {
+            has_unpublished_atoms = true;
+            if previous.symbols_at_site != 1
+                || current.symbols_at_site != 1
+                || output_symbols_by_name.contains_key(current.name.as_slice())
+                || macho_atom_has_liveness_symbol(
+                    previous_bytes,
+                    previous_file,
+                    previous_index,
+                    previous.section_offset..previous.atom_end,
+                )?
+                || macho_atom_has_liveness_symbol(
+                    current_bytes,
+                    current_file,
+                    current_index,
+                    current.section_offset..current.atom_end,
+                )?
+                || macho_atom_has_incoming_relocation(
+                    previous_file,
+                    previous_index,
+                    previous.section_offset..previous.atom_end,
+                )?
+                || macho_atom_has_incoming_relocation(
+                    current_file,
+                    current_index,
+                    current.section_offset..current.atom_end,
+                )?
+            {
+                return Ok(Err(
+                    "unpublished local Mach-O const atom has an alias, root, or incoming relocation"
+                        .to_owned(),
+                ));
+            }
+            continue;
+        }
+        let [output_symbol_index] = output_matches else {
+            return Ok(Err(
+                "published local Mach-O const atom has no unique output nlist".to_owned(),
+            ));
+        };
+        let output_symbol = output_file.symbol_by_index(*output_symbol_index)?;
+        let object::SymbolFlags::MachO { n_desc } = output_symbol.flags() else {
+            return Ok(Err(
+                "published local Mach-O const atom has non-Mach-O output metadata".to_owned(),
+            ));
+        };
+        let Some(output_section) = output_symbol.section_index() else {
+            return Ok(Err(
+                "published local Mach-O const atom has no output section".to_owned(),
+            ));
+        };
+        let Some(output_section_index) = u8::try_from(output_section.0).ok() else {
+            return Ok(Err(
+                "published local Mach-O const atom output section exceeds u8".to_owned(),
+            ));
+        };
+        if output_symbol.is_global()
+            || output_symbol.is_weak()
+            || output_symbol.scope() != object::SymbolScope::Compilation
+            || n_desc != previous.n_desc
+        {
+            return Ok(Err(
+                "published local Mach-O const atom output metadata changed".to_owned(),
+            ));
+        }
+        if !macho_local_const_atom_has_recorded_output_owner(
+            relocations,
+            input_file_path,
+            previous_input_ref,
+            previous_record_index,
+            previous.section_offset,
+            &previous.name,
+            output_symbol.address(),
+        ) {
+            return Ok(Err(
+                "published local Mach-O const atom has no recorded output owner".to_owned(),
+            ));
+        }
+        if macho_atom_incoming_relocation_from_sections(
+            current_file,
+            Some(&current_owned),
+            current_index,
+            current.section_offset..current.atom_end,
+        )? != MachOAtomIncomingRelocation::Exact
+        {
+            return Ok(Err(
+                "published local Mach-O const atom is not referenced by the current object"
+                    .to_owned(),
+            ));
+        }
+        let atom_size = previous.atom_end - previous.section_offset;
+        let Some(output_offset) =
+            macho_output_file_offset_for_address(output_file, output_symbol.address(), atom_size)?
+        else {
+            return Ok(Err(
+                "published local Mach-O const atom has no output byte range".to_owned(),
+            ));
+        };
+        let output_end = output_offset
+            .checked_add(atom_size)
+            .ok_or_else(|| crate::error!("Published local Mach-O const atom range overflowed"))?;
+        let input_start = usize::try_from(previous.section_offset)?;
+        let input_end = usize::try_from(previous.atom_end)?;
+        let output_start = usize::try_from(output_offset)?;
+        let output_end_usize = usize::try_from(output_end)?;
+        if previous_data.get(input_start..input_end)
+            != previous_output.get(output_start..output_end_usize)
+        {
+            return Ok(Err(
+                "published local Mach-O const atom output bytes changed".to_owned(),
+            ));
+        }
+        if !output_sites.insert((output_section_index, output_symbol.address())) {
+            return Ok(Err(
+                "published local Mach-O const atoms alias an output site".to_owned(),
+            ));
+        }
+        output_ranges.push(output_offset..output_end);
+        previous_entries.push(MachOLocalSymbolCohortEntry {
+            name: previous.name.clone(),
+            n_desc: previous.n_desc,
+            output_section_index,
+            output_value: output_symbol.address(),
+            output_entry_offset: None,
+            string_index: None,
+        });
+        current_entries.push(MachOLocalSymbolCohortEntry {
+            name: current.name.clone(),
+            n_desc: current.n_desc,
+            output_section_index,
+            output_value: output_symbol.address(),
+            output_entry_offset: None,
+            string_index: None,
+        });
+    }
+    output_ranges.sort_unstable_by_key(|range| range.start);
+    if output_ranges
+        .windows(2)
+        .any(|pair| pair[0].end > pair[1].start)
+    {
+        return Ok(Err(
+            "published local Mach-O const atom output ranges overlap".to_owned(),
+        ));
+    }
+    if has_unpublished_atoms
+        && (!macho_subsections_via_symbols(previous_bytes)?
+            || !macho_subsections_via_symbols(current_bytes)?)
+    {
+        return Ok(Err(
+            "unpublished local Mach-O const atoms require subsections-via-symbols".to_owned(),
+        ));
+    }
+    Ok(Ok(Some(MachOLocalSymbolCohortSupplement {
+        previous_section: previous_index,
+        current_section: current_index,
+        previous: previous_entries,
+        current: current_entries,
+        output_sites,
+    })))
+}
+
 fn macho_local_symbol_cohort_entries(
     bytes: &[u8],
     file: &object::File<'_>,
     sections: &[PatchSection],
     output_file: &object::File<'_>,
+    supplemental_section: Option<object::SectionIndex>,
 ) -> Result<std::result::Result<Vec<MachOLocalSymbolCohortEntry>, String>> {
     let mut owned_sections = Vec::with_capacity(sections.len());
     for section in sections {
@@ -17290,14 +17850,6 @@ fn macho_local_symbol_cohort_entries(
     for symbol in file.symbols() {
         if symbol.is_global() {
             continue;
-        }
-        if symbol.is_undefined()
-            || symbol.is_weak()
-            || symbol.scope() != object::SymbolScope::Compilation
-        {
-            return Ok(Err(
-                "published local Mach-O cohort contains an unsupported local symbol".to_owned(),
-            ));
         }
         let Some(section_index) = symbol.section_index() else {
             return Ok(Err(
@@ -17329,6 +17881,17 @@ fn macho_local_symbol_cohort_entries(
         let name = symbol.name_bytes()?;
         if name.is_empty() || macho_local_symbol_is_default_strippable(&symbol, raw, name) {
             continue;
+        }
+        if supplemental_section == Some(section_index) {
+            continue;
+        }
+        if symbol.is_undefined()
+            || symbol.is_weak()
+            || symbol.scope() != object::SymbolScope::Compilation
+        {
+            return Ok(Err(
+                "published local Mach-O cohort contains an unsupported local symbol".to_owned(),
+            ));
         }
         let Some((_, owner)) = owned_sections
             .iter()
@@ -17376,21 +17939,43 @@ fn macho_local_symbol_cohort_entries(
             string_index: None,
         });
     }
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    if entries.windows(2).any(|pair| pair[0].name == pair[1].name) {
-        return Ok(Err(
-            "published local Mach-O cohort contains duplicate names".to_owned(),
-        ));
-    }
-    let mut sites = HashSet::new();
-    for entry in &entries {
-        if !sites.insert((entry.output_section_index, entry.output_value)) {
-            return Ok(Err(
-                "published local Mach-O cohort contains aliased output sites".to_owned(),
-            ));
-        }
+    if let Err(reason) = validate_macho_local_symbol_cohort_entries(&mut entries) {
+        return Ok(Err(reason));
     }
     Ok(Ok(entries))
+}
+
+fn validate_macho_local_symbol_cohort_entries(
+    entries: &mut [MachOLocalSymbolCohortEntry],
+) -> std::result::Result<(), String> {
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    if entries.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err("published local Mach-O cohort contains duplicate names".to_owned());
+    }
+    let mut sites = HashSet::new();
+    for entry in entries.iter() {
+        if !sites.insert((entry.output_section_index, entry.output_value)) {
+            return Err("published local Mach-O cohort contains aliased output sites".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn macho_local_symbol_cohort_retains_published_sites(
+    previous: &[MachOLocalSymbolCohortEntry],
+    current: &[MachOLocalSymbolCohortEntry],
+) -> bool {
+    let previous_sites = previous
+        .iter()
+        .map(|entry| (entry.output_section_index, entry.output_value, entry.n_desc))
+        .collect::<HashSet<_>>();
+    let current_sites = current
+        .iter()
+        .map(|entry| (entry.output_section_index, entry.output_value, entry.n_desc))
+        .collect::<HashSet<_>>();
+    previous.len() == current.len()
+        && previous_sites.len() == previous.len()
+        && previous_sites == current_sites
 }
 
 fn verify_previous_macho_local_symbol_cohort(
@@ -17398,6 +17983,7 @@ fn verify_previous_macho_local_symbol_cohort(
     output_file: &object::File<'_>,
     sections: &[PatchSection],
     entries: &mut [MachOLocalSymbolCohortEntry],
+    supplemental_output_sites: &HashSet<(u8, u64)>,
 ) -> std::result::Result<(), String> {
     let symbol_table_offset = macho_symbol_table_offset_for_recycling(previous_output)?;
     let mut owned_ranges = Vec::with_capacity(sections.len());
@@ -17442,9 +18028,13 @@ fn verify_previous_macho_local_symbol_cohort(
             continue;
         }
         let in_owned_range = symbol.section_index().is_some_and(|symbol_section| {
-            owned_ranges.iter().any(|(section_index, range)| {
-                symbol_section.0 == usize::from(*section_index) && range.contains(&symbol.address())
-            })
+            let Ok(symbol_section) = u8::try_from(symbol_section.0) else {
+                return false;
+            };
+            supplemental_output_sites.contains(&(symbol_section, symbol.address()))
+                || owned_ranges.iter().any(|(section_index, range)| {
+                    symbol_section == *section_index && range.contains(&symbol.address())
+                })
         });
         if in_owned_range && !observed_names.insert(name.to_vec()) {
             return Err("published local Mach-O output contains duplicate cohort names".to_owned());
@@ -18099,11 +18689,30 @@ fn plan_macho_local_symbol_cohort(
             "published local Mach-O cohort has no matched section ownership".to_owned(),
         ));
     }
+    let supplement = match supplemental_macho_local_const_cohort(
+        previous_input.bytes,
+        current_input.bytes,
+        previous_file,
+        current_file,
+        previous_output,
+        output_file,
+        &previous_sections,
+        &current_sections,
+        relocations,
+        input_file_path,
+        caller_section.previous.input.as_str(),
+    )? {
+        Ok(supplement) => supplement,
+        Err(reason) => return Ok(Err(reason)),
+    };
     let mut previous = match macho_local_symbol_cohort_entries(
         previous_input.bytes,
         previous_file,
         &previous_sections,
         output_file,
+        supplement
+            .as_ref()
+            .map(|supplement| supplement.previous_section),
     )? {
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
@@ -18113,33 +18722,59 @@ fn plan_macho_local_symbol_cohort(
         current_file,
         &current_sections,
         output_file,
+        supplement
+            .as_ref()
+            .map(|supplement| supplement.current_section),
     )? {
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
     };
-    if previous.is_empty() || current.is_empty() {
-        return Ok(Err(
-            "published local Mach-O cohort has an empty emitted population".to_owned(),
-        ));
-    }
-    if let Err(reason) = verify_previous_macho_local_symbol_cohort(
-        previous_output,
-        output_file,
-        &previous_sections,
-        &mut previous,
-    ) {
-        return Ok(Err(reason));
-    }
-    // Direct patches preserve the previously live atom set. Exact output ownership therefore
-    // carries liveness across value-only migrations, but not population or metadata changes.
-    let retains_published_population = previous.len() == current.len()
+    let mut current = current;
+    let standard_retains_published_population = previous.len() == current.len()
         && previous.iter().zip(&current).all(|(previous, current)| {
             previous.name == current.name
                 && previous.n_desc == current.n_desc
                 && previous.output_section_index == current.output_section_index
         });
-    if !retains_published_population
-        && !current_macho_local_cohort_atoms_are_live(
+    let supplement_retains_published_sites = supplement.as_ref().is_none_or(|supplement| {
+        macho_local_symbol_cohort_retains_published_sites(&supplement.previous, &supplement.current)
+    });
+    if let Some(supplement) = &supplement {
+        previous.extend(supplement.previous.iter().cloned());
+        current.extend(supplement.current.iter().cloned());
+        if let Err(reason) = validate_macho_local_symbol_cohort_entries(&mut previous) {
+            return Ok(Err(reason));
+        }
+        if let Err(reason) = validate_macho_local_symbol_cohort_entries(&mut current) {
+            return Ok(Err(reason));
+        }
+    }
+    if previous.is_empty() || current.is_empty() {
+        return Ok(Err(
+            "published local Mach-O cohort has an empty emitted population".to_owned(),
+        ));
+    }
+    let empty_supplemental_output_sites = HashSet::new();
+    let supplemental_output_sites = supplement
+        .as_ref()
+        .map_or(&empty_supplemental_output_sites, |supplement| {
+            &supplement.output_sites
+        });
+    if let Err(reason) = verify_previous_macho_local_symbol_cohort(
+        previous_output,
+        output_file,
+        &previous_sections,
+        &mut previous,
+        supplemental_output_sites,
+    ) {
+        return Ok(Err(reason));
+    }
+    // Direct patches preserve the previously live atom set. Exact output ownership therefore
+    // carries liveness across value-only migrations, but not population or metadata changes.
+    let retained_atoms_are_live =
+        standard_retains_published_population && supplement_retains_published_sites;
+    let current_atoms_are_live = retained_atoms_are_live
+        || current_macho_local_cohort_atoms_are_live(
             relocations,
             symbol_resolutions,
             input_file_path,
@@ -18152,8 +18787,8 @@ fn plan_macho_local_symbol_cohort(
             current_input.bytes,
             output_file,
             normalize_rust_archive_patch_inputs,
-        )?
-    {
+        )?;
+    if !current_atoms_are_live {
         return Ok(Err(
             "published local Mach-O cohort has no complete current atom-liveness proof".to_owned(),
         ));
@@ -51694,9 +52329,595 @@ mod tests {
                 &output_file,
                 &[test_macho_patch_section(&output, "__text")],
                 &mut entries,
+                &HashSet::new(),
             )
             .unwrap_err(),
             "published local Mach-O cohort string ownership is shared"
+        );
+    }
+
+    #[test]
+    fn published_local_macho_const_subset_requires_exact_atoms_and_dead_omissions() {
+        let retarget_competing_atom = |mut object: Vec<u8>| {
+            let competing = (1_u32 | 3 << 25 | 1 << 27).to_le_bytes();
+            let matches = object
+                .windows(competing.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == competing).then_some(offset))
+                .collect::<Vec<_>>();
+            let [offset] = matches.as_slice() else {
+                panic!("expected one relocation to the competing local atom");
+            };
+            object[*offset..*offset + 4].copy_from_slice(&(3_u32 << 25 | 1 << 27).to_le_bytes());
+            object
+        };
+        let previous =
+            retarget_competing_atom(test_macho_local_data_retarget_object(b"old.0", 0x12));
+        let current =
+            retarget_competing_atom(test_macho_local_data_retarget_object(b"new.0", 0x12));
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let previous_const = previous_file
+            .sections()
+            .find(|section| {
+                section.segment_name().ok().flatten() == Some("__TEXT")
+                    && section.name().ok() == Some("__const")
+            })
+            .unwrap();
+        assert!(
+            !macho_atom_has_incoming_relocation(
+                &previous_file,
+                previous_const.index(),
+                0x30..previous_const.size(),
+            )
+            .unwrap()
+        );
+
+        let mut output = test_macho_object_with_data_section_name(
+            &[0; 16],
+            previous_const.data().unwrap(),
+            0,
+            b"__const",
+        );
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let output_const = output_file.section_by_name("__const").unwrap();
+        let output_section = u8::try_from(output_const.index().0).unwrap();
+        let output_value = output_const.address() + 0x12;
+        output = add_test_macho_local_alias(output, b"old.0", output_section, output_value);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let direct_input = hex::encode("member.o");
+        let owner = RelocationRecord {
+            target_symbol_id: 0,
+            written_value: Some(output_value),
+            target_value: output_value,
+            applied_target_value: Some(output_value),
+            target_name: Some(hex::encode("old.0").into()),
+            target: Some(RelocationTargetRecord {
+                input_file: direct_input.clone().into(),
+                input: direct_input.clone().into(),
+                section_index: relocation_target_record_index(previous_const.index()).unwrap(),
+                section_offset: 0x12,
+            }),
+            input_file: direct_input.clone().into(),
+            input: direct_input.clone().into(),
+            section_index: 0,
+            relocation_offset: 0,
+            output_offset: 0,
+            size: 8,
+            kind: 0,
+            addend: 0,
+        };
+        let previous_source = previous_file
+            .sections()
+            .find(|section| section.segment_name().ok().flatten() == Some("__DATA"))
+            .unwrap();
+        let current_source = current_file
+            .sections()
+            .find(|section| section.segment_name().ok().flatten() == Some("__DATA"))
+            .unwrap();
+        let direct_previous_sections = [PatchSection {
+            input: direct_input.clone(),
+            section_index: patch_section_record_index(&previous_file, previous_source.index())
+                .unwrap(),
+            section_name: Some("__DATA,__const".to_owned()),
+            input_size: previous_source.size(),
+            output_offset: 0,
+            output_size: previous_source.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        }];
+        let direct_current_sections = [PatchSection {
+            input: direct_input.clone(),
+            section_index: patch_section_record_index(&current_file, current_source.index())
+                .unwrap(),
+            section_name: Some("__DATA,__const".to_owned()),
+            input_size: current_source.size(),
+            output_offset: 0,
+            output_size: current_source.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        }];
+
+        let supplement = supplemental_macho_local_const_cohort(
+            &previous,
+            &current,
+            &previous_file,
+            &current_file,
+            &output,
+            &output_file,
+            &direct_previous_sections,
+            &direct_current_sections,
+            std::slice::from_ref(&owner),
+            &direct_input,
+            &direct_input,
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(supplement.previous.len(), 1);
+        assert_eq!(supplement.previous[0].name, b"old.0");
+        assert_eq!(supplement.current[0].name, b"new.0");
+        assert_eq!(supplement.previous[0].output_value, output_value);
+        assert_eq!(supplement.current[0].output_value, output_value);
+        assert!(macho_local_symbol_cohort_retains_published_sites(
+            &supplement.previous,
+            &supplement.current,
+        ));
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &current,
+                &previous_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                &[],
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const atom has no recorded output owner",
+        );
+        let mut wrong_section_owner = owner.clone();
+        wrong_section_owner.target.as_mut().unwrap().section_index -= 1;
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &current,
+                &previous_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&wrong_section_owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const atom has no recorded output owner",
+        );
+        let mut verified = supplement.previous.clone();
+        verify_previous_macho_local_symbol_cohort(
+            &output,
+            &output_file,
+            &[],
+            &mut verified,
+            &supplement.output_sites,
+        )
+        .unwrap();
+
+        let archive = |identifier: &[u8], object: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let previous_identifier = b"crate-hash.cgu.previous.rcgu.o";
+        let current_identifier = b"crate-hash.cgu.current.rcgu.o";
+        let previous_archive = archive(previous_identifier, &previous);
+        let current_archive = archive(current_identifier, &current);
+        let input_file = hex::encode("input.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous_archive, previous_identifier).unwrap()
+        else {
+            panic!("expected previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current_archive, current_identifier).unwrap()
+        else {
+            panic!("expected current archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_member).unwrap();
+        let current_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_member).unwrap();
+        let mut plan_owner = owner.clone();
+        let target = plan_owner.target.as_mut().unwrap();
+        target.input_file = input_file.clone().into();
+        target.input = previous_input.clone().into();
+        let output_text = output_file.section_by_name("__text").unwrap();
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_input.clone(),
+                section_index: patch_section_record_index(&previous_file, previous_source.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__const".to_owned()),
+                input_size: previous_source.size(),
+                output_offset: output_text.file_range().unwrap().0,
+                output_size: previous_source.size(),
+                data_hash: Some(hash_bytes(previous_source.data().unwrap())),
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: current_input.clone(),
+                section_index: patch_section_record_index(&current_file, current_source.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__const".to_owned()),
+                input_size: current_source.size(),
+                output_offset: output_text.file_range().unwrap().0,
+                output_size: current_source.size(),
+                data_hash: Some(hash_bytes(current_source.data().unwrap())),
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let previous_resolver = PatchInputResolver::new(&previous_archive, true).unwrap();
+        let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let previous_input_bytes = previous_resolver
+            .resolve(
+                &input_file,
+                &previous_input,
+                PatchInputLookup::MatchArchiveMember,
+            )
+            .unwrap()
+            .unwrap();
+        let current_input_bytes = current_resolver
+            .resolve(
+                &input_file,
+                &current_input,
+                PatchInputLookup::MatchArchiveMember,
+            )
+            .unwrap()
+            .unwrap();
+        let plan = plan_macho_local_symbol_cohort(
+            std::slice::from_ref(&plan_owner),
+            &[],
+            &input_file,
+            &matched[0],
+            &matched,
+            &previous_resolver,
+            &current_resolver,
+            previous_input_bytes,
+            current_input_bytes,
+            &previous_file,
+            &current_file,
+            &output,
+            &output_file,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.previous.len(), 1);
+        assert_eq!(plan.current.len(), 1);
+        let patches =
+            apply_macho_local_symbol_cohort_plans(&[plan], &output, &mut Vec::new()).unwrap();
+        let mut migrated = output.clone();
+        apply_test_output_patches(&mut migrated, &patches);
+        let migrated_file = object::File::parse(migrated.as_slice()).unwrap();
+        assert!(
+            migrated_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"new.0"))
+        );
+        assert!(
+            !migrated_file
+                .symbols()
+                .any(|symbol| symbol.name_bytes().ok() == Some(b"old.0"))
+        );
+
+        let referenced = test_macho_local_data_retarget_object(b"old.0", 0x12);
+        let referenced_file = object::File::parse(referenced.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &referenced,
+                &current,
+                &referenced_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "unpublished local Mach-O const atom has an alias, root, or incoming relocation",
+        );
+
+        let subtractor_referenced = {
+            let mut object = test_macho_local_data_retarget_object(b"old.0", 0x12);
+            let competing = (1_u32 | 3 << 25 | 1 << 27).to_le_bytes();
+            let matches = object
+                .windows(competing.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == competing).then_some(offset))
+                .collect::<Vec<_>>();
+            let [offset] = matches.as_slice() else {
+                panic!("expected one relocation to the competing local atom");
+            };
+            object[offset - 4..*offset].fill(0);
+            object[*offset..*offset + 4]
+                .copy_from_slice(&(1_u32 | 3 << 25 | 1 << 27 | 1 << 28).to_le_bytes());
+            object
+        };
+        let subtractor_referenced_file =
+            object::File::parse(subtractor_referenced.as_slice()).unwrap();
+        assert!(
+            macho_atom_has_incoming_relocation(
+                &subtractor_referenced_file,
+                previous_const.index(),
+                0x30..previous_const.size(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &subtractor_referenced,
+                &current,
+                &subtractor_referenced_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "unpublished local Mach-O const atom has an alias, root, or incoming relocation",
+        );
+
+        let mut interior_root = add_test_macho_local_alias(
+            previous.clone(),
+            b"_interior_root",
+            u8::try_from(previous_const.index().0).unwrap(),
+            previous_const.address() + 0x38,
+        );
+        let root_entry = test_macho_symbol_entry_offset(&interior_root, b"_interior_root");
+        interior_root[root_entry + 4] |= object::macho::N_EXT;
+        interior_root[root_entry + 6..root_entry + 8].copy_from_slice(
+            &(object::macho::N_ALT_ENTRY | object::macho::N_NO_DEAD_STRIP).to_le_bytes(),
+        );
+        let interior_root_file = object::File::parse(interior_root.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &interior_root,
+                &current,
+                &interior_root_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "unpublished local Mach-O const atom has an alias, root, or incoming relocation",
+        );
+
+        let unreferenced_current = {
+            let mut object = current.clone();
+            let primary = (3_u32 << 25 | 1 << 27).to_le_bytes();
+            let matches = object
+                .windows(primary.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| {
+                    (bytes == primary
+                        && offset >= 4
+                        && matches!(read_u32_le(&object[offset - 4..offset]), Some(0) | Some(8)))
+                    .then_some(offset)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2);
+            for offset in matches {
+                object[offset..offset + 4].copy_from_slice(&(1_u32 | 3 << 25).to_le_bytes());
+            }
+            object
+        };
+        let unreferenced_current_file =
+            object::File::parse(unreferenced_current.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &unreferenced_current,
+                &previous_file,
+                &unreferenced_current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const atom is not referenced by the current object",
+        );
+
+        let page_current_reference = {
+            let mut object = current.clone();
+            let primary = (3_u32 << 25 | 1 << 27).to_le_bytes();
+            let matches = object
+                .windows(primary.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| {
+                    (bytes == primary
+                        && offset >= 4
+                        && matches!(read_u32_le(&object[offset - 4..offset]), Some(0) | Some(8)))
+                    .then_some(offset)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2);
+            for offset in matches {
+                object[offset..offset + 4]
+                    .copy_from_slice(&(3_u32 << 25 | 1 << 27 | 3 << 28).to_le_bytes());
+            }
+            object
+        };
+        let page_current_file = object::File::parse(page_current_reference.as_slice()).unwrap();
+        assert!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &page_current_reference,
+                &previous_file,
+                &page_current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap()
+            .is_some(),
+            "PAGE21/PAGEOFF12 symbol references must prove the target atom live",
+        );
+
+        let mut addend_source = [0_u8; 16];
+        addend_source[..8].copy_from_slice(&(0x30_i64 - 0x12).to_le_bytes());
+        let addend_referenced = retarget_competing_atom(
+            test_macho_local_data_retarget_object_with_source(b"old.0", 0x12, &addend_source),
+        );
+        let addend_referenced_file = object::File::parse(addend_referenced.as_slice()).unwrap();
+        assert!(
+            supplemental_macho_local_const_cohort(
+                &addend_referenced,
+                &current,
+                &addend_referenced_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap()
+            .is_some(),
+            "a symbol addend must not change the referenced GC subsection",
+        );
+
+        let mut indivisible = previous.clone();
+        indivisible[24..28].fill(0);
+        let indivisible_file = object::File::parse(indivisible.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &indivisible,
+                &current,
+                &indivisible_file,
+                &current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "unpublished local Mach-O const atoms require subsections-via-symbols",
+        );
+
+        let moved = retarget_competing_atom(test_macho_local_data_retarget_object(b"new.0", 0x13));
+        let moved_file = object::File::parse(moved.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &moved,
+                &previous_file,
+                &moved_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const cohort changed atom boundaries or metadata",
+        );
+
+        let mut changed_output = output.clone();
+        let output_offset = macho_output_file_offset_for_address(&output_file, output_value, 1)
+            .unwrap()
+            .unwrap() as usize;
+        changed_output[output_offset] ^= 1;
+        let changed_output_file = object::File::parse(changed_output.as_slice()).unwrap();
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &current,
+                &previous_file,
+                &current_file,
+                &changed_output,
+                &changed_output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const atom output bytes changed",
+        );
+
+        let no_local_previous = test_macho_object_with_text_const(b"text", b"old", false, false);
+        let no_local_current = test_macho_object_with_text_const(b"text", b"new", false, false);
+        let no_local_previous_file = object::File::parse(no_local_previous.as_slice()).unwrap();
+        let no_local_current_file = object::File::parse(no_local_current.as_slice()).unwrap();
+        assert!(
+            supplemental_macho_local_const_cohort(
+                &no_local_previous,
+                &no_local_current,
+                &no_local_previous_file,
+                &no_local_current_file,
+                &output,
+                &output_file,
+                &[],
+                &[],
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap()
+            .is_none(),
+            "candidate-free const sections must not introduce a new fallback",
         );
     }
 
