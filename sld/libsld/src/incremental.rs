@@ -19328,6 +19328,167 @@ fn published_macho_local_symbol_sources_changed(
     Ok(previous_unpublished != current_unpublished)
 }
 
+fn supplemental_macho_local_symbol_source_is_live(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    entry: &MachOLocalSymbolCohortSourceEntry,
+) -> Result<std::result::Result<bool, String>> {
+    if entry.undefined
+        || entry.weak
+        || entry.scope != object::SymbolScope::Compilation
+        || macho_local_cohort_symbol_is_root(entry.n_desc)
+    {
+        return Ok(Ok(true));
+    }
+    let section_ordinal = usize::try_from(entry.output_offset >> 32)
+        .context("Supplemental Mach-O local cohort section index exceeds usize")?;
+    let section_offset = entry.output_offset & u64::from(u32::MAX);
+    let Some(section_index) = file
+        .sections()
+        .map(|section| section.index())
+        .find(|index| index.0 == section_ordinal)
+    else {
+        return Ok(Err(
+            "supplemental Mach-O local cohort source section is missing".to_owned(),
+        ));
+    };
+    let section = file.section_by_index(section_index)?;
+    if section.flags()
+        != (object::SectionFlags::MachO {
+            flags: object::macho::S_REGULAR,
+        })
+    {
+        return Ok(Err(
+            "supplemental Mach-O local cohort source section has unsupported retention flags"
+                .to_owned(),
+        ));
+    }
+    let atoms = match macho_local_const_atoms(bytes, file, section_index)? {
+        Ok(atoms) => atoms,
+        Err(_) => return Ok(Ok(true)),
+    };
+    let matching_atoms = atoms
+        .iter()
+        .filter(|atom| atom.name == entry.name && atom.section_offset == section_offset)
+        .collect::<Vec<_>>();
+    let [atom] = matching_atoms.as_slice() else {
+        return Ok(Ok(true));
+    };
+    if atom.symbols_at_site != 1
+        || macho_atom_has_liveness_symbol(
+            bytes,
+            file,
+            section_index,
+            atom.section_offset..atom.atom_end,
+        )?
+        || macho_atom_has_incoming_relocation(
+            file,
+            section_index,
+            atom.section_offset..atom.atom_end,
+        )?
+    {
+        return Ok(Ok(true));
+    }
+    Ok(Ok(false))
+}
+
+fn supplemental_macho_local_symbol_source_section_index(
+    file: &object::File<'_>,
+    entry: &MachOLocalSymbolCohortSourceEntry,
+) -> std::result::Result<object::SectionIndex, String> {
+    let section_ordinal = usize::try_from(entry.output_offset >> 32)
+        .map_err(|_| "supplemental Mach-O local cohort section index exceeds usize".to_owned())?;
+    file.sections()
+        .map(|section| section.index())
+        .find(|index| index.0 == section_ordinal)
+        .ok_or_else(|| "supplemental Mach-O local cohort source section is missing".to_owned())
+}
+
+fn supplemental_macho_local_symbol_sources_changed(
+    relocations: &[RelocationRecord],
+    input_file_path: &str,
+    previous_input_ref: &str,
+    previous_bytes: &[u8],
+    previous_file: &object::File<'_>,
+    previous: &[MachOLocalSymbolCohortSourceEntry],
+    current_bytes: &[u8],
+    current_file: &object::File<'_>,
+    current: &[MachOLocalSymbolCohortSourceEntry],
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<bool, String>> {
+    if previous == current {
+        for (previous, current) in previous.iter().zip(current) {
+            let previous_index =
+                match supplemental_macho_local_symbol_source_section_index(previous_file, previous)
+                {
+                    Ok(index) => index,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+            let current_index =
+                match supplemental_macho_local_symbol_source_section_index(current_file, current) {
+                    Ok(index) => index,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+            if previous_file.section_by_index(previous_index)?.flags()
+                != current_file.section_by_index(current_index)?.flags()
+            {
+                return Ok(Err(
+                    "supplemental Mach-O local cohort source retention flags changed".to_owned(),
+                ));
+            }
+        }
+        return Ok(Ok(false));
+    }
+    match published_macho_local_symbol_sources_changed(&[], previous, current) {
+        Ok(true) => return Ok(Ok(true)),
+        Ok(false) => {}
+        Err(reason) => return Ok(Err(reason)),
+    }
+    if !macho_subsections_via_symbols(previous_bytes)?
+        || !macho_subsections_via_symbols(current_bytes)?
+    {
+        return Ok(Ok(true));
+    }
+    for (is_previous, bytes, file, entries, other) in [
+        (true, previous_bytes, previous_file, previous, current),
+        (false, current_bytes, current_file, current, previous),
+    ] {
+        for entry in entries.iter().filter(|entry| !other.contains(entry)) {
+            if is_previous {
+                let section_index =
+                    match supplemental_macho_local_symbol_source_section_index(file, entry) {
+                        Ok(index) => index,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                let section_offset = entry.output_offset & u64::from(u32::MAX);
+                let record_index = relocation_target_record_index(section_index)?;
+                if output_file.symbols().any(|symbol| {
+                    !symbol.is_global()
+                        && !symbol.is_undefined()
+                        && symbol.name_bytes().is_ok_and(|name| name == entry.name)
+                        && macho_local_const_atom_has_recorded_output_owner(
+                            relocations,
+                            input_file_path,
+                            previous_input_ref,
+                            record_index,
+                            section_offset,
+                            &entry.name,
+                            symbol.address(),
+                        )
+                }) {
+                    return Ok(Ok(true));
+                }
+            }
+            match supplemental_macho_local_symbol_source_is_live(bytes, file, entry)? {
+                Ok(true) => return Ok(Ok(true)),
+                Ok(false) => {}
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+    }
+    Ok(Ok(false))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn changed_macho_local_symbol_cohort_plan(
     relocations: &[RelocationRecord],
@@ -19345,6 +19506,11 @@ fn changed_macho_local_symbol_cohort_plan(
     output_file: &object::File<'_>,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
+    let Some(caller_section) = member_sections.first().copied() else {
+        return Ok(Err(
+            "published local Mach-O cohort has no source section ownership".to_owned(),
+        ));
+    };
     let previous_sections = member_sections
         .iter()
         .map(|section| &section.previous)
@@ -19369,11 +19535,18 @@ fn changed_macho_local_symbol_cohort_plan(
         Ok(entries) => entries,
         Err(reason) => return Ok(Err(reason)),
     };
-    let supplemental_changed = match published_macho_local_symbol_sources_changed(
-        &[],
+    let supplemental_changed = match supplemental_macho_local_symbol_sources_changed(
+        relocations,
+        input_file_path,
+        caller_section.previous.input.as_str(),
+        previous_input.bytes,
+        previous_file,
         &previous_supplemental,
+        current_input.bytes,
+        current_file,
         &current_supplemental,
-    ) {
+        output_file,
+    )? {
         Ok(changed) => changed,
         Err(reason) => return Ok(Err(reason)),
     };
@@ -19406,11 +19579,6 @@ fn changed_macho_local_symbol_cohort_plan(
         Ok(false) | Ok(true) => {}
         Err(reason) => return Ok(Err(reason)),
     }
-    let Some(caller_section) = member_sections.first().copied() else {
-        return Ok(Err(
-            "published local Mach-O cohort has no source section ownership".to_owned(),
-        ));
-    };
     plan_macho_local_symbol_cohort(
         relocations,
         symbol_resolutions,
@@ -52991,6 +53159,217 @@ mod tests {
         assert!(
             published_macho_local_symbol_sources_changed(&published, &previous, &rooted_current)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn supplemental_macho_local_cohort_plans_live_source_churn() {
+        let text = [0; 16];
+        let constant = [0; 32];
+        let object_with_alias = |offset| {
+            add_test_macho_local_alias(
+                test_macho_object_with_text_const(&text, &constant, false, false),
+                b"local_alias",
+                2,
+                text.len() as u64 + offset,
+            )
+        };
+        let supplemental_entries = |bytes: &[u8], file: &object::File<'_>| {
+            let text_section = file.section_by_name("__text").unwrap();
+            let direct = PatchSection {
+                input: String::new(),
+                section_index: patch_section_record_index(file, text_section.index()).unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: text_section.size(),
+                output_offset: 0,
+                output_size: text_section.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            };
+            supplemental_macho_local_symbol_cohort_source_entries(bytes, file, &[&direct])
+                .unwrap()
+                .unwrap()
+        };
+
+        let previous_dead = object_with_alias(4);
+        let current_dead = object_with_alias(8);
+        let previous_dead_file = object::File::parse(previous_dead.as_slice()).unwrap();
+        let current_dead_file = object::File::parse(current_dead.as_slice()).unwrap();
+        let unpublished_output = test_macho_object_with_text_const(&text, &constant, false, false);
+        let unpublished_output_file = object::File::parse(unpublished_output.as_slice()).unwrap();
+        let previous_dead_entries = supplemental_entries(&previous_dead, &previous_dead_file);
+        let current_dead_entries = supplemental_entries(&current_dead, &current_dead_file);
+        assert!(
+            !supplemental_macho_local_symbol_sources_changed(
+                &[],
+                "input",
+                "member",
+                &previous_dead,
+                &previous_dead_file,
+                &previous_dead_entries,
+                &current_dead,
+                &current_dead_file,
+                &current_dead_entries,
+                &unpublished_output_file,
+            )
+            .unwrap()
+            .unwrap(),
+            "isolated unpublished supplemental position churn must not force planning",
+        );
+        assert!(
+            !supplemental_macho_local_symbol_sources_changed(
+                &[],
+                "input",
+                "member",
+                &previous_dead,
+                &previous_dead_file,
+                &previous_dead_entries,
+                &current_dead,
+                &current_dead_file,
+                &current_dead_entries,
+                &previous_dead_file,
+            )
+            .unwrap()
+            .unwrap(),
+            "an unrelated same-name output local must not certify exact ownership",
+        );
+        let previous_const = previous_dead_file
+            .sections()
+            .find(|section| {
+                section.segment_name_bytes().ok().flatten() == Some(b"__TEXT")
+                    && section.name_bytes().ok() == Some(b"__const")
+            })
+            .unwrap();
+        let emitted_value = previous_dead_file
+            .symbols()
+            .find(|symbol| symbol.name_bytes().ok() == Some(b"local_alias"))
+            .unwrap()
+            .address();
+        let owner = RelocationRecord {
+            target_symbol_id: 0,
+            written_value: Some(emitted_value),
+            target_value: emitted_value,
+            applied_target_value: Some(emitted_value),
+            target_name: Some(hex::encode("local_alias").into()),
+            target: Some(RelocationTargetRecord {
+                input_file: "input".into(),
+                input: "member".into(),
+                section_index: relocation_target_record_index(previous_const.index()).unwrap(),
+                section_offset: 4,
+            }),
+            input_file: "input".into(),
+            input: "source".into(),
+            section_index: 1,
+            relocation_offset: 0,
+            output_offset: 0,
+            size: 4,
+            kind: 0,
+            addend: 0,
+        };
+        assert!(
+            supplemental_macho_local_symbol_sources_changed(
+                &[owner],
+                "input",
+                "member",
+                &previous_dead,
+                &previous_dead_file,
+                &previous_dead_entries,
+                &current_dead,
+                &current_dead_file,
+                &current_dead_entries,
+                &previous_dead_file,
+            )
+            .unwrap()
+            .unwrap(),
+            "an emitted unreferenced supplemental local must force planning",
+        );
+
+        let mut retained = previous_dead.clone();
+        let constant_section = 32 + 72 + 80;
+        let flags_offset = constant_section + 64;
+        let flags = read_u32_le(&retained[flags_offset..flags_offset + 4]).unwrap();
+        retained[flags_offset..flags_offset + 4]
+            .copy_from_slice(&(flags | object::macho::S_ATTR_NO_DEAD_STRIP).to_le_bytes());
+        let retained_file = object::File::parse(retained.as_slice()).unwrap();
+        let retained_entries = supplemental_entries(&retained, &retained_file);
+        assert!(
+            supplemental_macho_local_symbol_sources_changed(
+                &[],
+                "input",
+                "member",
+                &previous_dead,
+                &previous_dead_file,
+                &previous_dead_entries,
+                &retained,
+                &retained_file,
+                &retained_entries,
+                &unpublished_output_file,
+            )
+            .unwrap()
+            .is_err(),
+            "a supplemental section retention flip must fail closed",
+        );
+
+        let previous_aliased = object_with_alias(0);
+        let previous_aliased_file = object::File::parse(previous_aliased.as_slice()).unwrap();
+        let previous_aliased_entries =
+            supplemental_entries(&previous_aliased, &previous_aliased_file);
+        assert!(
+            supplemental_macho_local_symbol_sources_changed(
+                &[],
+                "input",
+                "member",
+                &previous_aliased,
+                &previous_aliased_file,
+                &previous_aliased_entries,
+                &current_dead,
+                &current_dead_file,
+                &current_dead_entries,
+                &unpublished_output_file,
+            )
+            .unwrap()
+            .unwrap(),
+            "a supplemental local alias on a live global site must force planning",
+        );
+
+        let rooted_object = |offset| {
+            let mut bytes = object_with_alias(offset);
+            let value_start = {
+                let file = object::File::parse(bytes.as_slice()).unwrap();
+                let symbol = file
+                    .symbols()
+                    .find(|symbol| symbol.name_bytes().ok() == Some(b"local_alias"))
+                    .unwrap();
+                macho_symbol_value_field_range(&bytes, symbol.index())
+                    .unwrap()
+                    .start
+            };
+            bytes[value_start - 2..value_start]
+                .copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
+            bytes
+        };
+        let previous_rooted = rooted_object(4);
+        let current_rooted = rooted_object(8);
+        let previous_rooted_file = object::File::parse(previous_rooted.as_slice()).unwrap();
+        let current_rooted_file = object::File::parse(current_rooted.as_slice()).unwrap();
+        let previous_rooted_entries = supplemental_entries(&previous_rooted, &previous_rooted_file);
+        let current_rooted_entries = supplemental_entries(&current_rooted, &current_rooted_file);
+        assert!(
+            supplemental_macho_local_symbol_sources_changed(
+                &[],
+                "input",
+                "member",
+                &previous_rooted,
+                &previous_rooted_file,
+                &previous_rooted_entries,
+                &current_rooted,
+                &current_rooted_file,
+                &current_rooted_entries,
+                &unpublished_output_file,
+            )
+            .unwrap()
+            .unwrap(),
+            "stable rooted supplemental position churn must force planning",
         );
     }
 
