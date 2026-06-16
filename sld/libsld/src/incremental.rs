@@ -34464,29 +34464,34 @@ fn changed_macho_archive_unwind_members(
                 "changed Mach-O member added or removed all unwind metadata".to_owned(),
             ));
         };
-        let (Some(previous_identifier), Some(current_identifier)) = (
+        match (
             previous_input.archive_identifier,
             current_input.archive_identifier,
-        ) else {
-            return Ok(Err(
-                "changed Mach-O unwind member has no archive identity".to_owned()
-            ));
-        };
-        let previous_identifier = archive_member_patch_identifier(previous_identifier);
-        let current_identifier = archive_member_patch_identifier(current_identifier);
-        if previous_identifier.is_empty() || previous_identifier != current_identifier {
-            return Ok(Err(
-                "changed Mach-O unwind member identity changed".to_owned()
-            ));
+        ) {
+            (Some(previous_identifier), Some(current_identifier)) => {
+                let previous_identifier = archive_member_patch_identifier(previous_identifier);
+                let current_identifier = archive_member_patch_identifier(current_identifier);
+                if previous_identifier.is_empty() || previous_identifier != current_identifier {
+                    return Ok(Err(
+                        "changed Mach-O unwind member identity changed".to_owned()
+                    ));
+                }
+                previous_common_members.push(MachOArchiveMemberIdentity {
+                    normalized_identifier: previous_identifier,
+                    object_hash: hash_bytes(previous_input.bytes),
+                });
+                current_common_members.push(MachOArchiveMemberIdentity {
+                    normalized_identifier: current_identifier,
+                    object_hash: hash_bytes(current_input.bytes),
+                });
+            }
+            (None, None) => {}
+            _ => {
+                return Ok(Err(
+                    "changed Mach-O unwind member changed archive membership".to_owned(),
+                ));
+            }
         }
-        previous_common_members.push(MachOArchiveMemberIdentity {
-            normalized_identifier: previous_identifier,
-            object_hash: hash_bytes(previous_input.bytes),
-        });
-        current_common_members.push(MachOArchiveMemberIdentity {
-            normalized_identifier: current_identifier,
-            object_hash: hash_bytes(current_input.bytes),
-        });
         match supplement_macho_unwind_section_mappings(
             input_file_path,
             previous_input_ref.as_str(),
@@ -34940,15 +34945,18 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
     ) {
         return Ok(Err(reason));
     }
+    let unwind_transaction = (!changed.previous_common_members.is_empty()).then_some(
+        MachOArchiveUnwindTransactionState {
+            forward: forward_version,
+            rollback: rollback_version,
+        },
+    );
     Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
         patches: activation.patches,
         previous_input_ranges: changed.previous_input_ranges,
         current_input_ranges: changed.current_input_ranges,
         remaining_reserved_ranges,
-        unwind_transaction: Some(MachOArchiveUnwindTransactionState {
-            forward: forward_version,
-            rollback: rollback_version,
-        }),
+        unwind_transaction,
     })))
 }
 
@@ -68172,6 +68180,54 @@ mod tests {
                 object_hash: hash_bytes(&current_object),
             }]
         );
+        let direct_input_file_path = hex::encode("input.o");
+        let direct_matched = vec![MatchedPatchSection {
+            previous: PatchSection {
+                input: direct_input_file_path.clone(),
+                ..matched[0].previous.clone()
+            },
+            current: PatchSection {
+                input: direct_input_file_path.clone(),
+                ..matched[0].current.clone()
+            },
+        }];
+        let direct = changed_macho_archive_unwind_members(
+            &previous_object,
+            &direct_input_file_path,
+            &direct_matched,
+            &[],
+            &PatchInputResolver::new(&current_object, true).unwrap(),
+            &output_file,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct.members.len(), 1);
+        assert_eq!(direct.previous_input_ranges.len(), 2);
+        assert_eq!(direct.current_input_ranges.len(), 2);
+        assert_eq!(direct.retired_entries.len(), 1);
+        assert!(direct.previous_common_members.is_empty());
+        assert!(direct.current_common_members.is_empty());
+
+        let mut mixed_matched = matched.clone();
+        mixed_matched[0].previous.input = input_file_path.clone();
+        let mixed = changed_macho_archive_unwind_members(
+            &previous_object,
+            &input_file_path,
+            &mixed_matched,
+            &[],
+            &current_resolver,
+            &output_file,
+            &[],
+        )
+        .unwrap();
+        let Err(mixed) = mixed else {
+            panic!("mixed direct/archive unwind provenance unexpectedly succeeded");
+        };
+        assert_eq!(
+            mixed,
+            "changed Mach-O unwind member changed archive membership"
+        );
         assert!(
             changed.retired_entries.windows(2).all(|pair| {
                 pair[0].function_offset + pair[0].length <= pair[1].function_offset
@@ -68239,6 +68295,124 @@ mod tests {
             previous_only_excluded,
             "changed Mach-O unwind member identity changed"
         );
+    }
+
+    #[test]
+    fn changed_direct_macho_unwind_does_not_persist_archive_transaction() {
+        let previous = test_observed_049_macho_unwind_object(false);
+        let mut current = previous.clone();
+        let (compact_length_offset, eh_frame_length_offset) = {
+            let file = object::File::parse(current.as_slice()).unwrap();
+            let compact = file.section_by_name("__compact_unwind").unwrap();
+            let eh_frame = file.section_by_name("__eh_frame").unwrap();
+            let (compact_offset, _) = compact.file_range().unwrap();
+            let (eh_frame_offset, _) = eh_frame.file_range().unwrap();
+            (
+                compact_offset as usize
+                    + compact
+                        .data()
+                        .unwrap()
+                        .windows(4)
+                        .position(|bytes| bytes == 0x258_u32.to_le_bytes())
+                        .unwrap(),
+                eh_frame_offset as usize
+                    + eh_frame
+                        .data()
+                        .unwrap()
+                        .windows(8)
+                        .position(|bytes| bytes == 0x258_u64.to_le_bytes())
+                        .unwrap(),
+            )
+        };
+        current[compact_length_offset..compact_length_offset + 4]
+            .copy_from_slice(&0x250_u32.to_le_bytes());
+        current[eh_frame_length_offset..eh_frame_length_offset + 8]
+            .copy_from_slice(&0x250_u64.to_le_bytes());
+
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let input_file_path = hex::encode("input.o");
+        let mut output = test_macho_unwind_output(0x1000);
+        let (previous_member, mut previous_sections) = test_added_macho_unwind_member(false);
+        previous_sections[0].output_offset = output.text_offset + 0x100;
+        let mut reserves = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+            alignment_exponent: 3,
+            output_offset: output.eh_frame_offset,
+            size: output.eh_frame_size,
+        }];
+        let initial = {
+            let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+            added_macho_archive_unwind_activation(
+                std::slice::from_ref(&previous_member),
+                &[0],
+                &previous_sections,
+                &output_file,
+                &[],
+                &[],
+                &mut reserves,
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        };
+        apply_test_section_patches(&mut output.bytes, &initial.patches);
+
+        let matched = vec![MatchedPatchSection {
+            previous: PatchSection {
+                input: input_file_path.clone(),
+                section_index: patch_section_record_index(&previous_file, previous_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: output.text_offset + 0x100,
+                output_size: previous_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: input_file_path.clone(),
+                section_index: patch_section_record_index(&current_file, current_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: output.text_offset + 0x100,
+                output_size: current_text.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let current_sections = matched
+            .iter()
+            .map(|section| section.current.clone())
+            .collect::<Vec<_>>();
+        let migrated_definitions = HashSet::from([b"_function0".to_vec()]);
+        let activation = changed_macho_archive_unwind_activation(
+            &previous,
+            &current,
+            &input_file_path,
+            &matched,
+            &[],
+            &current_sections,
+            &PatchInputResolver::new(&current, true).unwrap(),
+            &output.bytes,
+            &[],
+            &reserves,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            &migrated_definitions,
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(activation.patches.len(), 2);
+        assert!(activation.unwind_transaction.is_none());
     }
 
     #[test]
@@ -68864,6 +69038,10 @@ mod tests {
             Some(144)
         );
 
+        assert!(
+            activation.unwind_transaction.is_some(),
+            "archive unwind replacement must retain its exact version transaction",
+        );
         let unwind_transaction = activation.unwind_transaction.clone().unwrap();
         let forward_patches = activation
             .patches
