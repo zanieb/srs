@@ -13390,6 +13390,7 @@ struct ChangedMachOArchiveUnwindMembers {
     previous_common_members: Vec<MachOArchiveMemberIdentity>,
     current_common_members: Vec<MachOArchiveMemberIdentity>,
     retired_entries: Vec<MachOUnwindFunctionIdentity>,
+    retired_fdes: Vec<MachOUnwindFunctionIdentity>,
     current_sections: Vec<PatchSection>,
     previous_input_ranges: Vec<std::ops::Range<usize>>,
     current_input_ranges: Vec<std::ops::Range<usize>>,
@@ -13479,6 +13480,8 @@ struct AddedMachOArchiveFde {
     cie_index: usize,
     function: AddedMachOArchiveUnwindSectionPosition,
     function_length: u32,
+    range_field_offset: usize,
+    range_field_width: u8,
     pc_begin: AddedMachOArchiveUnwindPointerField,
     lsda: Option<AddedMachOArchiveUnwindPointerField>,
 }
@@ -34120,6 +34123,39 @@ fn macho_unwind_function_identities(
         }));
     }
 
+    macho_unwind_positions_to_identities(input, functions, sections, output_file)
+}
+
+fn macho_unwind_fde_identities(
+    input: &str,
+    unwind: &AddedMachOArchiveUnwind,
+    sections: &[PatchSection],
+    output_file: &object::File<'_>,
+) -> std::result::Result<Vec<MachOUnwindFunctionIdentity>, String> {
+    let functions = unwind
+        .eh_frame
+        .iter()
+        .flat_map(|eh_frame| &eh_frame.fdes)
+        .filter(|fde| {
+            !unwind.compact_unwind.as_ref().is_some_and(|compact| {
+                compact.entries.iter().any(|entry| {
+                    entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF
+                        && entry.function == fde.function
+                        && entry.function_length == fde.function_length
+                })
+            })
+        })
+        .map(|fde| (fde.function.clone(), fde.function_length))
+        .collect::<Vec<_>>();
+    macho_unwind_positions_to_identities(input, functions, sections, output_file)
+}
+
+fn macho_unwind_positions_to_identities(
+    input: &str,
+    functions: Vec<(AddedMachOArchiveUnwindSectionPosition, u32)>,
+    sections: &[PatchSection],
+    output_file: &object::File<'_>,
+) -> std::result::Result<Vec<MachOUnwindFunctionIdentity>, String> {
     let mut identities = Vec::with_capacity(functions.len());
     for (function, length) in functions {
         let section = sections
@@ -34403,6 +34439,7 @@ fn changed_macho_archive_unwind_members(
     let mut previous_common_members = Vec::new();
     let mut current_common_members = Vec::new();
     let mut retired_entries = Vec::new();
+    let mut retired_fdes = Vec::new();
     let mut current_sections = Vec::new();
     let mut previous_input_ranges = Vec::new();
     let mut current_input_ranges = Vec::new();
@@ -34545,6 +34582,17 @@ fn changed_macho_archive_unwind_members(
                 Err(reason) => return Ok(Err(reason)),
             },
         );
+        retired_fdes.extend(
+            match macho_unwind_fde_identities(
+                previous_input_ref.as_str(),
+                &previous_unwind,
+                &previous_sections,
+                output_file,
+            ) {
+                Ok(identities) => identities,
+                Err(reason) => return Ok(Err(reason)),
+            },
+        );
 
         let Some(text) = current_file.section_by_name("__text") else {
             return Ok(Err(
@@ -34575,6 +34623,19 @@ fn changed_macho_archive_unwind_members(
             "changed Mach-O unwind retirement identities overlap or are duplicated".to_owned(),
         ));
     }
+    retired_fdes.sort_by_key(|identity| (identity.function_offset, identity.length));
+    if retired_fdes.windows(2).any(|pair| {
+        added_macho_archive_unwind_ranges_overlap(
+            pair[0].function_offset,
+            pair[0].length,
+            pair[1].function_offset,
+            pair[1].length,
+        )
+    }) {
+        return Ok(Err(
+            "changed Mach-O unwind FDE retirement identities overlap or are duplicated".to_owned(),
+        ));
+    }
     previous_input_ranges.sort_by_key(|range| range.start);
     current_input_ranges.sort_by_key(|range| range.start);
     previous_common_members
@@ -34597,6 +34658,7 @@ fn changed_macho_archive_unwind_members(
         previous_common_members,
         current_common_members,
         retired_entries,
+        retired_fdes,
         current_sections,
         previous_input_ranges,
         current_input_ranges,
@@ -34906,6 +34968,10 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         &output_file,
         resolutions,
         &changed.retired_entries,
+        &changed.retired_fdes,
+        !changed.members.is_empty()
+            && changed.previous_common_members.len() == changed.members.len()
+            && changed.current_common_members.len() == changed.members.len(),
         &mut remaining_reserved_ranges,
     )? {
         Ok(Some(activation)) => activation,
@@ -35446,6 +35512,9 @@ fn added_macho_archive_text_activations(
         Err(reason) => return Ok(Err(reason)),
     };
     let changed_unwind_member_start = members.len();
+    let changed_unwind_transactional = !changed_unwind.members.is_empty()
+        && changed_unwind.previous_common_members.len() == changed_unwind.members.len()
+        && changed_unwind.current_common_members.len() == changed_unwind.members.len();
     members.extend(changed_unwind.members);
     let unwind_selected_indices = selected_indices
         .iter()
@@ -35462,6 +35531,8 @@ fn added_macho_archive_text_activations(
         &output_file,
         &combined_resolutions,
         &changed_unwind.retired_entries,
+        &changed_unwind.retired_fdes,
+        changed_unwind_transactional,
         &mut remaining_reserved_ranges,
     )? {
         Ok(activation) => activation
@@ -38409,6 +38480,377 @@ fn added_macho_archive_unwind_ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
+#[derive(Clone, Copy)]
+struct OutputMachOArchiveCie {
+    address_size: u8,
+    fde_pointer_encoding: u8,
+}
+
+fn output_macho_archive_eh_frame_entries(
+    data: &[u8],
+) -> std::result::Result<HashMap<usize, std::ops::Range<usize>>, String> {
+    let mut entries = HashMap::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let length = read_u32_le(&data[offset..offset + 4]).unwrap() as usize;
+        if length == 0 {
+            return Ok(entries);
+        }
+        if length == u32::MAX as usize {
+            return Err("retired Mach-O FDE uses a 64-bit entry length".to_owned());
+        }
+        let end = offset
+            .checked_add(4)
+            .and_then(|start| start.checked_add(length))
+            .ok_or_else(|| "retired Mach-O FDE entry range overflowed".to_owned())?;
+        if length < 4 || end > data.len() {
+            return Err("retired Mach-O FDE entry extends past __eh_frame".to_owned());
+        }
+        entries.insert(offset, offset..end);
+        offset = end;
+    }
+    Err("retired Mach-O FDE __eh_frame has no terminator".to_owned())
+}
+
+fn output_macho_archive_cie(
+    data: &[u8],
+    input_range: std::ops::Range<usize>,
+) -> std::result::Result<OutputMachOArchiveCie, String> {
+    let mut cursor = input_range.start + 8;
+    let end = input_range.end;
+    let version = *data
+        .get(cursor)
+        .ok_or_else(|| "retired Mach-O FDE CIE version is truncated".to_owned())?;
+    cursor += 1;
+    if !matches!(version, 1 | 3 | 4) {
+        return Err(format!(
+            "retired Mach-O FDE CIE version {version} is unsupported"
+        ));
+    }
+    let augmentation_end = data
+        .get(cursor..end)
+        .and_then(|bytes| bytes.iter().position(|byte| *byte == 0))
+        .ok_or_else(|| "retired Mach-O FDE CIE augmentation is unterminated".to_owned())?;
+    let augmentation = &data[cursor..cursor + augmentation_end];
+    cursor += augmentation_end + 1;
+    let address_size = if version == 4 {
+        let address_size = *data
+            .get(cursor)
+            .ok_or_else(|| "retired Mach-O FDE CIE address size is truncated".to_owned())?;
+        let segment_size = *data
+            .get(cursor + 1)
+            .ok_or_else(|| "retired Mach-O FDE CIE segment size is truncated".to_owned())?;
+        cursor += 2;
+        if !matches!(address_size, 4 | 8) || segment_size != 0 {
+            return Err("retired Mach-O FDE CIE address or segment size is unsupported".to_owned());
+        }
+        address_size
+    } else {
+        8
+    };
+    read_added_macho_unwind_uleb(data, &mut cursor, end)
+        .map_err(|_| "retired Mach-O FDE CIE code alignment is malformed".to_owned())?;
+    read_added_macho_unwind_sleb(data, &mut cursor, end)
+        .map_err(|_| "retired Mach-O FDE CIE data alignment is malformed".to_owned())?;
+    if version == 1 {
+        cursor = cursor
+            .checked_add(1)
+            .filter(|cursor| *cursor <= end)
+            .ok_or_else(|| "retired Mach-O FDE CIE return register is truncated".to_owned())?;
+    } else {
+        read_added_macho_unwind_uleb(data, &mut cursor, end)
+            .map_err(|_| "retired Mach-O FDE CIE return register is malformed".to_owned())?;
+    }
+
+    let mut fde_pointer_encoding = DW_EH_PE_ABSPTR;
+    let mut has_fde_pointer_encoding = false;
+    if augmentation.first() == Some(&b'z') {
+        let augmentation_size = usize::try_from(
+            read_added_macho_unwind_uleb(data, &mut cursor, end)
+                .map_err(|_| "retired Mach-O FDE CIE augmentation size is malformed".to_owned())?,
+        )
+        .map_err(|_| "retired Mach-O FDE CIE augmentation is too large".to_owned())?;
+        let augmentation_data_end = cursor
+            .checked_add(augmentation_size)
+            .filter(|augmentation_end| *augmentation_end <= end)
+            .ok_or_else(|| "retired Mach-O FDE CIE augmentation is truncated".to_owned())?;
+        for &kind in &augmentation[1..] {
+            match kind {
+                b'L' => {
+                    let encoding = *data
+                        .get(cursor)
+                        .filter(|_| cursor < augmentation_data_end)
+                        .ok_or_else(|| {
+                            "retired Mach-O FDE CIE LSDA encoding is truncated".to_owned()
+                        })?;
+                    cursor += 1;
+                    if encoding != DW_EH_PE_OMIT {
+                        added_macho_archive_dwarf_pointer_width(encoding, address_size).map_err(
+                            |_| "retired Mach-O FDE CIE LSDA encoding is unsupported".to_owned(),
+                        )?;
+                    }
+                }
+                b'P' => {
+                    let encoding = *data
+                        .get(cursor)
+                        .filter(|_| cursor < augmentation_data_end)
+                        .ok_or_else(|| {
+                            "retired Mach-O FDE CIE personality encoding is truncated".to_owned()
+                        })?;
+                    cursor += 1;
+                    let width = added_macho_archive_dwarf_pointer_width(encoding, address_size)
+                        .map_err(|_| {
+                            "retired Mach-O FDE CIE personality encoding is unsupported".to_owned()
+                        })?;
+                    cursor = cursor
+                        .checked_add(usize::from(width))
+                        .filter(|cursor| *cursor <= augmentation_data_end)
+                        .ok_or_else(|| {
+                            "retired Mach-O FDE CIE personality is truncated".to_owned()
+                        })?;
+                }
+                b'R' => {
+                    let encoding = *data
+                        .get(cursor)
+                        .filter(|_| cursor < augmentation_data_end)
+                        .ok_or_else(|| {
+                            "retired Mach-O FDE CIE pointer encoding is truncated".to_owned()
+                        })?;
+                    cursor += 1;
+                    if has_fde_pointer_encoding {
+                        return Err(
+                            "retired Mach-O FDE CIE has duplicate pointer encodings".to_owned()
+                        );
+                    }
+                    added_macho_archive_dwarf_pointer_width(encoding, address_size).map_err(
+                        |_| "retired Mach-O FDE CIE pointer encoding is unsupported".to_owned(),
+                    )?;
+                    fde_pointer_encoding = encoding;
+                    has_fde_pointer_encoding = true;
+                }
+                b'S' => {}
+                _ => {
+                    return Err(format!(
+                        "retired Mach-O FDE CIE augmentation `{}` is unsupported",
+                        char::from(kind)
+                    ));
+                }
+            }
+        }
+        if cursor != augmentation_data_end {
+            return Err("retired Mach-O FDE CIE augmentation size is inconsistent".to_owned());
+        }
+    } else if !augmentation.is_empty() {
+        return Err("retired Mach-O FDE CIE augmentation without `z` is unsupported".to_owned());
+    }
+    Ok(OutputMachOArchiveCie {
+        address_size,
+        fde_pointer_encoding,
+    })
+}
+
+fn output_macho_archive_fde_address(
+    data: &[u8],
+    field_offset: usize,
+    field_address: u64,
+    encoding: u8,
+    address_size: u8,
+) -> std::result::Result<(u64, u8), String> {
+    const DW_EH_PE_APPLICATION_MASK: u8 = 0x70;
+    const DW_EH_PE_PCREL: u8 = 0x10;
+    const DW_EH_PE_INDIRECT: u8 = 0x80;
+
+    if encoding & DW_EH_PE_INDIRECT != 0 {
+        return Err("retired Mach-O FDE PC-begin is indirect".to_owned());
+    }
+    let width = added_macho_archive_dwarf_pointer_width(encoding, address_size)
+        .map_err(|_| "retired Mach-O FDE PC-begin encoding is unsupported".to_owned())?;
+    let raw = read_added_macho_unwind_pointer(data, field_offset, width)
+        .ok_or_else(|| "retired Mach-O FDE PC-begin is truncated".to_owned())?;
+    let signed = matches!(encoding & 0x0f, DW_EH_PE_SDATA4 | DW_EH_PE_SDATA8)
+        || encoding & DW_EH_PE_APPLICATION_MASK == DW_EH_PE_PCREL;
+    let value = match (width, signed) {
+        (4, true) => i128::from(i32::from_le_bytes((raw as u32).to_le_bytes())),
+        (8, true) => i128::from(i64::from_le_bytes(raw.to_le_bytes())),
+        (4 | 8, false) => i128::from(raw),
+        _ => unreachable!("validated DWARF pointer width"),
+    };
+    let address = match encoding & DW_EH_PE_APPLICATION_MASK {
+        0 => value,
+        DW_EH_PE_PCREL => i128::from(field_address)
+            .checked_add(value)
+            .ok_or_else(|| "retired Mach-O FDE PC-begin overflowed".to_owned())?,
+        _ => return Err("retired Mach-O FDE PC-begin application is unsupported".to_owned()),
+    };
+    Ok((
+        u64::try_from(address)
+            .map_err(|_| "retired Mach-O FDE PC-begin is outside the address space".to_owned())?,
+        width,
+    ))
+}
+
+fn retired_macho_archive_fde_range_patches(
+    output_file: &object::File<'_>,
+    existing_entries: &[crate::macho_writer::UnwindInfoEntry],
+    retired_entries: &[MachOUnwindFunctionIdentity],
+    allow_transactional_retirement: bool,
+) -> Result<std::result::Result<Vec<SectionPatch>, String>> {
+    if retired_entries.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    if !allow_transactional_retirement {
+        return Ok(Err(
+            "retired Mach-O FDE range needs an archive unwind transaction".to_owned(),
+        ));
+    }
+    let eh_frame_index =
+        match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__eh_frame") {
+            Ok(index) => index,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let eh_frame = output_file.section_by_index(eh_frame_index)?;
+    let Some((eh_frame_file_offset, _)) = eh_frame.file_range() else {
+        return Ok(Err(
+            "retired Mach-O FDE __eh_frame has no file range".to_owned()
+        ));
+    };
+    let data = eh_frame
+        .data()
+        .context("Failed to read retired Mach-O FDE __eh_frame")?;
+    let entries = match output_macho_archive_eh_frame_entries(data) {
+        Ok(entries) => entries,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let mut claimed_hints = HashSet::with_capacity(retired_entries.len());
+    let mut patches = Vec::with_capacity(retired_entries.len());
+    for retired in retired_entries {
+        let matches = existing_entries
+            .iter()
+            .filter(|entry| {
+                entry.encoding != 0
+                    && entry.function_offset == retired.function_offset
+                    && entry.length == retired.length
+            })
+            .collect::<Vec<_>>();
+        let [entry] = matches.as_slice() else {
+            return Ok(Err(
+                "retired Mach-O FDE identity does not match exactly one unwind-info entry"
+                    .to_owned(),
+            ));
+        };
+        if entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF {
+            return Ok(Err(
+                "retired Mach-O FDE unwind-info entry is not DWARF".to_owned()
+            ));
+        }
+        let hint = (entry.encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK) as usize;
+        if hint == 0 {
+            return Ok(Err("retired Mach-O FDE unwind-info hint is zero".to_owned()));
+        }
+        if !claimed_hints.insert(hint) {
+            return Ok(Err(
+                "retired Mach-O FDE unwind-info hint is duplicated".to_owned()
+            ));
+        }
+        let Some(fde_range) = entries.get(&hint) else {
+            return Ok(Err(
+                "retired Mach-O FDE unwind-info hint does not locate an entry".to_owned(),
+            ));
+        };
+        let cie_pointer = read_u32_le(
+            data.get(fde_range.start + 4..fde_range.start + 8)
+                .expect("validated EH-frame entry header"),
+        )
+        .unwrap() as usize;
+        if cie_pointer == 0 {
+            return Ok(Err(
+                "retired Mach-O FDE unwind-info hint locates a CIE".to_owned()
+            ));
+        }
+        let cie_start = fde_range
+            .start
+            .checked_add(4)
+            .and_then(|offset| offset.checked_sub(cie_pointer));
+        let Some(cie_range) = cie_start.and_then(|start| entries.get(&start)) else {
+            return Ok(Err("retired Mach-O FDE references a missing CIE".to_owned()));
+        };
+        if read_u32_le(
+            data.get(cie_range.start + 4..cie_range.start + 8)
+                .expect("validated EH-frame entry header"),
+        ) != Some(0)
+        {
+            return Ok(Err(
+                "retired Mach-O FDE references a non-CIE entry".to_owned()
+            ));
+        }
+        let cie = match output_macho_archive_cie(data, cie_range.clone()) {
+            Ok(cie) => cie,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let pc_offset = fde_range.start + 8;
+        let Some(pc_address) = eh_frame.address().checked_add(pc_offset as u64) else {
+            return Ok(Err(
+                "retired Mach-O FDE PC-begin address overflowed".to_owned()
+            ));
+        };
+        let (function_address, pc_width) = match output_macho_archive_fde_address(
+            data,
+            pc_offset,
+            pc_address,
+            cie.fde_pointer_encoding,
+            cie.address_size,
+        ) {
+            Ok(value) => value,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let range_offset = pc_offset + usize::from(pc_width);
+        let range_width = match added_macho_archive_dwarf_pointer_width(
+            cie.fde_pointer_encoding & 0x0f,
+            cie.address_size,
+        ) {
+            Ok(width) => width,
+            Err(_) => {
+                return Ok(Err(
+                    "retired Mach-O FDE range encoding is unsupported".to_owned()
+                ));
+            }
+        };
+        let function_length = read_added_macho_unwind_pointer(data, range_offset, range_width)
+            .and_then(|length| u32::try_from(length).ok())
+            .filter(|length| *length != 0);
+        let function_offset = function_address
+            .checked_sub(crate::macho::MACHO_START_MEM_ADDRESS)
+            .and_then(|offset| u32::try_from(offset).ok());
+        if function_offset != Some(retired.function_offset)
+            || function_length != Some(retired.length)
+        {
+            return Ok(Err(
+                "retired Mach-O FDE does not match its unwind-info identity".to_owned(),
+            ));
+        }
+        let range_end = range_offset + usize::from(range_width);
+        if range_end > fde_range.end {
+            return Ok(Err("retired Mach-O FDE range is truncated".to_owned()));
+        }
+        patches.push(SectionPatch {
+            output_offset: eh_frame_file_offset + range_offset as u64,
+            size: u64::from(range_width),
+            data: vec![0; usize::from(range_width)],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+    }
+    patches.sort_by_key(|patch| patch.output_offset);
+    if patches
+        .windows(2)
+        .any(|pair| pair[0].output_offset + pair[0].size > pair[1].output_offset)
+    {
+        return Ok(Err("retired Mach-O FDE range patches overlap".to_owned()));
+    }
+    Ok(Ok(patches))
+}
+
 fn merge_macho_unwind_info_entries(
     existing_entries: Vec<crate::macho_writer::UnwindInfoEntry>,
     retired_entries: &[MachOUnwindFunctionIdentity],
@@ -38657,9 +39099,9 @@ fn scratch_apply_macho_archive_unwind_transition(
         }
         patch_ranges.push(start..end);
     }
-    if eh_frame_patch_count != 1 || unwind_info_patch_count != 1 {
+    if eh_frame_patch_count == 0 || unwind_info_patch_count != 1 {
         return Err(
-            "Mach-O unwind transaction does not own one EH patch and whole unwind-info".to_owned(),
+            "Mach-O unwind transaction does not own EH patches and whole unwind-info".to_owned(),
         );
     }
     let mut target_output = source_output.to_vec();
@@ -38801,6 +39243,8 @@ fn added_macho_archive_unwind_activation(
     output_file: &object::File<'_>,
     resolutions: &[MachOSymbolResolutionRecord],
     retired_entries: &[MachOUnwindFunctionIdentity],
+    retired_fdes: &[MachOUnwindFunctionIdentity],
+    allow_transactional_retirement: bool,
     remaining_reserved_ranges: &mut Vec<ReservedRangeRecord>,
 ) -> Result<std::result::Result<Option<AddedMachOArchiveUnwindActivation>, String>> {
     if selected_indices
@@ -39011,6 +39455,14 @@ fn added_macho_archive_unwind_activation(
                 ) {
                     return Ok(Err(reason));
                 }
+            }
+            let range_offset = block.data_offset + fde.input_range.start + fde.range_field_offset;
+            if read_added_macho_unwind_pointer(data, range_offset, fde.range_field_width)
+                != Some(u64::from(fde.function_length))
+            {
+                return Ok(Err(
+                    "added Mach-O FDE range field changed after materialization".to_owned(),
+                ));
             }
         }
     }
@@ -39256,6 +39708,16 @@ fn added_macho_archive_unwind_activation(
             )));
         }
     };
+    let retired_fde_patches = match retired_macho_archive_fde_range_patches(
+        output_file,
+        &existing_entries,
+        retired_fdes,
+        allow_transactional_retirement,
+    )? {
+        Ok(patches) => patches,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    patches.extend(retired_fde_patches);
     let existing_entries =
         match merge_macho_unwind_info_entries(existing_entries, retired_entries, added_entries) {
             Ok(entries) => entries,
@@ -39982,11 +40444,14 @@ fn added_macho_archive_fde(
             ));
         }
     }
+    let range_field_offset = range_offset - input_range.start;
     Ok(Ok(AddedMachOArchiveFde {
         input_range,
         cie_index,
         function,
         function_length,
+        range_field_offset,
+        range_field_width: range_width,
         pc_begin,
         lsda,
     }))
@@ -60815,6 +61280,7 @@ mod tests {
             previous_common_members: Vec::new(),
             current_common_members: Vec::new(),
             retired_entries: Vec::new(),
+            retired_fdes: Vec::new(),
             current_sections: Vec::new(),
             previous_input_ranges: Vec::new(),
             current_input_ranges: Vec::new(),
@@ -64005,6 +64471,7 @@ mod tests {
                     previous_common_members: Vec::new(),
                     current_common_members: Vec::new(),
                     retired_entries: Vec::new(),
+                    retired_fdes: Vec::new(),
                     current_sections: Vec::new(),
                     previous_input_ranges: Vec::new(),
                     current_input_ranges: Vec::new(),
@@ -68092,6 +68559,109 @@ mod tests {
     }
 
     #[test]
+    fn retired_macho_archive_fdes_require_exact_transactional_hints() {
+        for width in [4, 8] {
+            let lengths = if width == 4 {
+                vec![0x40, 0x50]
+            } else {
+                vec![0x60]
+            };
+            let (mut output, entries, identities, range_offsets) =
+                test_macho_retirable_fdes(width, &lengths);
+            let original_len = output.bytes.len();
+            let patches = {
+                let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+                retired_macho_archive_fde_range_patches(&output_file, &entries, &identities, true)
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(patches.len(), identities.len());
+            assert!(patches.iter().all(|patch| patch.size == u64::from(width)));
+            apply_test_section_patches(&mut output.bytes, &patches);
+            assert_eq!(output.bytes.len(), original_len);
+            for range_offset in range_offsets {
+                assert!(
+                    output.bytes[output.eh_frame_offset as usize + range_offset
+                        ..output.eh_frame_offset as usize + range_offset + usize::from(width)]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+            }
+        }
+
+        let (mut shared, entries, identities, range_offsets) =
+            test_macho_retirable_fdes(4, &[0x40, 0x50]);
+        let one_patch = {
+            let output_file = object::File::parse(shared.bytes.as_slice()).unwrap();
+            retired_macho_archive_fde_range_patches(&output_file, &entries, &identities[..1], true)
+                .unwrap()
+                .unwrap()
+        };
+        apply_test_section_patches(&mut shared.bytes, &one_patch);
+        assert_eq!(
+            read_u32_le(
+                &shared.bytes[shared.eh_frame_offset as usize + range_offsets[0]
+                    ..shared.eh_frame_offset as usize + range_offsets[0] + 4]
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            read_u32_le(
+                &shared.bytes[shared.eh_frame_offset as usize + range_offsets[1]
+                    ..shared.eh_frame_offset as usize + range_offsets[1] + 4]
+            ),
+            Some(0x50)
+        );
+
+        let (output, entries, identities, range_offsets) =
+            test_macho_retirable_fdes(4, &[0x40, 0x50]);
+        let failure = |bytes: &[u8],
+                       entries: &[crate::macho_writer::UnwindInfoEntry],
+                       identities: &[MachOUnwindFunctionIdentity],
+                       transactional| {
+            let output_file = object::File::parse(bytes).unwrap();
+            match retired_macho_archive_fde_range_patches(
+                &output_file,
+                entries,
+                identities,
+                transactional,
+            )
+            .unwrap()
+            {
+                Err(reason) => reason,
+                Ok(_) => panic!("expected retired FDE validation to fail"),
+            }
+        };
+        assert!(failure(&output.bytes, &entries, &identities, false).contains("transaction"));
+
+        let mut invalid_entries = entries.clone();
+        invalid_entries[0].encoding = ADDED_MACHO_UNWIND_MODE_DWARF;
+        assert!(failure(&output.bytes, &invalid_entries, &identities[..1], true).contains("zero"));
+        invalid_entries[0].encoding = 0x0200_0000;
+        assert!(
+            failure(&output.bytes, &invalid_entries, &identities[..1], true).contains("not DWARF")
+        );
+        invalid_entries[0].encoding = entries[0].encoding + 1;
+        assert!(
+            failure(&output.bytes, &invalid_entries, &identities[..1], true)
+                .contains("does not locate")
+        );
+        invalid_entries = entries.clone();
+        invalid_entries[1].encoding = (invalid_entries[1].encoding
+            & !ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK)
+            | (invalid_entries[0].encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK);
+        assert!(failure(&output.bytes, &invalid_entries, &identities, true).contains("duplicated"));
+
+        let mut mismatched = output.bytes.clone();
+        let range = output.eh_frame_offset as usize + range_offsets[0];
+        mismatched[range..range + 4].copy_from_slice(&0x41_u32.to_le_bytes());
+        assert!(failure(&mismatched, &entries, &identities[..1], true).contains("does not match"));
+        let mut malformed = output.bytes.clone();
+        malformed[output.eh_frame_offset as usize + 8] = 2;
+        assert!(failure(&malformed, &entries, &identities[..1], true).contains("unsupported"));
+    }
+
+    #[test]
     fn changed_macho_archive_unwind_members_record_exact_replacement_proof() {
         let previous_object = test_observed_049_macho_unwind_object(false);
         let current_object = test_observed_049_macho_unwind_object(true);
@@ -68305,7 +68875,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_direct_macho_unwind_does_not_persist_archive_transaction() {
+    fn changed_direct_macho_unwind_fde_retirement_fails_closed() {
         let previous = test_observed_049_macho_unwind_object(false);
         let mut current = previous.clone();
         let (compact_length_offset, eh_frame_length_offset) = {
@@ -68359,6 +68929,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -68415,11 +68987,11 @@ mod tests {
             &migrated_definitions,
             &[],
         )
-        .unwrap()
-        .unwrap()
         .unwrap();
-        assert_eq!(activation.patches.len(), 2);
-        assert!(activation.unwind_transaction.is_none());
+        let Err(reason) = activation else {
+            panic!("direct FDE retirement unexpectedly succeeded");
+        };
+        assert!(reason.contains("needs an archive unwind transaction"));
     }
 
     #[test]
@@ -68906,6 +69478,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -69013,7 +69587,23 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(activation.patches.len(), 2);
+        assert_eq!(activation.patches.len(), 3);
+        let retired_fde_patch = activation
+            .patches
+            .iter()
+            .find(|patch| {
+                patch.output_offset >= output.eh_frame_offset
+                    && patch.output_offset < reserve_after_initial.output_offset
+                    && patch.data.iter().all(|byte| *byte == 0)
+            })
+            .unwrap();
+        assert_eq!(retired_fde_patch.size, 8);
+        assert!(
+            output.bytes[retired_fde_patch.output_offset as usize
+                ..retired_fde_patch.output_offset as usize + retired_fde_patch.data.len()]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
         assert_eq!(
             activation.remaining_reserved_ranges,
             vec![ReservedRangeRecord {
@@ -69037,6 +69627,12 @@ mod tests {
         let previous_version_output = output.bytes.clone();
         apply_test_section_patches(&mut output.bytes, &activation.patches);
         let current_version_output = output.bytes.clone();
+        assert!(
+            current_version_output[retired_fde_patch.output_offset as usize
+                ..retired_fde_patch.output_offset as usize + retired_fde_patch.data.len()]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(
             eh_frame_terminator_offset(
                 &output.bytes[output.eh_frame_offset as usize
@@ -69083,6 +69679,7 @@ mod tests {
                 previous_common_members,
                 current_common_members,
                 retired_entries: Vec::new(),
+                retired_fdes: Vec::new(),
                 current_sections: Vec::new(),
                 previous_input_ranges: Vec::new(),
                 current_input_ranges: Vec::new(),
@@ -69682,7 +70279,7 @@ mod tests {
         .unwrap()
         .unwrap()
         .unwrap();
-        assert_eq!(next_activation.patches.len(), 2);
+        assert_eq!(next_activation.patches.len(), 3);
         assert_eq!(
             next_activation.remaining_reserved_ranges,
             vec![ReservedRangeRecord {
@@ -69881,6 +70478,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -70006,7 +70605,7 @@ mod tests {
         .unwrap()
         .unwrap()
         .unwrap();
-        assert_eq!(activation.patches.len(), 2);
+        assert_eq!(activation.patches.len(), 3);
 
         let mut unrelated_source = current_changed;
         unrelated_source[24] ^= 1;
@@ -70065,6 +70664,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut undersized_reserves,
             )
             .unwrap()
@@ -70095,6 +70696,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut nonzero_reserves,
             )
             .unwrap()
@@ -70114,6 +70717,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -70177,6 +70782,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -70198,6 +70805,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -70239,6 +70848,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut gapped_reserves,
             )
             .unwrap()
@@ -70287,6 +70898,8 @@ mod tests {
                 &output_file,
                 &[],
                 &[],
+                &[],
+                true,
                 &mut insufficient_capacity_reserves,
             )
             .unwrap()
@@ -70335,6 +70948,8 @@ mod tests {
                 &output_file,
                 std::slice::from_ref(&resolution),
                 &[],
+                &[],
+                true,
                 &mut reserves,
             )
             .unwrap()
@@ -70552,6 +71167,85 @@ mod tests {
             eh_frame_size: EH_FRAME_SIZE as u64,
             unwind_info_offset: unwind_info_offset as u64,
         }
+    }
+
+    fn test_macho_retirable_fdes(
+        width: u8,
+        lengths: &[u32],
+    ) -> (
+        TestMachOUnwindOutput,
+        Vec<crate::macho_writer::UnwindInfoEntry>,
+        Vec<MachOUnwindFunctionIdentity>,
+        Vec<usize>,
+    ) {
+        let mut output = test_macho_unwind_output(0x1000);
+        let encoding = match width {
+            4 => DW_EH_PE_SDATA4 | 0x10,
+            8 => DW_EH_PE_SDATA8 | 0x10,
+            _ => panic!("unsupported test width"),
+        };
+        let mut eh_frame = Vec::new();
+        push_u32(&mut eh_frame, 0);
+        push_u32(&mut eh_frame, 0);
+        eh_frame.push(1);
+        eh_frame.extend_from_slice(b"zR\0");
+        eh_frame.extend_from_slice(&[1, 0x78, 30, 1, encoding]);
+        while !eh_frame.len().is_multiple_of(8) {
+            eh_frame.push(0);
+        }
+        let cie_length = eh_frame.len() as u32 - 4;
+        eh_frame[..4].copy_from_slice(&cie_length.to_le_bytes());
+
+        let mut entries = Vec::new();
+        let mut identities = Vec::new();
+        let mut range_offsets = Vec::new();
+        for (index, &length) in lengths.iter().enumerate() {
+            let fde_start = eh_frame.len();
+            push_u32(&mut eh_frame, 4 + 2 * u32::from(width));
+            push_u32(&mut eh_frame, (fde_start + 4) as u32);
+            let pc_offset = eh_frame.len();
+            let function_offset = output.text_offset as u32 + 0x100 + index as u32 * 0x100;
+            let field_address =
+                crate::macho::MACHO_START_MEM_ADDRESS + output.eh_frame_offset + pc_offset as u64;
+            let function_address =
+                crate::macho::MACHO_START_MEM_ADDRESS + u64::from(function_offset);
+            let delta = i128::from(function_address) - i128::from(field_address);
+            match width {
+                4 => eh_frame.extend_from_slice(&(delta as i32).to_le_bytes()),
+                8 => eh_frame.extend_from_slice(&(delta as i64).to_le_bytes()),
+                _ => unreachable!(),
+            }
+            range_offsets.push(eh_frame.len());
+            match width {
+                4 => eh_frame.extend_from_slice(&length.to_le_bytes()),
+                8 => eh_frame.extend_from_slice(&u64::from(length).to_le_bytes()),
+                _ => unreachable!(),
+            }
+            entries.push(crate::macho_writer::UnwindInfoEntry {
+                function_offset,
+                length,
+                encoding: ADDED_MACHO_UNWIND_MODE_DWARF | fde_start as u32,
+                personality_offset: None,
+                lsda_offset: None,
+            });
+            identities.push(MachOUnwindFunctionIdentity {
+                function_offset,
+                length,
+            });
+        }
+        eh_frame.extend_from_slice(&0_u32.to_le_bytes());
+        let eh_start = output.eh_frame_offset as usize;
+        output.bytes[eh_start..eh_start + eh_frame.len()].copy_from_slice(&eh_frame);
+        let mut unwind_info = vec![0; 0x1000];
+        crate::macho_writer::serialize_macho_unwind_info(
+            &mut unwind_info,
+            entries.clone(),
+            output.text_offset as u32 + 0x800,
+        )
+        .unwrap();
+        let unwind_start = output.unwind_info_offset as usize;
+        output.bytes[unwind_start..unwind_start + unwind_info.len()].copy_from_slice(&unwind_info);
+        (output, entries, identities, range_offsets)
     }
 
     struct TestMachOImportOutput {
@@ -75772,6 +76466,7 @@ mod tests {
             previous_common_members: Vec::new(),
             current_common_members: Vec::new(),
             retired_entries: Vec::new(),
+            retired_fdes: Vec::new(),
             current_sections: Vec::new(),
             previous_input_ranges: Vec::new(),
             current_input_ranges: Vec::new(),
@@ -75957,6 +76652,7 @@ mod tests {
             previous_common_members: Vec::new(),
             current_common_members: Vec::new(),
             retired_entries: Vec::new(),
+            retired_fdes: Vec::new(),
             current_sections: Vec::new(),
             previous_input_ranges: Vec::new(),
             current_input_ranges: Vec::new(),
