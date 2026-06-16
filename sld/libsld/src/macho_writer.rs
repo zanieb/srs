@@ -2284,7 +2284,7 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = MachO>>(
     Ok(Some((new_value, thunk_address)))
 }
 
-fn rewrite_pageoff_load_to_add(out: &mut [u8]) -> Result {
+pub(crate) fn rewrite_pageoff_load_to_add(out: &mut [u8]) -> Result {
     ensure!(
         out.len() >= 4,
         "Mach-O pageoff relocation must have a 4-byte instruction"

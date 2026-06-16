@@ -16173,6 +16173,7 @@ struct MachOTextRelocationReplay {
     current_target_value: u64,
     used_normalized_target_alias: bool,
     current_relocation_target_candidates: Vec<u64>,
+    relax_pageoff_load_to_direct: bool,
     current_target_section_offset: u64,
     target_symbol_id: u32,
     target_name: Option<SharedText>,
@@ -19755,6 +19756,19 @@ fn macho_text_relocation_target_candidates_for_resolution(
     candidates
 }
 
+fn macho_pageoff_load_relaxes_to_direct(
+    resolution: Option<&MachOSymbolResolutionRecord>,
+    r_type: u8,
+) -> bool {
+    matches!(
+        r_type,
+        object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) && resolution
+        .and_then(|resolution| resolution.got_address)
+        .is_none()
+}
+
 fn recorded_macho_branch_target_candidate(
     relocation: &RelocationRecord,
     target_name: Option<&SharedText>,
@@ -20252,6 +20266,10 @@ fn rematerialized_macho_text_relocation_replay(
         current_target_value,
         used_normalized_target_alias,
         current_relocation_target_candidates,
+        relax_pageoff_load_to_direct: macho_pageoff_load_relaxes_to_direct(
+            resolution,
+            current_context.r_type,
+        ),
         current_target_section_offset: target.as_ref().map_or(0, |target| target.section_offset),
         target_symbol_id,
         target_name,
@@ -21405,6 +21423,9 @@ fn macho_text_relocation_replays_for_input(
                     current_target_value,
                     &previous_applied_target_values,
                 );
+                let current_resolution = replay_target_name
+                    .as_deref()
+                    .and_then(|name| resolution_lookup.get_encoded(resolutions, name));
 
                 replays.push(MachOTextRelocationReplay {
                     relocation_index: Some(relocation_index),
@@ -21422,6 +21443,10 @@ fn macho_text_relocation_replays_for_input(
                     current_target_value,
                     used_normalized_target_alias: false,
                     current_relocation_target_candidates,
+                    relax_pageoff_load_to_direct: macho_pageoff_load_relaxes_to_direct(
+                        current_resolution,
+                        raw_relocation.r_type,
+                    ),
                     current_target_section_offset: replay_target
                         .as_ref()
                         .map(|target| target.section_offset)
@@ -22834,6 +22859,10 @@ fn apply_macho_text_relocation_replays(
                 .get(replay.current_range.clone())
                 .ok_or_else(|| "current Mach-O text relocation range is out of bounds".to_owned())?
                 .to_vec();
+            if replay.relax_pageoff_load_to_direct {
+                crate::macho_writer::rewrite_pageoff_load_to_add(&mut relocated)
+                    .map_err(|error| error.to_string())?;
+            }
             if replay
                 .rel_info
                 .write_to_buffer(written_value, &mut relocated)
@@ -33406,6 +33435,9 @@ fn added_macho_archive_text_relocation_replays(
                 current_target_value,
                 &recorded_target_candidates,
             );
+            let current_resolution = target_name
+                .as_deref()
+                .and_then(|name| resolution_lookup.get_encoded(resolutions, name));
             let target_symbol_id = relocations
                 .iter()
                 .find(|relocation| {
@@ -33428,6 +33460,10 @@ fn added_macho_archive_text_relocation_replays(
                 current_target_value,
                 used_normalized_target_alias: false,
                 current_relocation_target_candidates,
+                relax_pageoff_load_to_direct: macho_pageoff_load_relaxes_to_direct(
+                    current_resolution,
+                    context.r_type,
+                ),
                 current_target_section_offset: target
                     .as_ref()
                     .map_or(0, |target| target.section_offset),
@@ -33606,6 +33642,7 @@ fn added_macho_archive_text_relocation_replays(
                     current_target_value,
                     used_normalized_target_alias: false,
                     current_relocation_target_candidates: vec![current_target_value],
+                    relax_pageoff_load_to_direct: false,
                     current_target_section_offset: target
                         .as_ref()
                         .map_or(0, |target| target.section_offset),
@@ -65879,6 +65916,7 @@ mod tests {
             current_target_value: target_value,
             used_normalized_target_alias: false,
             current_relocation_target_candidates: vec![target_value],
+            relax_pageoff_load_to_direct: false,
             current_target_section_offset: target.section_offset,
             target_symbol_id: 1,
             target_name: Some(SharedText::from(hex::encode(target_name))),
@@ -66215,6 +66253,107 @@ mod tests {
             relocations[0].output_offset,
             current_text_range.start as u64
         );
+    }
+
+    #[test]
+    fn macho_text_relocation_replay_matches_pageoff_got_relaxation() {
+        let load = 0xf940_0000_u32.to_le_bytes();
+        let previous_output = test_macho_object(&load, b"\x01\x02\x03\x04", 0);
+        let text_range = test_macho_section_range(&previous_output, "__text");
+        let input = "input.o";
+        let target = RelocationTargetRecord {
+            input_file: SharedText::from(hex::encode(input)),
+            input: SharedText::from(hex::encode(input)),
+            section_index: 2,
+            section_offset: 0,
+        };
+        let target_value = 0x1000_0120;
+        let got_address = 0x1000_0400;
+
+        for r_type in [
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+        ] {
+            let raw_relocation = object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 0,
+                r_pcrel: false,
+                r_length: 2,
+                r_extern: true,
+                r_type,
+            };
+            let rel_info =
+                <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::relocation_from_raw(
+                    raw_relocation,
+                )
+                .unwrap();
+            let apply = |candidate, relax_pageoff_load_to_direct| {
+                let mut replay =
+                    rematerialized_macho_replay(input, "_target", target_value, target.clone());
+                replay.r_type = r_type;
+                replay.kind = encode_macho_aarch64_relocation_kind(raw_relocation);
+                replay.rel_info = rel_info;
+                replay.current_target_value = target_value;
+                replay.current_relocation_target_candidates = vec![candidate];
+                replay.relax_pageoff_load_to_direct = relax_pageoff_load_to_direct;
+                let replays = MachOTextRelocationReplays {
+                    replays: vec![replay],
+                    rematerialized_sections: Vec::new(),
+                    local_symbol_cohorts: Vec::new(),
+                    normalize_rust_archive_patch_inputs: false,
+                    symbol_resolutions_changed: false,
+                };
+                let mut patches = vec![ResolvedSectionPatch {
+                    section: PatchSection {
+                        input: hex::encode(input),
+                        section_index: 1,
+                        section_name: Some("__TEXT,__text".to_owned()),
+                        input_size: 4,
+                        output_offset: text_range.start as u64,
+                        output_size: 4,
+                        data_hash: None,
+                        cstring_nul_boundaries_hash: None,
+                    },
+                    patch: SectionPatch {
+                        output_offset: text_range.start as u64,
+                        size: 4,
+                        data: load.to_vec(),
+                        deferred_relocation: None,
+                        preserve_ranges: vec![0..4],
+                        adjustments: Vec::new(),
+                    },
+                }];
+                apply_macho_text_relocation_replays(
+                    &mut patches,
+                    &replays,
+                    &previous_output,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                patches[0].patch.data.clone()
+            };
+
+            let mut direct = load;
+            crate::macho_writer::rewrite_pageoff_load_to_add(&mut direct).unwrap();
+            rel_info.write_to_buffer(target_value, &mut direct).unwrap();
+            assert_eq!(apply(target_value, true), direct);
+
+            let mut indirect = load;
+            rel_info
+                .write_to_buffer(got_address, &mut indirect)
+                .unwrap();
+            assert_eq!(apply(got_address, false), indirect);
+
+            let mut colliding_indirect = load;
+            rel_info
+                .write_to_buffer(target_value, &mut colliding_indirect)
+                .unwrap();
+            assert_eq!(apply(target_value, false), colliding_indirect);
+        }
     }
 
     #[test]
