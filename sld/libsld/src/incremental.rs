@@ -1342,7 +1342,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 &metadata_update_input_indices,
             )?
         } else if should_start_with_filtered_records {
-            let complete_macho_symbol_resolutions =
+            let filtered_record_coverage =
                 previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
             append_log(
                 &state_dir,
@@ -1365,11 +1365,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 previous_output_source.is_live(),
                 previous,
                 current_link_start.clone(),
-                if complete_macho_symbol_resolutions {
-                    ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions
-                } else {
-                    ChangedInputRecordCoverage::ChangedInputs
-                },
+                ChangedInputRecordCoverage::ChangedInputs(filtered_record_coverage),
                 &changed_inputs_to_patch,
                 &metadata_update_input_indices,
             )?
@@ -1412,7 +1408,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
-                let complete_macho_symbol_resolutions =
+                let filtered_record_coverage =
                     previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
                 append_log(
                     &state_dir,
@@ -1435,11 +1431,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     previous_output_source.is_live(),
                     previous,
                     current_link_start.clone(),
-                    if complete_macho_symbol_resolutions {
-                        ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions
-                    } else {
-                        ChangedInputRecordCoverage::ChangedInputs
-                    },
+                    ChangedInputRecordCoverage::ChangedInputs(filtered_record_coverage),
                     &changed_inputs_to_patch,
                     &metadata_update_input_indices,
                 )?
@@ -1497,7 +1489,9 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
-                previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                let mut filtered_record_coverage =
+                    previous.read_records_for_input_files(&state_dir, &changed_input_files)?;
+                filtered_record_coverage.complete_macho_symbol_resolutions = true;
                 patch_changed_inputs(
                     args,
                     &state_dir,
@@ -1506,7 +1500,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     previous_output_source.is_live(),
                     previous,
                     current_link_start.clone(),
-                    ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions,
+                    ChangedInputRecordCoverage::ChangedInputs(filtered_record_coverage),
                     &changed_inputs_to_patch,
                     &metadata_update_input_indices,
                 )?
@@ -2556,25 +2550,47 @@ const MACHO_LOCAL_TEXT_TARGET_INDIRECT_RELOCATION_UNSUPPORTED: &str =
 const MACHO_SYMBOL_RESOLUTIONS_REQUIRED: &str = "missing Mach-O symbol resolution";
 const DIRECT_MACHO_CGU_MIGRATION_REQUIRED: &str = "missing direct Mach-O CGU catalog target";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FilteredRecordCoverage {
+    complete_macho_symbol_resolutions: bool,
+    complete_record_input_files: HashSet<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum ChangedInputRecordCoverage {
     MetadataOnly,
-    ChangedInputs,
-    ChangedInputsWithCompleteMachOResolutions,
+    ChangedInputs(FilteredRecordCoverage),
     Complete,
 }
 
 impl ChangedInputRecordCoverage {
-    fn has_changed_input_records(self) -> bool {
-        self != Self::MetadataOnly
+    fn has_changed_input_records(&self) -> bool {
+        !matches!(self, Self::MetadataOnly)
     }
 
-    fn has_complete_macho_symbol_resolutions(self) -> bool {
-        self != Self::ChangedInputs
+    fn has_complete_macho_symbol_resolutions(&self) -> bool {
+        !matches!(
+            self,
+            Self::ChangedInputs(coverage) if !coverage.complete_macho_symbol_resolutions
+        )
     }
 
-    fn is_complete(self) -> bool {
-        self == Self::Complete
+    fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    fn has_complete_records_for_input(
+        &self,
+        input_file: &str,
+        changed_input_files: &HashSet<String>,
+    ) -> bool {
+        self.is_complete()
+            || changed_input_files.contains(input_file)
+            || matches!(
+                self,
+                Self::ChangedInputs(coverage)
+                    if coverage.complete_record_input_files.contains(input_file)
+            )
     }
 }
 
@@ -7359,7 +7375,11 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
 
     let records_complete = record_coverage.is_complete();
     let mut previous = previous;
-    if record_coverage == ChangedInputRecordCoverage::ChangedInputsWithCompleteMachOResolutions {
+    if matches!(
+        &record_coverage,
+        ChangedInputRecordCoverage::ChangedInputs(coverage)
+            if coverage.complete_macho_symbol_resolutions
+    ) {
         previous.macho_symbol_resolutions.clear();
     }
     if record_coverage.has_complete_macho_symbol_resolutions() {
@@ -8061,7 +8081,7 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 &relocation_target_patches,
                 &previous.relocations,
                 &changed_input_files,
-                records_complete,
+                &record_coverage,
             ) {
                 Ok(changed_record_owners) => {
                     record_override_input_files.extend(changed_record_owners);
@@ -11796,7 +11816,7 @@ fn changed_relocation_target_record_owners(
     target_patches: &RelocationTargetPatches,
     relocations: &[RelocationRecord],
     changed_input_files: &HashSet<String>,
-    records_complete: bool,
+    record_coverage: &ChangedInputRecordCoverage,
 ) -> std::result::Result<HashSet<String>, RelocationTargetRecordCoverageError> {
     let changed_record_owners = target_patches
         .changed_relocation_indices
@@ -11808,12 +11828,9 @@ fn changed_relocation_target_record_owners(
                 .ok_or(RelocationTargetRecordCoverageError::MissingOwner)
         })
         .collect::<std::result::Result<HashSet<_>, _>>()?;
-    // Selective reads contain complete owner blocks for changed inputs, but only incoming
-    // relocation aliases for other owners.
-    if !records_complete
-        && !changed_record_owners
-            .iter()
-            .all(|owner| changed_input_files.contains(owner))
+    if !changed_record_owners
+        .iter()
+        .all(|owner| record_coverage.has_complete_records_for_input(owner, changed_input_files))
     {
         return Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords);
     }
@@ -14758,14 +14775,19 @@ impl PersistedState {
         &mut self,
         state_dir: &Path,
         input_files: &HashSet<String>,
-    ) -> Result<bool> {
+    ) -> Result<FilteredRecordCoverage> {
         self.materialize_patch_record_locations()?;
         if let Some(patch_records_file) = self.patch_records_file.as_deref() {
             let canonical_index = self.sections_file.as_deref() == Some(patch_records_file);
-            if let Some(records) =
+            if let Some((records, mut complete_record_input_files)) =
                 self.read_indexed_patch_records(state_dir, patch_records_file, input_files)?
             {
                 let indexed_resolutions_complete = records.macho_symbol_resolutions_complete;
+                let retained_input_files = input_files
+                    .iter()
+                    .chain(complete_record_input_files.iter())
+                    .cloned()
+                    .collect::<HashSet<_>>();
                 self.sections = records.sections;
                 self.relocations = records.relocations;
                 self.macho_symbol_resolutions = records.macho_symbol_resolutions;
@@ -14777,11 +14799,25 @@ impl PersistedState {
                 {
                     self.macho_symbol_resolutions.clear();
                     self.load_macho_symbol_resolutions(state_dir)?;
-                    self.apply_record_overrides(state_dir, Some(input_files))?;
-                    return Ok(true);
+                    self.apply_record_overrides(state_dir, Some(&retained_input_files))?;
+                    self.retain_relevant_complete_record_inputs(
+                        input_files,
+                        &mut complete_record_input_files,
+                    );
+                    return Ok(FilteredRecordCoverage {
+                        complete_macho_symbol_resolutions: true,
+                        complete_record_input_files,
+                    });
                 }
-                self.apply_record_overrides(state_dir, Some(input_files))?;
-                return Ok(false);
+                self.apply_record_overrides(state_dir, Some(&retained_input_files))?;
+                self.retain_relevant_complete_record_inputs(
+                    input_files,
+                    &mut complete_record_input_files,
+                );
+                return Ok(FilteredRecordCoverage {
+                    complete_macho_symbol_resolutions: false,
+                    complete_record_input_files,
+                });
             }
             if canonical_index {
                 self.sections.clear();
@@ -14789,7 +14825,7 @@ impl PersistedState {
                 self.fdes.clear();
                 self.dynamic_relocations.clear();
                 self.apply_record_overrides(state_dir, Some(input_files))?;
-                return Ok(false);
+                return Ok(FilteredRecordCoverage::default());
             }
             if self.patch_record_locations.is_empty() {
                 timing_phase!("Read incremental patch-record sidecar");
@@ -14815,16 +14851,19 @@ impl PersistedState {
                         self.macho_symbol_resolutions.clear();
                         self.load_macho_symbol_resolutions(state_dir)?;
                         self.apply_record_overrides(state_dir, Some(input_files))?;
-                        return Ok(true);
+                        return Ok(FilteredRecordCoverage {
+                            complete_macho_symbol_resolutions: true,
+                            ..FilteredRecordCoverage::default()
+                        });
                     }
                     self.apply_record_overrides(state_dir, Some(input_files))?;
-                    return Ok(false);
+                    return Ok(FilteredRecordCoverage::default());
                 }
             }
         }
         let Some(sections_file) = self.sections_file.as_deref() else {
             self.apply_record_overrides(state_dir, Some(input_files))?;
-            return Ok(false);
+            return Ok(FilteredRecordCoverage::default());
         };
         timing_phase!("Read incremental sidecar records");
         let contents = read_sections_sidecar(state_dir, sections_file)?;
@@ -14841,10 +14880,49 @@ impl PersistedState {
             self.macho_symbol_resolutions.clear();
             self.load_macho_symbol_resolutions(state_dir)?;
             self.apply_record_overrides(state_dir, Some(input_files))?;
-            return Ok(true);
+            return Ok(FilteredRecordCoverage {
+                complete_macho_symbol_resolutions: true,
+                ..FilteredRecordCoverage::default()
+            });
         }
         self.apply_record_overrides(state_dir, Some(input_files))?;
-        Ok(false)
+        Ok(FilteredRecordCoverage::default())
+    }
+
+    fn retain_relevant_complete_record_inputs(
+        &mut self,
+        input_files: &HashSet<String>,
+        complete_record_input_files: &mut HashSet<String>,
+    ) {
+        // Immutable index aliases may be superseded by record overrides. Keep only owners that
+        // still have an incoming relocation to a requested input after applying those overrides.
+        complete_record_input_files.retain(|input_file| {
+            self.relocations.iter().any(|record| {
+                record.input_file.as_str() == input_file
+                    && record
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| input_files.contains(target.input_file.as_str()))
+            })
+        });
+        let retained_input_files = input_files
+            .iter()
+            .chain(complete_record_input_files.iter())
+            .map(String::as_str)
+            .collect::<HashSet<&str>>();
+        self.sections
+            .retain(|record| retained_input_files.contains(record.input_file.as_str()));
+        self.relocations.retain(|record| {
+            retained_input_files.contains(record.input_file.as_str())
+                || record
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| input_files.contains(target.input_file.as_str()))
+        });
+        self.fdes
+            .retain(|record| retained_input_files.contains(record.input_file.as_str()));
+        self.dynamic_relocations
+            .retain(|record| retained_input_files.contains(record.input_file.as_str()));
     }
 
     fn apply_record_overrides(
@@ -14950,10 +15028,10 @@ impl PersistedState {
         state_dir: &Path,
         patch_records_file: &str,
         input_files: &HashSet<String>,
-    ) -> Result<Option<CompactRecords>> {
+    ) -> Result<Option<(CompactRecords, HashSet<String>)>> {
         if self.patch_record_locations.is_empty() {
             return if self.sections_file.as_deref() == Some(patch_records_file) {
-                Ok(Some(CompactRecords::default()))
+                Ok(Some((CompactRecords::default(), HashSet::new())))
             } else {
                 Ok(None)
             };
@@ -14977,25 +15055,52 @@ impl PersistedState {
         locations.dedup_by(|left, right| {
             left.offset == right.offset && left.len == right.len && left.hash == right.hash
         });
-        let mut records =
+        let selected_location_keys = locations
+            .iter()
+            .map(|location| (location.offset, location.len, location.hash.as_str()))
+            .collect::<HashSet<_>>();
+        let canonical_record_input_files = self
+            .patch_record_locations
+            .iter()
+            .filter(|location| {
+                selected_location_keys.contains(&(
+                    location.offset,
+                    location.len,
+                    location.hash.as_str(),
+                ))
+            })
+            .map(|location| location.input_file.as_str())
+            .collect::<HashSet<_>>();
+        let records =
             Self::read_indexed_records_at_locations(state_dir, patch_records_file, locations)?;
-        records
+        // Alias locations point at canonical owner blocks, so every decoded record owner is
+        // complete when the index also maps that exact block under the decoded owner.
+        let complete_record_input_files = records
             .sections
-            .retain(|record| input_files.contains(record.input_file.as_str()));
-        records.relocations.retain(|record| {
-            input_files.contains(record.input_file.as_str())
-                || record
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| input_files.contains(target.input_file.as_str()))
-        });
-        records
-            .fdes
-            .retain(|record| input_files.contains(record.input_file.as_str()));
-        records
-            .dynamic_relocations
-            .retain(|record| input_files.contains(record.input_file.as_str()));
-        Ok(Some(records))
+            .iter()
+            .map(|record| record.input_file.to_string())
+            .chain(
+                records
+                    .relocations
+                    .iter()
+                    .map(|record| record.input_file.to_string()),
+            )
+            .chain(
+                records
+                    .fdes
+                    .iter()
+                    .map(|record| record.input_file.to_string()),
+            )
+            .chain(
+                records
+                    .dynamic_relocations
+                    .iter()
+                    .map(|record| record.input_file.to_string()),
+            )
+            .filter(|input_file| !input_files.contains(input_file))
+            .filter(|input_file| canonical_record_input_files.contains(input_file.as_str()))
+            .collect();
+        Ok(Some((records, complete_record_input_files)))
     }
 
     fn read_all_indexed_records(&self, state_dir: &Path) -> Result<CompactRecords> {
@@ -82283,9 +82388,10 @@ mod tests {
 
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let b_inputs = [hex::encode("b.o")].into_iter().collect::<HashSet<_>>();
-        metadata
+        let filtered_coverage = metadata
             .read_records_for_input_files(dir.path(), &b_inputs)
             .unwrap();
+        assert!(filtered_coverage.complete_record_input_files.is_empty());
         assert_eq!(metadata.sections, vec![section_record("b.o", 1, 200, 8)]);
         assert!(metadata.relocations.is_empty());
 
@@ -82669,7 +82775,7 @@ mod tests {
                 &target_patches,
                 &relocations,
                 &changed_input_files,
-                false,
+                &ChangedInputRecordCoverage::ChangedInputs(FilteredRecordCoverage::default(),),
             ),
             Ok(changed_input_files)
         );
@@ -82702,13 +82808,17 @@ mod tests {
             changed_relocation_indices: vec![0],
         };
         let changed_input_files = [hex::encode("target.o")].into_iter().collect();
+        let partial_coverage = ChangedInputRecordCoverage::ChangedInputs(FilteredRecordCoverage {
+            complete_record_input_files: [hex::encode("other-caller.o")].into_iter().collect(),
+            ..FilteredRecordCoverage::default()
+        });
 
         assert_eq!(
             changed_relocation_target_record_owners(
                 &target_patches,
                 &relocations,
                 &changed_input_files,
-                false,
+                &partial_coverage,
             ),
             Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords)
         );
@@ -82919,6 +83029,230 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn filtered_records_preserve_complete_incoming_relocation_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(
+            "args",
+            b"output",
+            &[
+                ("target.o", b"target"),
+                ("caller.o", b"caller"),
+                ("other.o", b"other"),
+            ],
+        );
+        state.sections.extend([
+            section_record("target.o", 1, 100, 8),
+            section_record("caller.o", 1, 200, 16),
+            section_record("other.o", 1, 300, 8),
+        ]);
+        let incoming = relocation_record(
+            "caller.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("target.o", 1, 0)),
+            0,
+            204,
+            8,
+            1,
+            0,
+        );
+        let sibling = relocation_record(
+            "caller.o",
+            1,
+            8,
+            Some(0x3000),
+            0x4000,
+            Some("other"),
+            Some(("other.o", 1, 0)),
+            0,
+            208,
+            8,
+            1,
+            0,
+        );
+        state.relocations.extend([incoming, sibling.clone()]);
+        let caller_fde = fde_record("caller.o", 1, 2, 0, 400, 24);
+        state.fdes.push(caller_fde.clone());
+        let caller_dynamic_relocation = dynamic_relocation_record("caller.o", 1, 0, 500, 24);
+        state
+            .dynamic_relocations
+            .push(caller_dynamic_relocation.clone());
+        state.write(dir.path()).unwrap();
+
+        let target = hex::encode("target.o");
+        let caller = hex::encode("caller.o");
+        let target_inputs = [target.clone()].into_iter().collect::<HashSet<_>>();
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        let filtered_coverage = metadata
+            .read_records_for_input_files(dir.path(), &target_inputs)
+            .unwrap();
+
+        assert_eq!(
+            filtered_coverage.complete_record_input_files,
+            [caller.clone()].into_iter().collect()
+        );
+        assert!(
+            metadata
+                .sections
+                .iter()
+                .any(|record| record.input_file == caller)
+        );
+        assert!(metadata.relocations.contains(&sibling));
+        assert!(metadata.fdes.contains(&caller_fde));
+        assert!(
+            metadata
+                .dynamic_relocations
+                .contains(&caller_dynamic_relocation)
+        );
+
+        let incoming_index = metadata
+            .relocations
+            .iter()
+            .position(|record| {
+                record
+                    .target
+                    .as_ref()
+                    .is_some_and(|target_record| target_record.input_file == target)
+            })
+            .unwrap();
+        let target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
+            validated_macho_local_text_retargets: Vec::new(),
+            changed_relocation_indices: vec![incoming_index],
+        };
+        let record_coverage = ChangedInputRecordCoverage::ChangedInputs(filtered_coverage);
+        assert_eq!(
+            changed_relocation_target_record_owners(
+                &target_patches,
+                &metadata.relocations,
+                &target_inputs,
+                &record_coverage,
+            ),
+            Ok([caller.clone()].into_iter().collect())
+        );
+
+        metadata.relocations[incoming_index]
+            .target
+            .as_mut()
+            .unwrap()
+            .section_offset = 4;
+        metadata
+            .write_record_overrides_for_inputs(dir.path(), [caller])
+            .unwrap();
+        metadata
+            .write_metadata_update_for_inputs(dir.path(), &[0])
+            .unwrap();
+
+        let restored = PersistedState::read(dir.path()).unwrap().unwrap();
+        assert!(restored.relocations.contains(&sibling));
+        assert!(restored.fdes.contains(&caller_fde));
+        assert!(
+            restored
+                .dynamic_relocations
+                .contains(&caller_dynamic_relocation)
+        );
+        assert!(restored.relocations.iter().any(|record| {
+            record.target.as_ref().is_some_and(|target_record| {
+                target_record.input_file == target && target_record.section_offset == 4
+            })
+        }));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn filtered_records_require_canonical_relocation_owner_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(
+            "args",
+            b"output",
+            &[("target.o", b"target"), ("caller.o", b"caller")],
+        );
+        state.sections.extend([
+            section_record("target.o", 1, 100, 8),
+            section_record("caller.o", 1, 200, 8),
+        ]);
+        state.relocations.push(relocation_record(
+            "caller.o",
+            1,
+            4,
+            Some(0x1000),
+            0x2000,
+            Some("target"),
+            Some(("target.o", 1, 0)),
+            0,
+            204,
+            8,
+            1,
+            0,
+        ));
+        state.write(dir.path()).unwrap();
+
+        let target = hex::encode("target.o");
+        let caller = hex::encode("caller.o");
+        let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
+        metadata.materialize_patch_record_locations().unwrap();
+        let caller_location = metadata
+            .patch_record_locations
+            .iter()
+            .find(|location| location.input_file == caller)
+            .cloned()
+            .unwrap();
+        let same_location = |location: &PatchRecordLocation| {
+            location.offset == caller_location.offset
+                && location.len == caller_location.len
+                && location.hash == caller_location.hash
+        };
+        assert!(
+            metadata
+                .patch_record_locations
+                .iter()
+                .any(|location| location.input_file == target && same_location(location))
+        );
+        metadata
+            .patch_record_locations
+            .retain(|location| location.input_file != caller || !same_location(location));
+
+        let target_inputs = [target].into_iter().collect::<HashSet<_>>();
+        let filtered_coverage = metadata
+            .read_records_for_input_files(dir.path(), &target_inputs)
+            .unwrap();
+
+        assert!(filtered_coverage.complete_record_input_files.is_empty());
+        assert_eq!(
+            metadata.sections,
+            vec![section_record("target.o", 1, 100, 8)]
+        );
+        let target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
+            validated_macho_local_text_retargets: Vec::new(),
+            changed_relocation_indices: vec![0],
+        };
+        assert_eq!(
+            changed_relocation_target_record_owners(
+                &target_patches,
+                &metadata.relocations,
+                &target_inputs,
+                &ChangedInputRecordCoverage::ChangedInputs(filtered_coverage),
+            ),
+            Err(RelocationTargetRecordCoverageError::RequiresCompleteRecords)
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn read_records_for_input_files_loads_owned_and_referenced_macho_resolutions() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
@@ -82981,11 +83315,15 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
         let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
 
-        metadata
+        let filtered_coverage = metadata
             .read_records_for_input_files(dir.path(), &input_files)
             .unwrap();
 
-        assert_eq!(metadata.sections, vec![state.sections[0].clone()]);
+        assert_eq!(metadata.sections, state.sections);
+        assert_eq!(
+            filtered_coverage.complete_record_input_files,
+            [hex::encode("b.o")].into_iter().collect()
+        );
         assert!(
             metadata
                 .macho_symbol_resolutions
@@ -83275,12 +83613,16 @@ mod tests {
         );
         let input_files = [hex::encode("b.o")].into_iter().collect::<HashSet<_>>();
 
-        metadata
+        let filtered_coverage = metadata
             .read_records_for_input_files(dir.path(), &input_files)
             .unwrap();
 
-        assert_eq!(metadata.sections, vec![state.sections[1].clone()]);
+        assert_eq!(metadata.sections, state.sections);
         assert_eq!(metadata.relocations, state.relocations);
+        assert_eq!(
+            filtered_coverage.complete_record_input_files,
+            [hex::encode("a.o")].into_iter().collect()
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
