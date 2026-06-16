@@ -3165,7 +3165,7 @@ fn finish_macho_cross_input_target_moves(
                 continue;
             }
         }
-        if !finish_unmatched {
+        if forwarding_move.is_none() && !finish_unmatched {
             remaining_moves.push(target_move);
             continue;
         }
@@ -71868,11 +71868,59 @@ mod tests {
         assert_eq!(got_relocations[0].applied_target_value, Some(got_address));
         assert_eq!(got_relocations[0].target.as_ref(), Some(&current_target));
 
+        let mut matched_direct_relocations = vec![relocation.clone()];
+        let mut matched_direct_patches =
+            relocation_target_patches_for_input(&mut matched_direct_relocations, &input, &current)
+                .unwrap()
+                .unwrap();
+        finish_macho_cross_input_target_moves(
+            &mut matched_direct_relocations,
+            &mut matched_direct_patches,
+            std::slice::from_ref(&moved),
+            &[],
+            false,
+            true,
+            false,
+            &input,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(matched_direct_patches.output_patches.len(), 1);
+        assert!(
+            matched_direct_patches
+                .macho_cross_input_target_moves
+                .is_empty()
+        );
+        assert_eq!(
+            matched_direct_relocations[0].target_value,
+            current_target_value
+        );
+        assert_eq!(
+            matched_direct_relocations[0].target.as_ref(),
+            Some(&current_target)
+        );
+
         let mut direct_relocations = vec![relocation];
         let mut direct_patches =
             relocation_target_patches_for_input(&mut direct_relocations, &input, &current)
                 .unwrap()
                 .unwrap();
+        finish_macho_cross_input_target_moves(
+            &mut direct_relocations,
+            &mut direct_patches,
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            &input,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct_patches.macho_cross_input_target_moves.len(), 1);
+        assert!(direct_patches.output_patches.is_empty());
         let reason = finish_macho_cross_input_target_moves(
             &mut direct_relocations,
             &mut direct_patches,
