@@ -53694,10 +53694,26 @@ mod tests {
     fn changed_normalized_macho_member_proactively_updates_published_local_cohort() {
         let previous_identifier = b"crate-hash.cgu.previous.rcgu.o";
         let current_identifier = b"crate-hash.cgu.current.rcgu.o";
-        let previous_object =
-            add_test_macho_local_alias(test_macho_object(&[0; 32], &[0; 4], 0), b"l_anon.ty", 1, 8);
+        let text_root_at = |mut object: Vec<u8>, value: u64| {
+            let range = {
+                let file = object::File::parse(object.as_slice()).unwrap();
+                let symbol = file
+                    .symbols()
+                    .find(|symbol| symbol.name_bytes().ok() == Some(b"_text"))
+                    .unwrap();
+                macho_symbol_value_field_range(&object, symbol.index()).unwrap()
+            };
+            object[range].copy_from_slice(&value.to_le_bytes());
+            object
+        };
+        let previous_object = add_test_macho_local_alias(
+            text_root_at(test_macho_object(&[0; 32], &[0; 4], 0), 8),
+            b"l_anon.ty",
+            1,
+            8,
+        );
         let current_object = add_test_macho_local_alias(
-            test_macho_object(&[0; 32], &[0; 4], 0),
+            text_root_at(test_macho_object(&[0; 32], &[0; 4], 0), 28),
             b"l_anon.ty",
             1,
             28,
@@ -53774,7 +53790,20 @@ mod tests {
             .remove(0);
             let previous_resolver = PatchInputResolver::new(&previous_archive, true).unwrap();
             let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
-            let mut resolutions = Vec::new();
+            let output_text_address = output_file.section_by_name("__text").unwrap().address();
+            let mut resolutions = vec![MachOSymbolResolutionRecord {
+                name: hex::encode("_text").into(),
+                direct_value: Some(output_text_address + 28),
+                got_address: None,
+                stub_address: None,
+                thunk_addresses: Vec::new(),
+                target: Some(RelocationTargetRecord {
+                    input_file: input_path.clone().into(),
+                    input: current_input.clone().into(),
+                    section_index: u32::try_from(current_text.index().0).unwrap(),
+                    section_offset: 28,
+                }),
+            }];
             let mut target_patches = RelocationTargetPatches {
                 input_ranges: Vec::new(),
                 output_patches: Vec::new(),
@@ -60798,7 +60827,7 @@ mod tests {
     }
 
     #[test]
-    fn local_macho_text_target_ownership_retains_exact_unrooted_symbol_population() {
+    fn local_macho_text_target_ownership_rejects_moved_unrooted_symbol_population() {
         let previous_identifier = b"uv-hash.cgu.old.rcgu.o";
         let current_identifier = b"uv-hash.cgu.new.rcgu.o";
         let enable_subsections = |mut object: Vec<u8>| {
@@ -60828,15 +60857,12 @@ mod tests {
                 object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
                 object
             });
-        let expected_file = object::File::parse(fixture.expected_output.as_slice()).unwrap();
-        let expected_value = expected_file.section_by_name("__const").unwrap().address() + 6;
-        let entry = test_macho_symbol_entry_offset(&fixture.expected_output, b"l_a.1");
-        fixture.expected_output[entry + 8..entry + 16]
-            .copy_from_slice(&expected_value.to_le_bytes());
-        let (output, _, _) =
-            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
-                .unwrap();
-        assert_eq!(output, fixture.expected_output);
+        let expected = "renamed local Mach-O text target is present in the output symbol table";
+        assert_eq!(
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true,)
+                .unwrap_err(),
+            expected,
+        );
 
         let population_change = |name: &'static [u8], n_desc: u16| {
             let mut added = local_text_target_transition_fixture(
@@ -60868,7 +60894,6 @@ mod tests {
             );
             added
         };
-        let expected = "renamed local Mach-O text target is present in the output symbol table";
         let added = population_change(b"new.dead", 0);
         assert_eq!(
             apply_local_text_target_transition(&added, vec![added.relocation.clone()], true)
