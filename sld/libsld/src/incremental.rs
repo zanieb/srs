@@ -6263,13 +6263,24 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             true
                         }
                     });
-                    state
-                        .symbol_resolutions
-                        .extend(macho_archive_member_symbol_resolutions(
-                            &previous.macho_symbol_resolutions,
-                            input.path.as_str(),
-                            &member_inputs,
-                        ));
+                    let current_symbol_resolutions = macho_archive_member_symbol_resolutions(
+                        &previous.macho_symbol_resolutions,
+                        input.path.as_str(),
+                        &member_inputs,
+                    );
+                    if state.sections.is_empty() && !retirement.newly_tracked {
+                        if !tracked_symbol_only_macho_archive_transaction_is_current(
+                            state,
+                            &current_symbol_resolutions,
+                            previous_output.get()?,
+                        ) {
+                            return Ok(ChangedInputPatchResult::Unsupported(
+                                "removed symbol-only Mach-O archive ownership changed".to_owned(),
+                            ));
+                        }
+                    } else {
+                        state.symbol_resolutions = current_symbol_resolutions;
+                    }
                     if retirement.newly_tracked {
                         if let Err(reason) = retain_initial_macho_archive_removal_transaction(
                             state,
@@ -22349,6 +22360,100 @@ fn macho_archive_transaction_patches_match(state: &MachOArchiveActivationState) 
             })
 }
 
+fn symbol_only_macho_archive_transaction_is_valid(
+    input_file_path: &str,
+    members: &[MachOArchiveMemberIdentity],
+    resolutions: &[MachOSymbolResolutionRecord],
+    forward_patches: &[StoredOutputPatch],
+    rollback_patches: &[StoredOutputPatch],
+) -> Result<bool> {
+    if resolutions.is_empty()
+        || resolutions.len() != forward_patches.len()
+        || forward_patches.len() != rollback_patches.len()
+    {
+        return Ok(false);
+    }
+    let mut names = HashSet::with_capacity(resolutions.len());
+    let mut represented_members = vec![false; members.len()];
+    let mut patch_ranges = Vec::with_capacity(forward_patches.len());
+    for ((resolution, forward), rollback) in resolutions
+        .iter()
+        .zip(forward_patches)
+        .zip(rollback_patches)
+    {
+        let name = match hex::decode(resolution.name.as_str()) {
+            Ok(name) if !name.is_empty() => name,
+            Ok(_) | Err(_) => return Ok(false),
+        };
+        if !names.insert(name)
+            || resolution.direct_value.is_none()
+            || resolution.got_address.is_some()
+            || resolution.stub_address.is_some()
+            || !resolution.thunk_addresses.is_empty()
+            || forward.output_offset != rollback.output_offset
+            || forward.data.len()
+                != std::mem::size_of::<object::macho::Nlist64<object::Endianness>>()
+            || forward.data.len() != rollback.data.len()
+            || forward.data[..std::mem::size_of::<u32>()] == [0; 4]
+            || rollback.data[..std::mem::size_of::<u32>()] != [0; 4]
+            || forward.data[std::mem::size_of::<u32>()..]
+                != rollback.data[std::mem::size_of::<u32>()..]
+            || forward.data[4] & object::macho::N_STAB != 0
+            || forward.data[4] & object::macho::N_TYPE != object::macho::N_SECT
+            || forward.data[4] & object::macho::N_EXT == 0
+            || read_u64_le(&forward.data[8..]) != resolution.direct_value
+        {
+            return Ok(false);
+        }
+        let mut matching_member = None;
+        for (index, member) in members.iter().enumerate() {
+            if macho_resolution_matches_archive_member(input_file_path, resolution, member)?
+                && matching_member.replace(index).is_some()
+            {
+                return Ok(false);
+            }
+        }
+        let Some(index) = matching_member else {
+            return Ok(false);
+        };
+        represented_members[index] = true;
+        let Some(end) = u64::try_from(forward.data.len())
+            .ok()
+            .and_then(|len| forward.output_offset.checked_add(len))
+        else {
+            return Ok(false);
+        };
+        patch_ranges.push(forward.output_offset..end);
+    }
+    patch_ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    Ok(represented_members.into_iter().all(std::convert::identity)
+        && patch_ranges
+            .windows(2)
+            .all(|ranges| ranges[0].end <= ranges[1].start))
+}
+
+fn tracked_symbol_only_macho_archive_transaction_is_current(
+    state: &MachOArchiveActivationState,
+    current_resolutions: &[MachOSymbolResolutionRecord],
+    current_output: &[u8],
+) -> bool {
+    let mut stored_resolutions = state.symbol_resolutions.clone();
+    stored_resolutions.sort_unstable();
+    let mut current_resolutions = current_resolutions.to_vec();
+    current_resolutions.sort_unstable();
+    state.active
+        && state.sections.is_empty()
+        && !stored_resolutions.is_empty()
+        && stored_resolutions == current_resolutions
+        && state.forward_patches.iter().all(|patch| {
+            usize::try_from(patch.output_offset).ok().and_then(|start| {
+                start
+                    .checked_add(patch.data.len())
+                    .and_then(|end| current_output.get(start..end))
+            }) == Some(patch.data.as_slice())
+        })
+}
+
 fn initially_owned_macho_archive_removal_state(
     previous_bytes: &[u8],
     input_file_path: &str,
@@ -22786,7 +22891,13 @@ fn reactivated_macho_archive_text_activation(
         .collect();
     let symbol_resolutions = states
         .iter_mut()
-        .flat_map(|state| std::mem::take(&mut state.symbol_resolutions))
+        .flat_map(|state| {
+            let resolutions = std::mem::take(&mut state.symbol_resolutions);
+            if state.sections.is_empty() {
+                state.symbol_resolutions = resolutions.clone();
+            }
+            resolutions
+        })
         .collect::<Vec<_>>();
     for (index, resolution) in symbol_resolutions.iter().enumerate() {
         if symbol_resolutions[..index]
@@ -37756,8 +37867,7 @@ fn parse_macho_archive_member_states(
             .iter()
             .map(|member| member.normalized_identifier.clone())
             .collect::<HashSet<_>>();
-        if (kind == MachOArchiveActivationKind::AddedMembers && sections.is_empty())
-            || (kind.is_changed_definitions() && !sections.is_empty())
+        if (kind.is_changed_definitions() && !sections.is_empty())
             || sections.iter().any(|section| {
                 parse_patch_input_ref(input_file, &section.input)
                     .ok()
@@ -37794,7 +37904,8 @@ fn parse_macho_archive_member_states(
         let symbol_resolutions = parse_macho_symbol_resolutions(resolution_contents.lines())?;
         if kind == MachOArchiveActivationKind::AddedMembers
             && active
-            && (!relocation_records.relocations.is_empty() || !symbol_resolutions.is_empty())
+            && (!relocation_records.relocations.is_empty()
+                || (!sections.is_empty() && !symbol_resolutions.is_empty()))
         {
             return Err(crate::error!(
                 "Active incremental Mach-O archive member has dormant records"
@@ -37840,6 +37951,21 @@ fn parse_macho_archive_member_states(
         {
             return Err(crate::error!(
                 "Incremental Mach-O archive transaction is incomplete"
+            ));
+        }
+        if kind == MachOArchiveActivationKind::AddedMembers
+            && sections.is_empty()
+            && (!relocation_records.relocations.is_empty()
+                || !symbol_only_macho_archive_transaction_is_valid(
+                    input_file,
+                    &members,
+                    &symbol_resolutions,
+                    &forward_patches,
+                    &rollback_patches,
+                )?)
+        {
+            return Err(crate::error!(
+                "Invalid incremental symbol-only Mach-O archive member state"
             ));
         }
         states.push(MachOArchiveActivationState {
@@ -58014,6 +58140,7 @@ mod tests {
     fn initially_owned_macho_archive_symbol_only_member_is_retained() {
         let input_file = hex::encode("libcrate.rlib");
         let previous_identifier = b"crate-hash.cgu.4.old.rcgu.o";
+        let current_identifier = b"crate-hash.cgu.4.new.rcgu.o";
         let object = test_macho_object(&[1; 4], &[2; 4], 0);
         let mut builder = ar::Builder::new(Vec::new());
         builder
@@ -58096,6 +58223,164 @@ mod tests {
         assert_eq!(state.forward_patches.len(), 1);
         assert_eq!(state.rollback_patches.len(), 1);
         assert_eq!(&state.rollback_patches[0].data[..4], &[0; 4]);
+
+        state.active = false;
+        let rendered = render_macho_archive_member_states(std::slice::from_ref(&state));
+        let parsed = parse_macho_archive_member_states(&input_file, &rendered).unwrap();
+        assert_eq!(parsed, vec![state.clone()]);
+
+        let mut missing_ownership = state.clone();
+        missing_ownership.symbol_resolutions.clear();
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&[missing_ownership]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symbol-only")
+        );
+
+        let mut indirect_ownership = state.clone();
+        indirect_ownership.symbol_resolutions[0].got_address = Some(1);
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&[indirect_ownership]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symbol-only")
+        );
+
+        let mut overlapping_ownership = state.clone();
+        let mut second_resolution = overlapping_ownership.symbol_resolutions[0].clone();
+        second_resolution.name = hex::encode("_other_text").into();
+        overlapping_ownership
+            .symbol_resolutions
+            .push(second_resolution);
+        overlapping_ownership
+            .forward_patches
+            .push(overlapping_ownership.forward_patches[0].clone());
+        overlapping_ownership
+            .rollback_patches
+            .push(overlapping_ownership.rollback_patches[0].clone());
+        assert!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&[overlapping_ownership]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symbol-only")
+        );
+
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(current_identifier.to_vec(), object.len() as u64),
+                object.as_slice(),
+            )
+            .unwrap();
+        let current = builder.into_inner().unwrap();
+        let resolver = PatchInputResolver::new(&current, true).unwrap();
+        let mut patch = patch;
+        patch.macho_archive_members = parsed;
+        let first_reactivation = reactivated_macho_archive_text_activation(
+            &current,
+            &input_file,
+            &[current_identifier.to_vec()],
+            &resolver,
+            &patch,
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(first_reactivation.reactivated);
+        assert_eq!(first_reactivation.symbol_resolutions.len(), 1);
+        assert_eq!(first_reactivation.member_states.len(), 1);
+        assert!(first_reactivation.member_states[0].active);
+        assert_eq!(
+            first_reactivation.member_states[0].symbol_resolutions,
+            first_reactivation.symbol_resolutions
+        );
+
+        let active_rendered = render_macho_archive_member_states(&first_reactivation.member_states);
+        let active = parse_macho_archive_member_states(&input_file, &active_rendered).unwrap();
+        assert!(tracked_symbol_only_macho_archive_transaction_is_current(
+            &active[0],
+            &first_reactivation.symbol_resolutions,
+            &object,
+        ));
+        assert!(!tracked_symbol_only_macho_archive_transaction_is_current(
+            &active[0],
+            &[],
+            &object,
+        ));
+        let mut recycled_output = object.clone();
+        let recycled_offset = active[0].forward_patches[0].output_offset as usize;
+        recycled_output[recycled_offset] ^= 1;
+        assert!(!tracked_symbol_only_macho_archive_transaction_is_current(
+            &active[0],
+            &first_reactivation.symbol_resolutions,
+            &recycled_output,
+        ));
+        patch.macho_archive_members = active.clone();
+        let ownership = owned_macho_archive_removal_indices(
+            &input_file,
+            &patch,
+            &first_reactivation.symbol_resolutions,
+            &[current_identifier.to_vec()],
+        )
+        .unwrap();
+        assert_eq!(ownership.tracked_indices, vec![0]);
+        assert!(ownership.initially_owned_identifiers.is_empty());
+
+        let mut dormant_again = active[0].clone();
+        let member_inputs = first_reactivation
+            .symbol_resolutions
+            .iter()
+            .filter_map(|resolution| {
+                resolution
+                    .target
+                    .as_ref()
+                    .map(|target| target.input.to_string())
+            })
+            .collect::<HashSet<_>>();
+        dormant_again.symbol_resolutions = macho_archive_member_symbol_resolutions(
+            &first_reactivation.symbol_resolutions,
+            &input_file,
+            &member_inputs,
+        );
+        dormant_again.active = false;
+        let dormant_again = parse_macho_archive_member_states(
+            &input_file,
+            &render_macho_archive_member_states(&[dormant_again]),
+        )
+        .unwrap();
+        patch.macho_archive_members = dormant_again;
+        let second_reactivation = reactivated_macho_archive_text_activation(
+            &current,
+            &input_file,
+            &[current_identifier.to_vec()],
+            &resolver,
+            &patch,
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parse_macho_archive_member_states(
+                &input_file,
+                &render_macho_archive_member_states(&second_reactivation.member_states),
+            )
+            .unwrap(),
+            second_reactivation.member_states
+        );
     }
 
     #[test]
@@ -63798,6 +64083,78 @@ mod tests {
                 .unwrap(),
             expected_v43_members,
         );
+    }
+
+    #[test]
+    fn persisted_state_round_trips_symbol_only_macho_archive_ownership() {
+        let mut state = state("args", b"output", &[("libarchive.rlib", b"archive")]);
+        let input_file = state.input_files[0].path.clone();
+        let identifier = b"crate.cgu.old.rcgu.o";
+        let mut member_input = b"libarchive.rlib".to_vec();
+        member_input.push(0);
+        member_input.extend_from_slice(identifier);
+        member_input.push(0);
+        member_input.extend_from_slice(b"64:128");
+        let member_input = hex::encode(member_input);
+        let direct_value = 0x2000_u64;
+        let resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_target").into(),
+            direct_value: Some(direct_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_file.clone().into(),
+                input: member_input.into(),
+                section_index: 1,
+                section_offset: 4,
+            }),
+        };
+        let mut forward =
+            vec![0; std::mem::size_of::<object::macho::Nlist64<object::Endianness>>()];
+        forward[..4].copy_from_slice(&1_u32.to_le_bytes());
+        forward[4] = object::macho::N_SECT | object::macho::N_EXT;
+        forward[5] = 1;
+        forward[8..].copy_from_slice(&direct_value.to_le_bytes());
+        let mut rollback = forward.clone();
+        rollback[..4].fill(0);
+        let ownership = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: vec![MachOArchiveMemberIdentity {
+                normalized_identifier: archive_member_patch_identifier(identifier),
+                object_hash: "a".repeat(blake3::OUT_LEN * 2),
+            }],
+            active: false,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: vec![resolution],
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 256,
+                data: forward,
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 256,
+                data: rollback,
+            }],
+        };
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "patch-hash".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: vec![ownership],
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+
+        assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
+        state.input_files[0]
+            .patch
+            .as_mut()
+            .unwrap()
+            .macho_archive_members[0]
+            .active = true;
+        assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
     }
 
     #[test]
