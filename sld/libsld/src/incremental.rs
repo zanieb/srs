@@ -20256,11 +20256,17 @@ fn macho_local_symbol_cohort_retained_current_names(
         {
             continue;
         }
-        retained.extend(
-            current_component
-                .into_iter()
-                .map(|current_index| current[current_index].name.clone()),
-        );
+        retained.extend(current_component.iter().enumerate().filter_map(
+            |(current_position, current_index)| {
+                let previous_position = matched_current_to_previous[current_position];
+                let previous_entry = &previous[previous_component[previous_position]];
+                let current_entry = &current[*current_index];
+                (previous_entry.n_desc == current_entry.n_desc
+                    && previous_entry.output_section_index == current_entry.output_section_index
+                    && previous_entry.output_value == current_entry.output_value)
+                    .then(|| current_entry.name.clone())
+            },
+        ));
     }
     retained
 }
@@ -57656,15 +57662,17 @@ mod tests {
         let previous_identifier = b"crate-hash.cgu.previous.rcgu.o";
         let current_identifier = b"crate-hash.cgu.current.rcgu.o";
         let text_root_at = |mut object: Vec<u8>, value: u64| {
-            let range = {
+            let (range, n_desc) = {
                 let file = object::File::parse(object.as_slice()).unwrap();
                 let symbol = file
                     .symbols()
                     .find(|symbol| symbol.name_bytes().ok() == Some(b"_text"))
                     .unwrap();
-                macho_symbol_value_field_range(&object, symbol.index()).unwrap()
+                let range = macho_symbol_value_field_range(&object, symbol.index()).unwrap();
+                (range.clone(), range.start - 2..range.start)
             };
             object[range].copy_from_slice(&value.to_le_bytes());
+            object[n_desc].copy_from_slice(&object::macho::N_NO_DEAD_STRIP.to_le_bytes());
             object
         };
         let previous_object = add_test_macho_local_alias(
@@ -58521,6 +58529,15 @@ mod tests {
             &workload_previous,
             &workload_current,
         ));
+        assert_eq!(
+            macho_local_symbol_cohort_retained_current_names(&workload_previous, &workload_current,),
+            HashSet::from([
+                b"GCC_except_table15".to_vec(),
+                b"GCC_except_table16".to_vec(),
+                b"GCC_except_table17".to_vec(),
+            ]),
+            "site-preserving renames are roots, but a same-name move is not",
+        );
 
         let ambiguous = vec![entry(b"old.0", 1, 0x1010, 0), entry(b"old.1", 1, 0x1000, 0)];
         assert!(!macho_local_symbol_cohort_retains_published_population(
@@ -58564,9 +58581,9 @@ mod tests {
             entry(b"old.1", 1, 0x1030, 0),
             entry(b"new.2", 1, 0x1040, 0),
         ];
-        assert_eq!(
-            macho_local_symbol_cohort_retained_current_names(&previous, &added),
-            HashSet::from([b"old.0".to_vec(), b"old.1".to_vec()]),
+        assert!(
+            macho_local_symbol_cohort_retained_current_names(&previous, &added).is_empty(),
+            "same-name moves must not manufacture retained roots",
         );
         assert_eq!(
             macho_local_symbol_cohort_retained_current_names(&previous, &renamed[..1]),
@@ -62177,8 +62194,19 @@ mod tests {
             .0
             .is_err()
         );
-        let mut without_cohort = original_relocations.clone();
-        assert!(validate(&mut without_cohort, &matched, &[]).0.is_err());
+        let mut without_preplanned_cohort = original_relocations.clone();
+        let (result, target_patches, planned_cohorts) =
+            validate(&mut without_preplanned_cohort, &matched, &[]);
+        assert!(result.unwrap());
+        let [planned] = planned_cohorts.as_slice() else {
+            panic!("expected one derived local symbol cohort");
+        };
+        assert_eq!(planned.previous_input, cohort.previous_input);
+        assert_eq!(planned.current_input, cohort.current_input);
+        assert_eq!(planned.previous, cohort.previous);
+        assert_eq!(planned.current, cohort.current);
+        assert_eq!(planned.validated_local_symbol_renames.len(), 1);
+        assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
         let mut duplicate_cohort = original_relocations.clone();
         assert!(
             validate(
@@ -67842,6 +67870,18 @@ mod tests {
                 .collect(),
             ..DirectMachOCguLivenessProof::default()
         };
+        let required_entry = MachOLocalSymbolCohortEntry {
+            name: b"_new!".to_vec(),
+            n_desc: 0,
+            output_section_index: macho_output_section_index_for_file_offset(
+                &output_file,
+                sections[0].output_offset,
+            )
+            .unwrap(),
+            output_value: forward.added_resolutions[0].direct_value.unwrap(),
+            output_entry_offset: None,
+            string_index: None,
+        };
         let atoms_are_live = |resolutions: &[MachOSymbolResolutionRecord],
                               liveness_proof,
                               current_file: &object::File<'_>,
@@ -67860,7 +67900,7 @@ mod tests {
                 &output_file,
                 &output,
                 &[],
-                &[],
+                std::slice::from_ref(&required_entry),
                 liveness_proof,
                 &HashSet::new(),
                 false,
