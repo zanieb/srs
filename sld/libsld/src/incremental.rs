@@ -17394,7 +17394,7 @@ fn macho_atom_has_incoming_relocation(
     )
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MachOAtomIncomingRelocation {
     Absent,
     Exact,
@@ -17416,12 +17416,12 @@ fn macho_atom_incoming_relocation_from_sections(
             if let Some(subtractor) = relocation.subtractor() {
                 let symbol = file.symbol_by_index(subtractor)?;
                 if symbol.section_index() == Some(target_section) {
-                    return Ok(MachOAtomIncomingRelocation::Exact);
+                    unknown = true;
                 }
             }
             match relocation.target() {
                 object::RelocationTarget::Section(index) if index == target_section => {
-                    return Ok(MachOAtomIncomingRelocation::Exact);
+                    unknown = true;
                 }
                 object::RelocationTarget::Symbol(index) => {
                     let symbol = file.symbol_by_index(index)?;
@@ -17434,7 +17434,13 @@ fn macho_atom_incoming_relocation_from_sections(
                         continue;
                     };
                     if target_range.contains(&base) {
-                        return Ok(MachOAtomIncomingRelocation::Exact);
+                        if !symbol.is_global()
+                            && !symbol.is_weak()
+                            && symbol.scope() == object::SymbolScope::Compilation
+                        {
+                            return Ok(MachOAtomIncomingRelocation::Exact);
+                        }
+                        unknown = true;
                     }
                 }
                 _ => {}
@@ -52672,6 +52678,17 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
+            macho_atom_incoming_relocation_from_sections(
+                &subtractor_referenced_file,
+                None,
+                previous_const.index(),
+                0x30..previous_const.size(),
+            )
+            .unwrap(),
+            MachOAtomIncomingRelocation::Unknown,
+            "a subtractor section load must not prove its symbol's atom live",
+        );
+        assert_eq!(
             supplemental_macho_local_const_cohort(
                 &subtractor_referenced,
                 &current,
@@ -52748,6 +52765,110 @@ mod tests {
                 &unreferenced_current,
                 &previous_file,
                 &unreferenced_current_file,
+                &output,
+                &output_file,
+                &direct_previous_sections,
+                &direct_current_sections,
+                std::slice::from_ref(&owner),
+                &direct_input,
+                &direct_input,
+            )
+            .unwrap()
+            .unwrap_err(),
+            "published local Mach-O const atom is not referenced by the current object",
+        );
+
+        let mut global_referenced_current = add_test_macho_local_alias(
+            current.clone(),
+            b"_global_alias",
+            u8::try_from(previous_const.index().0).unwrap(),
+            previous_const.address() + 0x12,
+        );
+        let global_entry =
+            test_macho_symbol_entry_offset(&global_referenced_current, b"_global_alias");
+        global_referenced_current[global_entry + 4] |= object::macho::N_EXT;
+        let primary = (3_u32 << 25 | 1 << 27).to_le_bytes();
+        let matches = global_referenced_current
+            .windows(primary.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| {
+                (bytes == primary
+                    && offset >= 4
+                    && matches!(
+                        read_u32_le(&global_referenced_current[offset - 4..offset]),
+                        Some(0) | Some(8)
+                    ))
+                .then_some(offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 2);
+        for offset in matches {
+            global_referenced_current[offset..offset + 4]
+                .copy_from_slice(&(3_u32 | 3 << 25 | 1 << 27).to_le_bytes());
+        }
+        let global_referenced_current_file =
+            object::File::parse(global_referenced_current.as_slice()).unwrap();
+        assert_eq!(
+            macho_atom_incoming_relocation_from_sections(
+                &global_referenced_current_file,
+                None,
+                previous_const.index(),
+                0x12..0x30,
+            )
+            .unwrap(),
+            MachOAtomIncomingRelocation::Unknown,
+            "a public alias may resolve outside this object's subsection",
+        );
+
+        let section_referenced_current = {
+            let mut object = current.clone();
+            let primary = (3_u32 << 25 | 1 << 27).to_le_bytes();
+            let matches = object
+                .windows(primary.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| {
+                    (bytes == primary
+                        && offset >= 4
+                        && matches!(read_u32_le(&object[offset - 4..offset]), Some(0) | Some(8)))
+                    .then_some(offset)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2);
+            for offset in matches {
+                object[offset..offset + 4].copy_from_slice(&(2_u32 | 3 << 25).to_le_bytes());
+            }
+            object
+        };
+        let section_referenced_current_file =
+            object::File::parse(section_referenced_current.as_slice()).unwrap();
+        assert_eq!(
+            macho_atom_incoming_relocation_from_sections(
+                &section_referenced_current_file,
+                None,
+                previous_const.index(),
+                0x12..0x30,
+            )
+            .unwrap(),
+            MachOAtomIncomingRelocation::Unknown,
+            "loading a section must not prove either contained atom live",
+        );
+        assert_eq!(
+            macho_atom_incoming_relocation_from_sections(
+                &section_referenced_current_file,
+                None,
+                previous_const.index(),
+                0x30..previous_const.size(),
+            )
+            .unwrap(),
+            MachOAtomIncomingRelocation::Unknown,
+            "loading a section must not prove either contained atom live",
+        );
+        assert_eq!(
+            supplemental_macho_local_const_cohort(
+                &previous,
+                &section_referenced_current,
+                &previous_file,
+                &section_referenced_current_file,
                 &output,
                 &output_file,
                 &direct_previous_sections,
