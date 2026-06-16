@@ -18273,6 +18273,34 @@ fn macho_local_symbol_cohort_retains_published_population(
     !(0..previous.len()).any(|node| has_cycle(node, &alternating_edges, &mut state))
 }
 
+fn macho_local_symbol_cohort_addition_collides(
+    output_file: &object::File<'_>,
+    entry: &MachOLocalSymbolCohortEntry,
+) -> bool {
+    let repeatable_local_name = entry
+        .name
+        .strip_prefix(b"GCC_except_table")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit));
+    output_file.symbols().any(|symbol| {
+        if !symbol
+            .name_bytes()
+            .is_ok_and(|candidate| candidate == entry.name)
+        {
+            return false;
+        }
+        let same_section = symbol.section_index().map(|index| index.0)
+            == Some(usize::from(entry.output_section_index));
+        let same_site = same_section && symbol.address() == entry.output_value;
+        same_site
+            || !repeatable_local_name
+            || !same_section
+            || symbol.is_global()
+            || symbol.is_weak()
+            || symbol.is_undefined()
+            || symbol.scope() != object::SymbolScope::Compilation
+    })
+}
+
 fn verify_previous_macho_local_symbol_cohort(
     previous_output: &[u8],
     output_file: &object::File<'_>,
@@ -19103,11 +19131,7 @@ fn plan_macho_local_symbol_cohort(
         if previous_names.contains(&entry.name) {
             continue;
         }
-        if output_file.symbols().any(|symbol| {
-            symbol
-                .name_bytes()
-                .is_ok_and(|candidate| candidate == entry.name)
-        }) {
+        if macho_local_symbol_cohort_addition_collides(output_file, entry) {
             return Ok(Err(
                 "published local Mach-O cohort addition collides with an output symbol".to_owned(),
             ));
@@ -52726,6 +52750,77 @@ mod tests {
             .unwrap_err(),
             "published local Mach-O output contains duplicate cohort names",
         );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_allows_other_local_names_only_at_distinct_sites() {
+        let output = test_macho_object(&[0; 16], &[0; 16], 0);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let text = output_file.section_by_name("__text").unwrap();
+        let data = output_file.section_by_name("__data").unwrap();
+        let text_section = u8::try_from(text.index().0).unwrap();
+        let data_section = u8::try_from(data.index().0).unwrap();
+        let entry = MachOLocalSymbolCohortEntry {
+            name: b"GCC_except_table17".to_vec(),
+            n_desc: 0,
+            output_section_index: text_section,
+            output_value: text.address(),
+            output_entry_offset: None,
+            string_index: None,
+        };
+
+        let outside = add_test_macho_local_alias(
+            output.clone(),
+            &entry.name,
+            text_section,
+            text.address() + 8,
+        );
+        let outside_file = object::File::parse(outside.as_slice()).unwrap();
+        assert!(!macho_local_symbol_cohort_addition_collides(
+            &outside_file,
+            &entry,
+        ));
+
+        let wrong_section =
+            add_test_macho_local_alias(output.clone(), &entry.name, data_section, data.address());
+        let wrong_section_file = object::File::parse(wrong_section.as_slice()).unwrap();
+        assert!(macho_local_symbol_cohort_addition_collides(
+            &wrong_section_file,
+            &entry,
+        ));
+
+        let nonrepeatable_entry = MachOLocalSymbolCohortEntry {
+            name: b"l_b.2".to_vec(),
+            ..entry.clone()
+        };
+        let nonrepeatable = add_test_macho_local_alias(
+            output.clone(),
+            &nonrepeatable_entry.name,
+            text_section,
+            text.address() + 8,
+        );
+        let nonrepeatable_file = object::File::parse(nonrepeatable.as_slice()).unwrap();
+        assert!(macho_local_symbol_cohort_addition_collides(
+            &nonrepeatable_file,
+            &nonrepeatable_entry,
+        ));
+
+        let same_site =
+            add_test_macho_local_alias(output.clone(), &entry.name, text_section, text.address());
+        let same_site_file = object::File::parse(same_site.as_slice()).unwrap();
+        assert!(macho_local_symbol_cohort_addition_collides(
+            &same_site_file,
+            &entry,
+        ));
+
+        let mut global = outside;
+        let global_entry = test_macho_symbol_entry_offset(&global, &entry.name);
+        global[global_entry + 4] |= object::macho::N_EXT;
+        let global_file = object::File::parse(global.as_slice()).unwrap();
+        assert!(macho_local_symbol_cohort_addition_collides(
+            &global_file,
+            &entry,
+        ));
     }
 
     #[test]
