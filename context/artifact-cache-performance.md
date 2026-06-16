@@ -20,17 +20,77 @@ met.
 
 ## Current Status
 
-The branch materially expands portable cache admission, but the final coverage
-and performance gate remains open pending the reproducible final-HEAD matrix in
-[`artifact-cache-benchmarking.md`](artifact-cache-benchmarking.md). Historical
-Clippy results restored 25 of 70 rustc actions: a 100% hit rate among eligible
-actions but only 35.7% total action coverage. That measurement predates the
-finalized custom-build expansion and must not be treated as current HEAD.
+The branch materially expands portable cache admission and reduces warm
+fresh-target work for both the full uv root build and workspace Clippy
+workloads. A controlled base-versus-branch comparison is reported below.
 
 Exact-path snapshots are a separate workload fallback. Units made fresh by a
 snapshot do not count as portable artifact-cache hits or portable coverage.
 Proc-macro producers and their dynamic consumers remain the largest measured
 portable-scope candidates.
+
+### Warm base-versus-branch comparison
+
+The comparison used uv `f74311c15` on one 16-vCPU AMD EPYC Namespace instance
+with LLVM target codegen and Clang 22.1.7. The base and branch used their own
+CI-built Cargo wrappers with the same rustc binary. Every measured invocation
+started with an empty consumer target and a fresh copy of an immutable cache
+seed produced from a different target path by that same Cargo binary.
+
+Eight paired trials used two-pair blocks containing one base-first and one
+branch-first pair. Each workload block was preceded by two excluded warm runs
+per side in ABBA order. Timed runs did not enable verbose logging or structured
+statistics. Seed copying was outside the timed interval and is reported
+separately below.
+
+| Workload | Base warm median (MAD) | Branch warm median (MAD) | Paired change (MAD) | Faster pairs |
+| --- | ---: | ---: | ---: | ---: |
+| `cargo build --profile no-debug --bin uv --bin uvx --locked` | 88.071s (0.160s) | 77.092s (0.098s) | -12.5% (0.2pp) | 8 / 8 |
+| `cargo clippy --workspace --all-targets --all-features --locked` | 111.840s (0.057s) | 99.841s (0.142s) | -10.8% (0.1pp) | 8 / 8 |
+
+The two-sided exact sign-test p-value is 0.0078 for each workload. Order did
+not explain the result: the build improvement was 12.4% with the branch first
+and 12.6% with it second; Clippy improved 10.9% and 10.6%, respectively.
+
+Independent cache-disabled controls used the same runner and block-balanced
+ordering. They were collected as separate workload-local blocks:
+
+| Workload | Base disabled median | Branch disabled median | Paired change |
+| --- | ---: | ---: | ---: |
+| Build | 86.105s | 86.147s | +0.1% |
+| Clippy | 112.743s | 112.616s | -0.2% |
+
+Neither disabled comparison was statistically significant. This supports
+attributing the improvement to the cache-enabled path rather than a general
+execution-speed difference between the two Cargo binaries. The hit and
+compiler-command counts below show that broader reuse appears to be the primary
+driver; cache-path overhead changes may also contribute.
+
+A separate verbosity-matched diagnostic lane measured the change in cache
+scope without perturbing the primary timing samples:
+
+| Workload | Base cache hits | Branch runtime cache hits | Branch Cargo-fresh units | Compiler commands, base to branch |
+| --- | ---: | ---: | ---: | ---: |
+| Build | 7 | 150 | 171 | 483 to 225 |
+| Clippy | 8 | 402 | 11 | 692 to 352 |
+
+The branch-only structured-statistics lane used nonverbose producer and
+consumer commands. Build hit 345 of 448 eligible actions, restored 690 files /
+570.7 MB, and made 195 units Cargo-fresh. Clippy hit 438 of 505 eligible
+actions, restored 489 files / 268.2 MB, and made 36 units Cargo-fresh. Those are
+77.0% and 86.7% hit rates among eligible actions, and 58.4% and 53.9% coverage
+across all eligible plus ineligible actions.
+
+The expanded scope also increases the local cache footprint. The build seed
+grew from 155.7 MB to 919.8 MB and its median local copy took 0.617s; the Clippy
+seed grew from 11.1 MB to 312.2 MB and copied in 0.692s. Both copy intervals
+were outside the command timer. This comparison therefore demonstrates warm
+local-cache execution, not remote cache download performance or aggregate uv
+CI time.
+
+Compiler identity remained a small fixed cost: each structured diagnostic
+hashed 60 files / 724.4 MB once, in 143-144ms wall, and reused that identity for
+the remaining actions in the Cargo process.
 
 ## Historical Investigation Results
 

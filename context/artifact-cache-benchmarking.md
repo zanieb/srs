@@ -151,9 +151,9 @@ deliberately separate aggregate rates:
 - **Effectiveness:** hits divided by eligible actions.
 - **Total coverage:** hits divided by eligible plus ineligible actions.
 
-Thus 25 hits among 25 eligible actions in a 70-action graph are 100% effective
-but cover only 35.7% of the graph. Disabled rows normally have no admission
-population and therefore show these rates as unavailable.
+Thus a cache can be 100% effective among eligible actions while still covering
+only a small fraction of the complete graph. Disabled rows normally have no
+admission population and therefore show these rates as unavailable.
 
 The summary also retains samples, availability, medians, and cross-trial totals
 for the supporting counters. Its rendered tables include:
