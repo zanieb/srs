@@ -18043,6 +18043,19 @@ fn macho_local_symbol_cohort_retains_published_sites(
         && previous_sites == current_sites
 }
 
+fn macho_local_symbol_cohort_retains_published_population(
+    previous: &[MachOLocalSymbolCohortEntry],
+    current: &[MachOLocalSymbolCohortEntry],
+) -> bool {
+    let retains_named_population = previous.len() == current.len()
+        && previous.iter().zip(current).all(|(previous, current)| {
+            previous.name == current.name
+                && previous.n_desc == current.n_desc
+                && previous.output_section_index == current.output_section_index
+        });
+    retains_named_population || macho_local_symbol_cohort_retains_published_sites(previous, current)
+}
+
 fn verify_previous_macho_local_symbol_cohort(
     previous_output: &[u8],
     output_file: &object::File<'_>,
@@ -18805,12 +18818,8 @@ fn plan_macho_local_symbol_cohort(
         Err(reason) => return Ok(Err(reason)),
     };
     let mut current = current;
-    let standard_retains_published_population = previous.len() == current.len()
-        && previous.iter().zip(&current).all(|(previous, current)| {
-            previous.name == current.name
-                && previous.n_desc == current.n_desc
-                && previous.output_section_index == current.output_section_index
-        });
+    let standard_retains_published_population =
+        macho_local_symbol_cohort_retains_published_population(&previous, &current);
     let supplement_retains_published_sites = supplement.as_ref().is_none_or(|supplement| {
         macho_local_symbol_cohort_retains_published_sites(&supplement.previous, &supplement.current)
     });
@@ -18845,7 +18854,8 @@ fn plan_macho_local_symbol_cohort(
         return Ok(Err(reason));
     }
     // Direct patches preserve the previously live atom set. Exact output ownership therefore
-    // carries liveness across value-only migrations, but not population or metadata changes.
+    // carries liveness across stable-name moves or same-site renames, but not population or
+    // metadata changes.
     let retained_atoms_are_live =
         standard_retains_published_population && supplement_retains_published_sites;
     let current_atoms_are_live = retained_atoms_are_live
@@ -52481,6 +52491,61 @@ mod tests {
             .unwrap_err(),
             "published local Mach-O output contains duplicate cohort names",
         );
+    }
+
+    #[test]
+    fn published_local_macho_cohort_retains_exact_renamed_sites() {
+        let entry = |name: &[u8], section, value, n_desc| MachOLocalSymbolCohortEntry {
+            name: name.to_vec(),
+            n_desc,
+            output_section_index: section,
+            output_value: value,
+            output_entry_offset: None,
+            string_index: None,
+        };
+        let previous = vec![entry(b"old.0", 1, 0x1000, 0), entry(b"old.1", 1, 0x1010, 0)];
+        let renamed = vec![entry(b"new.0", 1, 0x1000, 0), entry(b"new.1", 1, 0x1010, 0)];
+        assert!(macho_local_symbol_cohort_retains_published_population(
+            &previous, &renamed,
+        ));
+
+        let moved_named = vec![entry(b"old.0", 1, 0x1020, 0), entry(b"old.1", 1, 0x1030, 0)];
+        assert!(macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &moved_named,
+        ));
+
+        let mut aliased_site = renamed.clone();
+        aliased_site[1].output_value = aliased_site[0].output_value;
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &aliased_site,
+        ));
+
+        let mut moved_rename = renamed.clone();
+        moved_rename[1].output_value += 8;
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &moved_rename,
+        ));
+
+        let mut changed_section = renamed.clone();
+        changed_section[1].output_section_index += 1;
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &changed_section,
+        ));
+
+        let mut changed_metadata = renamed.clone();
+        changed_metadata[1].n_desc = 1;
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &changed_metadata,
+        ));
+        assert!(!macho_local_symbol_cohort_retains_published_population(
+            &previous,
+            &renamed[..1],
+        ));
     }
 
     #[test]
