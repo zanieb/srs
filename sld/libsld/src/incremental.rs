@@ -18274,31 +18274,63 @@ fn macho_local_symbol_cohort_retains_published_population(
 }
 
 fn macho_local_symbol_cohort_addition_collides(
-    output_file: &object::File<'_>,
+    previous_output: &[u8],
     entry: &MachOLocalSymbolCohortEntry,
 ) -> bool {
     let repeatable_local_name = entry
         .name
         .strip_prefix(b"GCC_except_table")
         .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit));
-    output_file.symbols().any(|symbol| {
-        if !symbol
-            .name_bytes()
-            .is_ok_and(|candidate| candidate == entry.name)
-        {
-            return false;
+    let Ok((symbol_table, string_table)) = macho_symbol_and_string_table_ranges(previous_output)
+    else {
+        return true;
+    };
+    let Ok(symbol_start) = usize::try_from(symbol_table.start) else {
+        return true;
+    };
+    let Ok(symbol_end) = usize::try_from(symbol_table.end) else {
+        return true;
+    };
+    let Ok(string_start) = usize::try_from(string_table.start) else {
+        return true;
+    };
+    let Ok(string_end) = usize::try_from(string_table.end) else {
+        return true;
+    };
+    for entry_start in (symbol_start..symbol_end).step_by(16) {
+        let raw = &previous_output[entry_start..entry_start + 16];
+        let Some(string_index) = read_u32_le(&raw[..4]) else {
+            return true;
+        };
+        let Some(name_start) = string_start.checked_add(string_index as usize) else {
+            return true;
+        };
+        if name_start < string_start || name_start >= string_end {
+            return true;
         }
-        let same_section = symbol.section_index().map(|index| index.0)
-            == Some(usize::from(entry.output_section_index));
-        let same_site = same_section && symbol.address() == entry.output_value;
-        same_site
-            || !repeatable_local_name
-            || !same_section
-            || symbol.is_global()
-            || symbol.is_weak()
-            || symbol.is_undefined()
-            || symbol.scope() != object::SymbolScope::Compilation
-    })
+        let Some(name_end) = previous_output[name_start..string_end]
+            .iter()
+            .position(|byte| *byte == 0)
+            .and_then(|length| name_start.checked_add(length))
+        else {
+            return true;
+        };
+        if previous_output.get(name_start..name_end) != Some(entry.name.as_slice()) {
+            continue;
+        }
+        let same_site = raw[5] == entry.output_section_index
+            && read_u64_le(&raw[8..16]) == Some(entry.output_value);
+        let ordinary_local = raw[4] == object::macho::N_SECT
+            && raw[5] == entry.output_section_index
+            && read_u16_le(&raw[6..8]).is_some_and(|n_desc| {
+                n_desc == entry.n_desc
+                    && n_desc & (object::macho::N_ALT_ENTRY | object::macho::N_NO_DEAD_STRIP) == 0
+            });
+        if same_site || !repeatable_local_name || !ordinary_local {
+            return true;
+        }
+    }
+    false
 }
 
 fn verify_previous_macho_local_symbol_cohort(
@@ -19131,7 +19163,7 @@ fn plan_macho_local_symbol_cohort(
         if previous_names.contains(&entry.name) {
             continue;
         }
-        if macho_local_symbol_cohort_addition_collides(output_file, entry) {
+        if macho_local_symbol_cohort_addition_collides(previous_output, entry) {
             return Ok(Err(
                 "published local Mach-O cohort addition collides with an output symbol".to_owned(),
             ));
@@ -52775,17 +52807,14 @@ mod tests {
             text_section,
             text.address() + 8,
         );
-        let outside_file = object::File::parse(outside.as_slice()).unwrap();
         assert!(!macho_local_symbol_cohort_addition_collides(
-            &outside_file,
-            &entry,
+            &outside, &entry
         ));
 
         let wrong_section =
             add_test_macho_local_alias(output.clone(), &entry.name, data_section, data.address());
-        let wrong_section_file = object::File::parse(wrong_section.as_slice()).unwrap();
         assert!(macho_local_symbol_cohort_addition_collides(
-            &wrong_section_file,
+            &wrong_section,
             &entry,
         ));
 
@@ -52799,28 +52828,35 @@ mod tests {
             text_section,
             text.address() + 8,
         );
-        let nonrepeatable_file = object::File::parse(nonrepeatable.as_slice()).unwrap();
         assert!(macho_local_symbol_cohort_addition_collides(
-            &nonrepeatable_file,
+            &nonrepeatable,
             &nonrepeatable_entry,
         ));
 
         let same_site =
             add_test_macho_local_alias(output.clone(), &entry.name, text_section, text.address());
-        let same_site_file = object::File::parse(same_site.as_slice()).unwrap();
         assert!(macho_local_symbol_cohort_addition_collides(
-            &same_site_file,
-            &entry,
+            &same_site, &entry
         ));
+
+        let mut stab = outside.clone();
+        let stab_entry = test_macho_symbol_entry_offset(&stab, &entry.name);
+        stab[stab_entry + 4] |= object::macho::N_STAB;
+        assert!(macho_local_symbol_cohort_addition_collides(&stab, &entry));
+
+        for n_desc in [object::macho::N_ALT_ENTRY, object::macho::N_NO_DEAD_STRIP] {
+            let mut metadata = outside.clone();
+            let metadata_entry = test_macho_symbol_entry_offset(&metadata, &entry.name);
+            metadata[metadata_entry + 6..metadata_entry + 8].copy_from_slice(&n_desc.to_le_bytes());
+            assert!(macho_local_symbol_cohort_addition_collides(
+                &metadata, &entry,
+            ));
+        }
 
         let mut global = outside;
         let global_entry = test_macho_symbol_entry_offset(&global, &entry.name);
         global[global_entry + 4] |= object::macho::N_EXT;
-        let global_file = object::File::parse(global.as_slice()).unwrap();
-        assert!(macho_local_symbol_cohort_addition_collides(
-            &global_file,
-            &entry,
-        ));
+        assert!(macho_local_symbol_cohort_addition_collides(&global, &entry));
     }
 
     #[test]
