@@ -2555,6 +2555,8 @@ const MACHO_LOCAL_TEXT_TARGET_INDIRECT_RELOCATION_UNSUPPORTED: &str =
     "renamed local Mach-O text target uses unsupported indirect relocation";
 const MACHO_SYMBOL_RESOLUTIONS_REQUIRED: &str = "missing Mach-O symbol resolution";
 const DIRECT_MACHO_CGU_MIGRATION_REQUIRED: &str = "missing direct Mach-O CGU catalog target";
+const MACHO_LOCAL_COHORT_LIVENESS_REQUIRED: &str =
+    "published local Mach-O cohort has no complete current atom-liveness proof";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct FilteredRecordCoverage {
@@ -5330,7 +5332,7 @@ struct DirectMachOCguLivenessProof {
     reference_roots_by_input: HashMap<String, Vec<DirectMachOCguLiveReferenceRoot>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedMachOLocalCohortEdge {
     relocation_index: usize,
     previous_relocation_offset: u64,
@@ -5347,6 +5349,25 @@ struct RecordedMachOLocalCohortEdge {
     r_pcrel: bool,
     r_length: u8,
     addend: i64,
+}
+
+fn merge_recorded_macho_local_cohort_edge(
+    edges: &mut Vec<RecordedMachOLocalCohortEdge>,
+    edge: RecordedMachOLocalCohortEdge,
+) -> std::result::Result<(), String> {
+    for existing in edges.iter() {
+        if existing == &edge {
+            return Ok(());
+        }
+        if existing.relocation_index == edge.relocation_index
+            || (existing.current_source_section_index == edge.current_source_section_index
+                && existing.current_relocation_offset == edge.current_relocation_offset)
+        {
+            return Err("recorded local Mach-O cohort caller edge is ambiguous".to_owned());
+        }
+    }
+    edges.push(edge);
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -11649,6 +11670,25 @@ struct MatchedMachOLocalTextTargetOwnership {
     current_target_value: u64,
     validated_retarget: ValidatedMachOLocalRelocationRetarget,
     local_symbol_cohort: Option<MachOLocalSymbolCohortPlan>,
+    recorded_incoming_edge: Option<RecordedMachOLocalCohortEdge>,
+    deferred_local_symbol_cohort_liveness: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WholeMemberMachOLocalCohortReplan {
+    Skipped,
+    NoChange,
+    Planned,
+}
+
+fn validate_deferred_macho_local_cohort_liveness(
+    deferred: bool,
+    replan: WholeMemberMachOLocalCohortReplan,
+) -> std::result::Result<(), String> {
+    if deferred && replan != WholeMemberMachOLocalCohortReplan::Planned {
+        return Err(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED.to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19281,6 +19321,8 @@ fn matched_macho_local_text_target_ownership(
                     current_target_value,
                     validated_retarget,
                     local_symbol_cohort: Some(plan),
+                    recorded_incoming_edge: None,
+                    deferred_local_symbol_cohort_liveness: false,
                 })));
             }
         }
@@ -19388,6 +19430,13 @@ fn matched_macho_local_text_target_ownership(
         r_length: record_kind.r_length,
         addend: relocation.addend,
     };
+    let whole_member_cohort_replan_is_guaranteed = normalize_rust_archive_patch_inputs
+        && previous_input.archive_identifier.is_some()
+        && current_input.archive_identifier.is_some()
+        && previous_input.bytes != current_input.bytes
+        && previous_file.architecture() == object::Architecture::Aarch64
+        && current_file.architecture() == object::Architecture::Aarch64;
+    let mut deferred_local_symbol_cohort_liveness = false;
     let local_symbol_cohort = if published_symbols == ExactLocalMachOOutputSymbol::Absent
         || exact_published_symbol_indices.is_some()
     {
@@ -19420,6 +19469,13 @@ fn matched_macho_local_text_target_ownership(
                     "renamed local Mach-O text target has no complete output-symbol transition"
                         .to_owned(),
                 ));
+            }
+            Err(reason)
+                if whole_member_cohort_replan_is_guaranteed
+                    && reason.starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED) =>
+            {
+                deferred_local_symbol_cohort_liveness = true;
+                None
             }
             Err(_reason) => {
                 return Ok(Err(
@@ -19465,6 +19521,8 @@ fn matched_macho_local_text_target_ownership(
         current_target_value: current_target_value.expect("checked current target value"),
         validated_retarget,
         local_symbol_cohort,
+        recorded_incoming_edge: Some(recorded_incoming_edge),
+        deferred_local_symbol_cohort_liveness,
     })))
 }
 
@@ -21080,6 +21138,27 @@ fn reachable_macho_local_cohort_atoms(
     reachable
 }
 
+fn add_macho_local_cohort_roots_to_fixed_point(
+    roots: &mut HashSet<MachOLocalCohortAtom>,
+    edges: &mut HashMap<MachOLocalCohortAtom, Vec<MachOLocalCohortAtom>>,
+    recorded_edges: &[(MachOLocalCohortAtom, MachOLocalCohortAtom)],
+    mut carried_roots: impl FnMut(
+        &HashSet<MachOLocalCohortAtom>,
+    ) -> Result<HashSet<MachOLocalCohortAtom>>,
+) -> Result<()> {
+    for (source, target) in recorded_edges {
+        edges.entry(*source).or_default().push(*target);
+    }
+    loop {
+        let previous_root_count = roots.len();
+        let reachable = reachable_macho_local_cohort_atoms(roots, edges);
+        roots.extend(carried_roots(&reachable)?);
+        if roots.len() == previous_root_count {
+            return Ok(());
+        }
+    }
+}
+
 fn required_macho_local_cohort_atoms_are_reachable(
     required: &[MachOLocalCohortAtom],
     reachable: &HashSet<MachOLocalCohortAtom>,
@@ -21862,7 +21941,6 @@ fn recorded_macho_local_cohort_edge_atoms(
     edge: &RecordedMachOLocalCohortEdge,
     relocations: &[RelocationRecord],
     input_file_path: &str,
-    caller_section: &MatchedPatchSection,
     previous_file: &object::File<'_>,
     current_file: &object::File<'_>,
     output_file: &object::File<'_>,
@@ -21870,6 +21948,12 @@ fn recorded_macho_local_cohort_edge_atoms(
     atom_for_offset: &impl Fn(object::SectionIndex, u64) -> Option<(object::SectionIndex, u64)>,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<Option<(MachOLocalCohortAtom, MachOLocalCohortAtom)>> {
+    let Some(source_owner) = owned_sections.get(&edge.current_source_section_index) else {
+        return Ok(None);
+    };
+    let Some(target_owner) = owned_sections.get(&edge.current_target_section_index) else {
+        return Ok(None);
+    };
     let Some(record) = relocations.get(edge.relocation_index) else {
         return Ok(None);
     };
@@ -21889,7 +21973,7 @@ fn recorded_macho_local_cohort_edge_atoms(
         .transpose()
         .context("Malformed recorded local Mach-O cohort edge target name")?;
     if record.input_file != input_file_path
-        || record.section_index != caller_section.previous.section_index
+        || record.section_index != source_owner.previous.section_index
         || record.relocation_offset != edge.previous_relocation_offset
         || record.addend != edge.addend
         || record_kind.r_type != edge.r_type
@@ -21902,13 +21986,13 @@ fn recorded_macho_local_cohort_edge_atoms(
         || !patch_input_refs_match(
             input_file_path,
             record.input.as_str(),
-            caller_section.previous.input.as_str(),
+            source_owner.previous.input.as_str(),
             normalize_rust_archive_patch_inputs,
         )?
         || !patch_input_refs_match(
             input_file_path,
             record_target.input.as_str(),
-            caller_section.previous.input.as_str(),
+            target_owner.previous.input.as_str(),
             normalize_rust_archive_patch_inputs,
         )?
     {
@@ -21919,12 +22003,12 @@ fn recorded_macho_local_cohort_edge_atoms(
         .enumerate()
         .filter(|(_, candidate)| {
             candidate.input_file == input_file_path
-                && candidate.section_index == caller_section.previous.section_index
+                && candidate.section_index == source_owner.previous.section_index
                 && candidate.relocation_offset == edge.previous_relocation_offset
                 && patch_input_refs_match(
                     input_file_path,
                     candidate.input.as_str(),
-                    caller_section.previous.input.as_str(),
+                    source_owner.previous.input.as_str(),
                     normalize_rust_archive_patch_inputs,
                 )
                 .unwrap_or(false)
@@ -21935,18 +22019,10 @@ fn recorded_macho_local_cohort_edge_atoms(
         return Ok(None);
     }
 
-    let Some(source_owner) = owned_sections.get(&edge.current_source_section_index) else {
-        return Ok(None);
-    };
-    let Some(target_owner) = owned_sections.get(&edge.current_target_section_index) else {
-        return Ok(None);
-    };
-    if source_owner.previous.section_index != caller_section.previous.section_index
-        || source_owner.current.section_index != caller_section.current.section_index
-        || relocation_target_record_index(patch_section_object_index(
-            previous_file,
-            target_owner.previous.section_index,
-        )?)? != edge.previous_target_section_index
+    if relocation_target_record_index(patch_section_object_index(
+        previous_file,
+        target_owner.previous.section_index,
+    )?)? != edge.previous_target_section_index
         || patch_section_object_index(current_file, target_owner.current.section_index)?
             != edge.current_target_section_index
         || edge.current_target_section_offset >= target_owner.current.input_size
@@ -21954,25 +22030,13 @@ fn recorded_macho_local_cohort_edge_atoms(
         || !patch_input_refs_match(
             input_file_path,
             source_owner.previous.input.as_str(),
-            caller_section.previous.input.as_str(),
+            target_owner.previous.input.as_str(),
             normalize_rust_archive_patch_inputs,
         )?
         || !patch_input_refs_match(
             input_file_path,
             source_owner.current.input.as_str(),
-            caller_section.current.input.as_str(),
-            normalize_rust_archive_patch_inputs,
-        )?
-        || !patch_input_refs_match(
-            input_file_path,
-            target_owner.previous.input.as_str(),
-            caller_section.previous.input.as_str(),
-            normalize_rust_archive_patch_inputs,
-        )?
-        || !patch_input_refs_match(
-            input_file_path,
             target_owner.current.input.as_str(),
-            caller_section.current.input.as_str(),
             normalize_rust_archive_patch_inputs,
         )?
     {
@@ -22773,13 +22837,12 @@ fn current_macho_local_cohort_atoms_are_live(
         }
     }
 
-    let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
+    let mut validated_recorded_edges = Vec::new();
     for edge in recorded_incoming_edges {
         let validated = recorded_macho_local_cohort_edge_atoms(
             edge,
             relocations,
             input_file_path,
-            caller_section,
             previous_file,
             current_file,
             output_file,
@@ -22790,27 +22853,32 @@ fn current_macho_local_cohort_atoms_are_live(
         let Some((source, target)) = validated else {
             continue;
         };
-        if reachable.contains(&source) {
-            roots.insert(target);
-        }
+        validated_recorded_edges.push((source, target));
     }
-    roots.extend(carried_macho_data_local_target_roots(
-        relocations,
-        symbol_resolutions,
-        input_file_path,
-        caller_section,
-        matched_sections,
-        previous_file,
-        current_file,
-        output_file,
-        previous_output,
-        &owned_sections,
-        &fully_recorded_sections,
-        &reachable,
-        &atom_for_offset,
-        rematerialized_sections,
-        normalize_rust_archive_patch_inputs,
-    )?);
+    add_macho_local_cohort_roots_to_fixed_point(
+        &mut roots,
+        &mut edges,
+        &validated_recorded_edges,
+        |reachable| {
+            carried_macho_data_local_target_roots(
+                relocations,
+                symbol_resolutions,
+                input_file_path,
+                caller_section,
+                matched_sections,
+                previous_file,
+                current_file,
+                output_file,
+                previous_output,
+                &owned_sections,
+                &fully_recorded_sections,
+                reachable,
+                &atom_for_offset,
+                rematerialized_sections,
+                normalize_rust_archive_patch_inputs,
+            )
+        },
+    )?;
     let reachable = reachable_macho_local_cohort_atoms(&roots, &edges);
     let mut required_atoms = Vec::with_capacity(required_current_entries.len());
     for entry in required_current_entries {
@@ -23322,6 +23390,7 @@ fn changed_macho_local_symbol_cohort_plan(
     previous_output: &[u8],
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
+    recorded_incoming_edges: &[RecordedMachOLocalCohortEdge],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<std::result::Result<Option<MachOLocalSymbolCohortPlan>, String>> {
@@ -23415,7 +23484,7 @@ fn changed_macho_local_symbol_cohort_plan(
         previous_output,
         output_file,
         rematerialized_sections,
-        &[],
+        recorded_incoming_edges,
         direct_macho_cgu_liveness_proof,
         normalize_rust_archive_patch_inputs,
     )
@@ -23636,7 +23705,7 @@ fn plan_macho_local_symbol_cohort(
     );
     if !current_atoms_are_live {
         return Ok(Err(format!(
-            "published local Mach-O cohort has no complete current atom-liveness proof in `{}`",
+            "{MACHO_LOCAL_COHORT_LIVENESS_REQUIRED} in `{}`",
             display_hex_text(&caller_section.current.input),
         )));
     }
@@ -25346,6 +25415,9 @@ fn macho_text_relocation_replays_for_input(
             .context("Failed to parse previous Mach-O text replay input")?;
         let current_section_indices = PatchSectionIndexLookup::new(&current_file);
         let previous_section_indices = PatchSectionIndexLookup::new(&previous_file);
+        let mut recorded_local_cohort_edges = Vec::new();
+        let mut deferred_local_symbol_cohort_liveness = false;
+        let mut whole_member_local_cohort_replan = WholeMemberMachOLocalCohortReplan::Skipped;
 
         for patch_section in &sections {
             let Some(current_index) =
@@ -25681,6 +25753,19 @@ fn macho_text_relocation_replays_for_input(
                         return Ok(Err(reason));
                     }
                 }
+                if let Some(edge) = matched_local_target_ownership
+                    .as_ref()
+                    .and_then(|ownership| ownership.recorded_incoming_edge.as_ref())
+                    && let Err(reason) = merge_recorded_macho_local_cohort_edge(
+                        &mut recorded_local_cohort_edges,
+                        edge.clone(),
+                    )
+                {
+                    return Ok(Err(reason));
+                }
+                deferred_local_symbol_cohort_liveness |= matched_local_target_ownership
+                    .as_ref()
+                    .is_some_and(|ownership| ownership.deferred_local_symbol_cohort_liveness);
                 if previous_target.is_none()
                     || (previous_target != current_target
                         && renamed_local_target_name.is_none()
@@ -26048,6 +26133,7 @@ fn macho_text_relocation_replays_for_input(
                 previous_output,
                 &output_file,
                 &rematerialized_sections,
+                &recorded_local_cohort_edges,
                 direct_macho_cgu_liveness_proof,
                 normalize_rust_archive_patch_inputs,
             )? {
@@ -26057,10 +26143,19 @@ fn macho_text_relocation_replays_for_input(
                     {
                         return Ok(Err(reason));
                     }
+                    whole_member_local_cohort_replan = WholeMemberMachOLocalCohortReplan::Planned;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    whole_member_local_cohort_replan = WholeMemberMachOLocalCohortReplan::NoChange;
+                }
                 Err(reason) => return Ok(Err(reason)),
             }
+        }
+        if let Err(reason) = validate_deferred_macho_local_cohort_liveness(
+            deferred_local_symbol_cohort_liveness,
+            whole_member_local_cohort_replan,
+        ) {
+            return Ok(Err(reason));
         }
     }
     drop(compare_changed_macho_text_sections);
@@ -62725,6 +62820,68 @@ mod tests {
             &roots,
             &rooted,
         ));
+
+        let mut recorded_roots = HashSet::from([(section, 0)]);
+        let mut recorded_graph = HashMap::from([((section, 0), vec![(section, 4)])]);
+        add_macho_local_cohort_roots_to_fixed_point(
+            &mut recorded_roots,
+            &mut recorded_graph,
+            &[((section, 8), (section, 12)), ((section, 4), (section, 8))],
+            |_| Ok(HashSet::new()),
+        )
+        .unwrap();
+        assert!(
+            reachable_macho_local_cohort_atoms(&recorded_roots, &recorded_graph)
+                .contains(&(section, 12)),
+            "recorded caller edges must reach a fixed point independent of input order",
+        );
+
+        let mut graph = HashMap::from([((section, 0), vec![(section, 4)])]);
+        let mut mixed_roots = HashSet::from([(section, 0)]);
+        add_macho_local_cohort_roots_to_fixed_point(
+            &mut mixed_roots,
+            &mut graph,
+            &[((section, 8), (section, 12))],
+            |reachable| {
+                Ok(if reachable.contains(&(section, 4)) {
+                    HashSet::from([(section, 8)])
+                } else {
+                    HashSet::new()
+                })
+            },
+        )
+        .unwrap();
+        assert!(
+            reachable_macho_local_cohort_atoms(&mixed_roots, &graph).contains(&(section, 12)),
+            "recorded caller edges must propagate roots added by carried data",
+        );
+    }
+
+    #[test]
+    fn deferred_local_macho_cohort_liveness_requires_a_planned_whole_member_replan() {
+        for replan in [
+            WholeMemberMachOLocalCohortReplan::Skipped,
+            WholeMemberMachOLocalCohortReplan::NoChange,
+        ] {
+            assert_eq!(
+                validate_deferred_macho_local_cohort_liveness(true, replan).unwrap_err(),
+                MACHO_LOCAL_COHORT_LIVENESS_REQUIRED,
+            );
+        }
+        assert!(
+            validate_deferred_macho_local_cohort_liveness(
+                true,
+                WholeMemberMachOLocalCohortReplan::Planned,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_deferred_macho_local_cohort_liveness(
+                false,
+                WholeMemberMachOLocalCohortReplan::Skipped,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -69735,11 +69892,10 @@ mod tests {
                 object[entry + 8..entry + 16].copy_from_slice(&10_u64.to_le_bytes());
                 object
             });
-        let expected = "renamed local Mach-O text target is present in the output symbol table";
-        assert_eq!(
+        assert!(
             apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true,)
-                .unwrap_err(),
-            expected,
+                .unwrap_err()
+                .starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED),
         );
 
         let population_change = |name: &'static [u8], n_desc: u16| {
@@ -69773,10 +69929,10 @@ mod tests {
             added
         };
         let added = population_change(b"new.dead", 0);
-        assert_eq!(
+        assert!(
             apply_local_text_target_transition(&added, vec![added.relocation.clone()], true)
-                .unwrap_err(),
-            expected,
+                .unwrap_err()
+                .starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED),
         );
 
         for n_desc in [
@@ -69785,14 +69941,17 @@ mod tests {
             object::macho::N_ALT_ENTRY,
         ] {
             let hostile = population_change(b"ltmp7", n_desc);
-            assert_eq!(
-                apply_local_text_target_transition(
-                    &hostile,
-                    vec![hostile.relocation.clone()],
-                    true,
-                )
-                .unwrap_err(),
-                expected,
+            let reason = apply_local_text_target_transition(
+                &hostile,
+                vec![hostile.relocation.clone()],
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                reason.starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED)
+                    || reason
+                        == "renamed local Mach-O text target is present in the output symbol table",
+                "unexpected rejection reason: {reason}",
             );
         }
     }
@@ -70041,6 +70200,24 @@ mod tests {
             r_length: record_kind.r_length,
             addend: fixture.relocation.addend,
         };
+        let mut carried_edges = Vec::new();
+        merge_recorded_macho_local_cohort_edge(&mut carried_edges, edge.clone()).unwrap();
+        merge_recorded_macho_local_cohort_edge(&mut carried_edges, edge.clone()).unwrap();
+        assert_eq!(carried_edges, [edge.clone()]);
+        let mut conflicting_edge = edge.clone();
+        conflicting_edge.current_target_section_offset += 4;
+        assert_eq!(
+            merge_recorded_macho_local_cohort_edge(&mut carried_edges, conflicting_edge)
+                .unwrap_err(),
+            "recorded local Mach-O cohort caller edge is ambiguous",
+        );
+        let mut duplicate_current_site = edge.clone();
+        duplicate_current_site.relocation_index += 1;
+        assert_eq!(
+            merge_recorded_macho_local_cohort_edge(&mut carried_edges, duplicate_current_site)
+                .unwrap_err(),
+            "recorded local Mach-O cohort caller edge is ambiguous",
+        );
         let required_entry = MachOLocalSymbolCohortEntry {
             name: b"l_b.2".to_vec(),
             n_desc: 0,
@@ -70117,6 +70294,33 @@ mod tests {
             current_input.bytes,
             &edge,
         ));
+        assert!(
+            current_macho_local_cohort_atoms_are_live(
+                &records,
+                &[],
+                &[],
+                &[],
+                fixture.input.path.as_str(),
+                &fixture.matched[1],
+                &fixture.matched,
+                &previous_resolver,
+                &current_resolver,
+                &previous_file,
+                previous_input.bytes,
+                &current_file,
+                current_input.bytes,
+                &output_file,
+                &fixture.previous_output,
+                &[],
+                std::slice::from_ref(&required_entry),
+                std::slice::from_ref(&edge),
+                &DirectMachOCguLivenessProof::default(),
+                &HashSet::new(),
+                true,
+            )
+            .unwrap(),
+            "the recorded edge must use its exact source owner, not the member representative",
+        );
 
         let mut wrong_record = records[0].clone();
         wrong_record.input_file = "other.rlib".into();
@@ -70153,6 +70357,29 @@ mod tests {
             &current_file,
             current_input.bytes,
             &wrong_target,
+        ));
+        let mut wrong_kind = edge.clone();
+        wrong_kind.r_type = if edge.r_type == object::macho::ARM64_RELOC_BRANCH26 {
+            object::macho::ARM64_RELOC_PAGE21
+        } else {
+            object::macho::ARM64_RELOC_BRANCH26
+        };
+        assert!(!proves(
+            &records,
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &wrong_kind,
+        ));
+        let mut wrong_current_offset = edge.clone();
+        wrong_current_offset.current_relocation_offset +=
+            u64::try_from(relocation_count * 4).unwrap();
+        assert!(!proves(
+            &records,
+            &current_resolver,
+            &current_file,
+            current_input.bytes,
+            &wrong_current_offset,
         ));
 
         let unreachable_archive =
