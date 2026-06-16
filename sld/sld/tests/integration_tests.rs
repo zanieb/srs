@@ -6631,6 +6631,7 @@ impl Assertions {
             }
             object::File::MachO64(macho_obj) => {
                 verify_sld_macho_chained_fixups(&macho_obj, &bytes, linker_used)?;
+                verify_sld_macho_has_no_unbacked_indirect_symbol_sections(&macho_obj, linker_used)?;
                 self.verify_macho_build_version(&macho_obj)?;
                 self.verify_sld_macho_unwind_info(&macho_obj, linker_used)?;
                 if !self.expected_comments.is_empty() {
@@ -7223,6 +7224,33 @@ fn verify_sld_macho_chained_fixups(
         ensure!(
             last_fixup_page.map(|page| page + 1) == Some(page_count),
             "Mach-O chained-fixup table has trailing pages without fixups"
+        );
+    }
+
+    Ok(())
+}
+
+fn verify_sld_macho_has_no_unbacked_indirect_symbol_sections(
+    obj: &object::read::macho::MachOFile64<'_>,
+    linker_used: &Linker,
+) -> Result {
+    if !linker_used.is_sld() {
+        return Ok(());
+    }
+
+    for section in obj.sections() {
+        let Ok(name) = section.name() else {
+            continue;
+        };
+        if !matches!(name, "__stubs" | "__got") {
+            continue;
+        }
+        let object::SectionFlags::MachO { flags } = section.flags() else {
+            bail!("SLD Mach-O section {name} has non-Mach-O flags");
+        };
+        ensure!(
+            flags & object::macho::SECTION_TYPE == object::macho::S_REGULAR,
+            "SLD Mach-O section {name} requires an indirect symbol table"
         );
     }
 
