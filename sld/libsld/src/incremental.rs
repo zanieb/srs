@@ -38792,24 +38792,61 @@ fn output_macho_archive_fdes(
     Ok(fdes)
 }
 
+fn output_macho_archive_fde_catalog(
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<(u64, Vec<OutputMachOArchiveFde>), String>> {
+    let eh_frame_index =
+        match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__eh_frame") {
+            Ok(index) => index,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let eh_frame = output_file.section_by_index(eh_frame_index)?;
+    let Some((eh_frame_file_offset, _)) = eh_frame.file_range() else {
+        return Ok(Err(
+            "retired Mach-O FDE __eh_frame has no file range".to_owned()
+        ));
+    };
+    let data = eh_frame
+        .data()
+        .context("Failed to read retired Mach-O FDE __eh_frame")?;
+    let entries = match output_macho_archive_eh_frame_entries(data) {
+        Ok(entries) => entries,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let fdes = match output_macho_archive_fdes(data, eh_frame.address(), &entries) {
+        Ok(fdes) => fdes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    Ok(Ok((eh_frame_file_offset, fdes)))
+}
+
 fn validate_zero_hint_macho_archive_fde_retirement(
     added_entries: &[crate::macho_writer::UnwindInfoEntry],
-    retired_entries: &[MachOUnwindFunctionIdentity],
-    range_zeroed_retired_fdes: &[MachOUnwindFunctionIdentity],
+    eh_frame_file_offset: u64,
+    physical_fdes: &[OutputMachOArchiveFde],
+    range_zero_patches: &[SectionPatch],
 ) -> std::result::Result<(), String> {
     for added in added_entries.iter().filter(|entry| {
         entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK == ADDED_MACHO_UNWIND_MODE_DWARF
             && entry.encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK == 0
     }) {
-        for retired in retired_entries.iter().filter(|retired| {
+        for physical in physical_fdes.iter().filter(|physical| {
             added_macho_archive_unwind_ranges_overlap(
                 added.function_offset,
                 added.length,
-                retired.function_offset,
-                retired.length,
+                physical.identity.function_offset,
+                physical.identity.length,
             )
         }) {
-            if !range_zeroed_retired_fdes.contains(retired) {
+            let output_offset = eh_frame_file_offset
+                .checked_add(physical.range_field_offset as u64)
+                .ok_or_else(|| "retired Mach-O FDE range offset overflowed".to_owned())?;
+            if !range_zero_patches.iter().any(|patch| {
+                patch.output_offset == output_offset
+                    && patch.size == u64::from(physical.range_field_width)
+                    && patch.data.len() == usize::from(physical.range_field_width)
+                    && patch.data.iter().all(|byte| *byte == 0)
+            }) {
                 return Err(
                     "zero-hint added Mach-O FDE overlaps an unretired historical FDE".to_owned(),
                 );
@@ -38831,26 +38868,9 @@ fn retired_macho_archive_fde_range_patches(
     if !allow_transactional_retirement {
         return Ok(Ok(Vec::new()));
     }
-    let eh_frame_index =
-        match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__eh_frame") {
-            Ok(index) => index,
-            Err(reason) => return Ok(Err(reason)),
-        };
-    let eh_frame = output_file.section_by_index(eh_frame_index)?;
-    let Some((eh_frame_file_offset, _)) = eh_frame.file_range() else {
-        return Ok(Err(
-            "retired Mach-O FDE __eh_frame has no file range".to_owned()
-        ));
-    };
-    let data = eh_frame
-        .data()
-        .context("Failed to read retired Mach-O FDE __eh_frame")?;
-    let entries = match output_macho_archive_eh_frame_entries(data) {
-        Ok(entries) => entries,
-        Err(reason) => return Ok(Err(reason)),
-    };
-    let physical_fdes = match output_macho_archive_fdes(data, eh_frame.address(), &entries) {
-        Ok(fdes) => fdes,
+    let (eh_frame_file_offset, physical_fdes) = match output_macho_archive_fde_catalog(output_file)?
+    {
+        Ok(catalog) => catalog,
         Err(reason) => return Ok(Err(reason)),
     };
     let mut claimed_hints = HashSet::with_capacity(retired_entries.len());
@@ -39816,17 +39836,23 @@ fn added_macho_archive_unwind_activation(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
-    let range_zeroed_retired_fdes = if allow_transactional_retirement {
-        retired_fdes
-    } else {
-        &[]
-    };
-    if let Err(reason) = validate_zero_hint_macho_archive_fde_retirement(
-        &added_entries,
-        retired_entries,
-        range_zeroed_retired_fdes,
-    ) {
-        return Ok(Err(reason));
+    if added_entries.iter().any(|entry| {
+        entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK == ADDED_MACHO_UNWIND_MODE_DWARF
+            && entry.encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK == 0
+    }) {
+        let (eh_frame_file_offset, physical_fdes) =
+            match output_macho_archive_fde_catalog(output_file)? {
+                Ok(catalog) => catalog,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        if let Err(reason) = validate_zero_hint_macho_archive_fde_retirement(
+            &added_entries,
+            eh_frame_file_offset,
+            &physical_fdes,
+            &retired_fde_patches,
+        ) {
+            return Ok(Err(reason));
+        }
     }
     patches.extend(retired_fde_patches);
     let existing_entries =
@@ -68793,31 +68819,49 @@ mod tests {
             personality_offset: None,
             lsda_offset: None,
         };
+        let physical = OutputMachOArchiveFde {
+            entry_offset: 0x10,
+            identity: retired,
+            range_field_offset: 0x20,
+            range_field_width: 4,
+        };
         let failure = validate_zero_hint_macho_archive_fde_retirement(
             std::slice::from_ref(&added),
-            std::slice::from_ref(&retired),
+            0x1000,
+            std::slice::from_ref(&physical),
             &[],
         )
         .unwrap_err();
         assert!(failure.contains("unretired historical FDE"));
+        let zero_patch = SectionPatch {
+            output_offset: 0x1020,
+            size: 4,
+            data: vec![0; 4],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
         validate_zero_hint_macho_archive_fde_retirement(
             std::slice::from_ref(&added),
-            std::slice::from_ref(&retired),
-            std::slice::from_ref(&retired),
+            0x1000,
+            std::slice::from_ref(&physical),
+            std::slice::from_ref(&zero_patch),
         )
         .unwrap();
 
         added.encoding = ADDED_MACHO_UNWIND_MODE_DWARF | 0x100;
         validate_zero_hint_macho_archive_fde_retirement(
             std::slice::from_ref(&added),
-            std::slice::from_ref(&retired),
+            0x1000,
+            std::slice::from_ref(&physical),
             &[],
         )
         .unwrap();
         added.encoding = 0x0200_0000;
         validate_zero_hint_macho_archive_fde_retirement(
             std::slice::from_ref(&added),
-            std::slice::from_ref(&retired),
+            0x1000,
+            std::slice::from_ref(&physical),
             &[],
         )
         .unwrap();
@@ -68879,13 +68923,31 @@ mod tests {
             personality_offset: None,
             lsda_offset: None,
         };
-        validate_zero_hint_macho_archive_fde_retirement(
-            std::slice::from_ref(&zero_hint_replacement),
-            &identities[..1],
-            &identities[..1],
-        )
-        .unwrap();
         let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let (eh_frame_file_offset, physical_fdes) = output_macho_archive_fde_catalog(&output_file)
+            .unwrap()
+            .unwrap();
+        let hinted_offset = (entries[0].encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK) as usize;
+        let hinted_fde = physical_fdes
+            .iter()
+            .find(|fde| fde.entry_offset == hinted_offset)
+            .unwrap();
+        let hinted_zero_patch = SectionPatch {
+            output_offset: eh_frame_file_offset + hinted_fde.range_field_offset as u64,
+            size: u64::from(hinted_fde.range_field_width),
+            data: vec![0; usize::from(hinted_fde.range_field_width)],
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        };
+        let failure = validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&zero_hint_replacement),
+            eh_frame_file_offset,
+            &physical_fdes,
+            std::slice::from_ref(&hinted_zero_patch),
+        )
+        .unwrap_err();
+        assert!(failure.contains("unretired historical FDE"));
         let retirement = retired_macho_archive_fde_range_patches(
             &output_file,
             &entries[..1],
@@ -68913,6 +68975,34 @@ mod tests {
         let failure =
             validate_macho_archive_unwind_version_output(&output.bytes, &version).unwrap_err();
         assert!(failure.contains("overlapping nonzero physical FDEs"));
+    }
+
+    #[test]
+    fn direct_a_b_c_zero_hint_rejects_non_immediate_stale_fde() {
+        let (output, entries, identities, _) = test_macho_retirable_fdes(4, &[0x40, 0x50]);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let immediate_y_patch =
+            retired_macho_archive_fde_range_patches(&output_file, &entries, &identities[1..], true)
+                .unwrap()
+                .unwrap();
+        let (eh_frame_file_offset, physical_fdes) = output_macho_archive_fde_catalog(&output_file)
+            .unwrap()
+            .unwrap();
+        let zero_hint_x = crate::macho_writer::UnwindInfoEntry {
+            function_offset: identities[0].function_offset,
+            length: identities[0].length,
+            encoding: ADDED_MACHO_UNWIND_MODE_DWARF,
+            personality_offset: None,
+            lsda_offset: None,
+        };
+        let failure = validate_zero_hint_macho_archive_fde_retirement(
+            std::slice::from_ref(&zero_hint_x),
+            eh_frame_file_offset,
+            &physical_fdes,
+            &immediate_y_patch,
+        )
+        .unwrap_err();
+        assert!(failure.contains("unretired historical FDE"));
     }
 
     #[test]
