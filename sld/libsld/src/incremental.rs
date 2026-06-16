@@ -8827,6 +8827,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             previous_output.get()?,
                             &mut relocation_target_patches,
                             &macho_resolution_moves,
+                            &macho_resolution_updates.moves,
+                            &macho_resolution_updates.output_symbols,
                             &direct_macho_cgu_liveness_proof,
                             record_coverage.has_changed_input_records(),
                             records_complete,
@@ -8869,6 +8871,8 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                             previous_output.get()?,
                             &mut relocation_target_patches,
                             &macho_resolution_moves,
+                            &macho_resolution_updates.moves,
+                            &macho_resolution_updates.output_symbols,
                             &direct_macho_cgu_liveness_proof,
                             &mut replays.local_symbol_cohorts,
                         )?
@@ -18915,6 +18919,8 @@ fn renamed_local_macho_relocation_target_candidate_name(
 fn matched_macho_local_text_target_ownership(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
+    liveness_resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
     relocation_index: usize,
     records_complete: bool,
     input: &FileState,
@@ -19090,6 +19096,8 @@ fn matched_macho_local_text_target_ownership(
             let plan = match plan_macho_local_symbol_cohort(
                 relocations,
                 symbol_resolutions,
+                liveness_resolution_moves,
+                liveness_output_symbol_patches,
                 input.path.as_str(),
                 caller_section,
                 matched_sections,
@@ -19267,6 +19275,8 @@ fn matched_macho_local_text_target_ownership(
         match plan_macho_local_symbol_cohort(
             relocations,
             symbol_resolutions,
+            liveness_resolution_moves,
+            liveness_output_symbol_patches,
             input.path.as_str(),
             caller_section,
             matched_sections,
@@ -21030,7 +21040,7 @@ fn macho_local_cohort_global_resolution_is_exact(
         && target.section_offset == section_offset)
 }
 
-fn macho_symbol_binding_is_public_strong_definition(
+fn macho_symbol_binding_is_strong_definition(
     symbol: &object::Symbol<'_, '_>,
     binding: MachOSymbolBindingMetadata,
 ) -> bool {
@@ -21040,13 +21050,22 @@ fn macho_symbol_binding_is_public_strong_definition(
         && binding.n_type & object::macho::N_STAB == 0
         && binding.n_type & object::macho::N_TYPE == object::macho::N_SECT
         && binding.n_type & object::macho::N_EXT != 0
-        && binding.n_type & object::macho::N_PEXT == 0
         && binding.n_desc & object::macho::N_WEAK_DEF == 0
+}
+
+fn macho_symbol_binding_is_public_strong_definition(
+    symbol: &object::Symbol<'_, '_>,
+    binding: MachOSymbolBindingMetadata,
+) -> bool {
+    macho_symbol_binding_is_strong_definition(symbol, binding)
+        && binding.n_type & object::macho::N_PEXT == 0
 }
 
 #[allow(clippy::too_many_arguments)]
 fn exact_current_macho_global_atom_liveness_root(
     symbol_resolutions: &[MachOSymbolResolutionRecord],
+    resolution_moves: &[MachOSymbolResolutionMove],
+    output_symbol_patches: &[RelocationTargetSymbolPatch],
     input_file_path: &str,
     owner: &MatchedPatchSection,
     previous_bytes: &[u8],
@@ -21087,8 +21106,8 @@ fn exact_current_macho_global_atom_liveness_root(
         return Ok(None);
     };
     if previous_binding != current_binding
-        || !macho_symbol_binding_is_public_strong_definition(previous_symbol, previous_binding)
-        || !macho_symbol_binding_is_public_strong_definition(current_symbol, current_binding)
+        || !macho_symbol_binding_is_strong_definition(previous_symbol, previous_binding)
+        || !macho_symbol_binding_is_strong_definition(current_symbol, current_binding)
     {
         return Ok(None);
     }
@@ -21116,7 +21135,11 @@ fn exact_current_macho_global_atom_liveness_root(
     else {
         return Ok(None);
     };
-    if previous_offset >= owner.previous.input_size || current_offset >= owner.current.input_size {
+    if previous_offset >= owner.previous.input_size
+        || current_offset >= owner.current.input_size
+        || previous_offset >= owner.previous.output_size
+        || current_offset >= owner.current.output_size
+    {
         return Ok(None);
     }
     let Some(previous_output_offset) = owner.previous.output_offset.checked_add(previous_offset)
@@ -21137,10 +21160,6 @@ fn exact_current_macho_global_atom_liveness_root(
     else {
         return Ok(None);
     };
-    if previous_value != current_value {
-        return Ok(None);
-    }
-
     let Ok(output_symbol_index) =
         unique_macho_output_symbol_index(output_file, name, previous_value)
     else {
@@ -21153,7 +21172,7 @@ fn exact_current_macho_global_atom_liveness_root(
         return Ok(None);
     };
     if output_binding != previous_binding
-        || !macho_symbol_binding_is_public_strong_definition(&output_symbol, output_binding)
+        || !macho_symbol_binding_is_strong_definition(&output_symbol, output_binding)
     {
         return Ok(None);
     }
@@ -21162,6 +21181,66 @@ fn exact_current_macho_global_atom_liveness_root(
     };
     if macho_output_section_index_for_file_offset(output_file, previous_output_offset)
         != u8::try_from(output_symbol_section.0).ok()
+    {
+        return Ok(None);
+    }
+    if previous_value != current_value {
+        if macho_output_section_index_for_file_offset(output_file, current_output_offset)
+            != u8::try_from(output_symbol_section.0).ok()
+        {
+            return Ok(None);
+        }
+        let encoded_name = hex::encode(name);
+        let previous_target = RelocationTargetRecord {
+            input_file: input_file_path.into(),
+            input: owner.previous.input.clone().into(),
+            section_index: previous_section_index.0 as u32,
+            section_offset: previous_offset,
+        };
+        let current_target = RelocationTargetRecord {
+            input_file: input_file_path.into(),
+            input: owner.current.input.clone().into(),
+            section_index: current_section_index.0 as u32,
+            section_offset: current_offset,
+        };
+        let matching_moves = resolution_moves
+            .iter()
+            .filter(|moved| moved.name.as_str() == encoded_name)
+            .collect::<Vec<_>>();
+        let [moved] = matching_moves.as_slice() else {
+            return Ok(None);
+        };
+        if moved.previous_value != previous_value
+            || moved.current_value != current_value
+            || moved.previous_target != previous_target
+            || moved.current_target != current_target
+        {
+            return Ok(None);
+        }
+        let matching_patches = output_symbol_patches
+            .iter()
+            .filter(|patch| patch.target_name == encoded_name)
+            .collect::<Vec<_>>();
+        let [patch] = matching_patches.as_slice() else {
+            return Ok(None);
+        };
+        if patch.previous_target_value != previous_value || patch.target_value != current_value {
+            return Ok(None);
+        }
+        let Some(current_resolution) = macho_symbol_resolution_for_name(symbol_resolutions, name)
+        else {
+            return Ok(None);
+        };
+        if current_resolution.direct_value != Some(current_value)
+            || current_resolution.target.as_ref() != Some(&current_target)
+        {
+            return Ok(None);
+        }
+        return Ok(Some((current_section_index, current_offset)));
+    }
+    if !macho_symbol_binding_is_public_strong_definition(previous_symbol, previous_binding)
+        || !macho_symbol_binding_is_public_strong_definition(current_symbol, current_binding)
+        || !macho_symbol_binding_is_public_strong_definition(&output_symbol, output_binding)
     {
         return Ok(None);
     }
@@ -21867,6 +21946,8 @@ fn recorded_macho_local_cohort_edge_atoms(
 fn current_macho_local_cohort_atoms_are_live(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
+    resolution_moves: &[MachOSymbolResolutionMove],
+    output_symbol_patches: &[RelocationTargetSymbolPatch],
     input_file_path: &str,
     caller_section: &MatchedPatchSection,
     matched_sections: &[MatchedPatchSection],
@@ -22132,8 +22213,8 @@ fn current_macho_local_cohort_atoms_are_live(
     }
 
     // Direct patches retain the previously published atom set. Preserve a moved strong global
-    // atom only when its definitions, binding, prior nlist, stable output value, and current
-    // resolution ownership are all exact.
+    // atom only when its definitions, binding, prior nlist, and current resolution ownership are
+    // exact. A changed output value also needs the catalog refresh's exact move and nlist patch.
     for current_symbol in current_file
         .symbols()
         .filter(|symbol| symbol.is_global() && !symbol.is_undefined() && !symbol.is_weak())
@@ -22150,6 +22231,8 @@ fn current_macho_local_cohort_atoms_are_live(
         let name = current_symbol.name_bytes()?;
         let Some((section_index, section_offset)) = exact_current_macho_global_atom_liveness_root(
             symbol_resolutions,
+            resolution_moves,
+            output_symbol_patches,
             input_file_path,
             owner,
             previous_bytes,
@@ -23104,6 +23187,8 @@ fn supplemental_macho_local_symbol_sources_changed(
 fn changed_macho_local_symbol_cohort_plan(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
+    liveness_resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
     input_file_path: &str,
     member_sections: &[&MatchedPatchSection],
     matched_sections: &[MatchedPatchSection],
@@ -23195,6 +23280,8 @@ fn changed_macho_local_symbol_cohort_plan(
     plan_macho_local_symbol_cohort(
         relocations,
         symbol_resolutions,
+        liveness_resolution_moves,
+        liveness_output_symbol_patches,
         input_file_path,
         caller_section,
         matched_sections,
@@ -23217,6 +23304,8 @@ fn changed_macho_local_symbol_cohort_plan(
 fn plan_macho_local_symbol_cohort(
     relocations: &[RelocationRecord],
     symbol_resolutions: &[MachOSymbolResolutionRecord],
+    liveness_resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
     input_file_path: &str,
     caller_section: &MatchedPatchSection,
     matched_sections: &[MatchedPatchSection],
@@ -23398,6 +23487,8 @@ fn plan_macho_local_symbol_cohort(
         current_macho_local_cohort_atoms_are_live(
             relocations,
             symbol_resolutions,
+            liveness_resolution_moves,
+            liveness_output_symbol_patches,
             input_file_path,
             caller_section,
             matched_sections,
@@ -25004,6 +25095,8 @@ fn macho_text_relocation_replays_for_input(
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     changed_input_records_loaded: bool,
     records_complete: bool,
@@ -25415,6 +25508,8 @@ fn macho_text_relocation_replays_for_input(
                     match matched_macho_local_text_target_ownership(
                         relocations,
                         resolutions,
+                        liveness_resolution_moves,
+                        liveness_output_symbol_patches,
                         relocation_index,
                         records_complete,
                         input,
@@ -25818,6 +25913,8 @@ fn macho_text_relocation_replays_for_input(
             match changed_macho_local_symbol_cohort_plan(
                 relocations,
                 resolutions,
+                liveness_resolution_moves,
+                liveness_output_symbol_patches,
                 input.path.as_str(),
                 &sections,
                 matched_sections,
@@ -25958,6 +26055,8 @@ fn validate_macho_data_relocations_are_stable(
     previous_output: &[u8],
     target_patches: &mut RelocationTargetPatches,
     resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_resolution_moves: &[MachOSymbolResolutionMove],
+    liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     local_symbol_cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
 ) -> Result<std::result::Result<bool, String>> {
@@ -26547,6 +26646,8 @@ fn validate_macho_data_relocations_are_stable(
                     let plan = match plan_macho_local_symbol_cohort(
                         relocations,
                         resolutions,
+                        liveness_resolution_moves,
+                        liveness_output_symbol_patches,
                         input.path.as_str(),
                         patch_section,
                         matched_sections,
@@ -58695,16 +58796,20 @@ mod tests {
                 section_offset: 4,
             }),
         };
-        let root = |resolutions: &[MachOSymbolResolutionRecord],
-                    owner: &MatchedPatchSection,
-                    previous: &[u8],
-                    current: &[u8],
-                    output: &[u8]| {
+        let root_with_witness = |resolutions: &[MachOSymbolResolutionRecord],
+                                 moves: &[MachOSymbolResolutionMove],
+                                 patches: &[RelocationTargetSymbolPatch],
+                                 owner: &MatchedPatchSection,
+                                 previous: &[u8],
+                                 current: &[u8],
+                                 output: &[u8]| {
             let previous_file = object::File::parse(previous).unwrap();
             let current_file = object::File::parse(current).unwrap();
             let output_file = object::File::parse(output).unwrap();
             exact_current_macho_global_atom_liveness_root(
                 resolutions,
+                moves,
+                patches,
                 "input.rlib",
                 owner,
                 previous,
@@ -58718,6 +58823,13 @@ mod tests {
             )
             .unwrap()
         };
+        let root = |resolutions: &[MachOSymbolResolutionRecord],
+                    owner: &MatchedPatchSection,
+                    previous: &[u8],
+                    current: &[u8],
+                    output: &[u8]| {
+            root_with_witness(resolutions, &[], &[], owner, previous, current, output)
+        };
 
         assert_eq!(
             root(
@@ -58730,6 +58842,385 @@ mod tests {
             Some((current_data.index(), 4)),
             "a uv/ty-shaped input move with a stable published value should remain live",
         );
+        for changed in ["previous-output", "current-output"] {
+            let mut bounded = owner.clone();
+            match changed {
+                "previous-output" => bounded.previous.output_size = 12,
+                "current-output" => bounded.current.output_size = 4,
+                _ => unreachable!(),
+            }
+            assert!(
+                root(
+                    std::slice::from_ref(&resolution),
+                    &bounded,
+                    &previous,
+                    &current,
+                    &output,
+                )
+                .is_none(),
+                "accepted equal-value {changed} bound",
+            );
+        }
+
+        let moved_current = test_macho_object(&[0; 16], &[0; 64], 32);
+        let moved_current_file = object::File::parse(moved_current.as_slice()).unwrap();
+        let moved_current_data = moved_current_file.section_by_name("__data").unwrap();
+        let mut moved_owner = owner.clone();
+        moved_owner.current.section_index =
+            patch_section_record_index(&moved_current_file, moved_current_data.index()).unwrap();
+        moved_owner.current.output_offset = output_data_offset;
+        let moved_value = output_data.address() + 32;
+        let moved_resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_data").into(),
+            direct_value: Some(moved_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: "input.rlib".into(),
+                input: moved_owner.current.input.clone().into(),
+                section_index: moved_current_data.index().0 as u32,
+                section_offset: 32,
+            }),
+        };
+        let moved = MachOSymbolResolutionMove {
+            name: hex::encode("_data").into(),
+            previous_value: output_value,
+            current_value: moved_value,
+            previous_target: RelocationTargetRecord {
+                input_file: "input.rlib".into(),
+                input: moved_owner.previous.input.clone().into(),
+                section_index: previous_data.index().0 as u32,
+                section_offset: 12,
+            },
+            current_target: moved_resolution.target.clone().unwrap(),
+        };
+        let moved_patch = RelocationTargetSymbolPatch {
+            target_name: hex::encode("_data"),
+            previous_target_value: output_value,
+            target_value: moved_value,
+            allow_missing: true,
+            source: "test Mach-O symbol catalog refresh",
+        };
+        assert_eq!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            ),
+            Some((moved_current_data.index(), 32)),
+            "a ty-shaped +0x14 published-value move needs the exact refresh witness",
+        );
+        let mut private_previous = previous.clone();
+        let entry = test_macho_symbol_entry_offset(&private_previous, b"_data");
+        private_previous[entry + 4] |= object::macho::N_PEXT;
+        let mut private_current = moved_current.clone();
+        let entry = test_macho_symbol_entry_offset(&private_current, b"_data");
+        private_current[entry + 4] |= object::macho::N_PEXT;
+        let mut private_output = output.clone();
+        let entry = test_macho_symbol_entry_offset(&private_output, b"_data");
+        private_output[entry + 4] |= object::macho::N_PEXT;
+        assert_eq!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &private_previous,
+                &private_current,
+                &private_output,
+            ),
+            Some((moved_current_data.index(), 32)),
+            "an exact private-external moved-value definition should remain live",
+        );
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &private_previous,
+                &moved_current,
+                &private_output,
+            )
+            .is_none(),
+            "private-external metadata must match in both input generations",
+        );
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                &[],
+                &[],
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "the refreshed catalog alone must not establish moved-value liveness",
+        );
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                &[],
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "a staged patch without its move must not establish liveness",
+        );
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                &[],
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "a move without its staged patch must not establish liveness",
+        );
+        assert!(
+            root_with_witness(
+                &[],
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "the move and patch must have an exact current catalog entry",
+        );
+
+        let duplicate_moves = [moved.clone(), moved.clone()];
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                &duplicate_moves,
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "duplicate moves must not establish liveness",
+        );
+        for changed in [
+            "previous-value",
+            "current-value",
+            "previous-file",
+            "previous-input",
+            "previous-section",
+            "previous-offset",
+            "current-file",
+            "current-input",
+            "current-section",
+            "current-offset",
+        ] {
+            let mut wrong = moved.clone();
+            match changed {
+                "previous-value" => wrong.previous_value += 1,
+                "current-value" => wrong.current_value += 1,
+                "previous-file" => wrong.previous_target.input_file = "other.rlib".into(),
+                "previous-input" => wrong.previous_target.input = "other-member".into(),
+                "previous-section" => wrong.previous_target.section_index += 1,
+                "previous-offset" => wrong.previous_target.section_offset += 1,
+                "current-file" => wrong.current_target.input_file = "other.rlib".into(),
+                "current-input" => wrong.current_target.input = "other-member".into(),
+                "current-section" => wrong.current_target.section_index += 1,
+                "current-offset" => wrong.current_target.section_offset += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                root_with_witness(
+                    std::slice::from_ref(&moved_resolution),
+                    std::slice::from_ref(&wrong),
+                    std::slice::from_ref(&moved_patch),
+                    &moved_owner,
+                    &previous,
+                    &moved_current,
+                    &output,
+                )
+                .is_none(),
+                "accepted mismatched move {changed}",
+            );
+        }
+
+        let duplicate_patches = [moved_patch.clone(), moved_patch.clone()];
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                &duplicate_patches,
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "duplicate patches must not establish liveness",
+        );
+        for changed in ["previous-value", "current-value"] {
+            let mut wrong = moved_patch.clone();
+            match changed {
+                "previous-value" => wrong.previous_target_value += 1,
+                "current-value" => wrong.target_value += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                root_with_witness(
+                    std::slice::from_ref(&moved_resolution),
+                    std::slice::from_ref(&moved),
+                    std::slice::from_ref(&wrong),
+                    &moved_owner,
+                    &previous,
+                    &moved_current,
+                    &output,
+                )
+                .is_none(),
+                "accepted mismatched patch {changed}",
+            );
+        }
+        let mut conflicting_patch = moved_patch.clone();
+        conflicting_patch.target_value += 1;
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                &[moved_patch.clone(), conflicting_patch],
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "conflicting patches must not establish liveness",
+        );
+
+        let duplicate_resolutions = [moved_resolution.clone(), moved_resolution.clone()];
+        assert!(
+            root_with_witness(
+                &duplicate_resolutions,
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &output,
+            )
+            .is_none(),
+            "duplicate current catalog entries must not establish liveness",
+        );
+        for changed in ["value", "file", "input", "section", "offset"] {
+            let mut stale = moved_resolution.clone();
+            match changed {
+                "value" => stale.direct_value = Some(output_value),
+                "file" => stale.target.as_mut().unwrap().input_file = "other.rlib".into(),
+                "input" => stale.target.as_mut().unwrap().input = "other-member".into(),
+                "section" => stale.target.as_mut().unwrap().section_index += 1,
+                "offset" => stale.target.as_mut().unwrap().section_offset += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                root_with_witness(
+                    std::slice::from_ref(&stale),
+                    std::slice::from_ref(&moved),
+                    std::slice::from_ref(&moved_patch),
+                    &moved_owner,
+                    &previous,
+                    &moved_current,
+                    &output,
+                )
+                .is_none(),
+                "accepted stale current catalog {changed}",
+            );
+        }
+
+        for changed in [
+            "previous-input",
+            "previous-output",
+            "current-input",
+            "current-output",
+        ] {
+            let mut bounded = moved_owner.clone();
+            match changed {
+                "previous-input" => bounded.previous.input_size = 12,
+                "previous-output" => bounded.previous.output_size = 12,
+                "current-input" => bounded.current.input_size = 32,
+                "current-output" => bounded.current.output_size = 32,
+                _ => unreachable!(),
+            }
+            assert!(
+                root_with_witness(
+                    std::slice::from_ref(&moved_resolution),
+                    std::slice::from_ref(&moved),
+                    std::slice::from_ref(&moved_patch),
+                    &bounded,
+                    &previous,
+                    &moved_current,
+                    &output,
+                )
+                .is_none(),
+                "accepted out-of-bounds {changed} offset",
+            );
+        }
+
+        let output_text = output_file.section_by_name("__text").unwrap();
+        let cross_section_value = output_text.address() + 4;
+        let mut cross_section_owner = owner.clone();
+        cross_section_owner.current.output_offset = output_text.file_range().unwrap().0;
+        let mut cross_section_resolution = resolution.clone();
+        cross_section_resolution.direct_value = Some(cross_section_value);
+        let mut cross_section_move = moved.clone();
+        cross_section_move.current_value = cross_section_value;
+        cross_section_move.current_target = cross_section_resolution.target.clone().unwrap();
+        cross_section_move.current_target.section_offset = 4;
+        let cross_section_patch = RelocationTargetSymbolPatch {
+            target_value: cross_section_value,
+            ..moved_patch.clone()
+        };
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&cross_section_resolution),
+                std::slice::from_ref(&cross_section_move),
+                std::slice::from_ref(&cross_section_patch),
+                &cross_section_owner,
+                &previous,
+                &current,
+                &output,
+            )
+            .is_none(),
+            "a moved value in a different output section must not establish liveness",
+        );
+        let mut wrong_nlist_section = output.clone();
+        let entry = test_macho_symbol_entry_offset(&wrong_nlist_section, b"_data");
+        wrong_nlist_section[entry + 5] = 1;
+        assert!(
+            root_with_witness(
+                std::slice::from_ref(&moved_resolution),
+                std::slice::from_ref(&moved),
+                std::slice::from_ref(&moved_patch),
+                &moved_owner,
+                &previous,
+                &moved_current,
+                &wrong_nlist_section,
+            )
+            .is_none(),
+            "a prior nlist in the wrong output section must not establish liveness",
+        );
+
         assert!(root(&[], &owner, &previous, &current, &output).is_none());
         assert!(
             root(
@@ -58865,6 +59356,135 @@ mod tests {
             )
             .is_none(),
             "binding metadata changes must not establish liveness",
+        );
+    }
+
+    #[test]
+    fn moved_macho_global_refresh_witness_roots_the_current_atom_graph() {
+        let mut previous =
+            test_macho_object_with_data_section_name(&[0; 16], &[0; 64], 12, b"__const");
+        let mut current =
+            test_macho_object_with_data_section_name(&[0; 16], &[0; 64], 32, b"__const");
+        for bytes in [&mut previous, &mut current] {
+            let entry = test_macho_symbol_entry_offset(bytes, b"_data");
+            bytes[entry + 4] |= object::macho::N_PEXT;
+        }
+        let output = previous.clone();
+        let previous_file = object::File::parse(previous.as_slice()).unwrap();
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let previous_section = previous_file.section_by_name("__const").unwrap();
+        let current_section = current_file.section_by_name("__const").unwrap();
+        let output_section = output_file.section_by_name("__const").unwrap();
+        let output_offset = output_section.file_range().unwrap().0;
+        let previous_value = output_section.address() + 12;
+        let current_value = output_section.address() + 32;
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: "previous-member".to_owned(),
+                section_index: patch_section_record_index(&previous_file, previous_section.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__const".to_owned()),
+                input_size: previous_section.size(),
+                output_offset,
+                output_size: previous_section.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: "current-member".to_owned(),
+                section_index: patch_section_record_index(&current_file, current_section.index())
+                    .unwrap(),
+                section_name: Some("__DATA,__const".to_owned()),
+                input_size: current_section.size(),
+                output_offset,
+                output_size: current_section.size(),
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let previous_target = RelocationTargetRecord {
+            input_file: "input.rlib".into(),
+            input: matched[0].previous.input.clone().into(),
+            section_index: previous_section.index().0 as u32,
+            section_offset: 12,
+        };
+        let current_target = RelocationTargetRecord {
+            input_file: "input.rlib".into(),
+            input: matched[0].current.input.clone().into(),
+            section_index: current_section.index().0 as u32,
+            section_offset: 32,
+        };
+        let resolution = MachOSymbolResolutionRecord {
+            name: hex::encode("_data").into(),
+            direct_value: Some(current_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(current_target.clone()),
+        };
+        let moved = MachOSymbolResolutionMove {
+            name: resolution.name.clone(),
+            previous_value,
+            current_value,
+            previous_target,
+            current_target,
+        };
+        let patch = RelocationTargetSymbolPatch {
+            target_name: resolution.name.to_string(),
+            previous_target_value: previous_value,
+            target_value: current_value,
+            allow_missing: true,
+            source: "test Mach-O symbol catalog refresh",
+        };
+        let required = MachOLocalSymbolCohortEntry {
+            name: b"_data".to_vec(),
+            n_desc: 0,
+            output_section_index: macho_output_section_index_for_file_offset(
+                &output_file,
+                output_offset,
+            )
+            .unwrap(),
+            output_value: current_value,
+            output_entry_offset: None,
+            string_index: None,
+        };
+        let previous_resolver = PatchInputResolver::new(&previous, false).unwrap();
+        let current_resolver = PatchInputResolver::new(&current, false).unwrap();
+        let atoms_are_live =
+            |moves: &[MachOSymbolResolutionMove], patches: &[RelocationTargetSymbolPatch]| {
+                current_macho_local_cohort_atoms_are_live(
+                    &[],
+                    std::slice::from_ref(&resolution),
+                    moves,
+                    patches,
+                    "input.rlib",
+                    &matched[0],
+                    &matched,
+                    &previous_resolver,
+                    &current_resolver,
+                    &previous_file,
+                    &previous,
+                    &current_file,
+                    &current,
+                    &output_file,
+                    &output,
+                    &[],
+                    std::slice::from_ref(&required),
+                    &[],
+                    &DirectMachOCguLivenessProof::default(),
+                    &HashSet::new(),
+                    false,
+                )
+                .unwrap()
+            };
+        assert!(
+            atoms_are_live(std::slice::from_ref(&moved), std::slice::from_ref(&patch),),
+            "the exact private-external move should root the current atom"
+        );
+        assert!(
+            !atoms_are_live(&[], &[]),
+            "a current catalog entry alone must not root the moved atom graph",
         );
     }
 
@@ -59342,6 +59962,8 @@ mod tests {
                 &current_resolver,
                 &previous_output,
                 &mut target_patches,
+                &[],
+                &[],
                 &[],
                 &DirectMachOCguLivenessProof::default(),
                 true,
@@ -60610,6 +61232,8 @@ mod tests {
             .unwrap();
         let plan = plan_macho_local_symbol_cohort(
             std::slice::from_ref(&plan_owner),
+            &[],
+            &[],
             &[],
             &input_file,
             &matched[0],
@@ -62874,6 +63498,8 @@ mod tests {
                 &previous_output,
                 &mut target_patches,
                 &resolution_moves,
+                &[],
+                &[],
                 &DirectMachOCguLivenessProof::default(),
                 &mut local_symbol_cohorts,
             )
@@ -62923,6 +63549,8 @@ mod tests {
             &previous_output,
             &mut target_patches,
             std::slice::from_ref(&resolution_move),
+            &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             &mut local_symbol_cohorts,
         )
@@ -63806,6 +64434,8 @@ mod tests {
                 &current_resolver,
                 &previous_output,
                 &mut target_patches,
+                &[],
+                &[],
                 &[],
                 &DirectMachOCguLivenessProof::default(),
                 &mut cohorts,
@@ -68017,6 +68647,8 @@ mod tests {
             &fixture.previous_output,
             &mut target_patches,
             &[],
+            &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             true,
             records_complete,
@@ -68813,6 +69445,8 @@ mod tests {
             current_macho_local_cohort_atoms_are_live(
                 relocations,
                 &[],
+                &[],
+                &[],
                 fixture.input.path.as_str(),
                 &fixture.matched[0],
                 &fixture.matched,
@@ -68837,6 +69471,8 @@ mod tests {
         assert!(
             !current_macho_local_cohort_atoms_are_live(
                 &records,
+                &[],
+                &[],
                 &[],
                 fixture.input.path.as_str(),
                 &fixture.matched[0],
@@ -69996,6 +70632,8 @@ mod tests {
             current_macho_local_cohort_atoms_are_live(
                 &[],
                 resolutions,
+                &[],
+                &[],
                 "owner.o",
                 &matched[0],
                 &matched,
@@ -77246,6 +77884,8 @@ mod tests {
             &elf,
             &mut target_patches,
             &[],
+            &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             true,
             true,
@@ -77266,6 +77906,8 @@ mod tests {
                 &current_resolver,
                 &elf,
                 &mut target_patches,
+                &[],
+                &[],
                 &[],
                 &DirectMachOCguLivenessProof::default(),
                 &mut local_symbol_cohorts,
@@ -77364,6 +78006,8 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             true,
             true,
@@ -77410,6 +78054,8 @@ mod tests {
             &current_resolver,
             &previous_output,
             &mut target_patches,
+            &[],
+            &[],
             &[],
             &DirectMachOCguLivenessProof::default(),
             true,
@@ -77524,6 +78170,8 @@ mod tests {
             &previous_output,
             &mut target_patches,
             &[],
+            &[],
+            &[],
             &DirectMachOCguLivenessProof::default(),
             true,
             true,
@@ -77575,6 +78223,8 @@ mod tests {
             &current_resolver,
             &previous_output,
             &mut target_patches,
+            &[],
+            &[],
             &[],
             &DirectMachOCguLivenessProof::default(),
             true,
