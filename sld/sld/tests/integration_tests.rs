@@ -7107,10 +7107,24 @@ fn verify_sld_macho_chained_fixups(
     let starts_offset = read_macho_u32(payload, 4)? as usize;
     let segment_count = read_macho_u32(payload, starts_offset)? as usize;
 
-    let data_segment = obj
-        .segments()
-        .find(|segment| segment.name().ok().flatten() == Some("__DATA"))
-        .map(|segment| segment.file_range());
+    let mut actual_segment_count = 0;
+    let mut text_address = None;
+    let mut data_segment = None;
+    for (segment_index, segment) in obj.segments().enumerate() {
+        actual_segment_count += 1;
+        match segment.name().ok().flatten() {
+            Some("__TEXT") => text_address = Some(segment.address()),
+            Some("__DATA") => {
+                let (file_offset, file_size) = segment.file_range();
+                data_segment = Some((segment_index, segment.address(), file_offset, file_size));
+            }
+            _ => {}
+        }
+    }
+    ensure!(
+        segment_count == actual_segment_count,
+        "Mach-O chained-fixup segment count does not match the output"
+    );
 
     let mut saw_segment_fixups = false;
     for segment_index in 0..segment_count {
@@ -7126,16 +7140,35 @@ fn verify_sld_macho_chained_fixups(
             "SLD Mach-O output has chained fixups in multiple segments"
         );
         saw_segment_fixups = true;
-        let (data_file_offset, data_file_size) =
+        let (data_segment_index, data_address, data_file_offset, data_file_size) =
             data_segment.context("SLD Mach-O output has fixups but no __DATA segment")?;
+        ensure!(
+            segment_index == data_segment_index,
+            "SLD Mach-O chained fixups are not attached to __DATA"
+        );
 
         let segment_info_start = starts_offset
             .checked_add(segment_info_offset)
             .context("Mach-O chained-fixup segment-info offset overflowed")?;
         let segment_info_size = read_macho_u32(payload, segment_info_start)? as usize;
         let page_size = u64::from(read_macho_u16(payload, segment_info_start + 4)?);
+        let pointer_format = read_macho_u16(payload, segment_info_start + 6)?;
+        let segment_runtime_offset = read_macho_u64(payload, segment_info_start + 8)?;
         let page_count = usize::from(read_macho_u16(payload, segment_info_start + 20)?);
-        ensure!(page_size != 0, "Mach-O chained-fixup page size is zero");
+        ensure!(
+            page_size == 0x4000,
+            "SLD Mach-O chained-fixup page size is not 16 KiB"
+        );
+        ensure!(
+            pointer_format == 6,
+            "SLD Mach-O chained-fixup pointer format is not DYLD_CHAINED_PTR_64_OFFSET"
+        );
+        let image_base =
+            text_address.context("SLD Mach-O output has fixups but no __TEXT segment")?;
+        ensure!(
+            data_address.checked_sub(image_base) == Some(segment_runtime_offset),
+            "SLD Mach-O chained-fixup __DATA runtime offset is incorrect"
+        );
         let page_starts_offset = segment_info_start + 22;
         let page_starts_size = page_count
             .checked_mul(size_of::<u16>())
