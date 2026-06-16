@@ -5548,6 +5548,18 @@ fn unique_macho_output_symbol_value_by_name(
     Ok(Ok(Some(value)))
 }
 
+fn normalized_macho_local_target_has_output_witness(
+    bytes: &[u8],
+    file: &object::File<'_>,
+    encoded_name: &str,
+    target_value: u64,
+) -> Result<std::result::Result<bool, String>> {
+    match unique_macho_output_symbol_value_by_name(bytes, file, encoded_name)? {
+        Ok(value) => Ok(Ok(value == Some(target_value))),
+        Err(reason) => Ok(Err(reason)),
+    }
+}
+
 fn symbol_position_by_name_and_value(
     bytes: &[u8],
     file_offset: usize,
@@ -7227,14 +7239,27 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     }
                 }
             };
-            // A historical member alias does not prove that a separate archive activation
-            // transaction preserves the same live output population.
-            if added_macho_archive_text_activation.is_some()
-                && !macho_text_relocation_replays.can_activate_macho_archive_members()
-            {
-                return Ok(ChangedInputPatchResult::Unsupported(
-                    "normalized Mach-O target aliases cannot activate archive members".to_owned(),
-                ));
+            if added_macho_archive_text_activation.is_some() {
+                let can_activate = match macho_text_relocation_replays
+                    .can_activate_macho_archive_members(
+                        &previous.macho_symbol_resolutions,
+                        &macho_resolution_moves,
+                        added_macho_archive_text_activation
+                            .as_ref()
+                            .map_or(&[], |activation| activation.symbol_resolutions.as_slice()),
+                        &relocation_target_patches.macho_cross_input_target_moves,
+                    ) {
+                    Ok(can_activate) => can_activate,
+                    Err(reason) => {
+                        return Ok(ChangedInputPatchResult::Unsupported(reason));
+                    }
+                };
+                if !can_activate {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "normalized Mach-O target aliases cannot activate archive members"
+                            .to_owned(),
+                    ));
+                }
             }
             let mut changed_macho_archive_unwind_activation = if args
                 .should_activate_macho_archive_members()
@@ -16142,10 +16167,75 @@ struct MachOTextRelocationReplays {
 }
 
 impl MachOTextRelocationReplays {
-    fn can_activate_macho_archive_members(&self) -> bool {
-        self.replays
+    fn can_activate_macho_archive_members(
+        &self,
+        resolutions: &[MachOSymbolResolutionRecord],
+        resolution_moves: &[MachOSymbolResolutionMove],
+        activation_resolutions: &[MachOSymbolResolutionRecord],
+        pending_cross_input_target_moves: &[MachORelocationTargetMove],
+    ) -> std::result::Result<bool, String> {
+        if !pending_cross_input_target_moves.is_empty() {
+            return Ok(false);
+        }
+        let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
+        for replay in self
+            .replays
             .iter()
-            .all(|replay| !replay.used_normalized_target_alias)
+            .filter(|replay| replay.used_normalized_target_alias)
+        {
+            let owner_is_rematerialized = self.rematerialized_sections.iter().any(
+                |(input_file, _, _, current_input, current_section_index)| {
+                    input_file == &replay.input_file
+                        && current_input == &replay.input
+                        && *current_section_index == replay.section_index
+                },
+            );
+            if !owner_is_rematerialized {
+                return Ok(false);
+            }
+            let Some(target) = replay.target.as_ref() else {
+                return Ok(false);
+            };
+            if target.input_file != replay.input_file
+                || target.section_offset != replay.current_target_section_offset
+                || !replay.target_is_global
+            {
+                return Ok(false);
+            }
+            let Some(target_name) = replay.target_name.as_deref() else {
+                return Ok(false);
+            };
+            let Some(resolution_index) = resolution_lookup.unique_index_encoded(target_name)?
+            else {
+                return Ok(false);
+            };
+            let resolution = &resolutions[resolution_index];
+            if resolution.direct_value != Some(replay.current_target_value)
+                || resolution.target.as_ref() != Some(target)
+            {
+                return Ok(false);
+            }
+            let move_witnesses = resolution_moves
+                .iter()
+                .filter(|moved| {
+                    moved.name.as_str() == target_name
+                        && moved.current_value == replay.current_target_value
+                        && moved.current_target == *target
+                })
+                .count();
+            let activation_witnesses = activation_resolutions
+                .iter()
+                .filter(|resolution| {
+                    resolution.name.as_str() == target_name
+                        && resolution.direct_value == Some(replay.current_target_value)
+                        && resolution.target.as_ref() == Some(target)
+                })
+                .count();
+            if move_witnesses + activation_witnesses != 1 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn uses_only_records_owned_by_input(
@@ -19921,6 +20011,24 @@ fn rematerialized_macho_text_relocation_replay(
             )));
         }
     };
+
+    if used_normalized_target_alias
+        && !target_is_global
+        && let Some(target_name) = target_name.as_deref()
+    {
+        match normalized_macho_local_target_has_output_witness(
+            previous_output,
+            output_file,
+            target_name,
+            current_target_value,
+        )? {
+            Ok(true) => {
+                used_normalized_target_alias = false;
+            }
+            Ok(false) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
 
     let recorded_target_candidates = if recorded_import_stub_candidates.is_empty() {
         recorded_branch_targets.branch_targets(
@@ -65156,15 +65264,53 @@ mod tests {
     }
 
     #[test]
-    fn normalized_macho_target_alias_cannot_activate_archive_members() {
+    fn normalized_macho_local_target_requires_exact_output_symbol() {
+        let output = test_macho_object(&[0; 4], &[0; 8], 2);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let target_value = 6;
+
+        assert!(
+            normalized_macho_local_target_has_output_witness(
+                &output,
+                &output_file,
+                &hex::encode("_data"),
+                target_value,
+            )
+            .unwrap()
+            .unwrap()
+        );
+        assert!(
+            !normalized_macho_local_target_has_output_witness(
+                &output,
+                &output_file,
+                &hex::encode("_data"),
+                target_value + 1,
+            )
+            .unwrap()
+            .unwrap()
+        );
+        assert!(
+            !normalized_macho_local_target_has_output_witness(
+                &output,
+                &output_file,
+                &hex::encode("_missing"),
+                target_value,
+            )
+            .unwrap()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn normalized_macho_target_alias_requires_reconciled_activation() {
         let input = hex::encode("lib.rlib");
         let target = RelocationTargetRecord {
             input_file: input.clone().into(),
-            input: input.into(),
+            input: input.clone().into(),
             section_index: 1,
             section_offset: 0,
         };
-        let replay = rematerialized_macho_replay("lib.rlib", "_target", 0x1000, target);
+        let replay = rematerialized_macho_replay("lib.rlib", "_target", 0x1000, target.clone());
         let mut replays = MachOTextRelocationReplays {
             replays: vec![replay],
             rematerialized_sections: Vec::new(),
@@ -65172,10 +65318,100 @@ mod tests {
             normalize_rust_archive_patch_inputs: true,
             symbol_resolutions_changed: false,
         };
-        assert!(replays.can_activate_macho_archive_members());
+        let can_activate = |replays: &MachOTextRelocationReplays,
+                            resolutions: &[MachOSymbolResolutionRecord],
+                            moves: &[MachOSymbolResolutionMove],
+                            activation: &[MachOSymbolResolutionRecord],
+                            pending: &[MachORelocationTargetMove]| {
+            replays
+                .can_activate_macho_archive_members(resolutions, moves, activation, pending)
+                .unwrap()
+        };
+        assert!(can_activate(&replays, &[], &[], &[], &[]));
 
         replays.replays[0].used_normalized_target_alias = true;
-        assert!(!replays.can_activate_macho_archive_members());
+        assert!(!can_activate(&replays, &[], &[], &[], &[]));
+
+        replays.rematerialized_sections.push((
+            input.clone().into(),
+            hex::encode("previous.o"),
+            1,
+            input.clone(),
+            1,
+        ));
+        assert!(!can_activate(&replays, &[], &[], &[], &[]));
+
+        let resolution = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_target")),
+            direct_value: Some(0x1000),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(target.clone()),
+        };
+        assert!(!can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            &[],
+            &[],
+            &[],
+        ));
+        let resolution_move = MachOSymbolResolutionMove {
+            name: resolution.name.clone(),
+            previous_value: 0x800,
+            current_value: 0x1000,
+            previous_target: target.clone(),
+            current_target: target.clone(),
+        };
+        assert!(can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            std::slice::from_ref(&resolution_move),
+            &[],
+            &[],
+        ));
+        let mut mismatched_move = resolution_move.clone();
+        mismatched_move.current_value += 1;
+        assert!(!can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            std::slice::from_ref(&mismatched_move),
+            &[],
+            &[],
+        ));
+        assert!(can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            &[],
+            std::slice::from_ref(&resolution),
+            &[],
+        ));
+        assert!(!can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            std::slice::from_ref(&resolution_move),
+            std::slice::from_ref(&resolution),
+            &[],
+        ));
+
+        let pending_move = MachORelocationTargetMove {
+            relocation_index: 0,
+            current_section_offset: 0,
+            current_target_value: 0x1000,
+            current_input: None,
+        };
+        assert!(!can_activate(
+            &replays,
+            std::slice::from_ref(&resolution),
+            std::slice::from_ref(&resolution_move),
+            &[],
+            std::slice::from_ref(&pending_move),
+        ));
+
+        replays.replays[0].target_is_global = false;
+        assert!(!can_activate(&replays, &[], &[], &[], &[]));
+        replays.replays[0].target.as_mut().unwrap().input = hex::encode("other.o").into();
+        assert!(!can_activate(&replays, &[], &[], &[], &[]));
     }
 
     #[test]
