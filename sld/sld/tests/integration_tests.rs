@@ -7121,11 +7121,6 @@ fn verify_sld_macho_chained_fixups(
             _ => {}
         }
     }
-    ensure!(
-        segment_count == actual_segment_count,
-        "Mach-O chained-fixup segment count does not match the output"
-    );
-
     let mut saw_segment_fixups = false;
     for segment_index in 0..segment_count {
         let segment_info_offset = read_macho_u32(
@@ -7140,6 +7135,10 @@ fn verify_sld_macho_chained_fixups(
             "SLD Mach-O output has chained fixups in multiple segments"
         );
         saw_segment_fixups = true;
+        ensure!(
+            segment_count == actual_segment_count,
+            "Mach-O chained-fixup segment count does not match the output"
+        );
         let (data_segment_index, data_address, data_file_offset, data_file_size) =
             data_segment.context("SLD Mach-O output has fixups but no __DATA segment")?;
         ensure!(
