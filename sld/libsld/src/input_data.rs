@@ -599,7 +599,7 @@ fn process_thin_archive<'data, P: Platform>(
     Ok(LoadedFileState::ThinArchive(files, parsed_files))
 }
 
-fn should_skip_archive_member(identifier: &[u8]) -> bool {
+pub(crate) fn should_skip_archive_member(identifier: &[u8]) -> bool {
     identifier == b"__.SYMDEF" || identifier.ends_with(b".rmeta")
 }
 
