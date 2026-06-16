@@ -34963,6 +34963,9 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         return Ok(Err(reason));
     }
     let selected_indices = (0..changed.members.len()).collect::<Vec<_>>();
+    let transactional_unwind = !changed.members.is_empty()
+        && changed.previous_common_members.len() == changed.members.len()
+        && changed.current_common_members.len() == changed.members.len();
     let mut remaining_reserved_ranges = reserved_ranges.to_vec();
     let mut unwind_sections = current_sections.to_vec();
     unwind_sections.extend(changed.current_sections.iter().cloned());
@@ -34974,9 +34977,7 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         resolutions,
         &changed.retired_entries,
         &changed.retired_fdes,
-        !changed.members.is_empty()
-            && changed.previous_common_members.len() == changed.members.len()
-            && changed.current_common_members.len() == changed.members.len(),
+        transactional_unwind,
         &mut remaining_reserved_ranges,
     )? {
         Ok(Some(activation)) => activation,
@@ -34999,29 +35000,29 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
     if forward_version.eh_frame_reserve.end != rollback_version.eh_frame_reserve.end {
         return Ok(Err("changed Mach-O unwind reserve end changed".to_owned()));
     }
-    let target_patches = match activation
-        .patches
-        .iter()
-        .map(|patch| stored_output_patch(patch, previous_output))
-        .collect::<std::result::Result<Vec<_>, _>>()
-    {
-        Ok(patches) => patches,
-        Err(reason) => return Ok(Err(reason)),
-    };
-    if let Err(reason) = scratch_apply_macho_archive_unwind_transition(
-        previous_output,
-        &target_patches,
-        &rollback_version,
-        &forward_version,
-    ) {
-        return Ok(Err(reason));
+    if transactional_unwind {
+        let target_patches = match activation
+            .patches
+            .iter()
+            .map(|patch| stored_output_patch(patch, previous_output))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(patches) => patches,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if let Err(reason) = scratch_apply_macho_archive_unwind_transition(
+            previous_output,
+            &target_patches,
+            &rollback_version,
+            &forward_version,
+        ) {
+            return Ok(Err(reason));
+        }
     }
-    let unwind_transaction = (!changed.previous_common_members.is_empty()).then_some(
-        MachOArchiveUnwindTransactionState {
-            forward: forward_version,
-            rollback: rollback_version,
-        },
-    );
+    let unwind_transaction = transactional_unwind.then_some(MachOArchiveUnwindTransactionState {
+        forward: forward_version,
+        rollback: rollback_version,
+    });
     Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
         patches: activation.patches,
         previous_input_ranges: changed.previous_input_ranges,
@@ -38827,9 +38828,7 @@ fn retired_macho_archive_fde_range_patches(
         return Ok(Ok(Vec::new()));
     }
     if !allow_transactional_retirement {
-        return Ok(Err(
-            "retired Mach-O FDE range needs an archive unwind transaction".to_owned(),
-        ));
+        return Ok(Ok(Vec::new()));
     }
     let eh_frame_index =
         match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__eh_frame") {
@@ -39816,10 +39815,15 @@ fn added_macho_archive_unwind_activation(
         Ok(patches) => patches,
         Err(reason) => return Ok(Err(reason)),
     };
+    let range_zeroed_retired_fdes = if allow_transactional_retirement {
+        retired_fdes
+    } else {
+        &[]
+    };
     if let Err(reason) = validate_zero_hint_macho_archive_fde_retirement(
         &added_entries,
         retired_entries,
-        retired_fdes,
+        range_zeroed_retired_fdes,
     ) {
         return Ok(Err(reason));
     }
@@ -68738,7 +68742,13 @@ mod tests {
                 Ok(_) => panic!("expected retired FDE validation to fail"),
             }
         };
-        assert!(failure(&output.bytes, &entries, &identities, false).contains("transaction"));
+        let direct_patches = {
+            let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+            retired_macho_archive_fde_range_patches(&output_file, &entries, &identities, false)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(direct_patches.is_empty());
 
         let mut invalid_entries = entries.clone();
         invalid_entries[0].encoding = ADDED_MACHO_UNWIND_MODE_DWARF;
@@ -68768,7 +68778,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_hint_added_dwarf_requires_exact_retired_fde_patch() {
+    fn direct_zero_hint_added_dwarf_requires_exact_retired_fde_patch() {
         let retired = MachOUnwindFunctionIdentity {
             function_offset: 0x1200,
             length: 0x80,
@@ -69134,7 +69144,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_direct_macho_unwind_fde_retirement_fails_closed() {
+    fn changed_direct_macho_unwind_retains_old_fde_without_transaction() {
         let previous = test_observed_049_macho_unwind_object(false);
         let mut current = previous.clone();
         let (compact_length_offset, eh_frame_length_offset) = {
@@ -69246,11 +69256,11 @@ mod tests {
             &migrated_definitions,
             &[],
         )
+        .unwrap()
+        .unwrap()
         .unwrap();
-        let Err(reason) = activation else {
-            panic!("direct FDE retirement unexpectedly succeeded");
-        };
-        assert!(reason.contains("needs an archive unwind transaction"));
+        assert_eq!(activation.patches.len(), 2);
+        assert!(activation.unwind_transaction.is_none());
     }
 
     #[test]
