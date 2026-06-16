@@ -29042,6 +29042,11 @@ fn refresh_dormant_macho_archive_rollback_patches(
         if !macho_archive_transaction_patches_match(retired) {
             return Err("newly retired Mach-O archive transaction is incomplete".to_owned());
         }
+        let unwind_ranges = if retired.unwind_transaction.is_some() {
+            macho_unwind_output_ranges(current_output)?
+        } else {
+            Vec::new()
+        };
 
         for (rollback_index, rollback) in retired.rollback_patches.iter().enumerate() {
             let start = usize::try_from(rollback.output_offset)
@@ -29093,9 +29098,9 @@ fn refresh_dormant_macho_archive_rollback_patches(
             match exact_replacement {
                 Some(replacement) if actual == replacement && actual == rollback.data => {}
                 Some(replacement) if actual == replacement => {
-                    if retired.unwind_transaction.is_some() {
+                    if stored_output_patch_overlaps_ranges(rollback, &unwind_ranges)? {
                         return Err(
-                            "cannot refresh a proof-bearing Mach-O archive unwind rollback"
+                            "cannot refresh a proof-bearing Mach-O archive semantic unwind rollback"
                                 .to_owned(),
                         );
                     }
@@ -69113,6 +69118,179 @@ mod tests {
         );
         assert_eq!(refreshed_proof, before_interleaved_refresh);
 
+        let nonsemantic_offset = output.text_offset as usize + 32;
+        let replacement_bytes = vec![0x5a; 16];
+        let rollback_bytes = previous_version_output
+            [nonsemantic_offset..nonsemantic_offset + replacement_bytes.len()]
+            .to_vec();
+        let mut proof_bearing_retired = historical_state.clone();
+        proof_bearing_retired.active = false;
+        proof_bearing_retired.forward_patches.insert(
+            0,
+            StoredOutputPatch {
+                output_offset: nonsemantic_offset as u64,
+                data: replacement_bytes.clone(),
+            },
+        );
+        proof_bearing_retired.rollback_patches.insert(
+            0,
+            StoredOutputPatch {
+                output_offset: nonsemantic_offset as u64,
+                data: rollback_bytes.clone(),
+            },
+        );
+        let replacement_state = |forward_patches: Vec<StoredOutputPatch>, rollback_patches| {
+            MachOArchiveActivationState {
+                kind: MachOArchiveActivationKind::AddedMembers,
+                members: vec![MachOArchiveMemberIdentity {
+                    normalized_identifier: b"replacement.rcgu.o".to_vec(),
+                    object_hash: "e".repeat(blake3::OUT_LEN * 2),
+                }],
+                active: true,
+                sections: Vec::new(),
+                relocations: Vec::new(),
+                symbol_resolutions: Vec::new(),
+                indirect_dependencies: Vec::new(),
+                rollback_symbol_resolutions: Vec::new(),
+                forward_patches,
+                rollback_patches,
+                unwind_transaction: None,
+            }
+        };
+        let refresh_inputs = |retired: MachOArchiveActivationState,
+                              active: MachOArchiveActivationState| {
+            let mut inputs =
+                state("args", b"output", &[("libarchive.rlib", b"archive")]).input_files;
+            inputs[0].patch = Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: vec![retired, active],
+                sections: Vec::new(),
+                raw_sections: None,
+            });
+            inputs
+        };
+        let retired_ref = [RetiredMachOArchiveStateRef {
+            input_index: 0,
+            state_index: 0,
+        }];
+        let unrelated_forward = StoredOutputPatch {
+            output_offset: nonsemantic_offset as u64,
+            data: replacement_bytes.clone(),
+        };
+        let unrelated_rollback = StoredOutputPatch {
+            output_offset: nonsemantic_offset as u64,
+            data: rollback_bytes,
+        };
+        let active_replacement = replacement_state(
+            vec![unrelated_forward.clone()],
+            vec![unrelated_rollback.clone()],
+        );
+        let mut retirement_output = previous_version_output.clone();
+        retirement_output[nonsemantic_offset..nonsemantic_offset + replacement_bytes.len()]
+            .copy_from_slice(&replacement_bytes);
+        let proof_before_refresh = proof_bearing_retired.unwind_transaction.clone();
+        let mut proof_refresh_inputs =
+            refresh_inputs(proof_bearing_retired.clone(), active_replacement);
+        assert_eq!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut proof_refresh_inputs,
+                &retired_ref,
+                &retirement_output,
+            )
+            .unwrap(),
+            1,
+        );
+        let refreshed_retired = &proof_refresh_inputs[0]
+            .patch
+            .as_ref()
+            .unwrap()
+            .macho_archive_members[0];
+        assert_eq!(
+            refreshed_retired.rollback_patches[0].data,
+            replacement_bytes
+        );
+        assert_eq!(refreshed_retired.unwind_transaction, proof_before_refresh);
+        assert!(stored_output_patches_match(
+            &refreshed_retired.rollback_patches,
+            &retirement_output,
+        ));
+
+        let unwind_rollback = proof_bearing_retired
+            .rollback_patches
+            .iter()
+            .find(|patch| {
+                patch.output_offset == unwind_info_offset as u64
+                    && patch.data.len() == unwind_info_size
+            })
+            .unwrap()
+            .clone();
+        let mut semantic_output = retirement_output.clone();
+        semantic_output[unwind_info_offset..unwind_info_offset + unwind_info_size]
+            .copy_from_slice(&other_unwind_info);
+        let semantic_replacement = replacement_state(
+            vec![
+                unrelated_forward.clone(),
+                StoredOutputPatch {
+                    output_offset: unwind_rollback.output_offset,
+                    data: other_unwind_info.clone(),
+                },
+            ],
+            vec![unrelated_rollback.clone(), unwind_rollback.clone()],
+        );
+        let mut semantic_refresh_inputs =
+            refresh_inputs(proof_bearing_retired.clone(), semantic_replacement);
+        let semantic_refresh_before = semantic_refresh_inputs.clone();
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut semantic_refresh_inputs,
+                &retired_ref,
+                &semantic_output,
+            )
+            .unwrap_err()
+            .contains("semantic unwind rollback")
+        );
+        assert_eq!(semantic_refresh_inputs, semantic_refresh_before);
+
+        let eh_start = output.eh_frame_offset;
+        let eh_end = eh_start + output.eh_frame_size;
+        let partial_eh_rollback = proof_bearing_retired
+            .rollback_patches
+            .iter()
+            .find(|patch| {
+                let patch_end = patch.output_offset + patch.data.len() as u64;
+                patch.output_offset < eh_end && eh_start < patch_end
+            })
+            .unwrap()
+            .clone();
+        let partial_eh_end =
+            partial_eh_rollback.output_offset + partial_eh_rollback.data.len() as u64;
+        assert!(partial_eh_rollback.output_offset > eh_start || partial_eh_end < eh_end);
+        let mut partial_eh_replacement = partial_eh_rollback.clone();
+        partial_eh_replacement.data[0] ^= 1;
+        let mut partial_eh_output = retirement_output.clone();
+        partial_eh_output[partial_eh_rollback.output_offset as usize
+            ..partial_eh_rollback.output_offset as usize + partial_eh_rollback.data.len()]
+            .copy_from_slice(&partial_eh_replacement.data);
+        let partial_semantic_replacement = replacement_state(
+            vec![unrelated_forward, partial_eh_replacement],
+            vec![unrelated_rollback, partial_eh_rollback],
+        );
+        let mut partial_semantic_inputs =
+            refresh_inputs(proof_bearing_retired, partial_semantic_replacement);
+        let partial_semantic_before = partial_semantic_inputs.clone();
+        assert!(
+            refresh_dormant_macho_archive_rollback_patches(
+                &mut partial_semantic_inputs,
+                &retired_ref,
+                &partial_eh_output,
+            )
+            .unwrap_err()
+            .contains("semantic unwind rollback")
+        );
+        assert_eq!(partial_semantic_inputs, partial_semantic_before);
+
         let mut invalidated_output = refreshed_output.clone();
         let eh_frame = object::File::parse(invalidated_output.as_slice())
             .unwrap()
@@ -76906,42 +77084,6 @@ mod tests {
         assert_eq!(
             tampered, original,
             "a failed refresh changed persisted state"
-        );
-
-        let mut proof_bearing = input_files(16);
-        let common_members = vec![MachOArchiveMemberIdentity {
-            normalized_identifier: b"common.rcgu.o".to_vec(),
-            object_hash: "b".repeat(blake3::OUT_LEN * 2),
-        }];
-        proof_bearing[0]
-            .patch
-            .as_mut()
-            .unwrap()
-            .macho_archive_members[0]
-            .unwind_transaction = Some(MachOArchiveUnwindTransactionState {
-            forward: MachOArchiveUnwindVersionState {
-                common_members: common_members.clone(),
-                eh_frame_reserve: MachOEhFrameReserveState { start: 0, end: 0 },
-            },
-            rollback: MachOArchiveUnwindVersionState {
-                common_members,
-                eh_frame_reserve: MachOEhFrameReserveState { start: 0, end: 0 },
-            },
-        });
-        let original = proof_bearing.clone();
-        output[16..20].copy_from_slice(&[5, 6, 7, 8]);
-        assert!(
-            refresh_dormant_macho_archive_rollback_patches(
-                &mut proof_bearing,
-                &retired_ref,
-                &output,
-            )
-            .unwrap_err()
-            .contains("proof-bearing")
-        );
-        assert_eq!(
-            proof_bearing, original,
-            "an interleaved active transaction changed proof-bearing rollback bytes",
         );
 
         let mut partial = input_files(18);
