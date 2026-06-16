@@ -21,7 +21,7 @@ met.
 ## Current Status
 
 The branch materially expands portable cache admission and reduces warm
-fresh-target work for both the full uv root build and workspace Clippy
+fresh-target work for both the uv/uvx no-debug build and workspace Clippy
 workloads. A controlled base-versus-branch comparison is reported below.
 
 Exact-path snapshots are a separate workload fallback. Units made fresh by a
@@ -31,11 +31,12 @@ portable-scope candidates.
 
 ### Warm base-versus-branch comparison
 
-The comparison used uv `f74311c15` on one 16-vCPU AMD EPYC Namespace instance
-with LLVM target codegen and Clang 22.1.7. The base and branch used their own
-CI-built Cargo wrappers with the same rustc binary. Every measured invocation
-started with an empty consumer target and a fresh copy of an immutable cache
-seed produced from a different target path by that same Cargo binary.
+The comparison used SRS base `4a8cc277e`, branch code `83f3c89c`, and uv
+`f74311c15` on one 16-vCPU AMD EPYC Namespace instance with LLVM target codegen
+and Clang 22.1.7. The base and branch used their own CI-built Cargo wrappers
+with the same rustc binary. Each Cargo binary separately populated an immutable
+cache seed from an empty producer target using the exact command and
+environment later measured from a different empty consumer target.
 
 Eight paired trials used two-pair blocks containing one base-first and one
 branch-first pair. Each workload block was preceded by two excluded warm runs
@@ -43,7 +44,7 @@ per side in ABBA order. Timed runs did not enable verbose logging or structured
 statistics. Seed copying was outside the timed interval and is reported
 separately below.
 
-| Workload | Base warm median (MAD) | Branch warm median (MAD) | Paired change (MAD) | Faster pairs |
+| Workload | Base warm median (MAD) | Branch warm median (MAD) | Median paired change (MAD) | Faster pairs |
 | --- | ---: | ---: | ---: | ---: |
 | `cargo build --profile no-debug --bin uv --bin uvx --locked` | 88.071s (0.160s) | 77.092s (0.098s) | -12.5% (0.2pp) | 8 / 8 |
 | `cargo clippy --workspace --all-targets --all-features --locked` | 111.840s (0.057s) | 99.841s (0.142s) | -10.8% (0.1pp) | 8 / 8 |
@@ -55,31 +56,35 @@ and 12.6% with it second; Clippy improved 10.9% and 10.6%, respectively.
 Independent cache-disabled controls used the same runner and block-balanced
 ordering. They were collected as separate workload-local blocks:
 
-| Workload | Base disabled median | Branch disabled median | Paired change |
+| Workload | Base disabled median | Branch disabled median | Median paired change |
 | --- | ---: | ---: | ---: |
 | Build | 86.105s | 86.147s | +0.1% |
 | Clippy | 112.743s | 112.616s | -0.2% |
 
-Neither disabled comparison was statistically significant. This supports
-attributing the improvement to the cache-enabled path rather than a general
-execution-speed difference between the two Cargo binaries. The hit and
-compiler-command counts below show that broader reuse appears to be the primary
-driver; cache-path overhead changes may also contribute.
+The disabled-path differences were within run-to-run noise (two-sided sign-test
+p=0.289 for Build and p=0.727 for Clippy). This indicates that the improvement
+is specific to the cache-enabled path rather than a general execution-speed
+difference between the two Cargo binaries. The hit and compiler-command counts
+below are consistent with broader reuse being a major contributor; preflight
+reconstruction and cache-path overhead changes may also contribute.
 
 A separate verbosity-matched diagnostic lane measured the change in cache
 scope without perturbing the primary timing samples:
 
-| Workload | Base cache hits | Branch runtime cache hits | Branch Cargo-fresh units | Compiler commands, base to branch |
-| --- | ---: | ---: | ---: | ---: |
-| Build | 7 | 150 | 171 | 483 to 225 |
-| Clippy | 8 | 402 | 11 | 692 to 352 |
+| Workload | Base scheduler-time hits | Branch scheduler-time hits | Compiler commands, base to branch |
+| --- | ---: | ---: | ---: |
+| Build | 7 | 150 | 483 to 225 |
+| Clippy | 8 | 402 | 692 to 352 |
 
 The branch-only structured-statistics lane used nonverbose producer and
-consumer commands. Build hit 345 of 448 eligible actions, restored 690 files /
-570.7 MB, and made 195 units Cargo-fresh. Clippy hit 438 of 505 eligible
-actions, restored 489 files / 268.2 MB, and made 36 units Cargo-fresh. Those are
-77.0% and 86.7% hit rates among eligible actions, and 58.4% and 53.9% coverage
-across all eligible plus ineligible actions.
+consumer commands. Its total lookup hits combine actions restored during
+preflight with later scheduler-time hits. Build restored 195 actions during
+preflight and hit 150 later, for 345 of 448 eligible actions; it restored 690
+files / 570.7 MB. Clippy restored 36 actions during preflight and hit 402
+later, for 438 of 505 eligible actions; it restored 489 files / 268.2 MB.
+Those are 77.0% and 86.7% hit rates among eligible actions, and 58.4% and 53.9%
+coverage across all cache-classified Cargo unit actions (eligible plus
+ineligible).
 
 The expanded scope also increases the local cache footprint. The build seed
 grew from 155.7 MB to 919.8 MB and its median local copy took 0.617s; the Clippy
