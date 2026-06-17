@@ -75407,32 +75407,132 @@ mod tests {
             object[24..28]
                 .copy_from_slice(&object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.to_le_bytes());
             set_test_macho_symbol_desc(&mut object, b"_text", object::macho::N_NO_DEAD_STRIP);
+
+            let text_file_offset = object::File::parse(object.as_slice())
+                .unwrap()
+                .section_by_name("__text")
+                .unwrap()
+                .file_range()
+                .unwrap()
+                .0 as usize;
+            object[text_file_offset + 4..text_file_offset + 8]
+                .copy_from_slice(&0x9000_0000_u32.to_le_bytes());
+
+            const TEXT_SECTION_COMMAND: usize = 32 + 72;
+            const RELOCATION_OFFSET_FIELD: usize = TEXT_SECTION_COMMAND + 56;
+            const RELOCATION_COUNT_FIELD: usize = TEXT_SECTION_COMMAND + 60;
+            let relocation_offset =
+                read_u32_le(&object[RELOCATION_OFFSET_FIELD..RELOCATION_OFFSET_FIELD + 4]).unwrap()
+                    as usize;
+            assert_eq!(
+                read_u32_le(&object[RELOCATION_COUNT_FIELD..RELOCATION_COUNT_FIELD + 4]).unwrap(),
+                1,
+            );
+            let mut command_offset = 32;
+            let symtab_command = loop {
+                let command = read_u32_le(&object[command_offset..command_offset + 4]).unwrap();
+                if command == object::macho::LC_SYMTAB {
+                    break command_offset;
+                }
+                command_offset +=
+                    read_u32_le(&object[command_offset + 4..command_offset + 8]).unwrap() as usize;
+            };
+            let symbol_offset =
+                read_u32_le(&object[symtab_command + 8..symtab_command + 12]).unwrap() as usize;
+            let string_offset =
+                read_u32_le(&object[symtab_command + 16..symtab_command + 20]).unwrap() as usize;
+            assert_eq!(symbol_offset, relocation_offset + 8);
+            let mut second_relocation = object[relocation_offset..relocation_offset + 8].to_vec();
+            second_relocation[..4].copy_from_slice(&4_u32.to_le_bytes());
+            object.splice(symbol_offset..symbol_offset, second_relocation);
+            object[RELOCATION_COUNT_FIELD..RELOCATION_COUNT_FIELD + 4]
+                .copy_from_slice(&2_u32.to_le_bytes());
+            object[symtab_command + 8..symtab_command + 12]
+                .copy_from_slice(&(u32::try_from(symbol_offset).unwrap() + 8).to_le_bytes());
+            object[symtab_command + 16..symtab_command + 20]
+                .copy_from_slice(&(u32::try_from(string_offset).unwrap() + 8).to_le_bytes());
             object
         };
-        let mut fixture = local_text_target_transition_fixture(
+        let mut fixture = local_text_target_transition_fixture_with_alias_sources_and_text_size(
             b"l_a.1",
             b"l_a.1",
             b"A-target",
             b"B-target",
             0,
             4,
+            None,
+            0,
+            0,
+            8,
         );
+        fixture.previous =
+            mutate_test_macho_archive_member(&fixture.previous, previous_identifier, prepare);
+        fixture.current =
+            mutate_test_macho_archive_member(&fixture.current, current_identifier, prepare);
+        let input_ref = |archive: &[u8], identifier: &[u8]| {
+            let ArchiveMemberMatch::Unique(member) =
+                patch_archive_member_bytes(archive, identifier).unwrap()
+            else {
+                panic!("expected one transition archive member");
+            };
+            resolved_patch_input_ref(&fixture.input.path, &fixture.input.path, member).unwrap()
+        };
+        let previous_input = input_ref(&fixture.previous, previous_identifier);
+        let current_input = input_ref(&fixture.current, current_identifier);
+        for section in &mut fixture.matched {
+            section.previous.input = previous_input.clone();
+            section.current.input = current_input.clone();
+        }
+        fixture.relocation.input = previous_input.clone().into();
+        fixture.relocation.target.as_mut().unwrap().input = previous_input.into();
+
+        let output_text_offset = object::File::parse(fixture.previous_output.as_slice())
+            .unwrap()
+            .section_by_name("__text")
+            .unwrap()
+            .file_range()
+            .unwrap()
+            .0 as usize;
+        let previous_instruction =
+            fixture.previous_output[output_text_offset..output_text_offset + 4].to_vec();
+        fixture.previous_output[output_text_offset + 4..output_text_offset + 8]
+            .copy_from_slice(&previous_instruction);
+        let current_instruction =
+            fixture.expected_output[output_text_offset..output_text_offset + 4].to_vec();
+        fixture.expected_output[output_text_offset + 4..output_text_offset + 8]
+            .copy_from_slice(&current_instruction);
+
         publish_local_transition_symbols(&mut fixture, &[(b"l_a.1", 0)]);
         let output_file = object::File::parse(fixture.expected_output.as_slice()).unwrap();
         let current_value = output_file.section_by_name("__const").unwrap().address() + 4;
         let output_entry = test_macho_symbol_entry_offset(&fixture.expected_output, b"l_a.1");
         fixture.expected_output[output_entry + 8..output_entry + 16]
             .copy_from_slice(&current_value.to_le_bytes());
-        fixture.previous =
-            mutate_test_macho_archive_member(&fixture.previous, previous_identifier, prepare);
-        fixture.current =
-            mutate_test_macho_archive_member(&fixture.current, current_identifier, prepare);
+        let mut second_relocation = fixture.relocation.clone();
+        second_relocation.relocation_offset = 4;
+        second_relocation.output_offset += 4;
 
+        let records = vec![fixture.relocation.clone(), second_relocation.clone()];
         let (output, _, retargets) =
-            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
-                .unwrap();
+            apply_local_text_target_transition(&fixture, records, true).unwrap();
         assert_eq!(output, fixture.expected_output);
-        assert_eq!(retargets.len(), 1);
+        assert_eq!(retargets.len(), 2);
+
+        assert!(
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
+                .is_err(),
+            "omitting one incoming edge must reject the deferred whole-member plan",
+        );
+        second_relocation.target.as_mut().unwrap().section_offset += 4;
+        assert!(
+            apply_local_text_target_transition(
+                &fixture,
+                vec![fixture.relocation.clone(), second_relocation],
+                true,
+            )
+            .is_err(),
+            "a conflicting incoming edge must reject the deferred whole-member plan",
+        );
     }
 
     #[test]
