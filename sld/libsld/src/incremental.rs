@@ -2683,11 +2683,11 @@ impl ChangedInputRecordCoverage {
         changed_input_files: &HashSet<String>,
     ) -> bool {
         self.is_complete()
-            || changed_input_files.contains(input_file)
             || matches!(
                 self,
                 Self::ChangedInputs(coverage)
-                    if coverage.complete_record_input_files.contains(input_file)
+                    if changed_input_files.contains(input_file)
+                        || coverage.complete_record_input_files.contains(input_file)
             )
     }
 }
@@ -8529,7 +8529,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 .iter()
                 .map(|section| section.current.clone())
                 .collect::<Vec<_>>();
-            if records_complete {
+            if record_coverage
+                .has_complete_records_for_input(input.path.as_str(), &changed_input_files)
+            {
                 let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
                     return Ok(ChangedInputPatchResult::Unsupported(
                         "retained Mach-O output owner needs the previous input snapshot".to_owned(),
@@ -8552,6 +8554,13 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                     current_sections.push(mapping.current.clone());
                     matched_sections.push(mapping);
                 }
+            }
+            if records_complete {
+                let Some(previous_bytes) = previous_snapshot_bytes.get()? else {
+                    return Ok(ChangedInputPatchResult::Unsupported(
+                        "retained Mach-O target owner needs the previous input snapshot".to_owned(),
+                    ));
+                };
                 let mut target_move_owner_trace = Vec::new();
                 let mappings = match retained_macho_text_target_move_owner_mappings(
                     previous_bytes,
@@ -9280,15 +9289,22 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                         )?
                     };
                     match data_relocations_are_stable {
-                        Ok(changed) => {
-                            if changed {
-                                if !records_complete {
+                        Ok(changed_record_owners) => {
+                            let records_changed = !changed_record_owners.is_empty();
+                            if records_changed {
+                                if !changed_record_owners.iter().all(|owner| {
+                                    record_coverage
+                                        .has_complete_records_for_input(owner, &changed_input_files)
+                                }) {
                                     return Ok(ChangedInputPatchResult::RequiresCompleteRecords(
-                                        "changed Mach-O data relocations need complete \
-                                             relocation records"
+                                        "changed Mach-O data relocations need complete owner \
+                                         records"
                                             .to_owned(),
                                     ));
                                 }
+                                record_override_input_files.extend(changed_record_owners);
+                            }
+                            if records_complete && records_changed {
                                 previous.sections_file = None;
                             }
                         }
@@ -26850,11 +26866,11 @@ fn validate_macho_data_relocations_are_stable(
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     direct_macho_cgu_liveness_proof: &DirectMachOCguLivenessProof,
     local_symbol_cohorts: &mut Vec<MachOLocalSymbolCohortPlan>,
-) -> Result<std::result::Result<bool, String>> {
+) -> Result<std::result::Result<HashSet<String>, String>> {
     let output_file = object::File::parse(previous_output)
         .context("Failed to parse previous Mach-O output for data relocation validation")?;
     if output_file.format() != object::BinaryFormat::MachO {
-        return Ok(Ok(false));
+        return Ok(Ok(HashSet::new()));
     }
     let target_moves = std::mem::take(&mut target_patches.macho_target_moves);
     let target_moves_by_index = target_moves
@@ -26870,7 +26886,7 @@ fn validate_macho_data_relocations_are_stable(
         input.path.as_str(),
         normalize_rust_archive_patch_inputs,
     )?;
-    let mut changed = false;
+    let mut changed_record_owners = HashSet::new();
     let mut sections_by_input = HashMap::<(&str, &str), Vec<&MatchedPatchSection>>::new();
     for section in matched_sections {
         sections_by_input
@@ -27117,7 +27133,7 @@ fn validate_macho_data_relocations_are_stable(
                         .map(|name| SharedText::from(hex::encode(name)));
                     if relocation.target_name != current_name {
                         relocation.target_name = current_name;
-                        changed = true;
+                        changed_record_owners.insert(relocation.input_file.to_string());
                     }
                 }
                 let current_output_offset = patch_section
@@ -27221,7 +27237,7 @@ fn validate_macho_data_relocations_are_stable(
                     }
                     relocation.input = patch_section.current.input.clone().into();
                     relocation.section_index = patch_section.current.section_index;
-                    changed = true;
+                    changed_record_owners.insert(relocation.input_file.to_string());
                     continue;
                 }
                 if previous_target_is_global && current_target_is_global {
@@ -27259,7 +27275,7 @@ fn validate_macho_data_relocations_are_stable(
                         target_patches.output_symbols.push(symbol_patch);
                         relocation.input = patch_section.current.input.clone().into();
                         relocation.section_index = patch_section.current.section_index;
-                        changed = true;
+                        changed_record_owners.insert(relocation.input_file.to_string());
                         continue;
                     }
                     if macho_catalog_data_relocation_target_is_stable_with_lookup(
@@ -27275,7 +27291,9 @@ fn validate_macho_data_relocations_are_stable(
                             relocation.input = patch_section.current.input.clone().into();
                         }
                         relocation.section_index = patch_section.current.section_index;
-                        changed |= *relocation != previous_record;
+                        if *relocation != previous_record {
+                            changed_record_owners.insert(relocation.input_file.to_string());
+                        }
                         continue;
                     }
                 }
@@ -27542,7 +27560,7 @@ fn validate_macho_data_relocations_are_stable(
                             .validated_macho_local_retargets
                             .push(retarget);
                     }
-                    changed = true;
+                    changed_record_owners.insert(relocation.input_file.to_string());
                     continue;
                 }
                 if target_address != relocation.target_value
@@ -27565,7 +27583,7 @@ fn validate_macho_data_relocations_are_stable(
                     let current_name = Some(SharedText::from(hex::encode(current_name)));
                     if relocation.target_name != current_name {
                         relocation.target_name = current_name;
-                        changed = true;
+                        changed_record_owners.insert(relocation.input_file.to_string());
                     }
                 }
                 let previous_record = relocation.clone();
@@ -27585,7 +27603,9 @@ fn validate_macho_data_relocations_are_stable(
                         .validated_macho_local_retargets
                         .push(retarget);
                 }
-                changed |= *relocation != previous_record;
+                if *relocation != previous_record {
+                    changed_record_owners.insert(relocation.input_file.to_string());
+                }
             }
         }
     }
@@ -27595,7 +27615,7 @@ fn validate_macho_data_relocations_are_stable(
             display_hex_path(&input.path)
         )));
     }
-    Ok(Ok(changed))
+    Ok(Ok(changed_record_owners))
 }
 
 fn moved_macho_data_relocation_patch(
@@ -67880,7 +67900,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-            assert!(changed);
+            assert_eq!(
+                changed,
+                [input.path.clone()].into_iter().collect::<HashSet<_>>()
+            );
             assert!(
                 target_patches
                     .output_patches
@@ -68890,7 +68913,10 @@ mod tests {
             std::slice::from_ref(&cohort),
             &[],
         );
-        assert!(result.unwrap());
+        assert_eq!(
+            result.unwrap(),
+            [input.path.clone()].into_iter().collect::<HashSet<_>>()
+        );
         assert_eq!(planned_cohorts, [cohort.clone()]);
         assert_eq!(target_patches.validated_macho_local_retargets.len(), 2);
         assert!(
@@ -68964,7 +68990,10 @@ mod tests {
             &[],
             &exact_rematerialized_text,
         );
-        assert!(result.unwrap());
+        assert_eq!(
+            result.unwrap(),
+            [input.path.clone()].into_iter().collect::<HashSet<_>>()
+        );
         let [planned] = planned_cohorts.as_slice() else {
             panic!("expected one derived local symbol cohort");
         };
@@ -69078,7 +69107,10 @@ mod tests {
             &[],
             &exact_rematerialized_text,
         );
-        assert!(result.unwrap());
+        assert_eq!(
+            result.unwrap(),
+            [input.path.clone()].into_iter().collect::<HashSet<_>>()
+        );
         let [planned] = planned_cohorts.as_slice() else {
             panic!("expected one retained-target local symbol cohort");
         };
@@ -85351,7 +85383,7 @@ mod tests {
 
         let mut local_symbol_cohorts = Vec::new();
         assert!(
-            !validate_macho_data_relocations_are_stable(
+            validate_macho_data_relocations_are_stable(
                 &mut [],
                 &resolutions,
                 &input,
@@ -85369,6 +85401,7 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+            .is_empty()
         );
     }
 
@@ -90152,6 +90185,30 @@ mod tests {
                 "changed bytes outside patchable sections in `input.o`".to_owned()
             )
         ));
+    }
+
+    #[test]
+    fn complete_record_owner_coverage_requires_loaded_records() {
+        let changed = hex::encode("changed.o");
+        let referenced = hex::encode("referenced.o");
+        let unrelated = hex::encode("unrelated.o");
+        let changed_inputs = [changed.clone()].into_iter().collect::<HashSet<_>>();
+
+        assert!(
+            !ChangedInputRecordCoverage::MetadataOnly
+                .has_complete_records_for_input(&changed, &changed_inputs)
+        );
+        let filtered = ChangedInputRecordCoverage::ChangedInputs(FilteredRecordCoverage {
+            complete_record_input_files: [referenced.clone()].into_iter().collect(),
+            ..FilteredRecordCoverage::default()
+        });
+        assert!(filtered.has_complete_records_for_input(&changed, &changed_inputs));
+        assert!(filtered.has_complete_records_for_input(&referenced, &changed_inputs));
+        assert!(!filtered.has_complete_records_for_input(&unrelated, &changed_inputs));
+        assert!(
+            ChangedInputRecordCoverage::Complete
+                .has_complete_records_for_input(&unrelated, &changed_inputs)
+        );
     }
 
     #[test]
