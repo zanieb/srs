@@ -150,8 +150,11 @@ cargo +srs build
 The installed Cargo wrapper sets `SLD_INCREMENTAL=1` by default so `sld` can
 reuse link state across development builds. It passes `-Z checksum-freshness`
 so touched-but-unchanged source files stay fresh and source content changes are
-detected even when their mtimes are preserved. Build-script inputs, including
-`rerun-if-changed` paths and generated outputs, remain mtime-driven.
+detected even when their mtimes are preserved. Regular files declared through
+build-script `rerun-if-changed` directives use the same content-based freshness.
+Directories, symlinks, and unavailable watched paths retain Cargo's
+conservative mtime behavior. Cargo also preserves its invocation-time guard
+for watched files modified while a build script is running.
 
 On Apple silicon macOS, the wrapper also
 requests signed private root-executable outputs and transient-input
