@@ -3495,13 +3495,87 @@ fn retained_macho_output_owner_mappings(
 ) -> Result<std::result::Result<Vec<MatchedPatchSection>, String>> {
     let mut current_inputs = matched_sections
         .iter()
-        .map(|section| section.current.input.clone())
+        .map(|section| (section.current.input.clone(), true))
         .collect::<Vec<_>>();
-    current_inputs.sort_unstable();
-    current_inputs.dedup();
+    current_inputs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    current_inputs.dedup_by(|left, right| left.0 == right.0);
+
+    let mut previous_resolver = None;
+    let mut normalized_record_inputs = HashSet::new();
+    for record in section_records {
+        if !current_resolver.normalize_rust_archive_patch_inputs
+            || record.input_file != input_file_path
+        {
+            continue;
+        }
+        let Some(parsed) = parse_patch_input_ref(input_file_path, record.input.as_str())? else {
+            continue;
+        };
+        if parsed.identifier.is_empty() {
+            continue;
+        }
+        let normalized_identifier = archive_member_patch_identifier(&parsed.identifier);
+        if normalized_identifier == parsed.identifier
+            || !normalized_record_inputs.insert(normalized_identifier.clone())
+        {
+            continue;
+        }
+        if previous_resolver.is_none() {
+            previous_resolver = Some(PatchInputResolver::new(previous_bytes, true)?);
+        }
+        let Some(previous_input) = previous_resolver.as_ref().unwrap().resolve(
+            input_file_path,
+            record.input.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            continue;
+        };
+        let Some(current_input) = current_resolver.resolve(
+            input_file_path,
+            record.input.as_str(),
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            continue;
+        };
+        let (Some(previous_identifier), Some(current_identifier)) = (
+            previous_input.archive_identifier,
+            current_input.archive_identifier,
+        ) else {
+            continue;
+        };
+        if archive_member_patch_identifier(previous_identifier) != normalized_identifier
+            || archive_member_patch_identifier(current_identifier) != normalized_identifier
+            || resolved_patch_input_ref(input_file_path, record.input.as_str(), previous_input)?
+                != record.input.as_str()
+            || previous_input.bytes == current_input.bytes
+        {
+            continue;
+        }
+        let current_input_ref =
+            resolved_patch_input_ref(input_file_path, record.input.as_str(), current_input)?;
+        let mut already_known = false;
+        for (input, _) in &current_inputs {
+            if input == &current_input_ref
+                || normalized_archive_input_refs_match(
+                    input_file_path,
+                    input.as_str(),
+                    current_input_ref.as_str(),
+                )?
+            {
+                already_known = true;
+                break;
+            }
+        }
+        if already_known {
+            continue;
+        }
+        current_inputs.push((current_input_ref, false));
+    }
 
     let mut mappings = Vec::new();
-    for current_input in current_inputs {
+    for (current_input, recover_text) in current_inputs {
         let Some(input_bytes) = current_resolver.resolve(
             input_file_path,
             &current_input,
@@ -3532,6 +3606,9 @@ fn retained_macho_output_owner_mappings(
             }
         }) {
             let is_text = section.name_bytes().ok() == Some(b"__text".as_slice());
+            if is_text && !recover_text {
+                continue;
+            }
             let section_index = patch_section_record_index(&current_file, section.index())?;
             let mapping = match retained_macho_section_owner_mapping(
                 previous_bytes,
@@ -58312,6 +58389,322 @@ mod tests {
             .unwrap()
             .is_empty(),
             "const growth beyond its recorded capacity must not recover ownership",
+        );
+    }
+
+    #[test]
+    fn retained_macho_const_only_archive_member_owner_is_recovered_from_records() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let previous_a_identifier = b"crate-hash.a.previous.rcgu.o";
+        let current_a_identifier = b"crate-hash.a.current.rcgu.o";
+        let previous_b_identifier = b"crate-hash.b.previous.rcgu.o";
+        let current_b_identifier = b"crate-hash.b.current.rcgu.o";
+        let ambiguous_b_identifier = b"crate-hash.b.ambiguous.rcgu.o";
+        let previous_a = test_macho_object(b"old!", b"same", 0);
+        let current_a = test_macho_object(b"new!", b"same", 0);
+        let previous_source = [0; 24];
+        let mut current_source = previous_source;
+        current_source[16..19].copy_from_slice(&[1, 2, 3]);
+        let previous_b =
+            test_macho_local_data_retarget_object_with_source(b"l_anon.20", 0x12, &previous_source);
+        let mut current_b =
+            test_macho_local_data_retarget_object_with_source(b"l_anon.20", 0x12, &current_source);
+        let current_text_const_offset = {
+            let current_b_file = object::File::parse(current_b.as_slice()).unwrap();
+            current_b_file
+                .sections()
+                .find(|section| {
+                    section.name().ok() == Some("__const")
+                        && section.segment_name().ok().flatten() == Some("__TEXT")
+                })
+                .unwrap()
+                .file_range()
+                .unwrap()
+                .0 as usize
+        };
+        current_b[current_text_const_offset + 32..current_text_const_offset + 35]
+            .copy_from_slice(&[4, 5, 6]);
+        let previous = archive(&[
+            (previous_a_identifier, previous_a.as_slice()),
+            (previous_b_identifier, previous_b.as_slice()),
+        ]);
+        let current = archive(&[
+            (current_a_identifier, current_a.as_slice()),
+            (current_b_identifier, current_b.as_slice()),
+        ]);
+        let unchanged = archive(&[
+            (current_a_identifier, current_a.as_slice()),
+            (current_b_identifier, previous_b.as_slice()),
+        ]);
+        let ambiguous = archive(&[
+            (current_a_identifier, current_a.as_slice()),
+            (current_b_identifier, current_b.as_slice()),
+            (ambiguous_b_identifier, current_b.as_slice()),
+        ]);
+        let input_file = hex::encode("input.rlib");
+        let ArchiveMemberMatch::Unique(previous_a_member) =
+            patch_archive_member_bytes(&previous, previous_a_identifier).unwrap()
+        else {
+            panic!("expected previous member A");
+        };
+        let ArchiveMemberMatch::Unique(previous_b_member) =
+            patch_archive_member_bytes(&previous, previous_b_identifier).unwrap()
+        else {
+            panic!("expected previous member B");
+        };
+        let ArchiveMemberMatch::Unique(current_a_member) =
+            patch_archive_member_bytes(&current, current_a_identifier).unwrap()
+        else {
+            panic!("expected current member A");
+        };
+        let ArchiveMemberMatch::Unique(current_b_member) =
+            patch_archive_member_bytes(&current, current_b_identifier).unwrap()
+        else {
+            panic!("expected current member B");
+        };
+        let previous_a_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_a_member).unwrap();
+        let previous_b_input =
+            resolved_patch_input_ref(&input_file, &input_file, previous_b_member).unwrap();
+        let current_a_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_a_member).unwrap();
+        let current_b_input =
+            resolved_patch_input_ref(&input_file, &input_file, current_b_member).unwrap();
+
+        let previous_a_file = object::File::parse(previous_a_member.bytes).unwrap();
+        let current_a_file = object::File::parse(current_a_member.bytes).unwrap();
+        let previous_b_file = object::File::parse(previous_b_member.bytes).unwrap();
+        let current_b_file = object::File::parse(current_b_member.bytes).unwrap();
+        let previous_a_text = previous_a_file.section_by_name("__text").unwrap();
+        let current_a_text = current_a_file.section_by_name("__text").unwrap();
+        let previous_b_text_const = previous_b_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__TEXT")
+            })
+            .unwrap();
+        let current_b_text_const = current_b_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__TEXT")
+            })
+            .unwrap();
+        let previous_b_data_const = previous_b_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__DATA")
+            })
+            .unwrap();
+        let current_b_data_const = current_b_file
+            .sections()
+            .find(|section| {
+                section.name().ok() == Some("__const")
+                    && section.segment_name().ok().flatten() == Some("__DATA")
+            })
+            .unwrap();
+        let a_text_index =
+            patch_section_record_index(&previous_a_file, previous_a_text.index()).unwrap();
+        let b_text_const_index =
+            patch_section_record_index(&previous_b_file, previous_b_text_const.index()).unwrap();
+        let b_data_const_index =
+            patch_section_record_index(&previous_b_file, previous_b_data_const.index()).unwrap();
+        assert_eq!(
+            a_text_index,
+            patch_section_record_index(&current_a_file, current_a_text.index()).unwrap()
+        );
+        assert_eq!(
+            b_text_const_index,
+            patch_section_record_index(&current_b_file, current_b_text_const.index()).unwrap()
+        );
+        assert_eq!(
+            b_data_const_index,
+            patch_section_record_index(&current_b_file, current_b_data_const.index()).unwrap()
+        );
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_a_input.clone(),
+                section_index: a_text_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_a_text.size(),
+                output_offset: 0x100,
+                output_size: previous_a_text.size(),
+                data_hash: Some(hash_bytes(previous_a_text.data().unwrap())),
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: current_a_input,
+                section_index: a_text_index,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_a_text.size(),
+                output_offset: 0x100,
+                output_size: current_a_text.size(),
+                data_hash: Some(hash_bytes(current_a_text.data().unwrap())),
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let text_record = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_a_input.into(),
+            section_index: a_text_index,
+            output_offset: 0x100,
+            size: previous_a_text.size(),
+        };
+        let text_const_record = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_b_input.clone().into(),
+            section_index: b_text_const_index,
+            output_offset: 0x200,
+            size: previous_b_text_const.size(),
+        };
+        let data_const_record = SectionRecord {
+            input_file: input_file.clone().into(),
+            input: previous_b_input.into(),
+            section_index: b_data_const_index,
+            output_offset: 0x300,
+            size: previous_b_data_const.size(),
+        };
+        let records = [
+            text_record.clone(),
+            text_const_record.clone(),
+            data_const_record.clone(),
+        ];
+        let resolver = PatchInputResolver::new(&current, true).unwrap();
+
+        let recovered = retained_macho_output_owner_mappings(
+            &previous,
+            &input_file,
+            &resolver,
+            &records,
+            &matched,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .iter()
+                .all(|mapping| mapping.current.input == current_b_input)
+        );
+        assert!(recovered.iter().any(|mapping| {
+            mapping.current.section_name.as_deref() == Some("__TEXT,__const")
+                && mapping.previous.data_hash != mapping.current.data_hash
+        }));
+        assert!(recovered.iter().any(|mapping| {
+            mapping.current.section_name.as_deref() == Some("__DATA,__const")
+                && mapping.previous.data_hash != mapping.current.data_hash
+        }));
+        let mappings = matched
+            .iter()
+            .cloned()
+            .chain(recovered.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(mappings.len(), 3);
+        let relocation_kind = encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 3,
+            r_extern: true,
+            r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        });
+        let data_relocation = |offset| {
+            let mut relocation = relocation_record(
+                current_b_input.as_str(),
+                b_data_const_index,
+                0,
+                Some(0),
+                0,
+                None,
+                None,
+                offset,
+                0x300 + offset,
+                8,
+                relocation_kind,
+                0,
+            );
+            relocation.input_file = input_file.clone().into();
+            relocation.input = current_b_input.clone().into();
+            relocation
+        };
+        let relocations = [data_relocation(0), data_relocation(8)];
+        let resolved = resolved_patch_sections_for_input_with_resolver_detailed(
+            &input_file,
+            mappings.iter().map(|mapping| mapping.current.clone()),
+            std::iter::empty(),
+            &relocations,
+            &resolver,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert!(
+            resolved
+                .iter()
+                .any(|section| section.patch.output_offset == 0x100)
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|section| section.patch.output_offset == 0x200
+                    && section.patch.preserve_ranges.is_empty())
+        );
+        assert!(resolved.iter().any(|section| {
+            section.patch.output_offset == 0x300 && section.patch.preserve_ranges == [0..8, 8..16]
+        }));
+
+        assert!(
+            retained_macho_output_owner_mappings(
+                &previous,
+                &input_file,
+                &resolver,
+                std::slice::from_ref(&text_record),
+                &matched,
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+            "a const-only member without an exact record must remain unowned",
+        );
+        assert!(
+            retained_macho_output_owner_mappings(
+                &previous,
+                &input_file,
+                &PatchInputResolver::new(&unchanged, true).unwrap(),
+                &records,
+                &matched,
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+            "an unchanged const-only member must remain unowned",
+        );
+        assert!(
+            retained_macho_output_owner_mappings(
+                &previous,
+                &input_file,
+                &PatchInputResolver::new(&ambiguous, true).unwrap(),
+                &[text_record, text_const_record, data_const_record],
+                &matched,
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty(),
+            "an ambiguous normalized const-only member must remain unowned",
         );
     }
 
