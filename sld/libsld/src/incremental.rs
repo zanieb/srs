@@ -12131,6 +12131,36 @@ fn macho_local_cohort_plan_timing(
     }
 }
 
+fn macho_local_cohort_whole_input_replan_is_guaranteed(
+    normalize_rust_archive_patch_inputs: bool,
+    previous_input: PatchInputBytes<'_>,
+    current_input: PatchInputBytes<'_>,
+    previous_architecture: object::Architecture,
+    current_architecture: object::Architecture,
+) -> bool {
+    let ownership_domain_matches = matches!(
+        (
+            previous_input.archive_identifier,
+            current_input.archive_identifier,
+        ),
+        (Some(_), Some(_)) | (None, None)
+    );
+    normalize_rust_archive_patch_inputs
+        && ownership_domain_matches
+        && previous_input.bytes != current_input.bytes
+        && previous_architecture == object::Architecture::Aarch64
+        && current_architecture == object::Architecture::Aarch64
+}
+
+fn macho_local_cohort_whole_input_replan_is_required(
+    guaranteed: bool,
+    previous_input: PatchInputBytes<'_>,
+    deferred_local_symbol_cohort_liveness: bool,
+) -> bool {
+    guaranteed
+        && (previous_input.archive_identifier.is_some() || deferred_local_symbol_cohort_liveness)
+}
+
 fn validate_deferred_macho_local_cohort_liveness(
     deferred: bool,
     replan: WholeMemberMachOLocalCohortReplan,
@@ -19956,12 +19986,14 @@ fn matched_macho_local_text_target_ownership(
         r_length: record_kind.r_length,
         addend: relocation.addend,
     };
-    let whole_member_cohort_replan_is_guaranteed = normalize_rust_archive_patch_inputs
-        && previous_input.archive_identifier.is_some()
-        && current_input.archive_identifier.is_some()
-        && previous_input.bytes != current_input.bytes
-        && previous_file.architecture() == object::Architecture::Aarch64
-        && current_file.architecture() == object::Architecture::Aarch64;
+    let whole_member_cohort_replan_is_guaranteed =
+        macho_local_cohort_whole_input_replan_is_guaranteed(
+            normalize_rust_archive_patch_inputs,
+            previous_input,
+            current_input,
+            previous_file.architecture(),
+            current_file.architecture(),
+        );
     let mut deferred_local_symbol_cohort_liveness = false;
     let local_symbol_cohort = match macho_local_cohort_plan_timing(
         published_symbols,
@@ -19970,7 +20002,7 @@ fn matched_macho_local_text_target_ownership(
     ) {
         MachOLocalCohortPlanTiming::NotRequired => None,
         MachOLocalCohortPlanTiming::DeferredToWholeMember => {
-            // This archive member is replanned once after every exact incoming edge has been
+            // This input pair is replanned once after every exact incoming edge has been
             // collected. Avoid rebuilding the same whole-member liveness graph per retarget.
             deferred_local_symbol_cohort_liveness = true;
             None
@@ -26645,13 +26677,19 @@ fn macho_text_relocation_replays_for_input(
                 replays.truncate(replay_start);
             }
         }
-        if normalize_rust_archive_patch_inputs
-            && previous_input_bytes.archive_identifier.is_some()
-            && current_input_bytes.archive_identifier.is_some()
-            && previous_input_bytes.bytes != current_input_bytes.bytes
-            && previous_file.architecture() == object::Architecture::Aarch64
-            && current_file.architecture() == object::Architecture::Aarch64
-        {
+        let whole_input_cohort_replan_is_guaranteed =
+            macho_local_cohort_whole_input_replan_is_guaranteed(
+                normalize_rust_archive_patch_inputs,
+                previous_input_bytes,
+                current_input_bytes,
+                previous_file.architecture(),
+                current_file.architecture(),
+            );
+        if macho_local_cohort_whole_input_replan_is_required(
+            whole_input_cohort_replan_is_guaranteed,
+            previous_input_bytes,
+            deferred_local_symbol_cohort_liveness,
+        ) {
             match changed_macho_local_symbol_cohort_plan(
                 relocations,
                 resolutions,
@@ -66365,6 +66403,58 @@ mod tests {
             macho_local_cohort_plan_timing(ExactLocalMachOOutputSymbol::Inexact, false, true),
             MachOLocalCohortPlanTiming::DeferredToWholeMember,
         );
+
+        let direct = |bytes| PatchInputBytes {
+            bytes,
+            file_offset: 0,
+            archive_identifier: None,
+        };
+        let archived = |bytes| PatchInputBytes {
+            bytes,
+            file_offset: 0,
+            archive_identifier: Some(b"member.o"),
+        };
+        let guarantees_replan = |previous, current| {
+            macho_local_cohort_whole_input_replan_is_guaranteed(
+                true,
+                previous,
+                current,
+                object::Architecture::Aarch64,
+                object::Architecture::Aarch64,
+            )
+        };
+        assert!(guarantees_replan(direct(b"previous"), direct(b"current")));
+        assert!(guarantees_replan(
+            archived(b"previous"),
+            archived(b"current")
+        ));
+        assert!(!guarantees_replan(
+            direct(b"previous"),
+            archived(b"current")
+        ));
+        assert!(!guarantees_replan(direct(b"same"), direct(b"same")));
+        assert!(!macho_local_cohort_whole_input_replan_is_guaranteed(
+            false,
+            direct(b"previous"),
+            direct(b"current"),
+            object::Architecture::Aarch64,
+            object::Architecture::Aarch64,
+        ));
+        assert!(macho_local_cohort_whole_input_replan_is_required(
+            true,
+            archived(b"previous"),
+            false,
+        ));
+        assert!(!macho_local_cohort_whole_input_replan_is_required(
+            true,
+            direct(b"previous"),
+            false,
+        ));
+        assert!(macho_local_cohort_whole_input_replan_is_required(
+            true,
+            direct(b"previous"),
+            true,
+        ));
     }
 
     #[test]
