@@ -1188,6 +1188,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
 
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
+    let mut rewritten_input_contents = HashMap::new();
     let mut checked_ambiguous_inputs = false;
     let input_checks = {
         timing_phase!("Check incremental fast-path input contents");
@@ -1197,7 +1198,10 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
             .enumerate()
             .map(|(index, input)| {
                 let path = decode_path(&input.path)?;
-                if input.content.identity_matches_path(&path)? {
+                let current_identity = FileIdentity::from_path(&path)?;
+                let identity_matches = input.content.identity.as_ref().is_some()
+                    && input.content.identity.as_ref() == current_identity.as_ref();
+                if identity_matches {
                     if input_content_is_anchored_before_link_start(
                         input,
                         previous.link_start.as_ref(),
@@ -1205,12 +1209,30 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                         .content
                         .identity_is_ambiguous_since(previous.link_start.as_ref())
                     {
-                        return Ok((None, None, false));
+                        return Ok((None, None, false, None));
                     }
-                    if input_content_matches_previous(&state_dir, input, &path)? {
-                        return Ok((None, None, true));
+                    if stable_input_content_matching_previous(input, &path)?.is_some() {
+                        return Ok((None, None, true, None));
                     }
-                    return Ok((Some((index, path)), None, true));
+                    return Ok((Some((index, path)), None, true, None));
+                }
+                // Creating another hardlink advances ctime without changing the inode data. A
+                // full hash keeps that metadata-only change out of the archive patcher without
+                // hiding same-size in-place writes that preserve mtime.
+                let change_time_only = input
+                    .content
+                    .identity
+                    .as_ref()
+                    .zip(current_identity.as_ref())
+                    .is_some_and(|(previous, current)| {
+                        previous != current
+                            && previous.matches_same_data_ignoring_change_time(current)
+                    });
+                if change_time_only
+                    && !input.content.hash.is_empty()
+                    && let Some(content) = stable_input_content_matching_previous(input, &path)?
+                {
+                    return Ok((None, Some((index, path)), false, Some(content)));
                 }
                 if args.should_patch_changed_inputs_before_loading()
                     && (input.patch.is_some()
@@ -1220,20 +1242,23 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     // The patcher must read a changed input under a stable identity anyway. Let it
                     // classify patchable identity replacements during that read instead of hashing
                     // the same large archive first.
-                    return Ok((Some((index, path)), None, false));
+                    return Ok((Some((index, path)), None, false, None));
                 }
-                if input_content_matches_previous(&state_dir, input, &path)? {
-                    return Ok((None, Some((index, path)), false));
+                if let Some(content) = stable_input_content_matching_previous(input, &path)? {
+                    return Ok((None, Some((index, path)), false, Some(content)));
                 }
-                Ok((Some((index, path)), None, false))
+                Ok((Some((index, path)), None, false, None))
             })
             .collect::<Result<Vec<_>>>()?
     };
-    for (changed_input, rewritten_input, checked_ambiguous_input) in input_checks {
+    for (changed_input, rewritten_input, checked_ambiguous_input, stable_content) in input_checks {
         if let Some(changed_input) = changed_input {
             changed_inputs.push(changed_input);
         }
         if let Some(rewritten_input) = rewritten_input {
+            if let Some(stable_content) = stable_content {
+                rewritten_input_contents.insert(rewritten_input.0, stable_content);
+            }
             rewritten_inputs.push(rewritten_input);
         }
         checked_ambiguous_inputs |= checked_ambiguous_input;
@@ -1241,19 +1266,44 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
 
     if !rewritten_inputs.is_empty() {
         timing_phase!("Snapshot rewritten incremental inputs");
+        let inputs_needing_snapshot = rewritten_inputs
+            .iter()
+            .filter(|(input_index, _)| {
+                previous
+                    .input_files
+                    .get(*input_index)
+                    .is_none_or(|input| input.snapshot_identity.is_none())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         snapshot_input_paths(
             &state_dir,
-            rewritten_inputs
+            inputs_needing_snapshot
                 .iter()
-                .filter(|(input_index, _)| {
-                    previous
-                        .input_files
-                        .get(*input_index)
-                        .is_none_or(|input| input.snapshot_identity.is_none())
-                })
                 .map(|(_, path)| path.as_path()),
         )?;
-        refresh_snapshotted_rewritten_input_metadata(&state_dir, &mut previous, &rewritten_inputs);
+        for (input_index, path) in inputs_needing_snapshot {
+            let Some(input) = previous.input_files.get(input_index) else {
+                return Ok(false);
+            };
+            let Some(content) = stable_input_content_matching_previous(input, &path)? else {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "incremental fast path unavailable before loading inputs: rewritten input changed while installing snapshot: {}",
+                        path.display()
+                    ),
+                )?;
+                return Ok(false);
+            };
+            rewritten_input_contents.insert(input_index, content);
+        }
+        refresh_snapshotted_rewritten_input_metadata(
+            &state_dir,
+            &mut previous,
+            &rewritten_inputs,
+            &rewritten_input_contents,
+        );
     }
 
     if !changed_inputs.is_empty() {
@@ -1348,6 +1398,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 &state_dir,
                 &mut full_previous,
                 &rewritten_inputs,
+                &rewritten_input_contents,
             );
             apply_preclassified_unchanged_rustc_rlibs(
                 &mut full_previous,
@@ -1429,6 +1480,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     &state_dir,
                     &mut previous,
                     &rewritten_inputs,
+                    &rewritten_input_contents,
                 );
                 apply_preclassified_unchanged_rustc_rlibs(
                     &mut previous,
@@ -1510,6 +1562,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     &state_dir,
                     &mut previous,
                     &rewritten_inputs,
+                    &rewritten_input_contents,
                 );
                 apply_preclassified_unchanged_rustc_rlibs(
                     &mut previous,
@@ -1554,6 +1607,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                         &state_dir,
                         &mut full_previous,
                         &rewritten_inputs,
+                        &rewritten_input_contents,
                     );
                     apply_preclassified_unchanged_rustc_rlibs(
                         &mut full_previous,
@@ -1592,6 +1646,7 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                         &state_dir,
                         &mut full_previous,
                         &rewritten_inputs,
+                        &rewritten_input_contents,
                     );
                     apply_preclassified_unchanged_rustc_rlibs(
                         &mut full_previous,
@@ -1649,7 +1704,12 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
     if (!rewritten_inputs.is_empty() || checked_ambiguous_inputs)
         && let Some(mut metadata) = PersistedState::read_metadata(&state_dir)?
     {
-        refresh_snapshotted_rewritten_input_metadata(&state_dir, &mut metadata, &rewritten_inputs);
+        refresh_snapshotted_rewritten_input_metadata(
+            &state_dir,
+            &mut metadata,
+            &rewritten_inputs,
+            &rewritten_input_contents,
+        );
         metadata.link_start = current_link_start;
         metadata.write_metadata_update(&state_dir)?;
     }
@@ -1682,8 +1742,9 @@ fn refresh_snapshotted_rewritten_input_metadata(
     state_dir: &Path,
     previous: &mut PersistedState,
     rewritten_inputs: &[(usize, PathBuf)],
+    rewritten_input_contents: &HashMap<usize, FileContentState>,
 ) {
-    refresh_rewritten_input_identities(previous, rewritten_inputs);
+    refresh_rewritten_input_identities(previous, rewritten_inputs, rewritten_input_contents);
     refresh_input_snapshot_identities_at_indices(
         state_dir,
         &mut previous.input_files,
@@ -2553,11 +2614,18 @@ fn apply_preclassified_unchanged_rustc_rlibs(
 fn refresh_rewritten_input_identities(
     previous: &mut PersistedState,
     rewritten_inputs: &[(usize, PathBuf)],
+    rewritten_input_contents: &HashMap<usize, FileContentState>,
 ) {
-    refresh_input_file_identities_at_indices(
-        &mut previous.input_files,
-        rewritten_inputs.iter().map(|(input_index, _)| *input_index),
-    );
+    for (input_index, _) in rewritten_inputs {
+        let Some(input) = previous.input_files.get_mut(*input_index) else {
+            continue;
+        };
+        if let Some(content) = rewritten_input_contents.get(input_index) {
+            input.content = content.clone();
+        } else {
+            refresh_input_file_identity(input);
+        }
+    }
 }
 
 enum ChangedInputPatchResult {
@@ -48824,6 +48892,19 @@ fn input_content_matches_previous(
     ))
 }
 
+fn stable_input_content_matching_previous(
+    previous_input: &FileState,
+    current_path: &Path,
+) -> Result<Option<FileContentState>> {
+    if previous_input.content.hash.is_empty() {
+        return Ok(None);
+    }
+    let Some(current) = read_file_content_with_stable_identity(current_path)? else {
+        return Ok(None);
+    };
+    Ok(content_state_matches_previous(&previous_input.content, &current).then_some(current))
+}
+
 fn content_state_matches_previous(previous: &FileContentState, current: &FileContentState) -> bool {
     !previous.hash.is_empty() && previous.len == current.len && previous.hash == current.hash
 }
@@ -49247,6 +49328,51 @@ fn snapshot_bytes_match_previous_content(previous_input: &FileState, bytes: &[u8
 
 fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileContentState)>> {
     read_file_with_stable_identity_and_hashing(path, true)
+}
+
+fn read_file_content_with_stable_identity(path: &Path) -> Result<Option<FileContentState>> {
+    let before_metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read metadata for `{}`", path.display()));
+        }
+    };
+    #[cfg(unix)]
+    let before_identity = Some(FileIdentity::from_metadata(&before_metadata));
+    #[cfg(not(unix))]
+    let before_identity: Option<FileIdentity> = None;
+
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read `{}`", path.display()));
+        }
+    };
+    let after_metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read metadata for `{}`", path.display()));
+        }
+    };
+    #[cfg(unix)]
+    let after_identity = Some(FileIdentity::from_metadata(&after_metadata));
+    #[cfg(not(unix))]
+    let after_identity: Option<FileIdentity> = None;
+    if before_identity != after_identity
+        || before_metadata.len() != after_metadata.len()
+        || bytes.len() as u64 != after_metadata.len()
+    {
+        return Ok(None);
+    }
+
+    let mut content = FileContentState::from_bytes(&bytes);
+    content.identity = after_identity;
+    Ok(Some(content))
 }
 
 fn read_file_with_stable_identity_and_hashing(
@@ -89744,7 +89870,7 @@ mod tests {
                 .is_some()
         );
 
-        refresh_rewritten_input_identities(&mut metadata, &[(0, input.clone())]);
+        refresh_rewritten_input_identities(&mut metadata, &[(0, input.clone())], &HashMap::new());
 
         assert_eq!(
             input_identity_mismatch_reason(&metadata.input_files).unwrap(),
@@ -91287,6 +91413,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preloading_hashes_recordful_input_after_hardlink_changes_only_ctime() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("libarchive.rlib");
+        let extra_link = dir.path().join("shared-input-snapshot");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"unchanged archive").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        state.input_files[0].content = FileContentState::from_path(&input).unwrap();
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "recordful-input".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+        let stored_identity = state.input_files[0].content.identity.clone().unwrap();
+        state.write(&state_dir).unwrap();
+
+        std::fs::hard_link(&input, &extra_link).unwrap();
+        let linked_identity = FileIdentity::from_path(&input).unwrap().unwrap();
+        assert_ne!(stored_identity, linked_identity);
+        assert!(stored_identity.matches_same_data_ignoring_change_time(&linked_identity));
+
+        assert!(maybe_reuse_output_before_loading(&args).unwrap());
+
+        let updated = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        assert!(
+            updated.input_files[0]
+                .content
+                .identity_matches_path(&input)
+                .unwrap()
+        );
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        assert!(snapshot.exists());
+        assert_eq!(
+            updated.input_files[0].snapshot_identity,
+            FileIdentity::from_path(&snapshot).unwrap(),
+        );
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains("updated 1 rewritten input file before loading inputs"));
+        assert!(log.contains("reused existing output before loading inputs"));
+        assert!(!log.contains("loaded records for"));
+        assert!(!log.contains("patched 1 changed input file before loading inputs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preloading_rejects_ctime_only_identity_change_when_content_hash_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("libarchive.rlib");
+        let extra_link = dir.path().join("shared-input-snapshot");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"unchanged archive").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        state.input_files[0].content = FileContentState::from_path(&input).unwrap();
+        state.input_files[0].content.hash = hash_bytes(b"different archive");
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "recordful-input".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+        let stored_identity = state.input_files[0].content.identity.clone().unwrap();
+        state.write(&state_dir).unwrap();
+
+        std::fs::hard_link(&input, &extra_link).unwrap();
+        let linked_identity = FileIdentity::from_path(&input).unwrap().unwrap();
+        assert_ne!(stored_identity, linked_identity);
+        assert!(stored_identity.matches_same_data_ignoring_change_time(&linked_identity));
+
+        assert!(!maybe_reuse_output_before_loading(&args).unwrap());
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(!log.contains("reused existing output before loading inputs"));
+    }
+
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn preloading_installs_missing_snapshot_for_same_content_input_rewrite() {
@@ -91394,6 +91614,27 @@ mod tests {
 
         assert_eq!(bytes, b"abcd");
         assert_eq!(content, FileContentState::from_path(&path).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn stable_content_read_records_identity_and_treats_missing_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.o");
+        std::fs::write(&path, b"abcd").unwrap();
+
+        assert_eq!(
+            read_file_content_with_stable_identity(&path)
+                .unwrap()
+                .unwrap(),
+            FileContentState::from_path(&path).unwrap(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            read_file_content_with_stable_identity(&path)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
