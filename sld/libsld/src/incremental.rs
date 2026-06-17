@@ -3547,8 +3547,6 @@ fn retained_macho_output_owner_mappings(
         };
         if archive_member_patch_identifier(previous_identifier) != normalized_identifier
             || archive_member_patch_identifier(current_identifier) != normalized_identifier
-            || resolved_patch_input_ref(input_file_path, record.input.as_str(), previous_input)?
-                != record.input.as_str()
             || previous_input.bytes == current_input.bytes
         {
             continue;
@@ -58411,6 +58409,7 @@ mod tests {
         let current_a_identifier = b"crate-hash.a.current.rcgu.o";
         let previous_b_identifier = b"crate-hash.b.previous.rcgu.o";
         let current_b_identifier = b"crate-hash.b.current.rcgu.o";
+        let stale_b_identifier = b"crate-hash.b.stale.rcgu.o";
         let ambiguous_b_identifier = b"crate-hash.b.ambiguous.rcgu.o";
         let previous_a = test_macho_object(b"old!", b"same", 0);
         let current_a = test_macho_object(b"new!", b"same", 0);
@@ -58482,6 +58481,22 @@ mod tests {
             resolved_patch_input_ref(&input_file, &input_file, current_a_member).unwrap();
         let current_b_input =
             resolved_patch_input_ref(&input_file, &input_file, current_b_member).unwrap();
+        let stale_b_input = resolved_patch_input_ref(
+            &input_file,
+            &input_file,
+            PatchInputBytes {
+                bytes: b"stale",
+                file_offset: 12_345_678,
+                archive_identifier: Some(stale_b_identifier),
+            },
+        )
+        .unwrap();
+        assert_ne!(stale_b_input, previous_b_input);
+        assert_ne!(stale_b_input, current_b_input);
+        assert!(
+            normalized_archive_input_refs_match(&input_file, &stale_b_input, &previous_b_input,)
+                .unwrap()
+        );
 
         let previous_a_file = object::File::parse(previous_a_member.bytes).unwrap();
         let current_a_file = object::File::parse(current_a_member.bytes).unwrap();
@@ -58566,14 +58581,14 @@ mod tests {
         };
         let text_const_record = SectionRecord {
             input_file: input_file.clone().into(),
-            input: previous_b_input.clone().into(),
+            input: stale_b_input.clone().into(),
             section_index: b_text_const_index,
             output_offset: 0x200,
             size: previous_b_text_const.size(),
         };
         let data_const_record = SectionRecord {
             input_file: input_file.clone().into(),
-            input: previous_b_input.into(),
+            input: stale_b_input.clone().into(),
             section_index: b_data_const_index,
             output_offset: 0x300,
             size: previous_b_data_const.size(),
@@ -58599,6 +58614,11 @@ mod tests {
             recovered
                 .iter()
                 .all(|mapping| mapping.current.input == current_b_input)
+        );
+        assert!(
+            recovered
+                .iter()
+                .all(|mapping| mapping.previous.input == stale_b_input)
         );
         assert!(recovered.iter().any(|mapping| {
             mapping.current.section_name.as_deref() == Some("__TEXT,__const")
