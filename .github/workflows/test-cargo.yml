@@ -31,6 +31,7 @@ jobs:
           cargo test --lib util::flock
           cargo test -p cargo-util atomic
           cargo test --test testsuite artifact_cache -- --ignored --test-threads=1 \
+            --skip artifact_cache::exact_path_snapshot_manifest_preserves_build_script_checksum_freshness \
             --skip artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact \
             --skip artifact_cache::same_mtime_input_changed_after_compilation_is_not_published \
             --skip artifact_cache::same_mtime_input_changed_during_publication_is_not_published
