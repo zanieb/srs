@@ -4844,6 +4844,60 @@ fn macho_symbol_binding_metadata(entry: &[u8]) -> Option<MachOSymbolBindingMetad
     })
 }
 
+fn rollback_resolution_has_unchanged_archive_member_without_symbol(
+    input_file_path: &str,
+    resolution: &MachOSymbolResolutionRecord,
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+) -> Result<bool> {
+    let Some(target) = resolution
+        .target
+        .as_ref()
+        .filter(|target| target.input_file == input_file_path)
+    else {
+        return Ok(false);
+    };
+    let Some(parsed) = parse_patch_input_ref(input_file_path, target.input.as_str())? else {
+        return Ok(false);
+    };
+    if parsed.identifier.is_empty() {
+        return Ok(false);
+    }
+    let normalized_identifier = archive_member_patch_identifier(&parsed.identifier);
+    let (Some(previous_members), Some(current_members)) = (
+        unique_archive_member_bytes_by_normalized_identifier(previous_bytes)?,
+        unique_archive_member_bytes_by_normalized_identifier(current_bytes)?,
+    ) else {
+        return Ok(false);
+    };
+    let (Some(Some(previous_member)), Some(Some(current_member))) = (
+        previous_members.get(&normalized_identifier),
+        current_members.get(&normalized_identifier),
+    ) else {
+        return Ok(false);
+    };
+    if previous_member != current_member {
+        return Ok(false);
+    }
+    let Ok(current_file) = object::File::parse(*current_member) else {
+        return Ok(false);
+    };
+    let name = hex::decode(resolution.name.as_str())
+        .context("Malformed active rollback Mach-O symbol name")?;
+    for symbol in current_file.symbols() {
+        if symbol.name_bytes()? == name {
+            return Ok(false);
+        }
+    }
+    let Some(current_symbols) = MachOArchiveSymbolInputLookup::new(current_bytes)? else {
+        return Ok(false);
+    };
+    if current_symbols.contains(resolution.name.as_str()) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn validate_active_macho_archive_rollback_symbol_resolutions_for_input(
     input_files: &[FileState],
     input: &FileState,
@@ -4921,6 +4975,16 @@ fn validate_active_macho_archive_rollback_symbol_resolutions_for_input(
                         .to_owned(),
                 ));
             };
+            if let Some((previous_bytes, _)) = reuse_context
+                && rollback_resolution_has_unchanged_archive_member_without_symbol(
+                    input.path.as_str(),
+                    stored,
+                    previous_bytes,
+                    bytes,
+                )?
+            {
+                continue;
+            }
             let mut current = stored.clone();
             let updates = match update_macho_symbol_resolutions_for_input_with_reuse(
                 std::slice::from_mut(&mut current),
@@ -34960,6 +35024,52 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         Err(reason) => return Ok(Err(reason)),
     };
     if changed.members.is_empty() {
+        if let Some(state) = historical_unwind_state
+            && state.kind == MachOArchiveActivationKind::AddedMembers
+        {
+            let Some(transaction) = state.unwind_transaction.as_ref() else {
+                return Ok(Err(
+                    "historical Mach-O unwind ownership has no version state".to_owned(),
+                ));
+            };
+            let (previous_common_members, current_common_members) = if state.active {
+                (
+                    transaction.rollback.common_members.clone(),
+                    transaction.forward.common_members.clone(),
+                )
+            } else {
+                (
+                    transaction.forward.common_members.clone(),
+                    transaction.rollback.common_members.clone(),
+                )
+            };
+            let transition = ChangedMachOArchiveUnwindMembers {
+                members: Vec::new(),
+                previous_common_members,
+                current_common_members,
+                retired_entries: Vec::new(),
+                retired_fdes: Vec::new(),
+                current_sections: Vec::new(),
+                previous_input_ranges: Vec::new(),
+                current_input_ranges: Vec::new(),
+            };
+            let remaining_reserved_ranges = match reuse_historical_macho_archive_unwind_transaction(
+                state,
+                &transition,
+                previous_output,
+                reserved_ranges,
+            ) {
+                Ok(ranges) => ranges,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            return Ok(Ok(Some(ChangedMachOArchiveUnwindActivation {
+                patches: Vec::new(),
+                previous_input_ranges: changed.previous_input_ranges,
+                current_input_ranges: changed.current_input_ranges,
+                remaining_reserved_ranges,
+                unwind_transaction: None,
+            })));
+        }
         if historical_unwind_state.is_some() {
             return Ok(Err(
                 "historical Mach-O unwind ownership was not consumed by an exact common-member transition"
@@ -35622,7 +35732,7 @@ fn added_macho_archive_text_activations(
             .unwrap_or_default(),
         Err(reason) => return Ok(Err(reason)),
     };
-    let unwind_transaction = if changed_unwind.previous_common_members.is_empty() {
+    let unwind_transaction = if unwind_patches.is_empty() {
         None
     } else {
         let rollback_reserve = match macho_eh_frame_reserve_state(&output_file, reserved_ranges)? {
@@ -47246,29 +47356,32 @@ fn parse_macho_archive_unwind_version_state(
     let (members, reserve) = encoded
         .split_once('|')
         .context("Malformed incremental Mach-O archive unwind version state")?;
-    let common_members = members
-        .split(',')
-        .map(|member| {
-            let (identifier, object_hash) = member
-                .split_once('=')
-                .context("Malformed incremental Mach-O archive unwind member identity")?;
-            let normalized_identifier = hex::decode(identifier)
-                .context("Invalid incremental Mach-O archive unwind member identifier")?;
-            if normalized_identifier.is_empty() || !is_blake3_hex_digest(object_hash) {
-                return Err(crate::error!(
-                    "Invalid incremental Mach-O archive unwind member identity"
-                ));
-            }
-            Ok(MachOArchiveMemberIdentity {
-                normalized_identifier,
-                object_hash: object_hash.to_owned(),
+    let common_members = if members.is_empty() {
+        Vec::new()
+    } else {
+        members
+            .split(',')
+            .map(|member| {
+                let (identifier, object_hash) = member
+                    .split_once('=')
+                    .context("Malformed incremental Mach-O archive unwind member identity")?;
+                let normalized_identifier = hex::decode(identifier)
+                    .context("Invalid incremental Mach-O archive unwind member identifier")?;
+                if normalized_identifier.is_empty() || !is_blake3_hex_digest(object_hash) {
+                    return Err(crate::error!(
+                        "Invalid incremental Mach-O archive unwind member identity"
+                    ));
+                }
+                Ok(MachOArchiveMemberIdentity {
+                    normalized_identifier,
+                    object_hash: object_hash.to_owned(),
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if common_members.is_empty()
-        || common_members
-            .windows(2)
-            .any(|pair| pair[0].normalized_identifier >= pair[1].normalized_identifier)
+            .collect::<Result<Vec<_>>>()?
+    };
+    if common_members
+        .windows(2)
+        .any(|pair| pair[0].normalized_identifier >= pair[1].normalized_identifier)
     {
         return Err(crate::error!(
             "Invalid incremental Mach-O archive unwind member identities"
@@ -57913,6 +58026,183 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolutions, vec![rollback]);
+    }
+
+    #[test]
+    fn unchanged_archive_owner_preserves_active_rollback_resolution() {
+        fn archive(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, object) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                        *object,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        }
+
+        let owner_identifier = b"retired.S.o";
+        let previous_unrelated_identifier = b"crate-hash.unrelated.previous.rcgu.o";
+        let current_unrelated_identifier = b"crate-hash.unrelated.current.rcgu.o";
+        let other_identifier = b"crate-hash.other.current.rcgu.o";
+        let output = test_macho_object(&vec![0; 0x200], &vec![0; 0x200], 0x100);
+        let output_file = object::File::parse(output.as_slice()).unwrap();
+        let output_data = output_file.section_by_name("__data").unwrap();
+        let output_offset = output_data.file_range().unwrap().0 + 0x100;
+        let output_value =
+            macho_output_address_for_file_offset(&output_file, output_offset).unwrap();
+        let output_entry = test_macho_symbol_entry_offset(&output, b"_data");
+        let rollback_nlist = output[output_entry..output_entry + 16].to_vec();
+
+        let mut member = test_macho_object(b"text", b"data", 0);
+        let name_offset = member
+            .windows(b"_data".len())
+            .rposition(|window| window == b"_data")
+            .unwrap();
+        member[name_offset..name_offset + b"_data".len()].copy_from_slice(b"_gone");
+        let member_file = object::File::parse(member.as_slice()).unwrap();
+        let member_text_offset = member_file
+            .section_by_name("__text")
+            .unwrap()
+            .file_range()
+            .unwrap()
+            .0 as usize;
+        let member_data = member_file.section_by_name("__data").unwrap();
+        let previous = archive(&[
+            (owner_identifier, member.as_slice()),
+            (previous_unrelated_identifier, member.as_slice()),
+        ]);
+        let current = archive(&[
+            (owner_identifier, member.as_slice()),
+            (current_unrelated_identifier, member.as_slice()),
+        ]);
+        let input_path = hex::encode("input.rlib");
+        let owner_path = hex::encode("owner.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous, owner_identifier).unwrap()
+        else {
+            panic!("expected unique previous archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_path, &input_path, previous_member).unwrap();
+        let rollback = MachOSymbolResolutionRecord {
+            name: SharedText::from(hex::encode("_data")),
+            direct_value: Some(output_value),
+            got_address: None,
+            stub_address: None,
+            thunk_addresses: Vec::new(),
+            target: Some(RelocationTargetRecord {
+                input_file: input_path.clone().into(),
+                input: previous_input.into(),
+                section_index: member_data.index().0 as u32,
+                section_offset: 0,
+            }),
+        };
+        let active = MachOArchiveActivationState {
+            kind: MachOArchiveActivationKind::AddedMembers,
+            members: Vec::new(),
+            active: true,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            indirect_dependencies: Vec::new(),
+            rollback_symbol_resolutions: vec![rollback],
+            forward_patches: vec![StoredOutputPatch {
+                output_offset: 0,
+                data: rollback_nlist.clone(),
+            }],
+            rollback_patches: vec![StoredOutputPatch {
+                output_offset: 0,
+                data: rollback_nlist,
+            }],
+            unwind_transaction: None,
+        };
+        let input = FileState {
+            path: input_path.clone(),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let owner = FileState {
+            path: owner_path,
+            content: FileContentState::from_bytes(&[]),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: vec![active],
+                sections: Vec::new(),
+                raw_sections: None,
+            }),
+        };
+        let input_files = [input.clone(), owner];
+
+        validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &input_files,
+            &input,
+            &current,
+            Some((&[], &output)),
+            Some((&previous, &[])),
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut changed_member = member.clone();
+        changed_member[member_text_offset] ^= 1;
+        let changed = archive(&[
+            (owner_identifier, changed_member.as_slice()),
+            (current_unrelated_identifier, member.as_slice()),
+        ]);
+        let reason = validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &input_files,
+            &input,
+            &changed,
+            Some((&[], &output)),
+            Some((&previous, &[])),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(reason.contains("shadowed by an active rollback transaction"));
+
+        let ambiguous = archive(&[
+            (owner_identifier, member.as_slice()),
+            (owner_identifier, member.as_slice()),
+            (current_unrelated_identifier, member.as_slice()),
+        ]);
+        let reason = validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &input_files,
+            &input,
+            &ambiguous,
+            Some((&[], &output)),
+            Some((&previous, &[])),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(reason.contains("shadowed by an active rollback transaction"));
+
+        let defining_member = test_macho_object(b"text", b"data", 0);
+        let shadowed = archive(&[
+            (owner_identifier, member.as_slice()),
+            (current_unrelated_identifier, member.as_slice()),
+            (other_identifier, defining_member.as_slice()),
+        ]);
+        let reason = validate_active_macho_archive_rollback_symbol_resolutions_for_input(
+            &input_files,
+            &input,
+            &shadowed,
+            Some((&[], &output)),
+            Some((&previous, &[])),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(reason.contains("shadowed by an active rollback transaction"));
     }
 
     #[test]
@@ -70510,8 +70800,8 @@ mod tests {
             current: matched[0].current.clone(),
         }];
         let fixed_current_sections = vec![fixed_current_matched[0].current.clone()];
-        let mut fixed_retirement = historical_state.clone();
-        fixed_retirement.active = false;
+        let mut fixed_retirement_state = historical_state.clone();
+        fixed_retirement_state.active = false;
         let fixed_retirement = changed_macho_archive_unwind_activation_with_local_symbol_renames(
             &current_archive,
             &current_archive,
@@ -70525,18 +70815,57 @@ mod tests {
             &activation.remaining_reserved_ranges,
             &[],
             &[],
-            Some(&fixed_retirement),
+            Some(&fixed_retirement_state),
             &[],
             &[],
             &HashSet::new(),
             &[],
             &[],
         )
+        .unwrap()
+        .unwrap()
         .unwrap();
-        let Err(fixed_retirement) = fixed_retirement else {
-            panic!("fixed common unwind unexpectedly skipped retirement ownership");
+        assert!(fixed_retirement.patches.is_empty());
+        assert!(fixed_retirement.unwind_transaction.is_none());
+        assert_eq!(
+            fixed_retirement.remaining_reserved_ranges,
+            vec![ReservedRangeRecord {
+                output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+                alignment_exponent: 3,
+                output_offset: unwind_transaction.rollback.eh_frame_reserve.start,
+                size: unwind_transaction.rollback.eh_frame_reserve.end
+                    - unwind_transaction.rollback.eh_frame_reserve.start,
+            }]
+        );
+
+        let mut wrong_kind_retirement = fixed_retirement_state.clone();
+        wrong_kind_retirement.kind = MachOArchiveActivationKind::ChangedDefinitionsWithUnwind;
+        let wrong_kind_retirement =
+            changed_macho_archive_unwind_activation_with_local_symbol_renames(
+                &current_archive,
+                &current_archive,
+                &input_file_path,
+                &fixed_current_matched,
+                &[],
+                &fixed_current_sections,
+                &current_resolver,
+                &current_version_output,
+                &[],
+                &activation.remaining_reserved_ranges,
+                &[],
+                &[],
+                Some(&wrong_kind_retirement),
+                &[],
+                &[],
+                &HashSet::new(),
+                &[],
+                &[],
+            )
+            .unwrap();
+        let Err(wrong_kind_retirement) = wrong_kind_retirement else {
+            panic!("fixed changed-definition unwind skipped retirement ownership");
         };
-        assert!(fixed_retirement.contains("was not consumed"));
+        assert!(wrong_kind_retirement.contains("was not consumed"));
 
         let previous_resolver = PatchInputResolver::new(&previous_archive, true).unwrap();
         let fixed_previous_matched = vec![MatchedPatchSection {
@@ -70566,11 +70895,53 @@ mod tests {
             &[],
             &[],
         )
+        .unwrap()
+        .unwrap()
         .unwrap();
-        let Err(fixed_reactivation) = fixed_reactivation else {
-            panic!("fixed common unwind unexpectedly skipped reactivation ownership");
+        assert!(fixed_reactivation.patches.is_empty());
+        assert!(fixed_reactivation.unwind_transaction.is_none());
+        assert_eq!(
+            fixed_reactivation.remaining_reserved_ranges,
+            activation.remaining_reserved_ranges
+        );
+
+        let empty_unwind_transaction = MachOArchiveUnwindTransactionState {
+            forward: MachOArchiveUnwindVersionState {
+                common_members: Vec::new(),
+                eh_frame_reserve: unwind_transaction.forward.eh_frame_reserve,
+            },
+            rollback: MachOArchiveUnwindVersionState {
+                common_members: Vec::new(),
+                eh_frame_reserve: unwind_transaction.rollback.eh_frame_reserve,
+            },
         };
-        assert!(fixed_reactivation.contains("was not consumed"));
+        let mut pure_added_state = historical_state.clone();
+        pure_added_state.unwind_transaction = Some(empty_unwind_transaction.clone());
+        pure_added_state.active = false;
+        pure_added_state = round_trip_state(&pure_added_state);
+        assert_eq!(
+            pure_added_state.unwind_transaction,
+            Some(empty_unwind_transaction.clone())
+        );
+        let empty_change = changed_for_direction(Vec::new(), Vec::new());
+        let retired_reserves = reuse_historical_macho_archive_unwind_transaction(
+            &pure_added_state,
+            &empty_change,
+            &current_version_output,
+            &activation.remaining_reserved_ranges,
+        )
+        .unwrap();
+        assert_eq!(retired_reserves, reserves);
+        pure_added_state.active = true;
+        pure_added_state = round_trip_state(&pure_added_state);
+        let reactivated_reserves = reuse_historical_macho_archive_unwind_transaction(
+            &pure_added_state,
+            &empty_change,
+            &previous_version_output,
+            &retired_reserves,
+        )
+        .unwrap();
+        assert_eq!(reactivated_reserves, activation.remaining_reserved_ranges);
 
         let mut legacy_unwind_state = historical_state.clone();
         legacy_unwind_state.unwind_transaction = None;
@@ -70582,6 +70953,31 @@ mod tests {
             .unwrap(),
             "legacy unwind ownership was not classified fail-closed",
         );
+        let legacy_transition = changed_macho_archive_unwind_activation_with_local_symbol_renames(
+            &current_archive,
+            &current_archive,
+            &input_file_path,
+            &fixed_current_matched,
+            &[],
+            &fixed_current_sections,
+            &current_resolver,
+            &current_version_output,
+            &[],
+            &activation.remaining_reserved_ranges,
+            &[],
+            &[],
+            Some(&legacy_unwind_state),
+            &[],
+            &[],
+            &HashSet::new(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let Err(legacy_transition) = legacy_transition else {
+            panic!("legacy unwind ownership skipped version validation");
+        };
+        assert!(legacy_transition.contains("no version state"));
         assert!(
             validate_historical_macho_archive_unwind_planning(Some(&historical_state), false)
                 .unwrap_err()
