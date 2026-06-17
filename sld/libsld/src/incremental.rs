@@ -12054,6 +12054,18 @@ struct ValidatedMachOLocalRelocationRetarget {
     current: ValidatedMachOLocalRelocationSite,
 }
 
+impl ValidatedMachOLocalRelocationRetarget {
+    fn belongs_to_input(&self, input_file_path: &str) -> bool {
+        self.input_file.as_str() == input_file_path
+    }
+
+    fn belongs_to_archive_input(&self, input_file_path: &str) -> bool {
+        self.belongs_to_input(input_file_path)
+            && (!self.previous.archive_identifier.is_empty()
+                || !self.current.archive_identifier.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ValidatedMachOLocalSymbolSite {
     archive_identifier: Vec<u8>,
@@ -12066,6 +12078,18 @@ struct ValidatedMachOLocalSymbolRename {
     input_file: SharedText,
     previous: ValidatedMachOLocalSymbolSite,
     current: ValidatedMachOLocalSymbolSite,
+}
+
+impl ValidatedMachOLocalSymbolRename {
+    fn belongs_to_input(&self, input_file_path: &str) -> bool {
+        self.input_file.as_str() == input_file_path
+    }
+
+    fn belongs_to_archive_input(&self, input_file_path: &str) -> bool {
+        self.belongs_to_input(input_file_path)
+            && (!self.previous.archive_identifier.is_empty()
+                || !self.current.archive_identifier.is_empty())
+    }
 }
 
 struct MatchedMachOLocalTextTargetOwnership {
@@ -32425,12 +32449,12 @@ fn archive_diff_allows_changed_macho_symbols(
     current_ranges.extend(current_extra_ranges.iter().cloned());
     let previous_local_retargets = validated_local_retargets
         .iter()
-        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
         .map(|retarget| retarget.previous.clone())
         .collect::<Vec<_>>();
     let current_local_retargets = validated_local_retargets
         .iter()
-        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
         .map(|retarget| retarget.current.clone())
         .collect::<Vec<_>>();
     let previous_fingerprint = if ignore_masked_unwind_sections {
@@ -32589,7 +32613,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
     ) else {
         return Ok(validated_local_retargets
             .iter()
-            .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+            .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
             .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
             .unzip());
     };
@@ -32605,7 +32629,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
     };
     Ok(validated_local_retargets
         .iter()
-        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
         .filter(|retarget| {
             retarget.previous.archive_identifier != retarget.current.archive_identifier
                 || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
@@ -32668,7 +32692,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_members(
 
     validated_local_retargets
         .iter()
-        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
         .filter(|retarget| {
             retarget.previous.archive_identifier != retarget.current.archive_identifier
                 || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
@@ -33497,7 +33521,11 @@ fn matched_macho_local_retarget_fingerprint_matches(
 ) -> Result<bool> {
     let retargets = retargets
         .iter()
-        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .filter(|retarget| {
+            retarget.belongs_to_input(input_file_path)
+                && (!normalize_rust_archive_patch_inputs
+                    || retarget.belongs_to_archive_input(input_file_path))
+        })
         .collect::<Vec<_>>();
     if retargets.is_empty() {
         return Ok(false);
@@ -34986,22 +35014,38 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
         return Ok(true);
     }
     let (previous_local_retargets, current_local_retargets) =
-        remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
-            validated_local_retargets,
-            input_file_path,
-            previous_bytes,
-            current_bytes,
-            ignored_previous_identifiers,
-            ignored_current_identifiers,
-        )?;
+        if current_resolver.normalize_rust_archive_patch_inputs {
+            remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
+                validated_local_retargets,
+                input_file_path,
+                previous_bytes,
+                current_bytes,
+                ignored_previous_identifiers,
+                ignored_current_identifiers,
+            )?
+        } else {
+            validated_local_retargets
+                .iter()
+                .filter(|retarget| retarget.belongs_to_input(input_file_path))
+                .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
+                .unzip()
+        };
     let previous_local_symbol_renames = validated_local_symbol_renames
         .iter()
-        .filter(|rename| rename.input_file.as_str() == input_file_path)
+        .filter(|rename| {
+            rename.belongs_to_input(input_file_path)
+                && (!current_resolver.normalize_rust_archive_patch_inputs
+                    || rename.belongs_to_archive_input(input_file_path))
+        })
         .map(|rename| rename.previous.clone())
         .collect::<Vec<_>>();
     let current_local_symbol_renames = validated_local_symbol_renames
         .iter()
-        .filter(|rename| rename.input_file.as_str() == input_file_path)
+        .filter(|rename| {
+            rename.belongs_to_input(input_file_path)
+                && (!current_resolver.normalize_rust_archive_patch_inputs
+                    || rename.belongs_to_archive_input(input_file_path))
+        })
         .map(|rename| rename.current.clone())
         .collect::<Vec<_>>();
     let previous_fingerprint =
@@ -35226,11 +35270,11 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
     if !allows_unwind_only && !allows_unwind_and_definitions {
         let local_retarget_count = validated_local_retargets
             .iter()
-            .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+            .filter(|retarget| retarget.belongs_to_archive_input(input_file_path))
             .count();
         let local_rename_count = validated_local_symbol_renames
             .iter()
-            .filter(|rename| rename.input_file.as_str() == input_file_path)
+            .filter(|rename| rename.belongs_to_archive_input(input_file_path))
             .count();
         return Ok(Err(format!(
             "changed Mach-O archive member differs outside text and unwind metadata: members={}, local-retargets={}, local-renames={}",
@@ -61743,6 +61787,50 @@ mod tests {
             0,
             "retargets from another input must not enter this archive proof",
         );
+
+        let direct = ValidatedMachOLocalRelocationRetarget {
+            input_file: "lib.rlib".into(),
+            previous: site(Vec::new(), 4),
+            current: site(Vec::new(), 9),
+        };
+        assert_eq!(
+            remaining(&direct, &previous, b"malformed", &[], &[]),
+            0,
+            "direct-object retargets must not enter an archive proof",
+        );
+
+        let mixed_domain = ValidatedMachOLocalRelocationRetarget {
+            current: site(normalized, 9),
+            ..direct
+        };
+        assert_eq!(
+            remaining(&mixed_domain, &previous, b"malformed", &[], &[]),
+            1,
+            "a mixed direct/archive retarget must remain for fail-closed validation",
+        );
+
+        let direct_rename = ValidatedMachOLocalSymbolRename {
+            input_file: "lib.rlib".into(),
+            previous: ValidatedMachOLocalSymbolSite {
+                archive_identifier: Vec::new(),
+                section_index: 3,
+                symbol_index: 4,
+            },
+            current: ValidatedMachOLocalSymbolSite {
+                archive_identifier: Vec::new(),
+                section_index: 3,
+                symbol_index: 9,
+            },
+        };
+        assert!(!direct_rename.belongs_to_archive_input("lib.rlib"));
+        let mixed_rename = ValidatedMachOLocalSymbolRename {
+            current: ValidatedMachOLocalSymbolSite {
+                archive_identifier: b"member.o".to_vec(),
+                ..direct_rename.current.clone()
+            },
+            ..direct_rename
+        };
+        assert!(mixed_rename.belongs_to_archive_input("lib.rlib"));
     }
 
     #[test]
@@ -65426,6 +65514,74 @@ mod tests {
                 &current_retarget,
                 &validated_rename.current,
             ),
+        );
+        let mut archive_retargets = previous_retarget
+            .iter()
+            .cloned()
+            .zip(current_retarget.iter().cloned())
+            .map(
+                |(previous, current)| ValidatedMachOLocalRelocationRetarget {
+                    input_file: input_file.clone().into(),
+                    previous,
+                    current,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut direct_noise = archive_retargets[0].clone();
+        direct_noise.previous.archive_identifier.clear();
+        direct_noise.current.archive_identifier.clear();
+        archive_retargets.push(direct_noise.clone());
+        let mut direct_rename_noise = validated_rename.clone();
+        direct_rename_noise.previous.archive_identifier.clear();
+        direct_rename_noise.current.archive_identifier.clear();
+        let archive_renames = [validated_rename.clone(), direct_rename_noise];
+        let unchanged_members = ChangedMachOArchiveUnwindMembers {
+            members: Vec::new(),
+            previous_common_members: Vec::new(),
+            current_common_members: Vec::new(),
+            retired_entries: Vec::new(),
+            retired_fdes: Vec::new(),
+            current_sections: Vec::new(),
+            previous_input_ranges: Vec::new(),
+            current_input_ranges: Vec::new(),
+        };
+        assert!(
+            archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
+                &previous_archive,
+                &current_archive,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &unchanged_members,
+                &[],
+                &[],
+                &HashSet::new(),
+                &archive_retargets,
+                &archive_renames,
+            )
+            .unwrap(),
+            "same-input direct evidence must stay outside an archive proof",
+        );
+        let mut mixed_domain = direct_noise;
+        mixed_domain.current.archive_identifier =
+            validated_rename.current.archive_identifier.clone();
+        archive_retargets.push(mixed_domain);
+        assert!(
+            !archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
+                &previous_archive,
+                &current_archive,
+                &input_file,
+                &matched,
+                &current_resolver,
+                &unchanged_members,
+                &[],
+                &[],
+                &HashSet::new(),
+                &archive_retargets,
+                &archive_renames,
+            )
+            .unwrap(),
+            "mixed direct/archive evidence must remain visible and fail closed",
         );
         assert!(
             direct_macho_masked_local_semantic_fingerprint_with_retargets_and_renames(
