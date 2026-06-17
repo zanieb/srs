@@ -342,6 +342,11 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
             "fn main() { assert_eq!(dependency::value(), 42); }\n",
         )
         .file(
+            "build.rs",
+            r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
+        )
+        .file("watched", "unchanged\n")
+        .file(
             "dependency/Cargo.toml",
             r#"
             [package]
@@ -356,10 +361,10 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
     let manifest_path = target.join("srs-artifact-cache-snapshot.json");
 
     let populated = project
-        .cargo("-Zartifact-cache build --bin foo")
+        .cargo("-Zartifact-cache -Zchecksum-freshness build --bin foo")
         .arg("--target-dir")
         .arg(&target)
-        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
         .env(
             cargo_util::paths::dylib_path_envvar(),
             isolated_loader_path(),
@@ -404,12 +409,13 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
         ));
         fs::remove_file(target_output).unwrap();
     }
+    project.root().join("watched").move_into_the_future();
 
     let restored = project
-        .cargo("-Zartifact-cache build --bin foo")
+        .cargo("-Zartifact-cache -Zchecksum-freshness build --bin foo")
         .arg("--target-dir")
         .arg(&target)
-        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
         .env(
             cargo_util::paths::dylib_path_envvar(),
             isolated_loader_path(),
@@ -423,8 +429,12 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
         .run();
     let stats = artifact_cache_stats(&restored);
     assert_eq!(artifact_cache_stat(&stats, &["rustc", "executions"]), 0);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["build_script", "executions"]),
+        0
+    );
     assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
-    assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 2);
+    assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 3);
     let cloned_files = artifact_cache_stat(&stats, &["snapshot", "restore", "cloned_files"]);
     let copied_files = artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]);
     assert_eq!(cloned_files + copied_files, records.len() as u64);

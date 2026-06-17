@@ -59,37 +59,265 @@ fn checksum_build_compatible_with_mtime_build() {
     let p = project()
         .file("src/main.rs", "mod a; fn main() {}")
         .file("src/a.rs", "")
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    let runs = std::fs::read_to_string("runs")
+                        .ok()
+                        .and_then(|runs| runs.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    std::fs::write("runs", (runs + 1).to_string()).unwrap();
+                    println!("cargo::rerun-if-changed=watched");
+                }
+            "#,
+        )
+        .file("watched", "unchanged")
+        .build();
+
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "1");
+    p.cargo("check -v")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "2");
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "3");
+    p.cargo("check -v")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "4");
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn build_script_rerun_if_changed_uses_checksums() {
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
+        )
+        .file("watched", "same")
         .build();
 
     p.cargo("check -Zchecksum-freshness")
         .masquerade_as_nightly_cargo(&["checksum-freshness"])
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
         .run();
-    p.cargo("check")
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
-"#]])
-        .run();
+    p.root().join("watched").move_into_the_future();
     p.cargo("check -Zchecksum-freshness")
         .masquerade_as_nightly_cargo(&["checksum-freshness"])
         .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
-    p.cargo("check")
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
-"#]])
+    let watched = p.root().join("watched");
+    let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&watched).unwrap());
+    p.change_file("watched", "diff");
+    filetime::set_file_mtime(&watched, mtime).unwrap();
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): the file `watched` has changed (checksum didn't match[..]",
+        )
+        .with_stderr_contains("[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`")
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn missing_build_script_rerun_if_changed_input_stays_dirty() {
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
+        )
+        .file("watched", "present")
+        .build();
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .run();
+    fs::remove_file(p.root().join("watched")).unwrap();
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): the rerun-if-changed instructions changed",
+        )
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains("[DIRTY] foo v0.0.1 ([ROOT]/foo): the file `watched` is missing")
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn build_script_checksum_preserves_mid_build_mutation_guard() {
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    let watched = std::path::Path::new("watched");
+                    let value = std::fs::read_to_string(watched).unwrap();
+                    let runs = std::fs::read_to_string("runs")
+                        .ok()
+                        .and_then(|runs| runs.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    std::fs::write("runs", (runs + 1).to_string()).unwrap();
+                    if value == "before" {
+                        std::thread::sleep(std::time::Duration::from_millis(1100));
+                        std::fs::write(watched, "after!").unwrap();
+                    }
+                    println!("cargo::rerun-if-changed=watched");
+                }
+            "#,
+        )
+        .file("watched", "before")
+        .build();
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "1");
+
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "2");
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_does_not_contain("[COMPILING]")
+        .run();
+    assert_eq!(fs::read_to_string(p.root().join("runs")).unwrap(), "2");
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn build_script_checksum_keeps_directory_mtime_fallback() {
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    println!("cargo::rerun-if-changed=watched");
+                    println!("cargo::rerun-if-changed=watched-dir");
+                }
+            "#,
+        )
+        .file("watched", "same")
+        .file("watched-dir/existing", "")
+        .build();
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .run();
+
+    p.root().join("watched").move_into_the_future();
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_does_not_contain("[COMPILING]")
+        .run();
+
+    p.root().join("watched-dir").move_into_the_future();
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): the file `watched-dir` has changed [..]",
+        )
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn build_script_checksum_keeps_symlink_mtime_fallback() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"fn main() { println!("cargo::rerun-if-changed=watched-link"); }"#,
+        )
+        .file("first", "first")
+        .build();
+    p.symlink("first", "watched-link");
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .run();
+    p.root().join("first").move_into_the_future();
+
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): the file `watched-link` has changed [..]",
+        )
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn build_script_checksum_detects_file_kind_change() {
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
+        )
+        .file("watched", "file")
+        .build();
+
+    p.cargo("check -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .run();
+    fs::remove_file(p.root().join("watched")).unwrap();
+    fs::create_dir(p.root().join("watched")).unwrap();
+
+    p.cargo("check -v -Zchecksum-freshness")
+        .masquerade_as_nightly_cargo(&["checksum-freshness"])
+        .with_stderr_contains(
+            "[DIRTY] foo v0.0.1 ([ROOT]/foo): the rerun-if-changed instructions changed",
+        )
+        .with_stderr_contains(
+            "[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`",
+        )
         .run();
 }
 
@@ -2993,7 +3221,7 @@ fn incremental_build_script_execution_got_new_mtime_and_cargo_check() {
         .masquerade_as_nightly_cargo(&["checksum-freshness"])
         .env("CARGO_INCREMENTAL", "1")
         .with_stderr_data(str![[r#"
-[DIRTY] foo v0.0.1 ([ROOT]/foo): the file `touch-me` has changed ([TIME_DIFF_AFTER_LAST_BUILD])
+[DIRTY] foo v0.0.1 ([ROOT]/foo): file size changed (0 != 4) for `touch-me`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
 [RUNNING] `rustc --crate-name foo [..]`

@@ -860,8 +860,11 @@ fingerprints with a file checksum value. This is most useful on systems with a p
 mtime implementation, or in CI/CD. The checksum algorithm can change without notice
 between cargo versions. Fingerprints are used by cargo to determine when a crate needs to be rebuilt.
 
-For the time being files ingested by build script will continue to use mtimes, even when `checksum-freshness`
-is enabled. This is not intended as a long term solution.
+Regular files named by build-script `rerun-if-changed` directives are compared
+by length and checksum. Directories, symlinks, missing or unreadable paths, and
+build scripts without explicit rerun directives retain mtime-based freshness.
+Files modified while a build script runs also rebuild conservatively on the
+next Cargo invocation.
 
 ## panic-abort-tests
 * Tracking Issue: [#67650](https://github.com/rust-lang/rust/issues/67650)

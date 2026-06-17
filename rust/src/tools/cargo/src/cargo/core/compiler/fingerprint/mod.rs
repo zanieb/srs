@@ -421,6 +421,8 @@ pub use self::dep_info::translate_dep_info;
 pub use self::dirty_reason::DirtyReason;
 pub use self::rustdoc::RustdocFingerprint;
 
+use self::dep_info::ChecksumAlgo;
+
 /// Result of comparing fingerprints between the current and previous builds.
 enum FingerprintComparison {
     /// The unit does not need rebuilding.
@@ -555,17 +557,21 @@ pub fn prepare_target(
             .build_script_output
             .clone();
         Work::new(move |_| {
-            let outputs = build_script_outputs.lock().unwrap();
-            let output = outputs
-                .get(metadata)
-                .expect("output must exist after running");
-            let deps = BuildDeps::new(&output_path, Some(output));
+            let deps = {
+                let outputs = build_script_outputs.lock().unwrap();
+                let output = outputs
+                    .get(metadata)
+                    .expect("output must exist after running");
+                BuildDeps::new(&output_path, Some(output))
+            };
 
             // FIXME: it's basically buggy that we pass `None` to `call_box`
             // here. See documentation on `build_script_local_fingerprints`
             // below for more information. Despite this just try to proceed and
             // hobble along if it happens to return `Some`.
-            if let Some(new_local) = (gen_local)(&deps, None)? {
+            if let Some(new_local) =
+                (gen_local)(&deps, None, BuildScriptFingerprintPhase::AfterBuild)?
+            {
                 *fingerprint.local.lock().unwrap() = new_local;
             }
 
@@ -847,6 +853,16 @@ enum LocalFingerprint {
         paths: Vec<PathBuf>,
     },
 
+    /// The checksum-freshness form of `RerunIfChanged`. Regular files are
+    /// compared by length and contents so an identical checkout with new
+    /// mtimes remains fresh. Paths that cannot be checksummed conservatively
+    /// retain the existing recursive-mtime behavior.
+    RerunIfChangedChecksum {
+        output: PathBuf,
+        checksums: Vec<(PathBuf, u64, Checksum)>,
+        mtimes: Vec<PathBuf>,
+    },
+
     /// This represents a single `rerun-if-env-changed` annotation printed by a
     /// build script. The exact env var and value are hashed here. There's no
     /// filesystem dependence here, and if the values are changed the hash will
@@ -1009,6 +1025,26 @@ impl LocalFingerprint {
                 paths.iter().map(|p| (pkg_root.join(p), None)),
                 false,
             )),
+            LocalFingerprint::RerunIfChangedChecksum {
+                output,
+                checksums: _,
+                mtimes,
+            } => {
+                let output = build_root.join(output);
+                // Regular files were already hashed while constructing the
+                // current fingerprint. Comparing it with the stored
+                // fingerprint detects content changes, so hashing them again
+                // here would only duplicate I/O. This check still verifies
+                // that the build-script output exists and handles paths that
+                // conservatively retain mtime freshness.
+                Ok(find_stale_file(
+                    mtime_cache,
+                    checksum_cache,
+                    &output,
+                    mtimes.iter().map(|path| (pkg_root.join(path), None)),
+                    false,
+                ))
+            }
 
             // These have no dependencies on the filesystem, and their values
             // are included natively in the `Fingerprint` hash so nothing
@@ -1023,6 +1059,7 @@ impl LocalFingerprint {
             LocalFingerprint::Precalculated(..) => "precalculated",
             LocalFingerprint::CheckDepInfo { .. } => "dep-info",
             LocalFingerprint::RerunIfChanged { .. } => "rerun-if-changed",
+            LocalFingerprint::RerunIfChangedChecksum { .. } => "rerun-if-changed-checksum",
             LocalFingerprint::RerunIfEnvChanged { .. } => "rerun-if-env-changed",
         }
     }
@@ -1166,6 +1203,68 @@ impl Fingerprint {
                             old: b_paths.clone(),
                             new: a_paths.clone(),
                         };
+                    }
+                }
+                (
+                    LocalFingerprint::RerunIfChangedChecksum {
+                        output: a_out,
+                        checksums: a_checksums,
+                        mtimes: a_mtimes,
+                    },
+                    LocalFingerprint::RerunIfChangedChecksum {
+                        output: b_out,
+                        checksums: b_checksums,
+                        mtimes: b_mtimes,
+                    },
+                ) => {
+                    if a_out != b_out {
+                        return DirtyReason::RerunIfChangedOutputFileChanged {
+                            old: b_out.clone(),
+                            new: a_out.clone(),
+                        };
+                    }
+                    let a_paths = a_checksums
+                        .iter()
+                        .map(|(path, _, _)| path)
+                        .chain(a_mtimes)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let b_paths = b_checksums
+                        .iter()
+                        .map(|(path, _, _)| path)
+                        .chain(b_mtimes)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if a_checksums.len() != b_checksums.len()
+                        || a_mtimes.len() != b_mtimes.len()
+                        || a_paths != b_paths
+                    {
+                        return DirtyReason::RerunIfChangedOutputPathsChanged {
+                            old: b_paths,
+                            new: a_paths,
+                        };
+                    }
+                    for ((path, new_size, new_checksum), (_, old_size, old_checksum)) in
+                        a_checksums.iter().zip(b_checksums)
+                    {
+                        if new_size != old_size {
+                            return DirtyReason::FsStatusOutdated(FsStatus::StaleItem(
+                                StaleItem::FileSizeChanged {
+                                    path: path.clone(),
+                                    old_size: *old_size,
+                                    new_size: *new_size,
+                                },
+                            ));
+                        }
+                        if new_checksum != old_checksum {
+                            return DirtyReason::FsStatusOutdated(FsStatus::StaleItem(
+                                StaleItem::ChangedChecksum {
+                                    source: path.clone(),
+                                    stored_checksum: *old_checksum,
+                                    new_checksum: *new_checksum,
+                                },
+                            ));
+                        }
                     }
                 }
                 (
@@ -1773,6 +1872,7 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
                 err.context(message)
             })
         }),
+        BuildScriptFingerprintPhase::BeforeBuild,
     )?
     .unwrap();
     let output = deps.build_script_output.clone();
@@ -1845,6 +1945,12 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
 /// FIXME(#6779) - see all the words above
 ///
 /// [`RunCustomBuild`]: crate::core::compiler::CompileMode::RunCustomBuild
+#[derive(Clone, Copy)]
+enum BuildScriptFingerprintPhase {
+    BeforeBuild,
+    AfterBuild,
+}
+
 fn build_script_local_fingerprints(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
@@ -1853,6 +1959,7 @@ fn build_script_local_fingerprints(
         dyn FnOnce(
                 &BuildDeps,
                 Option<&dyn Fn() -> CargoResult<String>>,
+                BuildScriptFingerprintPhase,
             ) -> CargoResult<Option<Vec<LocalFingerprint>>>
             + Send,
     >,
@@ -1865,7 +1972,9 @@ fn build_script_local_fingerprints(
         debug!("override local fingerprints deps {}", unit.pkg);
         return Ok((
             Box::new(
-                move |_: &BuildDeps, _: Option<&dyn Fn() -> CargoResult<String>>| {
+                move |_: &BuildDeps,
+                      _: Option<&dyn Fn() -> CargoResult<String>>,
+                      _: BuildScriptFingerprintPhase| {
                     Ok(Some(vec![fingerprint]))
                 },
             ),
@@ -1883,42 +1992,46 @@ fn build_script_local_fingerprints(
     let pkg_root = unit.pkg.root().to_path_buf();
     let build_dir = build_root(build_runner);
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
-    let calculate =
-        move |deps: &BuildDeps, pkg_fingerprint: Option<&dyn Fn() -> CargoResult<String>>| {
-            if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty() {
-                match pkg_fingerprint {
-                    // FIXME: this is somewhat buggy with respect to docker and
-                    // weird filesystems. The `Precalculated` variant
-                    // constructed below will, for `path` dependencies, contain
-                    // a stringified version of the mtime for the local crate.
-                    // This violates one of the things we describe in this
-                    // module's doc comment, never hashing mtimes. We should
-                    // figure out a better scheme where a package fingerprint
-                    // may be a string (like for a registry) or a list of files
-                    // (like for a path dependency). Those list of files would
-                    // be stored here rather than the mtime of them.
-                    Some(f) => {
-                        let s = f()?;
-                        debug!(
-                            "old local fingerprints deps {:?} precalculated={:?}",
-                            pkg_root, s
-                        );
-                        return Ok(Some(vec![LocalFingerprint::Precalculated(s)]));
-                    }
-                    None => return Ok(None),
+    let checksum_freshness = build_runner.bcx.gctx.cli_unstable().checksum_freshness;
+    let calculate = move |deps: &BuildDeps,
+                          pkg_fingerprint: Option<&dyn Fn() -> CargoResult<String>>,
+                          phase: BuildScriptFingerprintPhase| {
+        if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty() {
+            match pkg_fingerprint {
+                // FIXME: this is somewhat buggy with respect to docker and
+                // weird filesystems. The `Precalculated` variant
+                // constructed below will, for `path` dependencies, contain
+                // a stringified version of the mtime for the local crate.
+                // This violates one of the things we describe in this
+                // module's doc comment, never hashing mtimes. We should
+                // figure out a better scheme where a package fingerprint
+                // may be a string (like for a registry) or a list of files
+                // (like for a path dependency). Those list of files would
+                // be stored here rather than the mtime of them.
+                Some(f) => {
+                    let s = f()?;
+                    debug!(
+                        "old local fingerprints deps {:?} precalculated={:?}",
+                        pkg_root, s
+                    );
+                    return Ok(Some(vec![LocalFingerprint::Precalculated(s)]));
                 }
+                None => return Ok(None),
             }
+        }
 
-            // Ok so now we're in "new mode" where we can have files listed as
-            // dependencies as well as env vars listed as dependencies. Process
-            // them all here.
-            Ok(Some(local_fingerprints_deps(
-                deps,
-                &build_dir,
-                &pkg_root,
-                &env_config,
-            )))
-        };
+        // Ok so now we're in "new mode" where we can have files listed as
+        // dependencies as well as env vars listed as dependencies. Process
+        // them all here.
+        Ok(Some(local_fingerprints_deps(
+            deps,
+            &build_dir,
+            &pkg_root,
+            &env_config,
+            checksum_freshness,
+            matches!(phase, BuildScriptFingerprintPhase::AfterBuild),
+        )))
+    };
 
     // Note that `false` == "not overridden"
     Ok((Box::new(calculate), false))
@@ -1953,6 +2066,8 @@ fn local_fingerprints_deps(
     build_root: &Path,
     pkg_root: &Path,
     env_config: &Arc<HashMap<String, OsString>>,
+    checksum_freshness: bool,
+    check_mid_build_mtime: bool,
 ) -> Vec<LocalFingerprint> {
     debug!("new local fingerprints deps {:?}", pkg_root);
     let mut local = Vec::new();
@@ -1970,8 +2085,54 @@ fn local_fingerprints_deps(
             .rerun_if_changed
             .iter()
             .map(|p| p.strip_prefix(pkg_root).unwrap_or(p).to_path_buf())
-            .collect();
-        local.push(LocalFingerprint::RerunIfChanged { output, paths });
+            .collect::<Vec<_>>();
+        if checksum_freshness {
+            let mut checksums = Vec::new();
+            let mut mtimes = Vec::new();
+            let output_mtime = check_mid_build_mtime
+                .then(|| paths::mtime(&deps.build_script_output).ok())
+                .flatten();
+            for path in paths {
+                let absolute = pkg_root.join(&path);
+                let checksum = fs::symlink_metadata(&absolute)
+                    .ok()
+                    .filter(|metadata| metadata.file_type().is_file())
+                    .and_then(|_| {
+                        let file = File::open(&absolute).ok()?;
+                        let metadata = file.metadata().ok()?;
+                        let checksum = Checksum::compute(ChecksumAlgo::Blake3, &file).ok()?;
+
+                        // The build-script output is stamped with the
+                        // invocation-start time. If this input changed after
+                        // that point, the output may have been produced from
+                        // older bytes. Keep it on the mtime path for one run so
+                        // the next Cargo invocation rebuilds conservatively.
+                        if check_mid_build_mtime
+                            && !matches!(
+                                (output_mtime, paths::mtime(&absolute)),
+                                (Some(output_mtime), Ok(input_mtime))
+                                    if input_mtime <= output_mtime
+                            )
+                        {
+                            return None;
+                        }
+
+                        Some((path.clone(), metadata.len(), checksum))
+                    });
+                if let Some(checksum) = checksum {
+                    checksums.push(checksum);
+                } else {
+                    mtimes.push(path);
+                }
+            }
+            local.push(LocalFingerprint::RerunIfChangedChecksum {
+                output,
+                checksums,
+                mtimes,
+            });
+        } else {
+            local.push(LocalFingerprint::RerunIfChanged { output, paths });
+        }
     }
 
     local.extend(
