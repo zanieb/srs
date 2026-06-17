@@ -12049,6 +12049,7 @@ struct ValidatedMachOLocalRelocationSite {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedMachOLocalRelocationRetarget {
+    input_file: SharedText,
     previous: ValidatedMachOLocalRelocationSite,
     current: ValidatedMachOLocalRelocationSite,
 }
@@ -12062,6 +12063,7 @@ struct ValidatedMachOLocalSymbolSite {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedMachOLocalSymbolRename {
+    input_file: SharedText,
     previous: ValidatedMachOLocalSymbolSite,
     current: ValidatedMachOLocalSymbolSite,
 }
@@ -19766,6 +19768,7 @@ fn matched_macho_local_text_target_ownership(
                 relocation.target_value,
             ) {
                 let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
+                    input.path.as_str(),
                     previous_input,
                     current_input,
                     previous_caller_section,
@@ -19962,6 +19965,7 @@ fn matched_macho_local_text_target_ownership(
         }
     };
     let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
+        input.path.as_str(),
         previous_input,
         current_input,
         previous_caller_section,
@@ -24097,6 +24101,7 @@ fn plan_macho_local_symbol_cohort(
             .zip(&supplement.symbol_pairs)
             .filter_map(|((previous, current), (previous_symbol, current_symbol))| {
                 (previous.name != current.name).then(|| ValidatedMachOLocalSymbolRename {
+                    input_file: input_file_path.into(),
                     previous: ValidatedMachOLocalSymbolSite {
                         archive_identifier: previous_identifier.clone(),
                         section_index: supplement.previous_section.0,
@@ -27380,6 +27385,7 @@ fn validate_macho_data_relocations_are_stable(
                 let validated_local_retarget = renamed_local_target_is_stable
                     .then(|| {
                         validated_macho_data_local_relocation_retarget(
+                            input.path.as_str(),
                             previous_input_bytes,
                             current_input_bytes,
                             previous_index,
@@ -27568,6 +27574,7 @@ fn moved_local_macho_data_relocation_patch(
 }
 
 fn validated_macho_data_local_relocation_retarget(
+    input_file_path: &str,
     previous_input: PatchInputBytes<'_>,
     current_input: PatchInputBytes<'_>,
     previous_section: object::SectionIndex,
@@ -27576,6 +27583,7 @@ fn validated_macho_data_local_relocation_retarget(
     current_context: &MachODataRelocationContext,
 ) -> Option<ValidatedMachOLocalRelocationRetarget> {
     validated_macho_local_relocation_retarget(
+        input_file_path,
         previous_input,
         current_input,
         previous_section,
@@ -27587,6 +27595,7 @@ fn validated_macho_data_local_relocation_retarget(
 }
 
 fn validated_macho_local_relocation_retarget(
+    input_file_path: &str,
     previous_input: PatchInputBytes<'_>,
     current_input: PatchInputBytes<'_>,
     previous_section: object::SectionIndex,
@@ -27613,6 +27622,7 @@ fn validated_macho_local_relocation_retarget(
         return None;
     };
     Some(ValidatedMachOLocalRelocationRetarget {
+        input_file: input_file_path.into(),
         previous: ValidatedMachOLocalRelocationSite {
             archive_identifier: previous_identifier,
             section_index: previous_section.0,
@@ -32392,10 +32402,12 @@ fn archive_diff_allows_changed_macho_symbols(
     current_ranges.extend(current_extra_ranges.iter().cloned());
     let previous_local_retargets = validated_local_retargets
         .iter()
+        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
         .map(|retarget| retarget.previous.clone())
         .collect::<Vec<_>>();
     let current_local_retargets = validated_local_retargets
         .iter()
+        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
         .map(|retarget| retarget.current.clone())
         .collect::<Vec<_>>();
     let previous_fingerprint = if ignore_masked_unwind_sections {
@@ -32539,6 +32551,7 @@ fn unique_archive_member_bytes_by_normalized_identifier(
 
 fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    input_file_path: &str,
     previous_bytes: &[u8],
     current_bytes: &[u8],
     removed_identifiers: &[Vec<u8>],
@@ -32553,6 +32566,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
     ) else {
         return Ok(validated_local_retargets
             .iter()
+            .filter(|retarget| retarget.input_file.as_str() == input_file_path)
             .map(|retarget| (retarget.previous.clone(), retarget.current.clone()))
             .unzip());
     };
@@ -32568,6 +32582,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
     };
     Ok(validated_local_retargets
         .iter()
+        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
         .filter(|retarget| {
             retarget.previous.archive_identifier != retarget.current.archive_identifier
                 || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
@@ -32578,6 +32593,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
 
 fn remaining_archive_local_retargets_after_exact_unchanged_members(
     validated_local_retargets: &[ValidatedMachOLocalRelocationRetarget],
+    input_file_path: &str,
     previous_member_identifiers: &[Vec<u8>],
     current_member_identifiers: &[Vec<u8>],
     removed_identifiers: &[Vec<u8>],
@@ -32629,6 +32645,7 @@ fn remaining_archive_local_retargets_after_exact_unchanged_members(
 
     validated_local_retargets
         .iter()
+        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
         .filter(|retarget| {
             retarget.previous.archive_identifier != retarget.current.archive_identifier
                 || !is_exact_unchanged_member(&retarget.previous.archive_identifier)
@@ -32736,6 +32753,7 @@ fn archive_diff_allows_owned_macho_member_exchange(
     let (previous_local_retargets, current_local_retargets) =
         remaining_archive_local_retargets_after_exact_unchanged_members(
             validated_local_retargets,
+            input_file_path,
             &previous_member_identifiers,
             &current_member_identifiers,
             removed_identifiers,
@@ -33454,6 +33472,10 @@ fn matched_macho_local_retarget_fingerprint_matches(
     normalize_rust_archive_patch_inputs: bool,
     retargets: &[ValidatedMachOLocalRelocationRetarget],
 ) -> Result<bool> {
+    let retargets = retargets
+        .iter()
+        .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+        .collect::<Vec<_>>();
     if retargets.is_empty() {
         return Ok(false);
     }
@@ -34943,6 +34965,7 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
     let (previous_local_retargets, current_local_retargets) =
         remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
             validated_local_retargets,
+            input_file_path,
             previous_bytes,
             current_bytes,
             ignored_previous_identifiers,
@@ -34950,10 +34973,12 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
         )?;
     let previous_local_symbol_renames = validated_local_symbol_renames
         .iter()
+        .filter(|rename| rename.input_file.as_str() == input_file_path)
         .map(|rename| rename.previous.clone())
         .collect::<Vec<_>>();
     let current_local_symbol_renames = validated_local_symbol_renames
         .iter()
+        .filter(|rename| rename.input_file.as_str() == input_file_path)
         .map(|rename| rename.current.clone())
         .collect::<Vec<_>>();
     let previous_fingerprint =
@@ -35001,8 +35026,8 @@ fn archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
         return Ok(true);
     }
     if (ignored_migrated_definitions.is_empty()
-        && validated_local_retargets.is_empty()
-        && validated_local_symbol_renames.is_empty())
+        && previous_local_retargets.is_empty()
+        && previous_local_symbol_renames.is_empty())
         || !ignored_previous_identifiers.is_empty()
         || !ignored_current_identifiers.is_empty()
     {
@@ -35176,11 +35201,19 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
             true,
         )?;
     if !allows_unwind_only && !allows_unwind_and_definitions {
+        let local_retarget_count = validated_local_retargets
+            .iter()
+            .filter(|retarget| retarget.input_file.as_str() == input_file_path)
+            .count();
+        let local_rename_count = validated_local_symbol_renames
+            .iter()
+            .filter(|rename| rename.input_file.as_str() == input_file_path)
+            .count();
         return Ok(Err(format!(
             "changed Mach-O archive member differs outside text and unwind metadata: members={}, local-retargets={}, local-renames={}",
             changed.members.len(),
-            validated_local_retargets.len(),
-            validated_local_symbol_renames.len(),
+            local_retarget_count,
+            local_rename_count,
         )));
     }
     if let Some(state) = historical_unwind_state {
@@ -61615,6 +61648,7 @@ mod tests {
             let (previous, current) =
                 remaining_archive_local_retargets_after_exact_unchanged_member_bytes(
                     std::slice::from_ref(retarget),
+                    "lib.rlib",
                     previous,
                     current,
                     removed,
@@ -61628,6 +61662,7 @@ mod tests {
         let raw_identifier = b"crate-hash.common.0.rcgu.o";
         let normalized = archive_member_patch_identifier(raw_identifier);
         let retarget = ValidatedMachOLocalRelocationRetarget {
+            input_file: "lib.rlib".into(),
             previous: site(normalized.clone(), 4),
             current: site(normalized.clone(), 9),
         };
@@ -61676,6 +61711,15 @@ mod tests {
             ..retarget
         };
         assert_eq!(remaining(&cross_member, &previous, &current, &[], &[]), 1);
+        let other_input = ValidatedMachOLocalRelocationRetarget {
+            input_file: "other.rlib".into(),
+            ..cross_member
+        };
+        assert_eq!(
+            remaining(&other_input, &previous, b"malformed", &[], &[]),
+            0,
+            "retargets from another input must not enter this archive proof",
+        );
     }
 
     #[test]
@@ -61716,6 +61760,7 @@ mod tests {
             let (previous, current) =
                 remaining_archive_local_retargets_after_exact_unchanged_members(
                     retargets,
+                    "lib.rlib",
                     previous_members,
                     current_members,
                     removed,
@@ -61739,10 +61784,12 @@ mod tests {
         let current = fingerprint(10, identifier);
         let retargets = [
             ValidatedMachOLocalRelocationRetarget {
+                input_file: "lib.rlib".into(),
                 previous: site(identifier, 2),
                 current: site(identifier, 2),
             },
             ValidatedMachOLocalRelocationRetarget {
+                input_file: "lib.rlib".into(),
                 previous: site(identifier, 4),
                 current: site(identifier, 4),
             },
@@ -61858,6 +61905,7 @@ mod tests {
             "a cross-member retarget pair must remain exact-consumption work",
         );
         let orphan = ValidatedMachOLocalRelocationRetarget {
+            input_file: "lib.rlib".into(),
             previous: site(b"orphan.o", 2),
             current: site(b"orphan.o", 2),
         };
@@ -61942,6 +61990,7 @@ mod tests {
             exact_symbol_indices: Vec::new(),
         };
         let retarget = ValidatedMachOLocalRelocationRetarget {
+            input_file: hex::encode("lib.rlib").into(),
             previous: site.clone(),
             current: site,
         };
@@ -62180,6 +62229,7 @@ mod tests {
         let previous_identifier = archive_member_patch_identifier(kept_identifier);
         let current_identifier = previous_identifier.clone();
         let retarget = ValidatedMachOLocalRelocationRetarget {
+            input_file: hex::encode("lib.rlib").into(),
             previous: ValidatedMachOLocalRelocationSite {
                 archive_identifier: previous_identifier,
                 section_index: previous_source.index().0,
@@ -65416,12 +65466,31 @@ mod tests {
             .iter()
             .cloned()
             .zip(current_direct_retarget.iter().cloned())
-            .map(|(previous, current)| ValidatedMachOLocalRelocationRetarget { previous, current })
+            .map(
+                |(previous, current)| ValidatedMachOLocalRelocationRetarget {
+                    input_file: direct_input.clone().into(),
+                    previous,
+                    current,
+                },
+            )
             .collect::<Vec<_>>();
         let direct_rename = ValidatedMachOLocalSymbolRename {
+            input_file: direct_input.clone().into(),
             previous: previous_direct_rename,
             current: current_direct_rename,
         };
+        let mut global_retargets = direct_retargets.clone();
+        global_retargets.push(ValidatedMachOLocalRelocationRetarget {
+            input_file: hex::encode("other.rlib").into(),
+            previous: direct_retargets[0].previous.clone(),
+            current: direct_retargets[0].current.clone(),
+        });
+        let unrelated_rename = ValidatedMachOLocalSymbolRename {
+            input_file: hex::encode("other.rlib").into(),
+            previous: direct_rename.previous.clone(),
+            current: direct_rename.current.clone(),
+        };
+        let global_renames = [direct_rename, unrelated_rename];
         assert!(
             archive_diff_allows_changed_macho_unwind_with_local_symbol_renames(
                 &previous,
@@ -65445,11 +65514,11 @@ mod tests {
                 &[],
                 &[],
                 &HashSet::new(),
-                &direct_retargets,
-                std::slice::from_ref(&direct_rename),
+                &global_retargets,
+                &global_renames,
             )
             .unwrap(),
-            "direct unwind composition must not require an unrelated definition migration",
+            "direct unwind composition must ignore retarget and rename evidence from another input",
         );
         let mut wrong_site = validated_rename.current.clone();
         wrong_site.section_index += 1;
@@ -68219,6 +68288,7 @@ mod tests {
         };
 
         let retarget = validated_macho_data_local_relocation_retarget(
+            "direct.o",
             previous_input,
             current_input,
             previous_section.index(),
@@ -68246,6 +68316,7 @@ mod tests {
         };
         assert!(
             validated_macho_data_local_relocation_retarget(
+                "direct.o",
                 previous_input,
                 archived_current,
                 previous_section.index(),
@@ -70757,6 +70828,7 @@ mod tests {
             exact_symbol_indices: Vec::new(),
         };
         let common_retarget = ValidatedMachOLocalRelocationRetarget {
+            input_file: input_file_path.clone().into(),
             previous: common_site(0),
             current: common_site(1),
         };
@@ -76007,6 +76079,15 @@ mod tests {
                 .all(|retarget| retarget.previous.hash_target_symbol
                     && retarget.current.hash_target_symbol)
         );
+        assert!(
+            retargets
+                .iter()
+                .all(|retarget| retarget.input_file == fixture.input.path)
+        );
+        let mut global_retargets = retargets.clone();
+        let mut foreign_retarget = retargets[0].clone();
+        foreign_retarget.input_file = hex::encode("other.rlib").into();
+        global_retargets.push(foreign_retarget);
 
         let previous_target_identifier = b"uv-hash.cgu.old.rcgu.o";
         let current_target_identifier = b"uv-hash.cgu.new.rcgu.o";
@@ -76129,7 +76210,7 @@ mod tests {
                 fixture.input.path.as_str(),
                 &matched,
                 true,
-                &retargets,
+                &global_retargets,
             )
             .unwrap(),
             "an exact retarget must not make unrelated owned definitions exact",
