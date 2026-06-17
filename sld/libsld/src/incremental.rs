@@ -12084,6 +12084,29 @@ enum WholeMemberMachOLocalCohortReplan {
     Planned,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MachOLocalCohortPlanTiming {
+    NotRequired,
+    Immediate,
+    DeferredToWholeMember,
+}
+
+fn macho_local_cohort_plan_timing(
+    published_symbols: ExactLocalMachOOutputSymbol,
+    has_exact_published_symbol_indices: bool,
+    whole_member_cohort_replan_is_guaranteed: bool,
+) -> MachOLocalCohortPlanTiming {
+    if published_symbols == ExactLocalMachOOutputSymbol::Absent
+        || has_exact_published_symbol_indices
+    {
+        MachOLocalCohortPlanTiming::NotRequired
+    } else if whole_member_cohort_replan_is_guaranteed {
+        MachOLocalCohortPlanTiming::DeferredToWholeMember
+    } else {
+        MachOLocalCohortPlanTiming::Immediate
+    }
+}
+
 fn validate_deferred_macho_local_cohort_liveness(
     deferred: bool,
     replan: WholeMemberMachOLocalCohortReplan,
@@ -19916,12 +19939,19 @@ fn matched_macho_local_text_target_ownership(
         && previous_file.architecture() == object::Architecture::Aarch64
         && current_file.architecture() == object::Architecture::Aarch64;
     let mut deferred_local_symbol_cohort_liveness = false;
-    let local_symbol_cohort = if published_symbols == ExactLocalMachOOutputSymbol::Absent
-        || exact_published_symbol_indices.is_some()
-    {
-        None
-    } else {
-        match plan_macho_local_symbol_cohort(
+    let local_symbol_cohort = match macho_local_cohort_plan_timing(
+        published_symbols,
+        exact_published_symbol_indices.is_some(),
+        whole_member_cohort_replan_is_guaranteed,
+    ) {
+        MachOLocalCohortPlanTiming::NotRequired => None,
+        MachOLocalCohortPlanTiming::DeferredToWholeMember => {
+            // This archive member is replanned once after every exact incoming edge has been
+            // collected. Avoid rebuilding the same whole-member liveness graph per retarget.
+            deferred_local_symbol_cohort_liveness = true;
+            None
+        }
+        MachOLocalCohortPlanTiming::Immediate => match plan_macho_local_symbol_cohort(
             relocations,
             symbol_resolutions,
             liveness_resolution_moves,
@@ -19949,20 +19979,13 @@ fn matched_macho_local_text_target_ownership(
                         .to_owned(),
                 ));
             }
-            Err(reason)
-                if whole_member_cohort_replan_is_guaranteed
-                    && reason.starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED) =>
-            {
-                deferred_local_symbol_cohort_liveness = true;
-                None
-            }
             Err(_reason) => {
                 return Ok(Err(
                     "renamed local Mach-O text target is present in the output symbol table"
                         .to_owned(),
                 ));
             }
-        }
+        },
     };
     let Some(mut validated_retarget) = validated_macho_local_relocation_retarget(
         input.path.as_str(),
@@ -66169,6 +66192,26 @@ mod tests {
     }
 
     #[test]
+    fn archive_local_cohort_plans_wait_for_complete_whole_member_edges() {
+        assert_eq!(
+            macho_local_cohort_plan_timing(ExactLocalMachOOutputSymbol::Absent, false, true),
+            MachOLocalCohortPlanTiming::NotRequired,
+        );
+        assert_eq!(
+            macho_local_cohort_plan_timing(ExactLocalMachOOutputSymbol::Inexact, true, true),
+            MachOLocalCohortPlanTiming::NotRequired,
+        );
+        assert_eq!(
+            macho_local_cohort_plan_timing(ExactLocalMachOOutputSymbol::Inexact, false, false),
+            MachOLocalCohortPlanTiming::Immediate,
+        );
+        assert_eq!(
+            macho_local_cohort_plan_timing(ExactLocalMachOOutputSymbol::Inexact, false, true),
+            MachOLocalCohortPlanTiming::DeferredToWholeMember,
+        );
+    }
+
+    #[test]
     fn deferred_local_macho_cohort_liveness_requires_a_planned_whole_member_replan() {
         for replan in [
             WholeMemberMachOLocalCohortReplan::Skipped,
@@ -75190,7 +75233,11 @@ mod tests {
             assert!(
                 reason.starts_with(MACHO_LOCAL_COHORT_LIVENESS_REQUIRED)
                     || reason
-                        == "renamed local Mach-O text target is present in the output symbol table",
+                        == "renamed local Mach-O text target is present in the output symbol table"
+                    || reason
+                        == "published local Mach-O cohort contains an unsupported local symbol"
+                    || reason
+                        == "published local Mach-O cohort contains liveness-significant metadata",
                 "unexpected rejection reason: {reason}",
             );
         }
@@ -75338,7 +75385,7 @@ mod tests {
 
     #[test]
     fn local_macho_text_target_ownership_rejects_inexact_published_locals() {
-        let expected = "renamed local Mach-O text target is present in the output symbol table";
+        let expected = "published local Mach-O output population is incomplete or aliased";
 
         let mut moved = local_text_target_transition_fixture(
             b"l_a.1",
@@ -75419,7 +75466,7 @@ mod tests {
         assert_eq!(
             apply_local_text_target_transition(&external, vec![external.relocation.clone()], true,)
                 .unwrap_err(),
-            expected,
+            "published local Mach-O source has no exact previous input symbol",
         );
 
         let mut ambiguous = local_text_target_transition_fixture(
@@ -75444,7 +75491,7 @@ mod tests {
                 true,
             )
             .unwrap_err(),
-            expected,
+            "published local Mach-O output contains duplicate cohort names",
         );
 
         let mut stab = local_text_target_transition_fixture(
@@ -75461,7 +75508,7 @@ mod tests {
         assert_eq!(
             apply_local_text_target_transition(&stab, vec![stab.relocation.clone()], true)
                 .unwrap_err(),
-            expected,
+            "published local Mach-O source has no exact previous input symbol",
         );
 
         let mut wrong_section = local_text_target_transition_fixture(
@@ -75482,7 +75529,7 @@ mod tests {
                 true,
             )
             .unwrap_err(),
-            expected,
+            "published local Mach-O cohort addition collides with an output symbol",
         );
     }
 
@@ -76014,7 +76061,7 @@ mod tests {
                 true,
             )
             .unwrap_err(),
-            "renamed local Mach-O text target is present in the output symbol table",
+            MACHO_LOCAL_COHORT_LIVENESS_REQUIRED,
         );
     }
 
