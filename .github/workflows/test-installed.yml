@@ -55,6 +55,8 @@ jobs:
           esac
           export SLD_INCREMENTAL=0
           cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
+            artifact_cache::exact_path_snapshot_manifest_preserves_build_script_checksum_freshness -- --exact
+          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
             artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact -- --exact
           cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
             artifact_cache::same_mtime_input_changed_after_compilation_is_not_published -- --exact

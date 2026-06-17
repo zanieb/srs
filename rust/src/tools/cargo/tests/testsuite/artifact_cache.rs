@@ -312,6 +312,20 @@ fn artifact_cache_stats_are_disabled_by_default() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
+    exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting_impl(false);
+}
+
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zchecksum-freshness are unstable"
+)]
+fn exact_path_snapshot_manifest_preserves_build_script_checksum_freshness() {
+    exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting_impl(true);
+}
+
+fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting_impl(
+    checksum_freshness: bool,
+) {
     let cache = paths::root().join("shared-cache");
     let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
     let project = project_in("project")
@@ -340,12 +354,18 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
         .file(
             "src/main.rs",
             "fn main() { assert_eq!(dependency::value(), 42); }\n",
-        )
-        .file(
-            "build.rs",
-            r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
-        )
-        .file("watched", "unchanged\n")
+        );
+    let project = if checksum_freshness {
+        project
+            .file(
+                "build.rs",
+                r#"fn main() { println!("cargo::rerun-if-changed=watched"); }"#,
+            )
+            .file("watched", "unchanged\n")
+    } else {
+        project
+    };
+    let project = project
         .file(
             "dependency/Cargo.toml",
             r#"
@@ -360,11 +380,22 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
     let target = project.root().join("snapshot-target");
     let manifest_path = target.join("srs-artifact-cache-snapshot.json");
 
+    let cargo_args = if checksum_freshness {
+        "-Zartifact-cache -Zchecksum-freshness build --bin foo"
+    } else {
+        "-Zartifact-cache build --bin foo"
+    };
+    let nightly_reasons = if checksum_freshness {
+        &["artifact-cache", "checksum-freshness"][..]
+    } else {
+        &["artifact-cache"][..]
+    };
+
     let populated = project
-        .cargo("-Zartifact-cache -Zchecksum-freshness build --bin foo")
+        .cargo(cargo_args)
         .arg("--target-dir")
         .arg(&target)
-        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
+        .masquerade_as_nightly_cargo(nightly_reasons)
         .env(
             cargo_util::paths::dylib_path_envvar(),
             isolated_loader_path(),
@@ -409,13 +440,15 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
         ));
         fs::remove_file(target_output).unwrap();
     }
-    project.root().join("watched").move_into_the_future();
+    if checksum_freshness {
+        project.root().join("watched").move_into_the_future();
+    }
 
     let restored = project
-        .cargo("-Zartifact-cache -Zchecksum-freshness build --bin foo")
+        .cargo(cargo_args)
         .arg("--target-dir")
         .arg(&target)
-        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
+        .masquerade_as_nightly_cargo(nightly_reasons)
         .env(
             cargo_util::paths::dylib_path_envvar(),
             isolated_loader_path(),
@@ -434,7 +467,10 @@ fn exact_path_snapshot_manifest_reconstructs_outputs_before_fingerprinting() {
         0
     );
     assert_eq!(artifact_cache_stat(&stats, &["lookup", "hits"]), 0);
-    assert_eq!(artifact_cache_stat(&stats, &["units", "cargo_fresh"]), 3);
+    assert_eq!(
+        artifact_cache_stat(&stats, &["units", "cargo_fresh"]),
+        if checksum_freshness { 3 } else { 2 }
+    );
     let cloned_files = artifact_cache_stat(&stats, &["snapshot", "restore", "cloned_files"]);
     let copied_files = artifact_cache_stat(&stats, &["snapshot", "restore", "copied_files"]);
     assert_eq!(cloned_files + copied_files, records.len() as u64);
