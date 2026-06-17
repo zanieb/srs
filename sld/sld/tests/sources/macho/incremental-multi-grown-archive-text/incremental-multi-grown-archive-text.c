@@ -12,7 +12,7 @@
 //#TestIncrementalChangedInput:incremental-multi-grown-archive-first.a
 //#TestIncrementalChangedCompArgs:-DGROW_TEXT=1
 //#TestIncrementalChangedExpectPatch:true
-//#TestIncrementalChangedPatchedSectionCount:7
+//#TestIncrementalChangedPatchedSectionCount:8
 //#TestIncrementalChangedCompareFull:false
 //#TestIncrementalChangedRun:true
 //#TestIncrementalChangedRestore:true
