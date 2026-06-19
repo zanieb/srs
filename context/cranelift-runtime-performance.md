@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `642d0eeac`, with:
+recorded at SRS `5b3d2b69c`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.8 ms | 72.3 ms | 2.14x |
-| `uv lock --check`, offline | 59.2 ms | 103.7 ms | 1.75x |
-| `ruff check` over 1,592 fixtures | 78.8 ms | 202.5 ms | 2.57x |
-| `ty check` over `scripts/ty_benchmark` | 48.1 ms | 158.0 ms | 3.29x |
+| `uv venv --clear` | 30.9 ms | 65.3 ms | 2.12x |
+| `uv lock --check`, offline | 57.8 ms | 98.0 ms | 1.70x |
+| `ruff check` over 1,592 fixtures | 81.0 ms | 204.7 ms | 2.53x |
+| `ty check` over `scripts/ty_benchmark` | 47.5 ms | 150.1 ms | 3.16x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.7-3.3x faster for
+The conclusion is unambiguous: LLVM is currently about 1.7-3.2x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -53,9 +53,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 128.8 MB |
-| ty | 47.5 MB | 145.6 MB | 134.2 MB |
-| uv | 100.0 MB | 255.0 MB | 258.7 MB |
+| Ruff | 45.0 MB | 135.8 MB | 128.0 MB |
+| ty | 47.5 MB | 145.6 MB | 133.2 MB |
+| uv | 100.0 MB | 255.0 MB | 256.8 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -67,9 +67,10 @@ environment creation.
 
 ### Backend-aware MIR inlining
 
-Cranelift has no later, function-level inliner comparable to LLVM's. The
-shared MIR inliner is therefore its only opportunity to expose optimization
-across many call boundaries.
+Cranelift does not have LLVM's mature, whole-IR inlining pipeline. The shared
+MIR inliner remains the primary opportunity to expose optimization across most
+call boundaries; a bounded post-monomorphization CLIF inliner now handles a
+small scalar subset that MIR cannot resolve early enough.
 
 The codegen backend can now supply MIR inlining defaults. Cranelift initially
 raised the local thresholds from 30/100/50 to 60/200/100 for forwarders,
@@ -254,7 +255,8 @@ Cranelift leaves. Calls such as `vceq_u8`, `vcltz_s8`, `vdup_n_u8`, and
 AArch64 function. The MIR inliner required the caller and callee's explicit
 `#[target_feature]` lists to be identical and did not account for session-wide
 features. LLVM repaired the missed opportunity in its later IR inliner;
-Cranelift had no second inlining stage.
+at that point cg_clif had no enabled second inlining stage. The bounded CLIF
+inliner added later is too narrow to move target-feature-sensitive bodies.
 
 The compatibility check now removes globally enabled features before comparing
 the function-local sets. It retains exact matching for genuinely local
@@ -359,6 +361,46 @@ decisively. The size cost is bounded and well below the rejected 1,000-budget
 candidate, so 800 is retained as the backend default. Explicit command-line
 thresholds continue to override it.
 
+### Bounded post-monomorphization CLIF inlining
+
+The next ty profile showed tiny `rustc_hash::FxHasher` methods consuming about
+950 active samples. A targeted MIR census found that every direct
+`write_usize`, `write_u64`, `write_u32`, and `finish` call considered by the
+MIR inliner was already accepted. Machine-code inspection found the remaining
+calls inside generic upstream `Hash::hash` implementations: MIR optimizes those
+bodies while the `Hasher` type is still abstract, and the calls become direct
+only after monomorphization. LLVM inlines them in its later IR pipeline, while
+cg_clif previously emitted the newly direct calls unchanged.
+
+Cranelift 0.133 provides function-inlining mechanics but leaves policy and
+call-graph ownership to the embedding compiler. cg_clif now uses that API
+within each codegen unit for a deliberately narrow set of `#[inline]` callees:
+at most 32 CLIF instructions and three blocks, with no nested calls, stack
+slots, dynamic stack slots, global values, or stack limit. It legalizes the
+callee before insertion, skips recursion, and visits only the original caller
+body, so one decision cannot recursively expand another.
+
+The safety boundary is empirical. Allowing general three-block hinted bodies
+miscompiled stage-2 build scripts; call-free bodies still reproduced the
+failure until stack and global state were excluded. The retained scalar subset
+passed a complete two-stage SRS build. In the pinned ty binary it removes all
+847 direct calls to the four hot `FxHasher::write_*` families.
+
+The 50-run matched three-lane gate measured:
+
+| Workload | Candidate vs previous Cranelift | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -3.40% | 46/50 | 0.00000000045 | +112.4% | -0.736% |
+| `uv lock --check`, offline | -3.20% | 45/50 | 0.0000000042 | +70.4% | -0.736% |
+| `ruff check` over 1,592 fixtures | -0.40% | 28/50 | 0.47989 | +154.5% | -0.607% |
+| `ty check` over `scripts/ty_benchmark` | -4.90% | 48/50 | 0.0000000000023 | +218.6% | -0.751% |
+
+Both uv operations and ty improve decisively, Ruff is neutral, every binary
+shrinks, and all correctness-probe exit codes and output digests match. This is
+retained. Extending the CLIF inliner beyond the scalar subset now requires a
+reduced correctness reproducer and explicit validation of stack slots, global
+values, unwind edges, and debug metadata before expanding the policy.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
@@ -393,8 +435,8 @@ lowering change, not an independently profitable operation.
 
 Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
 because LLVM can fold the guard and inline their bodies later. Cranelift has no
-later function inliner, and these helpers appeared prominently in the amplified
-ty profile. A backend-specific experiment allowed only `#[inline]`,
+mature general-purpose later inliner, and these helpers appeared prominently in
+the amplified ty profile. A backend-specific experiment allowed only `#[inline]`,
 `#[track_caller]`, non-unwinding functions named `precondition_check` to bypass
 the attribute. It reduced retained helper copies from 627 to 584 in Ruff, 542
 to 502 in ty, and 1,161 to 1,103 in uv, but grew the binaries by 0.10%, 0.37%,
@@ -407,7 +449,8 @@ threshold did not remove any additional retained copies and produced another
 neutral-to-negative screen (+0.13% to +1.54%). Both variants are rejected.
 The result is useful attribution: these sampled helpers are symptoms of the
 larger call, range, and code-layout gap, not a profitable isolated exception to
-`rustc_no_mir_inline`.
+`rustc_no_mir_inline`. The later bounded CLIF inliner deliberately excludes
+these call-bearing helpers.
 
 ### AArch64 CRC intrinsics
 
@@ -464,10 +507,13 @@ target-feature policy passed another complete SRS build and its dedicated
 AArch64 MIR test. The current depth-12 policy passed a complete SRS build and
 all 18 interface tests. The small-copy policy passed a complete SRS build and
 its dedicated cg_clif AOT regression probe. The current 800-budget policy
-passed a complete SRS build and all 18 interface tests. Every complete runtime
-gate preserved every correctness digest. A fresh full uv/Ruff/ty suite pair is
-reserved for the next finalization gate rather than repeated after every
-retained optimization. The current cg_clif sysroot harness cannot provide
+passed a complete SRS build and all 18 interface tests. The subsequent bounded
+CLIF inliner passed a complete two-stage SRS build, a standalone stage-1 backend
+check, pinned uv/Ruff/ty builds, and the 50-run correctness probes. Every
+complete runtime gate preserved every correctness digest. A fresh full
+uv/Ruff/ty suite pair is reserved for the finalization gate rather than
+repeated after every retained optimization. The current cg_clif sysroot
+harness cannot provide
 additional coverage: its stdlib patch no longer applies to this Rust snapshot,
 and its standalone JIT smoke aborts in rustc query TLS before entering the test
 program.
@@ -539,6 +585,9 @@ The inlining result proves that call boundaries matter, but more indiscriminate
 inlining quickly becomes counterproductive. Continue with targeted policies:
 
 - incorporate call-site frequency and callee size into MIR defaults;
+- reduce and fix the broader cg_clif inliner miscompile before admitting
+  callees with stack slots, global values, nested calls, or larger control-flow
+  graphs;
 - investigate the open work to let
   [regalloc manage callee-saved registers](https://github.com/bytecodealliance/wasmtime/issues/7727);
 - remove [unused stack slots](https://github.com/bytecodealliance/wasmtime/issues/6661)
