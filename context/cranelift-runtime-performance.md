@@ -359,6 +359,56 @@ decisively. The size cost is bounded and well below the rejected 1,000-budget
 candidate, so 800 is retained as the backend default. Explicit command-line
 thresholds continue to override it.
 
+### Rejected native SIMD comparison expansion
+
+An amplified ty profile showed scalarized AArch64 hash-table control-group
+comparisons. A broad cg_clif experiment lowered integer comparisons over
+8-byte and 16-byte vectors directly to Cranelift vector `icmp`, and used native
+or SWAR high-bit packing for the corresponding `simd_bitmask` operations. The
+50-run gate exposed a real but unacceptable tradeoff:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +2.43% | 15/50 | 0.00660 |
+| `uv lock --check`, offline | +1.45% | 15/50 | 0.00660 |
+| `ruff check` over 1,592 fixtures | -0.75% | 30/50 | 0.20264 |
+| `ty check` over `scripts/ty_benchmark` | -1.81% | 39/50 | 0.00009 |
+
+Correctness probes matched and all three binaries became smaller, but both uv
+regressions are decisive, so the broad lowering is rejected.
+
+A compile-time census then proved that the applications instantiate only the
+shapes covered by three narrower controls: 8-lane hash-group equality and
+signed-less-than, 8-lane signed-greater-than-or-equal full-bucket scans, and
+16-lane byte equality plus bitmask extraction for core substring search. The
+first control was neutral in a 50-run gate (-0.25% to +0.05%, all sign-test
+`p >= 0.67`). The signed-greater-than-or-equal control was also neutral at 50
+runs, with changes from +0.15% to +1.40% and no sign-test below 0.0649. The
+16-lane substring control was neutral in its 20-run screen (-0.34% to +0.92%,
+all `p >= 0.26`). This rules out a missing fourth comparison shape: the broad
+ty improvement and uv regressions arise from the combined code-layout and
+lowering change, not an independently profitable operation.
+
+### Rejected backend-specific UB-check inlining
+
+Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
+because LLVM can fold the guard and inline their bodies later. Cranelift has no
+later function inliner, and these helpers appeared prominently in the amplified
+ty profile. A backend-specific experiment allowed only `#[inline]`,
+`#[track_caller]`, non-unwinding functions named `precondition_check` to bypass
+the attribute. It reduced retained helper copies from 627 to 584 in Ruff, 542
+to 502 in ty, and 1,161 to 1,103 in uv, but grew the binaries by 0.10%, 0.37%,
+and 0.12% respectively.
+
+The 20-run gate moved every workload in the wrong direction: uv environment
+creation +1.29%, uv resolution +0.85%, Ruff +0.49%, and ty +0.67%, with no
+sign-test below 0.26. Forcing every otherwise-legal helper past the MIR cost
+threshold did not remove any additional retained copies and produced another
+neutral-to-negative screen (+0.13% to +1.54%). Both variants are rejected.
+The result is useful attribution: these sampled helpers are symptoms of the
+larger call, range, and code-layout gap, not a profitable isolated exception to
+`rustc_no_mir_inline`.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
