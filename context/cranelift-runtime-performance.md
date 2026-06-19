@@ -723,8 +723,9 @@ destination is unreachable by construction. The skeleton cost model prices a
 branch table above an otherwise equivalent conditional branch so the rewrite
 is selected. The match remains explicitly scalar, and the resolved
 `BlockCall`s preserve destination arguments. In the profiled function, all
-three comparison-derived table checks disappear, one mask-derived table
-remains, and the body shrinks from 1,772 to 1,624 bytes (-8.35%).
+three comparison-derived table checks disappear, one separate two-entry Rust
+discriminant table remains, and the body shrinks from 1,772 to 1,624 bytes
+(-8.35%).
 
 The 50-run matched gate measured the rewrite against scalar boolean-result
 range folding:
@@ -742,6 +743,16 @@ Every correctness digest matches. The focused branch-argument filetest, all
 and standard-library build pass. The broad size reduction shows that this is a
 common Rust lowering shape, while the runtime result is strongest in the two
 hash-table-heavy workloads.
+
+A follow-up AArch64 experiment lowered all one- and two-entry tables to direct
+branches. It replaced the remaining hot indirect sequence with
+`cmp; b.hs; cbz` and shrank the uv, Ruff, and ty binaries by another 0.68%,
+0.67%, and 0.55%, respectively. The 20-run application screen nevertheless
+rejected it: `uv venv --clear` regressed by 1.92% with 5/20 wins
+(sign-test p=0.041), while `uv lock --check` improved by 0.53% with 12/20 wins
+(p=0.503), Ruff changed by +0.02% with 10/20 wins, and ty changed by +0.31%
+with 10/20 wins. Every correctness digest matched. Small-table encoding is
+therefore not a current runtime arc despite its local code-size win.
 
 ### Bounded stack-backed aggregate copies
 
@@ -980,11 +991,11 @@ but it does not carry facts through block parameters or joins. Boolean-indexed
 branch-table lowering consumes the same fact at a control-flow boundary,
 removes three bounds checks from the profiled hashbrown body, improves Ruff by
 1.97% and ty by 3.19%, and shrinks all three application binaries by more than
-2%. One mask-derived table remains in that body. Recognizing bounded results
-through simple bitwise expressions, then propagating scalar ranges through CFG
-edges, is the next concrete step before affine loop-index analysis. The reduced
-scan confirms that vectorization and loop-wide range reasoning remain the
-larger opportunities.
+2%. One separate two-entry discriminant table remains in that body, but direct
+small-table lowering lost the application gate despite shrinking code.
+Propagating scalar ranges through CFG edges and joins is the next concrete step
+before affine loop-index analysis. The reduced scan confirms that vectorization
+and loop-wide range reasoning remain the larger opportunities.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
