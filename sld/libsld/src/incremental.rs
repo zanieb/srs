@@ -8129,6 +8129,15 @@ fn preplanned_changed_macho_unwind_fdes(
     Ok(Ok(retired_fdes))
 }
 
+fn supports_preplanned_macho_unwind_reclaim(path: &Path) -> bool {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.ends_with(".rcgu.o"))
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "rlib")
+}
+
 fn preplanned_changed_macho_unwind_reclaim(
     state_dir: &Path,
     previous_output_source: &Path,
@@ -8167,14 +8176,7 @@ fn preplanned_changed_macho_unwind_reclaim(
             unavailable!("changed input has historical Mach-O unwind ownership");
         }
         let path = decode_path(&input.path)?;
-        let direct_cgu = path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.ends_with(".rcgu.o"));
-        let rust_archive = path
-            .extension()
-            .is_some_and(|extension| extension == "rlib");
-        if !direct_cgu && !rust_archive {
+        if !supports_preplanned_macho_unwind_reclaim(&path) {
             unavailable!(format!(
                 "changed input is not a direct CGU or Rust archive: {}",
                 path.display()
@@ -8395,6 +8397,9 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
 ) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
 
+    let can_retry_macho_unwind_reclaim = changed_inputs
+        .iter()
+        .all(|(_, path)| supports_preplanned_macho_unwind_reclaim(path));
     let retry_previous = reclaim_macho_unwind.is_none().then(|| previous.clone());
     let retry_current_link_start = current_link_start.clone();
     let retry_record_coverage = record_coverage.clone();
@@ -11925,7 +11930,10 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
         }
     }
 
-    if reclaim_macho_unwind.is_none() && !changed_macho_unwind_retired_fdes.is_empty() {
+    if reclaim_macho_unwind.is_none()
+        && can_retry_macho_unwind_reclaim
+        && !changed_macho_unwind_retired_fdes.is_empty()
+    {
         let source_output = previous_output.get()?;
         let output_file = object::File::parse(source_output)
             .context("Failed to parse previous Mach-O output for cohort unwind planning")?;
