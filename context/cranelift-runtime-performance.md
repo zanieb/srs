@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `7a434bc55`, with:
+recorded at SRS `09ad5c3dc`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 31.0 ms | 52.6 ms | 1.70x |
-| `uv lock --check`, offline | 56.0 ms | 80.5 ms | 1.44x |
-| `ruff check` over 1,592 fixtures | 78.0 ms | 141.1 ms | 1.81x |
-| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 115.7 ms | 2.44x |
+| `uv venv --clear` | 32.6 ms | 55.0 ms | 1.69x |
+| `uv lock --check`, offline | 59.8 ms | 84.1 ms | 1.41x |
+| `ruff check` over 1,592 fixtures | 78.4 ms | 143.7 ms | 1.83x |
+| `ty check` over `scripts/ty_benchmark` | 48.3 ms | 110.0 ms | 2.28x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.5x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.3x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -62,11 +62,11 @@ the work complete.
 The profiling binaries retain full debuginfo, so these are comparative rather
 than distribution sizes.
 
-| Binary | LLVM | Cranelift baseline | Current Cranelift |
+| Binary | LLVM | Previous Cranelift | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 117.4 MB |
-| ty | 47.5 MB | 145.6 MB | 122.2 MB |
-| uv | 100.0 MB | 255.0 MB | 238.7 MB |
+| Ruff | 45.0 MB | 117.4 MB | 117.1 MB |
+| ty | 47.5 MB | 122.2 MB | 121.4 MB |
+| uv | 100.0 MB | 238.7 MB | 238.2 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -1041,6 +1041,46 @@ all `p >= 0.26`). This rules out a missing fourth comparison shape: the broad
 ty improvement and uv regressions arise from the combined code-layout and
 lowering change, not an independently profitable operation.
 
+### Native AArch64 `i8x8` comparisons and splats
+
+A later profile returned to the same hash-table loop after the retained stack,
+branch, and body-import work had changed its surroundings. cg_clif still
+lowered Rust SIMD comparisons and splats one lane at a time even when
+Cranelift had a native fixed-vector representation. The active hashbrown
+`RawTableInner::find_or_find_insert_index_inner` copy was 1,624 bytes and
+contained dozens of lane loads, scalar comparisons, and OR operations.
+
+The retained lowering deliberately covers only AArch64 `i8x8`. Integer
+`simd_eq`, `simd_ne`, and signed or unsigned ordered comparisons become one
+Cranelift vector `icmp`; `simd_splat` becomes a native vector splat. All other
+targets and vector shapes retain the existing per-lane path. In the profiled
+hashbrown body, the generated AArch64 sequence now uses `dup.8b`, `cmeq.8b`,
+and `cmgt.8b`. Its span falls from 1,624 to 764 bytes (-52.96%).
+
+The narrow policy's 50-run matched gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.24% | 24/50 | 0.88772 | +68.5% | -0.203% |
+| `uv lock --check`, offline | +0.56% | 22/50 | 0.47989 | +40.9% | -0.203% |
+| `ruff check` over 1,592 fixtures | -0.34% | 26/50 | 0.88772 | +83.8% | -0.271% |
+| `ty check` over `scripts/ty_benchmark` | -5.79% | 49/50 | 0.000000000000091 | +127.1% | -0.651% |
+
+Both uv operations and Ruff are statistically neutral, ty improves
+decisively, every binary shrinks, and all correctness-probe digests match.
+The AArch64 NEON example covers equality, signed less-than, and splat. The
+focused cg_clif check and complete stage-2 cg_clif, standard-library, and
+proc-macro build pass.
+
+The shape restriction is empirical rather than aesthetic. A preceding version
+enabled the same comparison and splat lowering for every 64- and 128-bit
+vector. It improved Ruff by 1.77% (33/50 wins, `p = 0.03284`) and ty by 5.55%
+(50/50 wins), but regressed uv environment creation by 1.27% with only 14/50
+wins (`p = 0.00260`); uv resolution was neutral at +0.51%. That broader policy
+was rejected. Native SIMD should therefore expand one profiled shape at a time,
+with surrounding operations moved to vectors before a shape is enabled
+globally.
+
 ### Rejected backend-specific UB-check inlining
 
 Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
@@ -1078,7 +1118,7 @@ ty to become a usable performance benchmark.
 
 ## Full-Suite Backend Validation
 
-The 60/500/100 candidate also ran the repositories' complete macOS test
+An earlier 60/500/100 candidate also ran the repositories' complete macOS test
 commands from clean target directories under both LLVM and Cranelift. These are
 single-run operational timings, not block-balanced runtime benchmarks: they
 mix compilation, thousands of short subprocesses, filesystem work, and test
@@ -1132,13 +1172,17 @@ uv/Ruff/ty suite pair is reserved for the finalization gate rather than
 repeated after every retained optimization. The bounded stack-copy policy
 passed its stage-2 backend and standard-library build, direct standard-example
 execution, application correctness probes, and 50-run runtime gate. The
-scalar boolean-range and boolean-indexed branch-table policies passed focused
-scalar, vector, and branch-argument filetests, all 185 `cranelift-codegen` unit
-tests, cg_clif check, complete stage-2 backend and standard-library builds, and
-matched 50-run correctness probes. The current cg_clif sysroot harness cannot
-provide additional coverage: its stdlib
-patch no longer applies to this Rust snapshot, and its standalone JIT smoke
-aborts in rustc query TLS before entering the test program.
+subsequent scalar boolean-range and boolean-indexed branch-table policies
+passed focused scalar, vector, and branch-argument filetests, all 185
+`cranelift-codegen` unit tests, cg_clif check, complete stage-2 backend and
+standard-library builds, and matched 50-run correctness probes. The current
+native `i8x8` policy additionally passed its AArch64 execution example, cg_clif
+check, complete stage-2 cg_clif, standard-library, and proc-macro build, and
+matched application correctness probes. The final complete-suite matrix is
+still pending for the eventual final policy. The current cg_clif sysroot
+harness cannot provide additional coverage: its stdlib patch no longer applies
+to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
+before entering the test program.
 
 ## Performance Roadmap
 
@@ -1270,7 +1314,7 @@ screen and was rejected. Requiring four static call sites per caller retains
 the hot `Type::hash` transformation, improves every application median, and
 leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
 model is the next call arc, not broader body availability by itself.
-The remaining 1.4-2.5x LLVM gap shows that local representation fixes alone
+The remaining 1.4-2.3x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
@@ -1280,6 +1324,15 @@ can force slower fallback code. Add a benchmark startup smoke before every
 timing matrix, and treat any unsupported intrinsic as a prerequisite fix.
 Prefer native Cranelift instructions when available; use small, reviewed inline
 assembly lowerings only where the backend has no equivalent yet.
+
+The retained AArch64 `i8x8` comparison and splat lowering is the first
+profile-driven native-vector step in this arc. It halves the hot hashbrown
+body and improves ty by 5.79% without moving uv or Ruff. The rejected broad
+64- and 128-bit version is the important guardrail: enabling native operations
+piecemeal can add vector-to-lane materialization in surrounding scalarized
+code and significantly regress another application. Expand coverage by
+profiled vector shape and operation cluster, and require the complete matched
+application gate before making any shape global.
 
 ## Reproduction Shape
 
