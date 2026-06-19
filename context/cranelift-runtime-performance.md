@@ -7,10 +7,11 @@ Cranelift, not Cranelift compile time. LLVM and Cranelift use the same SRS
 rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
-The comparison was collected on aarch64 macOS at SRS `691d7d23a7a1`, with:
+The latest comparison was collected on aarch64 macOS from the source tree now
+recorded at SRS `9b5883937`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
-- Cranelift `0.133.0-691d7d23a`;
+- Cranelift `0.133.0`;
 - uv `6c963dd3cb0e`;
 - Ruff/ty `e0eb28d6345b`;
 - the repositories' `profiling` profile, with LTO disabled for both backends;
@@ -24,18 +25,16 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 20 timed trials after 5 warmups. Lower is better. The LLVM values
-come from the matched backend matrix; the final Cranelift values come from the
-latest balanced comparison against the preceding Cranelift policy on the same
-machine. The resulting LLVM leads are therefore representative rather than a
-single block-balanced estimate.
+Each row is 20 timed trials after 5 warmups. Lower is better. LLVM, the
+preceding Cranelift policy, and the current Cranelift policy were run in the
+same randomized, block-balanced matrix from freshly built binaries.
 
-| Workload | LLVM | Final Cranelift | LLVM lead |
+| Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.8 ms | 72.4 ms | 2.21x |
-| `uv lock --check`, offline | 62.2 ms | 106.2 ms | 1.71x |
-| `ruff check` over 1,592 fixtures | 80.1 ms | 205.0 ms | 2.56x |
-| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 166.4 ms | 3.57x |
+| `uv venv --clear` | 33.3 ms | 73.0 ms | 2.19x |
+| `uv lock --check`, offline | 61.3 ms | 106.9 ms | 1.74x |
+| `ruff check` over 1,592 fixtures | 79.8 ms | 206.7 ms | 2.59x |
+| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 160.1 ms | 3.35x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -52,11 +51,11 @@ the remaining loop-optimization and code-quality gap.
 The profiling binaries retain full debuginfo, so these are comparative rather
 than distribution sizes.
 
-| Binary | LLVM | Cranelift baseline | Final Cranelift |
+| Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 39.4 MB | 135.8 MB | 128.1 MB |
-| ty | 39.4 MB | 145.6 MB | 133.1 MB |
-| uv | 87.2 MB | 255.0 MB | 258.7 MB |
+| Ruff | 45.0 MB | 135.8 MB | 127.9 MB |
+| ty | 47.5 MB | 145.6 MB | 133.7 MB |
+| uv | 100.0 MB | 255.0 MB | 258.3 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -247,6 +246,41 @@ environment creation improve decisively; ty and uv resolution are neutral.
 All correctness digests match, and all three binaries become smaller, so the
 policy is retained.
 
+### Globally enabled target features
+
+An amplified ty profile made small AArch64 NEON wrappers the hottest active
+Cranelift leaves. Calls such as `vceq_u8`, `vcltz_s8`, `vdup_n_u8`, and
+`vld1_u8` remained out of line even though NEON is globally enabled for every
+AArch64 function. The MIR inliner required the caller and callee's explicit
+`#[target_feature]` lists to be identical and did not account for session-wide
+features. LLVM repaired the missed opportunity in its later IR inliner;
+Cranelift had no second inlining stage.
+
+The compatibility check now removes globally enabled features before comparing
+the function-local sets. It retains exact matching for genuinely local
+features, so moving a call across a feature or ABI boundary remains forbidden.
+The AArch64 regression test proves both sides: redundant NEON can inline into a
+normal caller, while local SVE cannot. In the pinned ty binary, the 284 copies
+of the four hot NEON wrapper families fall to zero.
+
+The matched three-lane gate used freshly rebuilt LLVM and Cranelift binaries
+from the same compiler and pinned application sources:
+
+| Workload | Candidate vs previous Cranelift | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -1.6% | 15/20 | 0.04139 | +120.3% | -0.162% |
+| `uv lock --check`, offline | +0.7% | 8/20 | 0.50344 | +74.3% | -0.162% |
+| `ruff check` over 1,592 fixtures | +1.7% | 5/20 | 0.04139 | +163.7% | -0.211% |
+| `ty check` over `scripts/ty_benchmark` | -4.5% | 18/20 | 0.00040 | +236.1% | +0.462% |
+
+A separate 50-trial Ruff/ty gate measured Ruff at +0.6% with 19/50 wins
+(two-sided sign-test p = 0.11892) and ty at -4.0% with 45/50 wins
+(p = 0.0000000042). The broader gate confirms a real tradeoff: the change
+improves the largest remaining gap and uv environment creation, leaves uv
+resolution neutral, and regresses Ruff. It is retained as a net improvement
+across the representative set, with the Ruff regression explicitly carried
+into the next optimization gate rather than hidden by the aggregate result.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -297,13 +331,14 @@ remains the decision gate for generated-code runtime.
 The subsequent 500-cross-crate/60/600/100 policy passed a complete two-stage
 SRS build, all 18 `rustc_interface` unit tests, a matching standalone cg_clif
 backend build, and cg_clif's no-sysroot AOT smoke. The current depth-8 policy
-also passed the complete SRS build and all 18 interface tests. Both complete
-runtime gates preserved every correctness digest. A fresh full uv/Ruff/ty
-suite pair is reserved for the next finalization gate rather than repeated
-after every retained threshold step. The current cg_clif sysroot harness
-cannot provide additional coverage: its stdlib patch no longer applies to this
-Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS before
-entering the test program.
+also passed the complete SRS build and all 18 interface tests. The subsequent
+target-feature policy passed another complete SRS build and its dedicated
+AArch64 MIR test. Every complete runtime gate preserved every correctness
+digest. A fresh full uv/Ruff/ty suite pair is reserved for the next
+finalization gate rather than repeated after every retained optimization. The
+current cg_clif sysroot harness cannot provide additional coverage: its stdlib
+patch no longer applies to this Rust snapshot, and its standalone JIT smoke
+aborts in rustc query TLS before entering the test program.
 
 ## Performance Roadmap
 
@@ -379,11 +414,11 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
 - pass or retain stack arguments without unnecessary entry-block loads where
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
-The application gate is important here: the latest policy helps Ruff and uv
-environment creation, but uv resolution and ty remain statistically neutral.
-Their hot paths will not all improve merely by buying more code size. Keeping
-thin `NonNull` iterator cursors in SSA completes one high-impact stack-slot
-case, but the remaining 2-4x LLVM gap shows that local representation fixes
+The application gate is important here: the latest policy helps ty and uv
+environment creation, leaves uv resolution neutral, and regresses Ruff. Their
+hot paths will not all improve merely by buying more code size. Keeping thin
+`NonNull` iterator cursors in SSA completes one high-impact stack-slot case,
+but the remaining 2-4x LLVM gap shows that local representation fixes
 alone will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
