@@ -1081,6 +1081,42 @@ was rejected. Native SIMD should therefore expand one profiled shape at a time,
 with surrounding operations moved to vectors before a shape is enabled
 globally.
 
+### Rejected same-width stack reinterpretation forwarding
+
+The retained `i8x8` lowering exposed four remaining vector-to-integer
+round-trips in the same hashbrown body. cg_clif stored each comparison result
+as `i8x8` and immediately reloaded the same eight bytes as `i64` for bitmask
+tests. Cranelift's pre-legalization stack pass keys known values by both
+location and type, so it could not forward those otherwise exact stores and
+loads.
+
+An experiment recognized a stored value covering the load's exact byte range
+and replaced the memory round-trip with a same-size `bitcast`. The bitcast used
+the target byte order because vector-to-scalar reinterpretation changes the
+lane shape. Focused little- and big-endian tests covered both scalar-to-vector
+and vector-to-scalar directions. In the reduced hot function, all four
+comparison-result slots disappeared, the local stack allocation fell from 208
+to 144 bytes, and the body shrank from 764 to 756 bytes.
+
+The cleaner local result did not move the complete 50-run application gate:
+
+| Workload | Previous Cranelift | Candidate | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 56.59 ms | 56.82 ms | -0.13% | 26/50 | 0.88772 |
+| `uv lock --check`, offline | 86.87 ms | 87.67 ms | +0.31% | 23/50 | 0.67181 |
+| `ruff check` over 1,592 fixtures | 143.72 ms | 143.97 ms | -0.56% | 30/50 | 0.20264 |
+| `ty check` over `scripts/ty_benchmark` | 108.84 ms | 108.21 ms | -0.59% | 30/50 | 0.20264 |
+
+All correctness-probe digests matched. uv and ty shrank by 9,552 and 12,160
+bytes, while Ruff grew by 5,632 bytes; every change is at most 0.01%. The
+focused filetests, all 185 `cranelift-codegen` unit tests and 21 passing
+doctests, cg_clif check, complete stage-2 cg_clif and standard-library build,
+and all three application builds passed. The transformation is sound and
+locally effective, but isolated transmute forwarding is runtime-neutral, so it
+is rejected. The next profitable vector-stack step must remove the
+address-taken group load or loop-invariant vector spill, or keep a larger
+region vector-shaped, rather than only replacing result materialization.
+
 ### Rejected backend-specific UB-check inlining
 
 Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
@@ -1178,8 +1214,12 @@ passed focused scalar, vector, and branch-argument filetests, all 185
 standard-library builds, and matched 50-run correctness probes. The current
 native `i8x8` policy additionally passed its AArch64 execution example, cg_clif
 check, complete stage-2 cg_clif, standard-library, and proc-macro build, and
-matched application correctness probes. The final complete-suite matrix is
-still pending for the eventual final policy. The current cg_clif sysroot
+matched application correctness probes. The rejected same-width stack
+reinterpretation experiment then passed endian-specific filetests, the
+Cranelift codegen unit and doc tests, cg_clif check, another complete stage-2
+cg_clif and standard-library build, and matched application correctness probes.
+The final complete-suite matrix is still pending for the eventual final policy.
+The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
 to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
 before entering the test program.
@@ -1299,7 +1339,12 @@ those comparison results with direct conditional branches then removes the
 corresponding bounds checks, decisively improves Ruff and ty, and cuts another
 2.1-2.5% from binary size without moving uv. The forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
-roadmap items. A matched profile before the repeated-call import showed
+roadmap items. Forwarding same-width, differently typed stores and loads with
+native-endian bitcasts removed four more vector materializations and cut the
+hot hashbrown frame by 64 bytes, but the complete 50-run gate was neutral.
+Further stack work in this loop must target the address-taken group load or the
+loop-invariant vector spill rather than another local transmute. A matched
+profile before the repeated-call import showed
 hashbrown's `find_or_find_insert_index_inner` and cross-CGU
 `FxHasher::write_isize` as prominent Cranelift-only leaves while LLVM had
 absorbed them into callers.
@@ -1330,7 +1375,11 @@ profile-driven native-vector step in this arc. It halves the hot hashbrown
 body and improves ty by 5.79% without moving uv or Ruff. The rejected broad
 64- and 128-bit version is the important guardrail: enabling native operations
 piecemeal can add vector-to-lane materialization in surrounding scalarized
-code and significantly regress another application. Expand coverage by
+code and significantly regress another application. Removing four exact
+vector-to-scalar stack round-trips after the narrow lowering improved local
+code without moving any application, so the next expansion must keep a larger
+producer-consumer region vector-shaped rather than add another isolated
+conversion. Expand coverage by
 profiled vector shape and operation cluster, and require the complete matched
 application gate before making any shape global.
 
