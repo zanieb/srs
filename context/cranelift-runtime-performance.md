@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `74a6a6dad`, with:
+recorded at SRS `431451f3f`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.7 ms | 59.5 ms | 1.82x |
-| `uv lock --check`, offline | 59.4 ms | 91.2 ms | 1.53x |
-| `ruff check` over 1,592 fixtures | 79.0 ms | 160.1 ms | 2.03x |
-| `ty check` over `scripts/ty_benchmark` | 47.5 ms | 128.7 ms | 2.71x |
+| `uv venv --clear` | 30.9 ms | 55.6 ms | 1.80x |
+| `uv lock --check`, offline | 58.4 ms | 85.4 ms | 1.46x |
+| `ruff check` over 1,592 fixtures | 79.2 ms | 153.9 ms | 1.94x |
+| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 122.9 ms | 2.58x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.5-2.7x faster for
+The conclusion is unambiguous: LLVM is currently about 1.5-2.6x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,9 +64,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 125.0 MB |
-| ty | 47.5 MB | 145.6 MB | 129.7 MB |
-| uv | 100.0 MB | 255.0 MB | 252.3 MB |
+| Ruff | 45.0 MB | 135.8 MB | 122.5 MB |
+| ty | 47.5 MB | 145.6 MB | 127.2 MB |
+| uv | 100.0 MB | 255.0 MB | 248.1 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -605,6 +605,49 @@ Cranelift build, and the candidate. The focused filetest, all 184
 library build pass. This is the largest broadly positive retained runtime step
 in the investigation so far.
 
+### Bounded stack-backed aggregate copies
+
+The first profile after stack forwarding still showed Darwin's
+`_platform_memmove` as the second-hottest active leaf. A dynamic size census
+made the scale visible: the representative ty corpus executed 3,565,932,020
+copy calls and moved about 450 GB, versus 119,334,944 calls and 17 GB in the
+LLVM binary. The dominant Cranelift-only sizes were 120, 128, and 80 bytes.
+Symbolicated callers showed repeated aggregate shuttling through temporary
+stack slots; one 328-byte `Default::default` body made nine separate 120-byte
+libc calls.
+
+cg_clif now retains a constant non-overlapping copy as explicit loads and
+stores when either endpoint is a known stack slot and the copy needs at most
+16 registers. Loads still precede every store, preserving overlap safety for
+the shared implementation. Arbitrary-pointer copies retain the separately
+profiled eight-register frontend ceiling. Keeping stack identity explicit lets
+the pre-legalization forwarding pass collapse chains that were previously
+hidden behind `stack_addr` and a libcall.
+
+On the same ty corpus, dynamic copy calls fell to 1,056,739,242 (-70.37%) and
+bytes moved fell to about 197 GB (-56.24%). The 120- and 128-byte libc buckets
+disappeared entirely. The 50-run matched gate measured the retained policy
+against stack forwarding alone:
+
+| Workload | LLVM | Stack forwarding | Stack-backed copies | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 30.9 ms | 59.6 ms | 55.6 ms | -5.98% | 45/50 | 0.0000000042 |
+| `uv lock --check`, offline | 58.4 ms | 90.7 ms | 85.4 ms | -5.63% | 47/50 | 0.000000000037 |
+| `ruff check` over 1,592 fixtures | 79.2 ms | 158.8 ms | 153.9 ms | -3.23% | 42/50 | 0.0000012 |
+| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 129.2 ms | 122.9 ms | -4.76% | 50/50 | 0.0000000000000018 |
+
+The uv, Ruff, and ty binaries shrink by 1.64%, 1.96%, and 1.94%, respectively,
+and all correctness digests match. The standard cg_clif example exercises
+80-, 120-, and 128-byte stack copies and runs successfully with the stage-2
+backend.
+
+The next profile-supported boundary was tested and rejected. Raising the
+ceiling to 20 registers grew uv, Ruff, and ty by 0.25%, 0.19%, and 0.14%.
+Against 16 registers it regressed uv environment creation by 1.19% (5/20 wins,
+`p = 0.04139`) and uv resolution by 1.40% (4/20, `p = 0.01182`); Ruff and ty
+were statistically neutral. Sixteen registers is therefore the retained
+stack-specific ceiling.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
@@ -723,10 +766,12 @@ library build. The stack-forwarding policy passed focused escaped-slot,
 overlap, and stack-map tests, all 184 `cranelift-codegen` unit tests, another
 complete stage-2 build, and the matched correctness probes. A fresh full
 uv/Ruff/ty suite pair is reserved for the finalization gate rather than
-repeated after every retained optimization. The current cg_clif sysroot
-harness cannot provide additional coverage: its stdlib patch no longer applies
-to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
-before entering the test program.
+repeated after every retained optimization. The bounded stack-copy policy
+passed its stage-2 backend and standard-library build, direct standard-example
+execution, application correctness probes, and 50-run runtime gate. The
+current cg_clif sysroot harness cannot provide additional coverage: its stdlib
+patch no longer applies to this Rust snapshot, and its standalone JIT smoke
+aborts in rustc query TLS before entering the test program.
 
 ## Performance Roadmap
 
@@ -811,14 +856,15 @@ The application gate is important here: the target-feature policy helped ty
 but regressed Ruff, while the subsequent depth increase recovered Ruff without
 giving back the ty win. Their hot paths will not all improve merely by buying
 more code size. Keeping thin
-`NonNull` and `NonZero` values in SSA and forwarding exact explicit stack-slot
-traffic complete several high-impact local cases. The new forwarding pass also
+`NonNull` and `NonZero` values in SSA, forwarding exact explicit stack-slot
+traffic, and exposing bounded stack-backed aggregate copies complete several
+high-impact local cases. The new forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
 prominent Cranelift-only leaves while LLVM has absorbed them into callers.
 That makes cross-CGU post-monomorphization body import the immediate call arc.
-The remaining 1.5-2.7x LLVM gap shows that local representation fixes alone
+The remaining 1.5-2.6x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
