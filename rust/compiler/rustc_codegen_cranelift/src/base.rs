@@ -938,17 +938,39 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     .expect("expected pointee to have a layout");
                 let elem_size: u64 = pointee_layout.layout.size().bytes();
 
+                // Cranelift has no later pass that expands constant libc copies. Preserve the
+                // constant size here so the frontend can emit a small load/store sequence.
+                let constant_bytes = count
+                    .constant()
+                    .and_then(|constant| {
+                        crate::constant::eval_mir_constant(fx, constant).0.try_to_scalar_int()
+                    })
+                    .and_then(|count| count.to_target_usize(fx.tcx).checked_mul(elem_size));
+
                 let dst = dst.load_scalar(fx);
                 let src = codegen_operand(fx, src).load_scalar(fx);
-                let count = codegen_operand(fx, count).load_scalar(fx);
-
-                let bytes = if elem_size != 1 {
-                    fx.bcx.ins().imul_imm(count, elem_size as i64)
+                if let Some(bytes) = constant_bytes {
+                    let align = pointee_layout.layout.align.abi.bytes().try_into().unwrap_or(128);
+                    fx.bcx.emit_small_memory_copy(
+                        fx.target_config,
+                        dst,
+                        src,
+                        bytes,
+                        align,
+                        align,
+                        true,
+                        MemFlags::new(),
+                    );
                 } else {
-                    count
-                };
+                    let count = codegen_operand(fx, count).load_scalar(fx);
+                    let bytes = if elem_size != 1 {
+                        fx.bcx.ins().imul_imm(count, elem_size as i64)
+                    } else {
+                        count
+                    };
 
-                fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                    fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                }
             }
         },
     }

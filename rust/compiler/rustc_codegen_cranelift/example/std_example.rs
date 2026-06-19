@@ -59,6 +59,7 @@ fn main() {
     let pointer = black_box(&pointee as *const u64);
     assert_eq!(unsafe { *reference_through_raw_pointer(pointer) }, pointee);
     assert_eq!(unsafe { raw_pointer_through_raw_pointer(pointer).read() }, pointee);
+    test_small_copy_nonoverlapping();
 
     let mut nonnull_pointee = 5678_u64;
     let nonnull = NonNull::from(&mut nonnull_pointee);
@@ -195,6 +196,20 @@ fn main() {
     static STATIC_WITH_MAYBE_NESTED_BOX: &Option<Box<str>> = &no_str();
 
     println!("{:?}", STATIC_WITH_MAYBE_NESTED_BOX);
+}
+
+#[inline(never)]
+fn test_small_copy_nonoverlapping() {
+    let source = black_box([11_u32, 22, 33]);
+    let mut destination = black_box([0_u32; 3]);
+    unsafe {
+        std::intrinsics::copy_nonoverlapping(source.as_ptr(), destination.as_mut_ptr(), 3);
+    }
+    assert_eq!(destination, source);
+
+    let bytes = black_box([0_u8, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let unaligned = unsafe { bytes.as_ptr().add(1).cast::<u64>().read_unaligned() };
+    assert_eq!(unaligned, u64::from_ne_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
 }
 
 fn panic(_: u128) {
