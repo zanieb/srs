@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `d4dc3d54b`, with:
+recorded at SRS `f7287c882`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -25,16 +25,16 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 20 timed trials after 5 warmups. Lower is better. LLVM, the
+Each row is 50 timed trials after 10 warmups. Lower is better. LLVM, the
 preceding Cranelift policy, and the current Cranelift policy were run in the
 same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.0 ms | 72.1 ms | 2.18x |
-| `uv lock --check`, offline | 61.7 ms | 107.7 ms | 1.75x |
-| `ruff check` over 1,592 fixtures | 80.2 ms | 204.9 ms | 2.55x |
-| `ty check` over `scripts/ty_benchmark` | 48.2 ms | 161.9 ms | 3.36x |
+| `uv venv --clear` | 33.5 ms | 71.3 ms | 2.13x |
+| `uv lock --check`, offline | 61.5 ms | 107.1 ms | 1.74x |
+| `ruff check` over 1,592 fixtures | 80.3 ms | 207.4 ms | 2.58x |
+| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 160.2 ms | 3.36x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -53,9 +53,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 127.9 MB |
-| ty | 47.5 MB | 145.6 MB | 133.7 MB |
-| uv | 100.0 MB | 255.0 MB | 258.3 MB |
+| Ruff | 45.0 MB | 135.8 MB | 127.7 MB |
+| ty | 47.5 MB | 145.6 MB | 133.6 MB |
+| uv | 100.0 MB | 255.0 MB | 258.2 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -301,6 +301,41 @@ ty improvement. The broader gate is directionally favorable for both uv
 operations and Ruff, ty is neutral across the higher-powered focused gate,
 and every binary becomes smaller, so the depth-12 policy is retained.
 
+### Small constant non-overlapping copies
+
+The next amplified ty profile put `_platform_memmove` at the top of the active
+stack at roughly 11 times LLVM's sampled rate: 5,748 samples over 10 seconds
+versus 257 over 5 seconds. A local interposition trace showed that two
+monomorphizations of `read_unaligned<uint8x8_t>` alone issued roughly 1.2
+million eight-byte libc copies in the unamplified check. Fixed-size hash-table
+group loads were another large family. LLVM expands these calls in its later
+IR pipeline; Cranelift was discarding the constant count and always calling
+libc.
+
+cg_clif now preserves a constant `CopyNonOverlapping` byte count and passes it,
+the known alignment, and the non-overlap guarantee to Cranelift's existing
+small-copy emitter. Copies requiring at most four load/store pairs stay in the
+function; larger or dynamic copies retain the libc path. The regression probe
+covers both a three-element `u32` copy and an unaligned `u64` read. The emitted
+AArch64 code for the former is three loads followed by three stores, with no
+libc call.
+
+The 50-run matched three-lane gate measured:
+
+| Workload | Candidate vs depth 12 | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.9% | 32/50 | 0.06491 | +114.6% | -0.028% |
+| `uv lock --check`, offline | -1.0% | 30/50 | 0.20264 | +73.1% | -0.028% |
+| `ruff check` over 1,592 fixtures | -0.2% | 26/50 | 0.88772 | +155.3% | -0.085% |
+| `ty check` over `scripts/ty_benchmark` | -1.0% | 32/50 | 0.06491 | +235.3% | -0.075% |
+
+A separate 50-run two-lane replication measured uv environment creation at
+-2.0% (37/50 wins, p = 0.00094), uv resolution at -0.9% (33/50,
+p = 0.03284), ty at -1.1% (37/50, p = 0.00094), and Ruff at +0.2%
+(23/50, p = 0.67181). An overlapping-copy experiment removed additional hot
+libc calls but regressed uv, so it was rejected. The retained change improves
+the three affected workloads, is neutral for Ruff, and shrinks every binary.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -354,12 +389,14 @@ backend build, and cg_clif's no-sysroot AOT smoke. The depth-8 policy also
 passed the complete SRS build and all 18 interface tests. The subsequent
 target-feature policy passed another complete SRS build and its dedicated
 AArch64 MIR test. The current depth-12 policy passed a complete SRS build and
-all 18 interface tests. Every complete runtime gate preserved every
-correctness digest. A fresh full uv/Ruff/ty suite pair is reserved for the next
-finalization gate rather than repeated after every retained optimization. The
-current cg_clif sysroot harness cannot provide additional coverage: its stdlib
-patch no longer applies to this Rust snapshot, and its standalone JIT smoke
-aborts in rustc query TLS before entering the test program.
+all 18 interface tests. The small-copy policy passed a complete SRS build and
+its dedicated cg_clif AOT regression probe. Every complete runtime gate
+preserved every correctness digest. A fresh full uv/Ruff/ty suite pair is
+reserved for the next finalization gate rather than repeated after every
+retained optimization. The current cg_clif sysroot harness cannot provide
+additional coverage: its stdlib patch no longer applies to this Rust snapshot,
+and its standalone JIT smoke aborts in rustc query TLS before entering the test
+program.
 
 ## Performance Roadmap
 
