@@ -497,6 +497,14 @@ struct FilePatchState {
     raw_sections: Option<String>,
 }
 
+impl FilePatchState {
+    fn has_historical_macho_unwind_ownership(&self) -> bool {
+        self.macho_archive_members
+            .iter()
+            .any(|state| state.unwind_transaction.is_some() || state.kind.owns_changed_unwind())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MachOArchiveActivationState {
     kind: MachOArchiveActivationKind,
@@ -2664,13 +2672,13 @@ const DIRECT_MACHO_CGU_MIGRATION_REQUIRED: &str = "missing direct Mach-O CGU cat
 const MACHO_LOCAL_COHORT_LIVENESS_REQUIRED: &str =
     "published local Mach-O cohort has no complete current atom-liveness proof";
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FilteredRecordCoverage {
     complete_macho_symbol_resolutions: bool,
     complete_record_input_files: HashSet<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ChangedInputRecordCoverage {
     MetadataOnly,
     ChangedInputs(FilteredRecordCoverage),
@@ -5775,6 +5783,12 @@ struct DirectMachOCguMigrationInput {
     current_hash: String,
 }
 
+#[derive(Clone)]
+struct MachOUnwindCohortReclaim {
+    fde_offsets: HashSet<usize>,
+    fde_identities: HashSet<MachOUnwindFunctionIdentity>,
+}
+
 enum DirectMachOCguUnmodeledInput {
     Changed {
         previous_bytes: Vec<u8>,
@@ -8039,6 +8053,225 @@ fn direct_macho_cgu_migration_inputs(
     Ok((inputs, unmodeled_changed_inputs, complete_changed_inputs))
 }
 
+fn preplanned_changed_macho_unwind_fdes(
+    previous_bytes: &[u8],
+    current_bytes: &[u8],
+    input_file_path: &str,
+    sections: &[PatchSection],
+    output_file: &object::File<'_>,
+) -> Result<std::result::Result<Vec<MachOUnwindFunctionIdentity>, String>> {
+    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
+    let current_resolver = PatchInputResolver::new(current_bytes, true)?;
+    let mut input_refs = sections
+        .iter()
+        .map(|section| section.input.as_str())
+        .collect::<Vec<_>>();
+    input_refs.sort_unstable();
+    input_refs.dedup();
+
+    let mut retired_fdes = Vec::new();
+    for input_ref in input_refs {
+        let Some(previous_input) = previous_resolver.resolve(
+            input_file_path,
+            input_ref,
+            PatchInputLookup::MatchArchiveMember,
+        )?
+        else {
+            return Ok(Err(
+                "could not resolve previous changed Mach-O unwind member".to_owned(),
+            ));
+        };
+        let Ok(previous_file) = object::File::parse(previous_input.bytes) else {
+            continue;
+        };
+        if !is_supported_incremental_macho_object(&previous_file) {
+            continue;
+        }
+        let previous_unwind = match added_macho_archive_unwind(&previous_file)? {
+            Ok(unwind) => unwind,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let Some(previous_unwind) = previous_unwind else {
+            continue;
+        };
+        let current_unwind = if let Some(current_input) = current_resolver.resolve(
+            input_file_path,
+            input_ref,
+            PatchInputLookup::MatchArchiveMember,
+        )? {
+            let Ok(current_file) = object::File::parse(current_input.bytes) else {
+                return Ok(Err(
+                    "current changed Mach-O unwind member is not parseable".to_owned()
+                ));
+            };
+            if !is_supported_incremental_macho_object(&current_file) {
+                return Ok(Err(
+                    "current changed Mach-O unwind member is unsupported".to_owned()
+                ));
+            }
+            match added_macho_archive_unwind(&current_file)? {
+                Ok(unwind) => unwind,
+                Err(reason) => return Ok(Err(reason)),
+            }
+        } else {
+            None
+        };
+        if current_unwind.as_ref() == Some(&previous_unwind) {
+            continue;
+        }
+        retired_fdes.extend(
+            match macho_unwind_fde_identities(input_ref, &previous_unwind, sections, output_file) {
+                Ok(identities) => identities,
+                Err(reason) => return Ok(Err(reason)),
+            },
+        );
+    }
+    Ok(Ok(retired_fdes))
+}
+
+fn preplanned_changed_macho_unwind_reclaim(
+    state_dir: &Path,
+    previous_output_source: &Path,
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+) -> Result<Option<MachOUnwindCohortReclaim>> {
+    macro_rules! unavailable {
+        ($reason:expr) => {{
+            append_log(
+                state_dir,
+                &format!("Mach-O unwind cohort preplan unavailable: {}", $reason),
+            )?;
+            return Ok(None);
+        }};
+    }
+    if changed_inputs.is_empty() {
+        return Ok(None);
+    }
+    let output = match read_output_bytes(previous_output_source) {
+        Ok(output) => output,
+        Err(_) => unavailable!("previous output is unavailable"),
+    };
+    let Ok(output_file) = object::File::parse(&output[..]) else {
+        unavailable!("previous output is not parseable");
+    };
+    let mut retired_fdes = Vec::new();
+    for (input_index, current_path) in changed_inputs {
+        let Some(input) = previous.input_files.get(*input_index) else {
+            unavailable!("changed input index is missing");
+        };
+        if input
+            .patch
+            .as_ref()
+            .is_some_and(FilePatchState::has_historical_macho_unwind_ownership)
+        {
+            unavailable!("changed input has historical Mach-O unwind ownership");
+        }
+        let path = decode_path(&input.path)?;
+        let direct_cgu = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".rcgu.o"));
+        let rust_archive = path
+            .extension()
+            .is_some_and(|extension| extension == "rlib");
+        if !direct_cgu && !rust_archive {
+            unavailable!(format!(
+                "changed input is not a direct CGU or Rust archive: {}",
+                path.display()
+            ));
+        }
+        let previous_bytes = match read_verified_input_snapshot(state_dir, input) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => unavailable!(format!(
+                "changed input snapshot is unavailable: {}",
+                path.display()
+            )),
+        };
+        let current_bytes = match read_file_with_stable_identity_and_hashing(current_path, false) {
+            Ok(Some((bytes, _))) => bytes,
+            Ok(None) | Err(_) => unavailable!(format!(
+                "changed input changed while being read: {}",
+                current_path.display()
+            )),
+        };
+        let sections = previous
+            .sections
+            .iter()
+            .filter(|section| section.input_file == input.path)
+            .map(|section| PatchSection {
+                input: section.input.to_string(),
+                section_index: section.section_index,
+                section_name: None,
+                input_size: section.size,
+                output_offset: section.output_offset,
+                output_size: section.size,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            })
+            .collect::<Vec<_>>();
+        let identities = match preplanned_changed_macho_unwind_fdes(
+            &previous_bytes,
+            &current_bytes,
+            input.path.as_str(),
+            &sections,
+            &output_file,
+        ) {
+            Ok(Ok(identities)) => identities,
+            Ok(Err(reason)) => unavailable!(reason),
+            Err(_) => unavailable!("changed Mach-O unwind members are unavailable"),
+        };
+        retired_fdes.extend(identities);
+    }
+    if retired_fdes.is_empty() {
+        unavailable!("changed Mach-O inputs have no retired FDEs");
+    }
+    let eh_frame_index =
+        match added_macho_archive_unique_output_section(&output_file, b"__TEXT", b"__eh_frame") {
+            Ok(index) => index,
+            Err(reason) => unavailable!(reason),
+        };
+    let eh_frame = output_file.section_by_index(eh_frame_index)?;
+    let section_data = eh_frame
+        .data()
+        .context("Failed to read previous Mach-O __eh_frame for cohort preplanning")?;
+    let fde_offsets = match retired_macho_archive_fde_suffix_offsets(
+        eh_frame.address(),
+        section_data,
+        &retired_fdes,
+    ) {
+        Ok(offsets) => offsets,
+        Err(reason) => unavailable!(reason),
+    };
+    let entries = match output_macho_archive_eh_frame_entries(section_data) {
+        Ok(entries) => entries,
+        Err(reason) => unavailable!(reason),
+    };
+    let physical_fdes = match output_macho_archive_fdes(section_data, eh_frame.address(), &entries)
+    {
+        Ok(fdes) => fdes,
+        Err(reason) => unavailable!(reason),
+    };
+    let fde_identities = physical_fdes
+        .iter()
+        .filter(|fde| fde_offsets.contains(&fde.entry_offset))
+        .map(|fde| fde.identity)
+        .collect::<HashSet<_>>();
+    if fde_identities.len() != fde_offsets.len() {
+        unavailable!("physical suffix FDE offsets do not have unique identities");
+    }
+    append_log(
+        state_dir,
+        &format!(
+            "preplanned changed Mach-O unwind cohort in {} retired physical FDE slots",
+            fde_offsets.len()
+        ),
+    )?;
+    Ok(Some(MachOUnwindCohortReclaim {
+        fde_offsets,
+        fde_identities,
+    }))
+}
+
 fn migrated_macho_archive_definition_names(
     input_file_path: &str,
     moves: &[MachOSymbolResolutionMove],
@@ -8090,12 +8323,85 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     metadata_update_input_indices: &[usize],
     trust_rustc_link_content_digests: bool,
 ) -> Result<ChangedInputPatchResult> {
+    let reclaim = record_coverage.is_complete().then(|| {
+        preplanned_changed_macho_unwind_reclaim(
+            state_dir,
+            previous_output_source,
+            &previous,
+            changed_inputs,
+        )
+    });
+    let reclaim = reclaim.transpose()?.flatten();
+    let fallback = reclaim.as_ref().map(|_| {
+        (
+            previous.clone(),
+            current_link_start.clone(),
+            record_coverage.clone(),
+        )
+    });
+    let result = patch_changed_inputs_with_macho_unwind_cohort_reclaim(
+        args,
+        state_dir,
+        previous_output_source,
+        live_output_identity,
+        previous_output_was_live,
+        previous,
+        current_link_start,
+        &record_coverage,
+        changed_inputs,
+        metadata_update_input_indices,
+        trust_rustc_link_content_digests,
+        reclaim.as_ref(),
+    )?;
+    if matches!(
+        &result,
+        ChangedInputPatchResult::Unsupported(reason)
+            if reason == "preplanned Mach-O unwind cohort retirement was incomplete"
+    ) {
+        let (previous, current_link_start, record_coverage) =
+            fallback.expect("preplanned unwind reclaim retains fallback state");
+        return patch_changed_inputs_with_macho_unwind_cohort_reclaim(
+            args,
+            state_dir,
+            previous_output_source,
+            live_output_identity,
+            previous_output_was_live,
+            previous,
+            current_link_start,
+            &record_coverage,
+            changed_inputs,
+            metadata_update_input_indices,
+            trust_rustc_link_content_digests,
+            None,
+        );
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
+    args: &impl platform::Args,
+    state_dir: &Path,
+    previous_output_source: &Path,
+    live_output_identity: Option<&FileIdentity>,
+    previous_output_was_live: bool,
+    previous: PersistedState,
+    current_link_start: Option<FileIdentity>,
+    record_coverage: &ChangedInputRecordCoverage,
+    changed_inputs: &[(usize, PathBuf)],
+    metadata_update_input_indices: &[usize],
+    trust_rustc_link_content_digests: bool,
+    reclaim_macho_unwind: Option<&MachOUnwindCohortReclaim>,
+) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
 
+    let retry_previous = reclaim_macho_unwind.is_none().then(|| previous.clone());
+    let retry_current_link_start = current_link_start.clone();
+    let retry_record_coverage = record_coverage.clone();
     let records_complete = record_coverage.is_complete();
     let mut previous = previous;
     if matches!(
-        &record_coverage,
+        record_coverage,
         ChangedInputRecordCoverage::ChangedInputs(coverage)
             if coverage.complete_macho_symbol_resolutions
     ) {
@@ -8130,6 +8436,69 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(previous_output_source));
     let mut staged_changed_macho_unwind_output = None;
     let mut accumulated_changed_macho_unwind_patches = Vec::new();
+    if let Some(reclaim) = reclaim_macho_unwind.as_ref() {
+        let source_output = previous_output.get()?;
+        let output_file = object::File::parse(source_output)
+            .context("Failed to parse previous Mach-O output for cohort unwind reclamation")?;
+        let eh_frame_section_index =
+            match added_macho_archive_unique_output_section(&output_file, b"__TEXT", b"__eh_frame")
+            {
+                Ok(section) => section,
+                Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
+            };
+        let eh_frame_section = output_file.section_by_index(eh_frame_section_index)?;
+        let Some((section_file_offset, _)) = eh_frame_section.file_range() else {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "previous Mach-O __eh_frame section has no file range".to_owned(),
+            ));
+        };
+        let section_data = eh_frame_section
+            .data()
+            .context("Failed to read previous Mach-O __eh_frame for cohort reclamation")?;
+        let reclaimed = reclaim_retired_macho_archive_eh_frame_tail_offsets(
+            section_file_offset,
+            section_data,
+            &reclaim.fde_offsets,
+            &mut previous.reserved_ranges,
+        )?;
+        let Some(reclaimed) = reclaimed else {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "changed Mach-O unwind cohort is no longer an exact physical suffix".to_owned(),
+            ));
+        };
+        let previous_reserve_start = usize::try_from(
+            reclaimed
+                .previous_reserve_start
+                .checked_sub(section_file_offset)
+                .context("Reclaimed Mach-O unwind cohort reserve precedes its section")?,
+        )
+        .context("Reclaimed Mach-O unwind cohort reserve exceeds usize")?;
+        let mut staged_output = source_output.to_vec();
+        let section_start = usize::try_from(section_file_offset)
+            .context("Mach-O __eh_frame file offset exceeds usize")?;
+        let reclaim_start = section_start
+            .checked_add(reclaimed.terminator_offset)
+            .context("Reclaimed Mach-O unwind cohort offset overflow")?;
+        let reclaim_end = section_start
+            .checked_add(previous_reserve_start)
+            .context("Reclaimed Mach-O unwind cohort end overflow")?;
+        let Some(reclaimed_output) = staged_output.get_mut(reclaim_start..reclaim_end) else {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "reclaimed Mach-O unwind cohort is outside the output".to_owned(),
+            ));
+        };
+        reclaimed_output.fill(0);
+        accumulated_changed_macho_unwind_patches.push(SectionPatch {
+            output_offset: reclaim_start as u64,
+            size: reclaimed_output.len() as u64,
+            data: reclaimed_output.to_vec(),
+            deferred_relocation: None,
+            preserve_ranges: Vec::new(),
+            adjustments: Vec::new(),
+        });
+        staged_changed_macho_unwind_output = Some(staged_output);
+    }
+    let mut changed_macho_unwind_retired_fdes = Vec::new();
     let mut direct_macho_cgu_migration_plan = DirectMachOCguMigrationPlan::default();
     let mut direct_macho_cgu_liveness_proof = DirectMachOCguLivenessProof::default();
     let mut historical_macho_relocations = HistoricalMachORelocationRecords::new();
@@ -9942,6 +10311,9 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
             } else {
                 None
             };
+            if let Some(activation) = &changed_macho_archive_unwind_activation {
+                changed_macho_unwind_retired_fdes.extend(activation.retired_fdes.iter().copied());
+            }
             if let Some(activation) = &added_macho_archive_text_activation {
                 macho_text_relocation_replays
                     .replays
@@ -11538,6 +11910,95 @@ fn patch_changed_inputs_with_rustc_link_content_digest_trust(
                 expected_changed_input_index,
                 bytes,
             ));
+        }
+    }
+
+    if let Some(reclaim) = reclaim_macho_unwind.as_ref() {
+        let retired = changed_macho_unwind_retired_fdes
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if !reclaim.fde_identities.is_subset(&retired) {
+            return Ok(ChangedInputPatchResult::Unsupported(
+                "preplanned Mach-O unwind cohort retirement was incomplete".to_owned(),
+            ));
+        }
+    }
+
+    if reclaim_macho_unwind.is_none() && !changed_macho_unwind_retired_fdes.is_empty() {
+        let source_output = previous_output.get()?;
+        let output_file = object::File::parse(source_output)
+            .context("Failed to parse previous Mach-O output for cohort unwind planning")?;
+        let can_reclaim =
+            match added_macho_archive_unique_output_section(&output_file, b"__TEXT", b"__eh_frame")
+            {
+                Ok(section_index) => {
+                    let section = output_file.section_by_index(section_index)?;
+                    let Some((section_file_offset, _)) = section.file_range() else {
+                        return Ok(ChangedInputPatchResult::Unsupported(
+                            "previous Mach-O __eh_frame section has no file range".to_owned(),
+                        ));
+                    };
+                    let section_data = section
+                        .data()
+                        .context("Failed to read previous Mach-O __eh_frame for cohort planning")?;
+                    let retired_offsets = match retired_macho_archive_fde_suffix_offsets(
+                        section.address(),
+                        section_data,
+                        &changed_macho_unwind_retired_fdes,
+                    ) {
+                        Ok(offsets) => offsets,
+                        Err(reason) => {
+                            append_log(
+                                state_dir,
+                                &format!(
+                                    "changed Mach-O unwind cohort reclamation unavailable: {reason}"
+                                ),
+                            )?;
+                            HashSet::new()
+                        }
+                    };
+                    let mut reserved_ranges = retry_previous
+                        .as_ref()
+                        .expect("first unwind pass retains its previous state")
+                        .reserved_ranges
+                        .clone();
+                    reclaim_retired_macho_archive_eh_frame_tail_offsets(
+                        section_file_offset,
+                        section_data,
+                        &retired_offsets,
+                        &mut reserved_ranges,
+                    )?
+                    .map(|_| retired_offsets)
+                }
+                Err(_) => None,
+            };
+        if let Some(retired_offsets) = can_reclaim {
+            append_log(
+                state_dir,
+                &format!(
+                    "replanning changed Mach-O unwind cohort in {} retired physical FDE slots",
+                    retired_offsets.len()
+                ),
+            )?;
+            let reclaim = MachOUnwindCohortReclaim {
+                fde_offsets: retired_offsets,
+                fde_identities: HashSet::new(),
+            };
+            return patch_changed_inputs_with_macho_unwind_cohort_reclaim(
+                args,
+                state_dir,
+                previous_output_source,
+                live_output_identity,
+                previous_output_was_live,
+                retry_previous.expect("first unwind pass retains its previous state"),
+                retry_current_link_start,
+                &retry_record_coverage,
+                changed_inputs,
+                metadata_update_input_indices,
+                trust_rustc_link_content_digests,
+                Some(&reclaim),
+            );
         }
     }
 
@@ -14713,6 +15174,7 @@ struct ChangedMachOArchiveUnwindActivation {
     patches: Vec<SectionPatch>,
     previous_input_ranges: Vec<std::ops::Range<usize>>,
     current_input_ranges: Vec<std::ops::Range<usize>>,
+    retired_fdes: Vec<MachOUnwindFunctionIdentity>,
     remaining_reserved_ranges: Vec<ReservedRangeRecord>,
     unwind_transaction: Option<MachOArchiveUnwindTransactionState>,
 }
@@ -28859,7 +29321,6 @@ fn macho_text_relocation_replays_for_input(
             .or_default()
             .push(section);
     }
-
     // A cohort in one member can target a member visited later in the replay pass. Predeclare the
     // rematerializations that are guaranteed by a changed logical relocation count so liveness
     // planning does not depend on hash-map iteration order. The replay pass still has to build
@@ -39301,6 +39762,7 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
                 patches: Vec::new(),
                 previous_input_ranges: changed.previous_input_ranges,
                 current_input_ranges: changed.current_input_ranges,
+                retired_fdes: transition.retired_fdes,
                 remaining_reserved_ranges,
                 unwind_transaction: None,
             })));
@@ -39372,6 +39834,7 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
             patches: Vec::new(),
             previous_input_ranges: changed.previous_input_ranges,
             current_input_ranges: changed.current_input_ranges,
+            retired_fdes: changed.retired_fdes,
             remaining_reserved_ranges,
             unwind_transaction: None,
         })));
@@ -39456,6 +39919,7 @@ fn changed_macho_archive_unwind_activation_with_local_symbol_renames(
         patches: activation.patches,
         previous_input_ranges: changed.previous_input_ranges,
         current_input_ranges: changed.current_input_ranges,
+        retired_fdes: changed.retired_fdes,
         remaining_reserved_ranges,
         unwind_transaction,
     })))
@@ -43254,6 +43718,90 @@ struct ReclaimedMachOEhFrameTail {
     previous_reserve_start: u64,
 }
 
+fn reusable_retired_macho_archive_eh_frame_block(
+    eh_frame_address: u64,
+    section_data: &[u8],
+    retired_fdes: &[MachOUnwindFunctionIdentity],
+    replacement_size: usize,
+) -> Option<std::ops::Range<usize>> {
+    if retired_fdes.is_empty() || !replacement_size.is_multiple_of(8) {
+        return None;
+    }
+    let entries = output_macho_archive_eh_frame_entries(section_data).ok()?;
+    let physical_fdes = output_macho_archive_fdes(section_data, eh_frame_address, &entries).ok()?;
+    let mut retired_offsets = HashSet::with_capacity(retired_fdes.len());
+    for retired in retired_fdes {
+        let mut matching = physical_fdes
+            .iter()
+            .filter(|fde| fde.identity == *retired)
+            .map(|fde| fde.entry_offset);
+        let entry_offset = matching.next()?;
+        if matching.next().is_some() || !retired_offsets.insert(entry_offset) {
+            return None;
+        }
+    }
+
+    let mut fde_cie_offsets = HashMap::new();
+    for (&entry_offset, entry) in &entries {
+        let cie_pointer = read_u32_le(
+            section_data
+                .get(entry.start + 4..entry.start + 8)
+                .expect("validated EH-frame entry header"),
+        )? as usize;
+        if cie_pointer == 0 {
+            continue;
+        }
+        let cie_start = entry.start.checked_add(4)?.checked_sub(cie_pointer)?;
+        if !entries.contains_key(&cie_start) {
+            return None;
+        }
+        fde_cie_offsets.insert(entry_offset, cie_start);
+    }
+    let retired_cie_offsets = retired_offsets
+        .iter()
+        .map(|entry_offset| fde_cie_offsets.get(entry_offset).copied())
+        .collect::<Option<HashSet<_>>>()?;
+    let owned_cie_offsets = retired_cie_offsets
+        .into_iter()
+        .filter(|cie_offset| {
+            fde_cie_offsets.iter().all(|(fde_offset, candidate)| {
+                candidate != cie_offset || retired_offsets.contains(fde_offset)
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    let owned_entry_offsets = retired_offsets
+        .iter()
+        .chain(&owned_cie_offsets)
+        .copied()
+        .collect::<HashSet<_>>();
+    let block_start = owned_entry_offsets.iter().copied().min()?;
+    let block_end = owned_entry_offsets
+        .iter()
+        .filter_map(|entry_offset| entries.get(entry_offset).map(|entry| entry.end))
+        .max()?;
+    if !block_start.is_multiple_of(8)
+        || block_end.checked_sub(block_start) != Some(replacement_size)
+    {
+        return None;
+    }
+
+    let mut entry_offsets = entries.keys().copied().collect::<Vec<_>>();
+    entry_offsets.sort_unstable();
+    let mut expected_offset = block_start;
+    for entry_offset in entry_offsets
+        .into_iter()
+        .filter(|entry_offset| *entry_offset >= block_start && *entry_offset < block_end)
+    {
+        let entry = &entries[&entry_offset];
+        if entry.start != expected_offset || !owned_entry_offsets.contains(&entry_offset) {
+            return None;
+        }
+        expected_offset = entry.end;
+    }
+    (expected_offset == block_end).then_some(block_start..block_end)
+}
+
 fn reclaim_retired_macho_archive_eh_frame_tail(
     eh_frame_address: u64,
     section_file_offset: u64,
@@ -43285,6 +43833,27 @@ fn reclaim_retired_macho_archive_eh_frame_tail(
             return Ok(None);
         }
     }
+    reclaim_retired_macho_archive_eh_frame_tail_offsets(
+        section_file_offset,
+        section_data,
+        &retired_offsets,
+        reserved_ranges,
+    )
+}
+
+fn reclaim_retired_macho_archive_eh_frame_tail_offsets(
+    section_file_offset: u64,
+    section_data: &[u8],
+    retired_offsets: &HashSet<usize>,
+    reserved_ranges: &mut [ReservedRangeRecord],
+) -> Result<Option<ReclaimedMachOEhFrameTail>> {
+    if retired_offsets.is_empty() {
+        return Ok(None);
+    }
+    let entries = match output_macho_archive_eh_frame_entries(section_data) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
     let Some(terminator_offset) = eh_frame_terminator_offset(section_data) else {
         return Ok(None);
     };
@@ -43391,6 +43960,130 @@ fn reclaim_retired_macho_archive_eh_frame_tail(
         terminator_offset: tail_start,
         previous_reserve_start,
     }))
+}
+
+#[cfg(test)]
+fn active_retired_macho_archive_fde_offsets(
+    output_file: &object::File<'_>,
+    retired_fdes: &[MachOUnwindFunctionIdentity],
+) -> Result<std::result::Result<HashSet<usize>, String>> {
+    if retired_fdes.is_empty() {
+        return Ok(Ok(HashSet::new()));
+    }
+    let unwind_info_index =
+        match added_macho_archive_unique_output_section(output_file, b"__TEXT", b"__unwind_info") {
+            Ok(index) => index,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let unwind_info = output_file.section_by_index(unwind_info_index)?;
+    let unwind_entries = match crate::macho_writer::parse_macho_unwind_info(
+        unwind_info
+            .data()
+            .context("Failed to read active Mach-O __unwind_info")?,
+    ) {
+        Ok(entries) => entries,
+        Err(reason) => return Ok(Err(reason.to_string())),
+    };
+    let (_, physical_fdes) = match output_macho_archive_fde_catalog(output_file)? {
+        Ok(catalog) => catalog,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let mut retired_offsets = HashSet::with_capacity(retired_fdes.len());
+    for retired in retired_fdes {
+        let matching_entries = unwind_entries
+            .iter()
+            .filter(|entry| {
+                entry.encoding != 0
+                    && entry.function_offset == retired.function_offset
+                    && entry.length == retired.length
+            })
+            .collect::<Vec<_>>();
+        let [entry] = matching_entries.as_slice() else {
+            return Ok(Err(
+                "retired Mach-O FDE identity does not match exactly one active unwind-info entry"
+                    .to_owned(),
+            ));
+        };
+        if entry.encoding & ADDED_MACHO_UNWIND_MODE_MASK != ADDED_MACHO_UNWIND_MODE_DWARF {
+            return Ok(Err(
+                "retired Mach-O FDE active unwind-info entry is not DWARF".to_owned(),
+            ));
+        }
+        let hint = (entry.encoding & ADDED_MACHO_UNWIND_DWARF_OFFSET_MASK) as usize;
+        if hint == 0 || !retired_offsets.insert(hint) {
+            return Ok(Err(
+                "retired Mach-O FDE active unwind-info hint is zero or duplicated".to_owned(),
+            ));
+        }
+        let matching_physical = physical_fdes
+            .iter()
+            .filter(|fde| fde.entry_offset == hint && fde.identity == *retired)
+            .count();
+        if matching_physical != 1 {
+            return Ok(Err(
+                "retired Mach-O FDE active unwind-info hint does not locate its exact physical entry"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(Ok(retired_offsets))
+}
+
+fn retired_macho_archive_fde_suffix_offsets(
+    eh_frame_address: u64,
+    section_data: &[u8],
+    retired_fdes: &[MachOUnwindFunctionIdentity],
+) -> std::result::Result<HashSet<usize>, String> {
+    let retired_identities = retired_fdes.iter().copied().collect::<HashSet<_>>();
+    if retired_identities.is_empty() {
+        return Err("retired FDE identity set is empty".to_owned());
+    }
+    if retired_identities.len() != retired_fdes.len() {
+        return Err(format!(
+            "retired FDE identity set contains duplicates: identities={}, records={}",
+            retired_identities.len(),
+            retired_fdes.len()
+        ));
+    }
+    let entries = output_macho_archive_eh_frame_entries(section_data)?;
+    let physical_fdes = output_macho_archive_fdes(section_data, eh_frame_address, &entries)?;
+    let physical_by_offset = physical_fdes
+        .iter()
+        .map(|fde| (fde.entry_offset, fde.identity))
+        .collect::<HashMap<_, _>>();
+    let mut entry_offsets = entries.keys().copied().collect::<Vec<_>>();
+    entry_offsets.sort_unstable();
+    let mut retired_offsets = HashSet::with_capacity(retired_identities.len());
+    let mut selected_identities = HashSet::with_capacity(retired_identities.len());
+    for entry_offset in entry_offsets.into_iter().rev() {
+        let entry = &entries[&entry_offset];
+        let cie_pointer = read_u32_le(
+            section_data
+                .get(entry.start + 4..entry.start + 8)
+                .expect("validated EH-frame entry header"),
+        )
+        .expect("validated EH-frame entry header");
+        if cie_pointer == 0 {
+            continue;
+        }
+        let Some(identity) = physical_by_offset.get(&entry_offset) else {
+            return Err(format!(
+                "physical suffix contains an unclassified FDE at {entry_offset:#x}"
+            ));
+        };
+        if !retired_identities.contains(identity) || selected_identities.contains(identity) {
+            if retired_offsets.is_empty() {
+                return Err(format!(
+                    "physical tail starts with unretired FDE identity {:#x}+{:#x}",
+                    identity.function_offset, identity.length,
+                ));
+            }
+            return Ok(retired_offsets);
+        }
+        retired_offsets.insert(entry_offset);
+        selected_identities.insert(*identity);
+    }
+    Ok(retired_offsets)
 }
 
 fn validate_zero_hint_macho_archive_fde_retirement(
@@ -43999,7 +44692,17 @@ fn added_macho_archive_unwind_activation(
         let section_data = eh_frame_section
             .data()
             .context("Failed to read previous Mach-O __eh_frame section")?;
-        let reclaimed_tail = if allow_transactional_retirement {
+        let reusable_block = if allow_transactional_retirement {
+            None
+        } else {
+            reusable_retired_macho_archive_eh_frame_block(
+                eh_frame_section.address(),
+                section_data,
+                retired_fdes,
+                eh_frame_data.len(),
+            )
+        };
+        let reclaimed_tail = if allow_transactional_retirement || reusable_block.is_some() {
             None
         } else {
             reclaim_retired_macho_archive_eh_frame_tail(
@@ -44035,26 +44738,43 @@ fn added_macho_archive_unwind_activation(
         } else {
             section_data
         };
-        let allocation = match allocate_added_macho_archive_eh_frame_range(
-            &mut staged_reserved_ranges,
-            allocation_section_data,
-            section_file_offset,
-            terminator_offset,
-            u64::try_from(eh_frame_data.len())
-                .context("Added Mach-O __eh_frame entry stream is too large")?,
-        )? {
-            Ok(allocation) => allocation,
-            Err(reason) => return Ok(Err(reason)),
+        let append_terminator = reusable_block.is_none();
+        let allocation = if let Some(block) = reusable_block {
+            ReservedRangeAllocation {
+                output_offset: section_file_offset
+                    .checked_add(block.start as u64)
+                    .context("Reused Mach-O __eh_frame block offset overflow")?,
+                size: u64::try_from(block.len())
+                    .context("Reused Mach-O __eh_frame block is too large")?,
+            }
+        } else {
+            match allocate_added_macho_archive_eh_frame_range(
+                &mut staged_reserved_ranges,
+                allocation_section_data,
+                section_file_offset,
+                terminator_offset,
+                u64::try_from(eh_frame_data.len())
+                    .context("Added Mach-O __eh_frame entry stream is too large")?,
+            )? {
+                Ok(allocation) => allocation,
+                Err(reason) => return Ok(Err(reason)),
+            }
         };
         let section_file_end = section_file_offset
             .checked_add(section_file_size)
             .context("Previous Mach-O __eh_frame file range overflow")?;
+        let allocation_end = allocation
+            .output_offset
+            .checked_add(allocation.size)
+            .and_then(|end| {
+                if append_terminator {
+                    end.checked_add(4)
+                } else {
+                    Some(end)
+                }
+            });
         if allocation.size != eh_frame_data.len() as u64
-            || allocation
-                .output_offset
-                .checked_add(allocation.size)
-                .and_then(|end| end.checked_add(4))
-                .is_none_or(|end| end > section_file_end)
+            || allocation_end.is_none_or(|end| end > section_file_end)
         {
             return Ok(Err(
                 "added Mach-O __eh_frame reserve does not begin at the current terminator"
@@ -44071,7 +44791,9 @@ fn added_macho_archive_unwind_activation(
                     .context("Added Mach-O __eh_frame block has no output address")?;
         }
         eh_frame_section_file_offset = Some(section_file_offset);
-        eh_frame_data.extend_from_slice(&[0; 4]);
+        if append_terminator {
+            eh_frame_data.extend_from_slice(&[0; 4]);
+        }
         if let Some(reclaimed) = reclaimed_tail {
             let reclaimed_len = usize::try_from(
                 reclaimed
@@ -75359,6 +76081,64 @@ mod tests {
     }
 
     #[test]
+    fn active_macho_unwind_hint_disambiguates_dormant_physical_fde() {
+        let (mut output, _, identities, range_offsets) = test_macho_retirable_fdes(4, &[0x40]);
+        let section_start = output.eh_frame_offset as usize;
+        let stream_size = eh_frame_terminator_offset(
+            &output.bytes[section_start..section_start + output.eh_frame_size as usize],
+        )
+        .unwrap();
+        let original_stream = output.bytes[section_start..section_start + stream_size].to_vec();
+        output.bytes[section_start + stream_size..section_start + 2 * stream_size]
+            .copy_from_slice(&original_stream);
+        let duplicate_pc_offset = section_start + range_offsets[0] - 4 + stream_size;
+        let duplicate_pc = i32::from_le_bytes(
+            output.bytes[duplicate_pc_offset..duplicate_pc_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) - i32::try_from(stream_size).unwrap();
+        output.bytes[duplicate_pc_offset..duplicate_pc_offset + 4]
+            .copy_from_slice(&duplicate_pc.to_le_bytes());
+        output.bytes[section_start + 2 * stream_size..section_start + 2 * stream_size + 4].fill(0);
+
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let active = active_retired_macho_archive_fde_offsets(&output_file, &identities)
+            .unwrap()
+            .unwrap();
+        let original_fde_offset = range_offsets[0] - 12;
+        assert_eq!(active, HashSet::from([original_fde_offset]));
+
+        let section_end = section_start + output.eh_frame_size as usize;
+        let section_data = &output.bytes[section_start..section_end];
+        let suffix = retired_macho_archive_fde_suffix_offsets(
+            crate::macho::MACHO_START_MEM_ADDRESS + output.eh_frame_offset,
+            section_data,
+            &identities,
+        )
+        .unwrap();
+        assert_eq!(suffix, HashSet::from([original_fde_offset + stream_size]));
+        let mut reserves = vec![ReservedRangeRecord {
+            output_section_id: crate::output_section_id::EH_FRAME.as_usize() as u32,
+            alignment_exponent: 3,
+            output_offset: output.eh_frame_offset + (2 * stream_size) as u64,
+            size: output.eh_frame_size - (2 * stream_size) as u64,
+        }];
+        let reclaimed = reclaim_retired_macho_archive_eh_frame_tail_offsets(
+            output.eh_frame_offset,
+            section_data,
+            &suffix,
+            &mut reserves,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reclaimed.terminator_offset, stream_size);
+        assert_eq!(
+            reserves[0].output_offset,
+            output.eh_frame_offset + stream_size as u64
+        );
+    }
+
+    #[test]
     fn direct_zero_hint_added_dwarf_requires_exact_retired_fde_patch() {
         let retired = MachOUnwindFunctionIdentity {
             function_offset: 0x1200,
@@ -75576,6 +76356,119 @@ mod tests {
     }
 
     #[test]
+    fn historical_macho_unwind_ownership_disables_cohort_preplanning() {
+        let state = |kind, unwind_transaction| MachOArchiveActivationState {
+            kind,
+            members: Vec::new(),
+            active: true,
+            sections: Vec::new(),
+            relocations: Vec::new(),
+            symbol_resolutions: Vec::new(),
+            indirect_dependencies: Vec::new(),
+            rollback_symbol_resolutions: Vec::new(),
+            forward_patches: Vec::new(),
+            rollback_patches: Vec::new(),
+            unwind_transaction,
+        };
+        let patch = |state| FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: vec![state],
+            sections: Vec::new(),
+            raw_sections: None,
+        };
+
+        assert!(
+            patch(state(
+                MachOArchiveActivationKind::ChangedDefinitionsWithUnwind,
+                None,
+            ))
+            .has_historical_macho_unwind_ownership()
+        );
+        let version = MachOArchiveUnwindVersionState {
+            common_members: Vec::new(),
+            eh_frame_reserve: MachOEhFrameReserveState { start: 0, end: 8 },
+        };
+        assert!(
+            patch(state(
+                MachOArchiveActivationKind::AddedMembers,
+                Some(MachOArchiveUnwindTransactionState {
+                    forward: version.clone(),
+                    rollback: version,
+                }),
+            ))
+            .has_historical_macho_unwind_ownership()
+        );
+        assert!(
+            !patch(state(MachOArchiveActivationKind::AddedMembers, None))
+                .has_historical_macho_unwind_ownership()
+        );
+    }
+
+    #[test]
+    fn preplanned_macho_unwind_fdes_resolve_changed_rust_archive_member() {
+        let previous_object = test_observed_049_macho_unwind_object(false);
+        let current_object = test_observed_049_macho_unwind_object(true);
+        let previous_identifier = b"crate-hash.codegen.previous.rcgu.o";
+        let current_identifier = b"crate-hash.codegen.current.rcgu.o";
+        let previous_archive = test_archive(&[(previous_identifier, &previous_object)]);
+        let current_archive = test_archive(&[(current_identifier, &current_object)]);
+        let input_file_path = hex::encode("input.rlib");
+        let mut entries = ArchiveIterator::from_archive_bytes(&previous_archive).unwrap();
+        let ArchiveEntry::Regular(previous_member) = entries.next().unwrap().unwrap() else {
+            panic!("expected regular archive member");
+        };
+        let previous_input = resolved_patch_input_ref(
+            &input_file_path,
+            &input_file_path,
+            PatchInputBytes {
+                bytes: previous_member.entry_data,
+                file_offset: previous_member.data_offset,
+                archive_identifier: Some(previous_member.ident.as_slice()),
+            },
+        )
+        .unwrap();
+        let previous_file = object::File::parse(previous_object.as_slice()).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let output = test_macho_unwind_output(0x1000);
+        let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+        let sections = vec![PatchSection {
+            input: previous_input,
+            section_index: patch_section_record_index(&previous_file, previous_text.index())
+                .unwrap(),
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: previous_text.size(),
+            output_offset: output.text_offset + 0x100,
+            output_size: previous_text.size(),
+            data_hash: None,
+            cstring_nul_boundaries_hash: None,
+        }];
+
+        let retired = preplanned_changed_macho_unwind_fdes(
+            &previous_archive,
+            &current_archive,
+            &input_file_path,
+            &sections,
+            &output_file,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retired.len(), 1);
+
+        let unchanged = preplanned_changed_macho_unwind_fdes(
+            &previous_archive,
+            &previous_archive,
+            &input_file_path,
+            &sections,
+            &output_file,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unchanged.is_empty());
+    }
+
+    #[test]
     fn changed_macho_archive_unwind_members_record_exact_replacement_proof() {
         let previous_object = test_observed_049_macho_unwind_object(false);
         let current_object = test_observed_049_macho_unwind_object(true);
@@ -75789,7 +76682,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_direct_macho_unwind_reuses_retired_eh_frame_tail() {
+    fn changed_direct_macho_unwind_reuses_exact_eh_frame_block() {
         let previous = test_observed_049_macho_unwind_object(false);
         let mut current = previous.clone();
         let (compact_length_offset, eh_frame_length_offset) = {
@@ -75853,6 +76746,35 @@ mod tests {
         };
         let eh_frame_output_offset = initial.patches[0].output_offset;
         apply_test_section_patches(&mut output.bytes, &initial.patches);
+        let mut live_suffix_sections = previous_sections.clone();
+        live_suffix_sections[0].output_offset = output.text_offset + 0x400;
+        let live_suffix = {
+            let output_file = object::File::parse(output.bytes.as_slice()).unwrap();
+            added_macho_archive_unwind_activation(
+                std::slice::from_ref(&previous_member),
+                &[0],
+                &live_suffix_sections,
+                &output_file,
+                &[],
+                &[],
+                &[],
+                true,
+                &mut reserves,
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        };
+        let live_suffix_eh_frame = live_suffix
+            .patches
+            .iter()
+            .find(|patch| patch.output_offset != output.unwind_info_offset)
+            .unwrap();
+        let live_suffix_range = live_suffix_eh_frame.output_offset
+            ..live_suffix_eh_frame.output_offset + live_suffix_eh_frame.size - 4;
+        apply_test_section_patches(&mut output.bytes, &live_suffix.patches);
+        let live_suffix_bytes =
+            output.bytes[live_suffix_range.start as usize..live_suffix_range.end as usize].to_vec();
         let stable_reserves = reserves.clone();
 
         let matched = vec![MatchedPatchSection {
@@ -75912,6 +76834,10 @@ mod tests {
         assert!(activation.unwind_transaction.is_none());
 
         apply_test_section_patches(&mut output.bytes, &activation.patches);
+        assert_eq!(
+            &output.bytes[live_suffix_range.start as usize..live_suffix_range.end as usize],
+            live_suffix_bytes
+        );
         let reverse_matched = vec![MatchedPatchSection {
             previous: matched[0].current.clone(),
             current: matched[0].previous.clone(),
@@ -75945,6 +76871,10 @@ mod tests {
         assert!(reverse.unwind_transaction.is_none());
 
         apply_test_section_patches(&mut output.bytes, &reverse.patches);
+        assert_eq!(
+            &output.bytes[live_suffix_range.start as usize..live_suffix_range.end as usize],
+            live_suffix_bytes
+        );
         let second_forward = changed_macho_archive_unwind_activation(
             &previous,
             &current,
