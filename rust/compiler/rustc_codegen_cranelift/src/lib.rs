@@ -156,6 +156,10 @@ impl CodegenBackend for CraneliftCodegenBackend {
         Some(MirInlinerThresholds { forwarder: 60, hint: 200, default: 100 })
     }
 
+    fn run_late_mir_sroa(&self) -> bool {
+        true
+    }
+
     fn target_config(&self, sess: &Session) -> TargetConfig {
         // FIXME return the actually used target features. this is necessary for #[cfg(target_feature)]
         let target_features = match sess.target.arch {

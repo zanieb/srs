@@ -56,6 +56,14 @@ pub trait CodegenBackend {
         None
     }
 
+    /// Whether optimized MIR should run SROA again after destination propagation.
+    ///
+    /// Backends that do not have a later memory-to-register pass can use this to
+    /// expose aggregate fields that only stop escaping late in the MIR pipeline.
+    fn run_late_mir_sroa(&self) -> bool {
+        false
+    }
+
     fn print(&self, _req: &PrintRequest, _out: &mut String, _sess: &Session) {}
 
     /// Collect target-specific options that should be set in `cfg(...)`, including

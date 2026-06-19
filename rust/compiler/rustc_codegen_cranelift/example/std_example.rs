@@ -54,6 +54,11 @@ fn main() {
 
     assert_eq!(i64::MAX.checked_mul(2), None);
 
+    let pointee = 1234_u64;
+    let pointer = black_box(&pointee as *const u64);
+    assert_eq!(unsafe { *reference_through_raw_pointer(pointer) }, pointee);
+    assert_eq!(unsafe { raw_pointer_through_raw_pointer(pointer).read() }, pointee);
+
     assert_eq!(-128i8, (-128i8).saturating_sub(1));
     assert_eq!(127i8, 127i8.saturating_sub(-128));
     assert_eq!(-128i8, (-128i8).saturating_add(-128));
@@ -245,6 +250,16 @@ unsafe fn test_aarch64_crc32() {
     assert_eq!(__crc32cw(crc, data as u32), 2543798776);
     assert_eq!(__crc32d(crc, data), 3931439525);
     assert_eq!(__crc32cd(crc, data), 133363847);
+}
+
+#[inline(never)]
+unsafe fn reference_through_raw_pointer<'a>(pointer: *const u64) -> &'a u64 {
+    unsafe { &*pointer }
+}
+
+#[inline(never)]
+fn raw_pointer_through_raw_pointer(pointer: *const u64) -> *const u64 {
+    &raw const *pointer
 }
 
 #[cfg(target_arch = "x86_64")]

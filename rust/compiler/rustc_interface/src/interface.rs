@@ -465,6 +465,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             );
             sess.replaced_intrinsics = FxHashSet::from_iter(codegen_backend.replaced_intrinsics());
             sess.thin_lto_supported = codegen_backend.thin_lto_supported();
+            sess.run_late_mir_sroa = codegen_backend.run_late_mir_sroa();
 
             let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
             let mut cfg = config::build_configuration(&sess, cfg);
