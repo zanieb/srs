@@ -198,14 +198,34 @@ CARGO_TARGET_DIR="$HOME/code/tmp/cranelift-runtime/ruff-cranelift" \
 
 Build the LLVM lane into a separate empty target with the same environment and
 `SRS_TARGET_CODEGEN_BACKEND=llvm`. Run each command repeatedly from the same
-workspace and keep output outside the timed path. For example:
+workspace and keep output outside the timed path.
+
+The checked-in runner records repository revisions, executable hashes and
+sizes, correctness-probe output, randomized lane order, every trial, and a
+summary. It accepts a third baseline lane when comparing a new candidate with
+both LLVM and the previous Cranelift result:
 
 ```bash
-hyperfine --warmup 5 --runs 20 \
-  --command-name llvm \
-  '<llvm-ruff> check --isolated --no-cache --exit-zero --quiet <fixtures>' \
-  --command-name cranelift \
-  '<cranelift-ruff> check --isolated --no-cache --exit-zero --quiet <fixtures>'
+python3 scripts/benchmark-cranelift-runtime.py \
+  --lane llvm=<uv-llvm>,<ruff-llvm>,<ty-llvm> \
+  --lane baseline=<uv-clif-base>,<ruff-clif-base>,<ty-clif-base> \
+  --lane candidate=<uv-clif-new>,<ruff-clif-new>,<ty-clif-new> \
+  --uv-workspace <uv-checkout> \
+  --ruff-workspace <ruff-checkout> \
+  --expect-uv-rev 6c963dd3cb0e \
+  --expect-ruff-rev e0eb28d6345b \
+  --scratch "$HOME/code/tmp/cranelift-runtime-benchmark" \
+  --output "$HOME/code/tmp/cranelift-runtime-benchmark/results.json"
+```
+
+For a quick single-workload investigation, select it with `--workloads` and
+reduce `--runs` explicitly. For example:
+
+```bash
+python3 scripts/benchmark-cranelift-runtime.py <lane and workspace arguments> \
+  --workloads ruff-check --warmups 5 --runs 20 \
+  --scratch "$HOME/code/tmp/cranelift-runtime-ruff" \
+  --output "$HOME/code/tmp/cranelift-runtime-ruff/results.json"
 ```
 
 Do not compare the two fresh build durations from this runtime matrix: source
