@@ -79,6 +79,29 @@
                       (iconst_u _ 1)))
       (subsume inner))
 
+;; Integer comparisons produce only 0 or 1, including after zero extension.
+;; Fold unsigned range checks that cannot distinguish either result.
+(rule (simplify (ugt (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 0 c))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (uge (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 1 c))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (ult (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 1 c))
+      (subsume (iconst_u bty 1)))
+(rule (simplify (ule (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 0 c))
+      (subsume (iconst_u bty 1)))
+
 ;; Optimize select-of-uextend-of-icmp to select-of-icmp, because
 ;; select can take an I8 condition too.
 (rule (simplify
