@@ -871,7 +871,7 @@ impl<'a> FunctionBuilder<'a> {
         mut flags: MemFlagsData,
     ) {
         // Profiled on the uv, Ruff, and ty application workloads.
-        const THRESHOLD: u64 = 5;
+        const THRESHOLD: u64 = 8;
 
         if size == 0 {
             return;
@@ -1410,7 +1410,7 @@ block0:
 
             let src = builder.use_var(x);
             let dest = builder.use_var(y);
-            let size = 40;
+            let size = 64;
             builder.emit_small_memory_copy(
                 frontend_config,
                 dest,
@@ -1431,20 +1431,26 @@ block0:
             &func,
             "function %sample() -> i32 system_v {
 block0:
-    v8 = iconst.i64 0
-    v1 -> v8
-    v7 = iconst.i64 0
-    v0 -> v7
+    v11 = iconst.i64 0
+    v1 -> v11
+    v10 = iconst.i64 0
+    v0 -> v10
     v2 = load.i64 aligned v0  ; v0 = 0
     v3 = load.i64 aligned v0+8  ; v0 = 0
     v4 = load.i64 aligned v0+16  ; v0 = 0
     v5 = load.i64 aligned v0+24  ; v0 = 0
     v6 = load.i64 aligned v0+32  ; v0 = 0
+    v7 = load.i64 aligned v0+40  ; v0 = 0
+    v8 = load.i64 aligned v0+48  ; v0 = 0
+    v9 = load.i64 aligned v0+56  ; v0 = 0
     store aligned v2, v1  ; v1 = 0
     store aligned v3, v1+8  ; v1 = 0
     store aligned v4, v1+16  ; v1 = 0
     store aligned v5, v1+24  ; v1 = 0
     store aligned v6, v1+32  ; v1 = 0
+    store aligned v7, v1+40  ; v1 = 0
+    store aligned v8, v1+48  ; v1 = 0
+    store aligned v9, v1+56  ; v1 = 0
     return v1  ; v1 = 0
 }
 ",
