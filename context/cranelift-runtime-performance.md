@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `f7287c882`, with:
+recorded at SRS `642d0eeac`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.5 ms | 71.3 ms | 2.13x |
-| `uv lock --check`, offline | 61.5 ms | 107.1 ms | 1.74x |
-| `ruff check` over 1,592 fixtures | 80.3 ms | 207.4 ms | 2.58x |
-| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 160.2 ms | 3.36x |
+| `uv venv --clear` | 33.8 ms | 72.3 ms | 2.14x |
+| `uv lock --check`, offline | 59.2 ms | 103.7 ms | 1.75x |
+| `ruff check` over 1,592 fixtures | 78.8 ms | 202.5 ms | 2.57x |
+| `ty check` over `scripts/ty_benchmark` | 48.1 ms | 158.0 ms | 3.29x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.7-3.4x faster for
+The conclusion is unambiguous: LLVM is currently about 1.7-3.3x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -53,9 +53,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 127.7 MB |
-| ty | 47.5 MB | 145.6 MB | 133.6 MB |
-| uv | 100.0 MB | 255.0 MB | 258.2 MB |
+| Ruff | 45.0 MB | 135.8 MB | 128.8 MB |
+| ty | 47.5 MB | 145.6 MB | 134.2 MB |
+| uv | 100.0 MB | 255.0 MB | 258.7 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -75,7 +75,7 @@ The codegen backend can now supply MIR inlining defaults. Cranelift initially
 raised the local thresholds from 30/100/50 to 60/200/100 for forwarders,
 hinted calls, and ordinary calls. After the scalarization work exposed more
 small iterator calls, the hinted-call threshold moved to 500. The final policy
-uses local thresholds of 60/600/100 and raises the cross-crate eligibility
+uses local thresholds of 60/800/100 and raises the cross-crate eligibility
 threshold from 100 to 500. It also expands the top-down multi-call inlining
 limit from 5 to 12. LLVM keeps its existing cross-crate and top-down defaults
 and does not receive Cranelift's local defaults. Explicit command-line
@@ -336,6 +336,29 @@ p = 0.03284), ty at -1.1% (37/50, p = 0.00094), and Ruff at +0.2%
 libc calls but regressed uv, so it was rejected. The retained change improves
 the three affected workloads, is neutral for Ruff, and shrinks every binary.
 
+### Final bounded hinted-call budget
+
+The small-copy profile left hashbrown's hinted group-probe loop as the hottest
+pure-Rust leaf. A threshold sweep provided a useful boundary. Raising the
+hinted-call budget from 600 to 1,000 reduced the remaining probe copies from 31
+to 20 and improved ty by 0.75%, but regressed Ruff by 1.85% while growing its
+binary by 1.74%; that candidate was rejected. A budget of 800 keeps the large
+probe out of line while admitting the smaller hinted bodies below it.
+
+The exact retained combination, measured in a 50-run three-lane gate, produced:
+
+| Workload | Candidate vs small-copy policy | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -1.4% | 32/50 | 0.06491 | +116.1% | +0.204% |
+| `uv lock --check`, offline | -0.5% | 30/50 | 0.20264 | +74.6% | +0.204% |
+| `ruff check` over 1,592 fixtures | -2.1% | 35/50 | 0.00660 | +160.6% | +0.846% |
+| `ty check` over `scripts/ty_benchmark` | -0.7% | 31/50 | 0.11892 | +227.5% | +0.450% |
+
+All four workloads move in the intended direction and Ruff improves
+decisively. The size cost is bounded and well below the rejected 1,000-budget
+candidate, so 800 is retained as the backend default. Explicit command-line
+thresholds continue to override it.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -390,8 +413,9 @@ passed the complete SRS build and all 18 interface tests. The subsequent
 target-feature policy passed another complete SRS build and its dedicated
 AArch64 MIR test. The current depth-12 policy passed a complete SRS build and
 all 18 interface tests. The small-copy policy passed a complete SRS build and
-its dedicated cg_clif AOT regression probe. Every complete runtime gate
-preserved every correctness digest. A fresh full uv/Ruff/ty suite pair is
+its dedicated cg_clif AOT regression probe. The current 800-budget policy
+passed a complete SRS build and all 18 interface tests. Every complete runtime
+gate preserved every correctness digest. A fresh full uv/Ruff/ty suite pair is
 reserved for the next finalization gate rather than repeated after every
 retained optimization. The current cg_clif sysroot harness cannot provide
 additional coverage: its stdlib patch no longer applies to this Rust snapshot,
