@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `4ee9f1170`, with:
+recorded at SRS `51a7c38ad`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,10 +31,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.3 ms | 55.8 ms | 1.73x |
-| `uv lock --check`, offline | 59.1 ms | 85.4 ms | 1.44x |
-| `ruff check` over 1,592 fixtures | 80.2 ms | 148.2 ms | 1.85x |
-| `ty check` over `scripts/ty_benchmark` | 48.3 ms | 119.9 ms | 2.48x |
+| `uv venv --clear` | 32.7 ms | 55.6 ms | 1.70x |
+| `uv lock --check`, offline | 58.7 ms | 84.5 ms | 1.44x |
+| `ruff check` over 1,592 fixtures | 79.2 ms | 145.3 ms | 1.83x |
+| `ty check` over `scripts/ty_benchmark` | 47.1 ms | 115.7 ms | 2.46x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -64,15 +64,15 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 120.3 MB |
-| ty | 47.5 MB | 145.6 MB | 124.9 MB |
-| uv | 100.0 MB | 255.0 MB | 243.7 MB |
+| Ruff | 45.0 MB | 135.8 MB | 117.4 MB |
+| ty | 47.5 MB | 145.6 MB | 122.2 MB |
+| uv | 100.0 MB | 255.0 MB | 238.7 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
 complete answer: the final policy reduces Ruff and ty size, but the remaining
-output is still roughly 2.5-2.7 times LLVM's and uv environment creation is
-still more than 80% slower.
+output is still roughly 2.4-2.6 times LLVM's and uv environment creation is
+still about 70% slower.
 
 ## Changes Implemented
 
@@ -708,6 +708,41 @@ and standard-library build pass. The runtime result is concentrated in ty;
 Ruff and both uv operations are statistically neutral rather than inheriting
 the apparent gains from an earlier vector-unsafe experiment.
 
+### Boolean-indexed branch-table lowering
+
+The optimized CLIF for the same hot hashbrown body showed where three of the
+remaining range checks came from. Rust had lowered boolean control flow to a
+`br_table` indexed by a zero-extended scalar comparison. The comparison can
+only produce zero or one, but AArch64 lowering still emitted a `cset`, a
+comparison against two, a branch to the out-of-range trap, and an indirect
+table branch.
+
+The skeleton optimizer now resolves jump-table entries zero and one and
+replaces this shape with a `brif` on the original comparison. The default
+destination is unreachable by construction. The skeleton cost model prices a
+branch table above an otherwise equivalent conditional branch so the rewrite
+is selected. The match remains explicitly scalar, and the resolved
+`BlockCall`s preserve destination arguments. In the profiled function, all
+three comparison-derived table checks disappear, one mask-derived table
+remains, and the body shrinks from 1,772 to 1,624 bytes (-8.35%).
+
+The 50-run matched gate measured the rewrite against scalar boolean-result
+range folding:
+
+| Workload | LLVM | Previous Cranelift | Boolean table lowering | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 32.7 ms | 55.7 ms | 55.6 ms | -0.34% | 28/50 | 0.47989 |
+| `uv lock --check`, offline | 58.7 ms | 84.6 ms | 84.5 ms | -0.001% | 25/50 | 1.00000 |
+| `ruff check` over 1,592 fixtures | 79.2 ms | 148.2 ms | 145.3 ms | -1.97% | 35/50 | 0.00660 |
+| `ty check` over `scripts/ty_benchmark` | 47.1 ms | 119.1 ms | 115.7 ms | -3.19% | 41/50 | 0.0000056 |
+
+The uv, Ruff, and ty binaries shrink by 2.07%, 2.46%, and 2.15%, respectively.
+Every correctness digest matches. The focused branch-argument filetest, all
+185 `cranelift-codegen` unit tests, cg_clif check, and complete stage-2 cg_clif
+and standard-library build pass. The broad size reduction shows that this is a
+common Rust lowering shape, while the runtime result is strongest in the two
+hash-table-heavy workloads.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -895,7 +930,11 @@ uv/Ruff/ty suite pair is reserved for the finalization gate rather than
 repeated after every retained optimization. The bounded stack-copy policy
 passed its stage-2 backend and standard-library build, direct standard-example
 execution, application correctness probes, and 50-run runtime gate. The
-current cg_clif sysroot harness cannot provide additional coverage: its stdlib
+scalar boolean-range and boolean-indexed branch-table policies passed focused
+scalar, vector, and branch-argument filetests, all 185 `cranelift-codegen` unit
+tests, cg_clif check, complete stage-2 backend and standard-library builds, and
+matched 50-run correctness probes. The current cg_clif sysroot harness cannot
+provide additional coverage: its stdlib
 patch no longer applies to this Rust snapshot, and its standalone JIT smoke
 aborts in rustc query TLS before entering the test program.
 
@@ -937,12 +976,15 @@ The late scalarization work above is the first completed part of this arc: it
 removes memory traffic around iterator state, but does not transform the loop.
 Boolean-result folding is the first retained range-reasoning step. It proves a
 small instruction-local fact through zero extension and improves ty by 1.61%,
-but it does not carry facts through block parameters or joins. The profiled
-hashbrown path still contains a later redundant comparison separated from its
-producer by control flow. Propagating bounded scalar ranges through simple CFG
-edges is therefore the next concrete step before affine loop-index analysis.
-The reduced scan confirms that vectorization and loop-wide range reasoning
-remain the larger opportunities.
+but it does not carry facts through block parameters or joins. Boolean-indexed
+branch-table lowering consumes the same fact at a control-flow boundary,
+removes three bounds checks from the profiled hashbrown body, improves Ruff by
+1.97% and ty by 3.19%, and shrinks all three application binaries by more than
+2%. One mask-derived table remains in that body. Recognizing bounded results
+through simple bitwise expressions, then propagating scalar ranges through CFG
+edges, is the next concrete step before affine loop-index analysis. The reduced
+scan confirms that vectorization and loop-wide range reasoning remain the
+larger opportunities.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
@@ -995,7 +1037,10 @@ single-predecessor blocks and assembling adjacent narrow values completes the
 profiled hashbrown control-group case without the uv regressions from broad
 SIMD lowering. Folding impossible unsigned checks on scalar comparison results
 adds the first bounded value-range rule and produces a decisive ty improvement
-without a material uv or Ruff regression. The forwarding pass also
+without a material uv or Ruff regression. Replacing branch tables indexed by
+those comparison results with direct conditional branches then removes the
+corresponding bounds checks, decisively improves Ruff and ty, and cuts another
+2.1-2.5% from binary size without moving uv. The forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
