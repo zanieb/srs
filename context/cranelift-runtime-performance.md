@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `ef4b5d86e`, with:
+recorded at SRS `176f13b24`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -25,16 +25,16 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 50 timed trials after five warmups. Lower is better. LLVM, the
+Each row is 50 timed trials after ten warmups. Lower is better. LLVM, the
 preceding Cranelift policy, and the current Cranelift policy were run in the
 same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.9 ms | 65.2 ms | 1.98x |
-| `uv lock --check`, offline | 58.0 ms | 96.8 ms | 1.67x |
-| `ruff check` over 1,592 fixtures | 79.5 ms | 177.7 ms | 2.24x |
-| `ty check` over `scripts/ty_benchmark` | 47.8 ms | 143.4 ms | 3.00x |
+| `uv venv --clear` | 33.1 ms | 67.1 ms | 2.02x |
+| `uv lock --check`, offline | 57.1 ms | 93.9 ms | 1.65x |
+| `ruff check` over 1,592 fixtures | 78.4 ms | 179.0 ms | 2.28x |
+| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 142.1 ms | 3.00x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -65,8 +65,8 @@ than distribution sizes.
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
 | Ruff | 45.0 MB | 135.8 MB | 128.7 MB |
-| ty | 47.5 MB | 145.6 MB | 133.8 MB |
-| uv | 100.0 MB | 255.0 MB | 258.0 MB |
+| ty | 47.5 MB | 145.6 MB | 133.7 MB |
+| uv | 100.0 MB | 255.0 MB | 257.9 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -495,6 +495,32 @@ neutral on all four workloads, with paired median changes of +0.60%, +0.17%,
 -1.57%, and -0.12%, respectively. The profile-supported ceiling therefore
 ends at eight registers; extending it speculatively does not pay for itself.
 
+### Profiled small constant byte fills
+
+The same libc census found that cg_clif sent constant-size byte repeats and
+`write_bytes` operations directly to `memset`, even though the Cranelift
+frontend already expands small fills. One representative ty check made
+1,432,618 eight-byte `memset` calls and 53,779 24-byte calls. Preserving the
+constant size through cg_clif and adding a frontend entry point for a runtime
+byte value reduced those counts to 16 and 3,289, respectively. The dynamic
+byte is widened and replicated only for an inline fill; larger or nonconstant
+operations retain the existing libc call.
+
+The 50-run matched gate measured the change against the retained eight-register
+copy policy:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +1.17% | 20/50 | 0.20264 | +102.1% | -0.027% |
+| `uv lock --check`, offline | -0.94% | 32/50 | 0.06491 | +64.6% | -0.027% |
+| `ruff check` over 1,592 fixtures | +0.12% | 24/50 | 0.88772 | +131.8% | -0.018% |
+| `ty check` over `scripts/ty_benchmark` | -0.43% | 33/50 | 0.03284 | +199.9% | -0.031% |
+
+Ty improves decisively, uv resolution improves directionally, and the other
+two rows are neutral. All three binaries shrink and every correctness digest
+matches, so the constant-size fill expansion is retained. Its focused
+frontend tests, cg_clif check, and complete SRS build pass.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
@@ -605,8 +631,9 @@ passed a complete SRS build and all 18 interface tests. The subsequent bounded
 CLIF inliner passed a complete two-stage SRS build, a standalone stage-1 backend
 check, pinned uv/Ruff/ty builds, and the 50-run correctness probes. The
 subsequent eight-register small-copy policy passed its focused frontend tests
-and another complete SRS build. Every complete runtime gate preserved every
-correctness digest. A fresh full
+and another complete SRS build. The constant-size byte-fill policy passed its
+focused frontend tests, cg_clif check, and a complete SRS build. Every complete
+runtime gate preserved every correctness digest. A fresh full
 uv/Ruff/ty suite pair is reserved for the finalization gate rather than
 repeated after every retained optimization. The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
