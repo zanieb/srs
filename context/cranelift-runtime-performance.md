@@ -121,6 +121,36 @@ The candidate's uv, Ruff, and ty binaries are respectively 1.02%, 1.14%, and
 codes and stdout/stderr digests match across LLVM, the previous Cranelift
 build, and the candidate.
 
+### Thin `NonNull` values in SSA
+
+Late SROA exposed iterator fields, but thin `NonNull<T>` values still lacked a
+Cranelift scalar type and therefore remained in stack slots. This was especially
+expensive for slice iterators: every loop iteration loaded, advanced, and
+stored the current pointer through memory.
+
+Thin `NonNull<T>` is now represented as a pointer-sized Cranelift SSA value;
+fat `NonNull<T>` remains memory-backed. Pattern-typed pointer fields use their
+base type's machine representation, and transparent scalar field projections
+and scalar constants preserve the wrapper's layout while operating on the
+underlying value.
+
+In the reduced byte-scan kernel, this shrank the AArch64 frame from 64 to 32
+bytes, removed the loop-carried pointer spills, and improved the scalar loop by
+about 6.2x. The application gate used the same 20 balanced, randomized trials
+and five warmups as the preceding comparison:
+
+| Workload | LLVM | Previous Cranelift | Scalar `NonNull` | LLVM lead | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 32.2 ms | 79.3 ms | 78.7 ms | 2.44x | -0.4% | 11/20 | 0.82380 |
+| `uv lock --check`, offline | 59.2 ms | 116.3 ms | 115.4 ms | 1.95x | -0.6% | 12/20 | 0.50344 |
+| `ruff check` over 1,592 fixtures | 77.2 ms | 282.7 ms | 248.4 ms | 3.22x | -13.0% | 20/20 | 0.000002 |
+| `ty check` over `scripts/ty_benchmark` | 47.5 ms | 195.4 ms | 188.3 ms | 3.96x | -4.9% | 17/20 | 0.00258 |
+
+The uv rows are statistically neutral, while Ruff and ty improve decisively.
+The candidate's uv, Ruff, and ty binaries are respectively 0.58%, 0.80%, and
+0.72% smaller. Correctness-probe exit codes and output digests match across all
+three lanes.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -210,7 +240,10 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
 The application gate is important here: uv's neutral inlining result says its
-hot paths will not improve merely by buying more code size.
+hot paths will not improve merely by buying more code size. Keeping thin
+`NonNull` iterator cursors in SSA completes one high-impact stack-slot case,
+but the remaining 2-4x LLVM gap shows that local representation fixes alone
+will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
 
