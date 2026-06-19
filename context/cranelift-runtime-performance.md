@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `d04b9a30a`, with:
+recorded at SRS `ef4b5d86e`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.8 ms | 65.0 ms | 1.98x |
-| `uv lock --check`, offline | 58.5 ms | 97.3 ms | 1.66x |
-| `ruff check` over 1,592 fixtures | 79.8 ms | 180.1 ms | 2.26x |
-| `ty check` over `scripts/ty_benchmark` | 48.6 ms | 148.1 ms | 3.05x |
+| `uv venv --clear` | 32.9 ms | 65.2 ms | 1.98x |
+| `uv lock --check`, offline | 58.0 ms | 96.8 ms | 1.67x |
+| `ruff check` over 1,592 fixtures | 79.5 ms | 177.7 ms | 2.24x |
+| `ty check` over `scripts/ty_benchmark` | 47.8 ms | 143.4 ms | 3.00x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.7-3.1x faster for
+The conclusion is unambiguous: LLVM is currently about 1.7-3.0x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,9 +64,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 128.1 MB |
-| ty | 47.5 MB | 145.6 MB | 133.2 MB |
-| uv | 100.0 MB | 255.0 MB | 256.9 MB |
+| Ruff | 45.0 MB | 135.8 MB | 128.7 MB |
+| ty | 47.5 MB | 145.6 MB | 133.8 MB |
+| uv | 100.0 MB | 255.0 MB | 258.0 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -430,7 +430,7 @@ resolution regressed by 0.94% with only 5/20 wins (two-sided sign-test
 place. Closing this part of the LLVM gap therefore needs cross-CGU body import
 or a genuinely post-link optimizer, not a looser per-CGU size threshold.
 
-### Five-register constant copies
+### Profiled small constant copies
 
 A size histogram of the remaining Darwin libc copy traffic corrected an
 important attribution detail: the hot `_platform_memmove` implementation is
@@ -458,7 +458,31 @@ The 50-run matched three-lane gate measured:
 All four workloads improve directionally, three decisively, while binary
 growth stays below 0.1%. Correctness-probe exit codes and output digests match.
 The focused frontend tests and the complete two-stage SRS build, including
-rustc, cg_clif, std, Cargo, and Clippy, pass. The threshold is retained.
+rustc, cg_clif, std, Cargo, and Clippy, pass. The five-register step was
+retained.
+
+A fresh profile after that change still put libc copies at the top. The next
+four exact sizes were 28, 48, 56, and 64 bytes, requiring seven, six, seven,
+and eight register pairs. Raising the ceiling from five to eight removed a
+further 25,602 static ty `memcpy` call sites. Their combined dynamic count fell
+from 5,836,618 to 11,494, eliminating 5,825,124 calls in the representative
+check.
+
+The subsequent 50-run gate measured the eight-register policy against the
+five-register policy:
+
+| Workload | Candidate vs five registers | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.76% | 19/50 | 0.11892 | +100.1% | +0.407% |
+| `uv lock --check`, offline | +0.62% | 21/50 | 0.32224 | +66.1% | +0.407% |
+| `ruff check` over 1,592 fixtures | -0.74% | 27/50 | 0.67181 | +124.8% | +0.439% |
+| `ty check` over `scripts/ty_benchmark` | -2.69% | 44/50 | 0.000000032 | +200.3% | +0.431% |
+
+The uv movements are both below 1% and statistically neutral, Ruff is neutral,
+and ty improves decisively for less than 0.5% binary growth. The regression
+test now fixes the ceiling at a 64-byte, eight-register copy. The complete SRS
+build and the focused frontend tests pass, so eight registers is the retained
+ceiling.
 
 ### Rejected native SIMD comparison expansion
 
@@ -568,14 +592,15 @@ all 18 interface tests. The small-copy policy passed a complete SRS build and
 its dedicated cg_clif AOT regression probe. The current 800-budget policy
 passed a complete SRS build and all 18 interface tests. The subsequent bounded
 CLIF inliner passed a complete two-stage SRS build, a standalone stage-1 backend
-check, pinned uv/Ruff/ty builds, and the 50-run correctness probes. Every
-complete runtime gate preserved every correctness digest. A fresh full
+check, pinned uv/Ruff/ty builds, and the 50-run correctness probes. The
+subsequent eight-register small-copy policy passed its focused frontend tests
+and another complete SRS build. Every complete runtime gate preserved every
+correctness digest. A fresh full
 uv/Ruff/ty suite pair is reserved for the finalization gate rather than
 repeated after every retained optimization. The current cg_clif sysroot
-harness cannot provide
-additional coverage: its stdlib patch no longer applies to this Rust snapshot,
-and its standalone JIT smoke aborts in rustc query TLS before entering the test
-program.
+harness cannot provide additional coverage: its stdlib patch no longer applies
+to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
+before entering the test program.
 
 ## Performance Roadmap
 
