@@ -657,23 +657,14 @@ impl<'tcx> CPlace<'tcx> {
                             _ => {}
                         }
 
-                        let from_addr = from_ptr.get_addr(fx);
-                        let to_addr = to_ptr.get_addr(fx);
                         let src_layout = from.1;
                         let size = dst_layout.size.bytes();
                         // `emit_small_memory_copy` uses `u8` for alignments, just use the maximum
                         // alignment that fits in a `u8` if the actual alignment is larger.
                         let src_align = src_layout.align.bytes().try_into().unwrap_or(128);
                         let dst_align = dst_layout.align.bytes().try_into().unwrap_or(128);
-                        fx.bcx.emit_small_memory_copy(
-                            fx.target_config,
-                            to_addr,
-                            from_addr,
-                            size,
-                            dst_align,
-                            src_align,
-                            true,
-                            flags,
+                        to_ptr.copy_from_nonoverlapping(
+                            fx, from_ptr, size, dst_align, src_align, flags,
                         );
                     }
                     CValueInner::ByRef(_from_ptr, Some(_extra)) => {

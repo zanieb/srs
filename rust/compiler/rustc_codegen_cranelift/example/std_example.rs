@@ -62,6 +62,7 @@ fn main() {
     assert_eq!(unsafe { *reference_through_raw_pointer(pointer) }, pointee);
     assert_eq!(unsafe { raw_pointer_through_raw_pointer(pointer).read() }, pointee);
     test_small_copy_nonoverlapping();
+    test_stack_copy_nonoverlapping();
 
     let mut nonnull_pointee = 5678_u64;
     let nonnull = NonNull::from(&mut nonnull_pointee);
@@ -218,6 +219,18 @@ fn test_small_copy_nonoverlapping() {
     let bytes = black_box([0_u8, 1, 2, 3, 4, 5, 6, 7, 8]);
     let unaligned = unsafe { bytes.as_ptr().add(1).cast::<u64>().read_unaligned() };
     assert_eq!(unaligned, u64::from_ne_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
+}
+
+#[inline(never)]
+fn test_stack_copy_nonoverlapping() {
+    fn check<const N: usize>(source: [u64; N]) {
+        let copy = source;
+        assert_eq!(copy, source);
+    }
+
+    check(black_box([11_u64; 10]));
+    check(black_box([22_u64; 15]));
+    check(black_box([33_u64; 16]));
 }
 
 fn panic(_: u128) {
