@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `431451f3f`, with:
+recorded at SRS `9415356b4`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,10 +31,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 30.9 ms | 55.6 ms | 1.80x |
-| `uv lock --check`, offline | 58.4 ms | 85.4 ms | 1.46x |
-| `ruff check` over 1,592 fixtures | 79.2 ms | 153.9 ms | 1.94x |
-| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 122.9 ms | 2.58x |
+| `uv venv --clear` | 32.9 ms | 55.2 ms | 1.68x |
+| `uv lock --check`, offline | 58.6 ms | 85.5 ms | 1.46x |
+| `ruff check` over 1,592 fixtures | 79.7 ms | 148.2 ms | 1.86x |
+| `ty check` over `scripts/ty_benchmark` | 47.8 ms | 122.2 ms | 2.55x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -64,14 +64,14 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 122.5 MB |
-| ty | 47.5 MB | 145.6 MB | 127.2 MB |
-| uv | 100.0 MB | 255.0 MB | 248.1 MB |
+| Ruff | 45.0 MB | 135.8 MB | 121.6 MB |
+| ty | 47.5 MB | 145.6 MB | 126.2 MB |
+| uv | 100.0 MB | 255.0 MB | 246.1 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
 complete answer: the final policy reduces Ruff and ty size, but the remaining
-output is still roughly 2.5-2.8 times LLVM's and uv environment creation is
+output is still roughly 2.5-2.7 times LLVM's and uv environment creation is
 still more than 80% slower.
 
 ## Changes Implemented
@@ -632,6 +632,43 @@ Cranelift build, and the candidate. The focused filetest, all 184
 library build pass. This is the largest broadly positive retained runtime step
 in the investigation so far.
 
+### Cross-block and width-changing stack forwarding
+
+A later profile made `hashbrown::find_or_find_insert_index_inner` the hottest
+active pure-Rust leaf. In its scalarized control-group comparison, eight byte
+results were stored to adjacent stack offsets in one block and reloaded as one
+`i64` in the next. The exact per-block forwarding rule could see neither the
+control-flow relationship nor the width-changing equivalence.
+
+The pass now carries known values into a block when it has exactly one distinct
+predecessor and that predecessor has already been processed. Joins and
+backedges without available state remain conservative. It can also assemble an
+integer load of at most 64 bits from smaller integer values that completely and
+uniquely cover the requested byte range. The shifts follow the target's native
+endianness; gaps, overlaps, partial coverage, multiple predecessors, and
+non-integer pieces leave the load intact. Focused x86-64 and s390x filetests
+cover little- and big-endian assembly, and a diamond test confirms that state is
+not propagated across a multi-predecessor join.
+
+For the profiled hashbrown body, the eight byte stores and `i64` reload
+disappear and the AArch64 frame drops from 112 to 80 bytes. The final 50-run
+matched gate measured this extension against the 16-register stack-copy
+policy:
+
+| Workload | LLVM | Previous Cranelift | Cross-block forwarding | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 32.9 ms | 56.3 ms | 55.2 ms | -1.46% | 35/50 | 0.00660 |
+| `uv lock --check`, offline | 58.6 ms | 85.9 ms | 85.5 ms | -0.90% | 28/50 | 0.47989 |
+| `ruff check` over 1,592 fixtures | 79.7 ms | 152.6 ms | 148.2 ms | -2.54% | 39/50 | 0.000090 |
+| `ty check` over `scripts/ty_benchmark` | 47.8 ms | 123.9 ms | 122.2 ms | -0.65% | 36/50 | 0.00260 |
+
+The uv, Ruff, and ty binaries shrink by 0.83%, 0.72%, and 0.83%, respectively,
+and every correctness digest matches. All 184 `cranelift-codegen` unit tests,
+the focused filetests, cg_clif check, and the complete stage-2 cg_clif and
+standard-library build pass. This is a smaller step than the original
+forwarding pass, but it is unusually clean: every workload moves forward and
+three of the four paired results are decisive.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -908,7 +945,10 @@ giving back the ty win. Their hot paths will not all improve merely by buying
 more code size. Keeping thin
 `NonNull` and `NonZero` values in SSA, forwarding exact explicit stack-slot
 traffic, and exposing bounded stack-backed aggregate copies complete several
-high-impact local cases. The new forwarding pass also
+high-impact local cases. Carrying nonescaped stack state through
+single-predecessor blocks and assembling adjacent narrow values completes the
+profiled hashbrown control-group case without the uv regressions from broad
+SIMD lowering. The forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
