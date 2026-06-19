@@ -203,6 +203,23 @@ unsafe fn test_vqadd_u8() {
 }
 
 #[cfg(target_arch = "aarch64")]
+unsafe fn test_vector_comparison_and_splat() {
+    let a = u8x8::from([1, 2, 3, 4, 5, 6, 7, 8]);
+    let b = u8x8::from([1, 0, 3, 0, 5, 0, 7, 0]);
+    let expected = u8x8::from([u8::MAX, 0, u8::MAX, 0, u8::MAX, 0, u8::MAX, 0]);
+    let equal: u8x8 = unsafe { transmute(vceq_u8(transmute(a), transmute(b))) };
+    assert_eq!(equal, expected);
+
+    let values = i8x8::from([-1, 0, 1, -2, 2, -3, 3, -4]);
+    let expected = u8x8::from([u8::MAX, 0, 0, u8::MAX, 0, u8::MAX, 0, u8::MAX]);
+    let negative: u8x8 = unsafe { transmute(vcltz_s8(transmute(values))) };
+    assert_eq!(negative, expected);
+
+    let splat: u8x8 = unsafe { transmute(vdup_n_u8(7)) };
+    assert_eq!(splat, u8x8::splat(7));
+}
+
+#[cfg(target_arch = "aarch64")]
 unsafe fn test_vmaxq_f32() {
     // AArch64 llvm intrinsic: llvm.aarch64.neon.fmax.v4f32
     let a = f32x4::from([0., -1., 2., -3.]);
@@ -267,6 +284,7 @@ fn main() {
 
         test_vqsub_u8();
         test_vqadd_u8();
+        test_vector_comparison_and_splat();
 
         test_vmaxq_f32();
         test_vminq_f32();
