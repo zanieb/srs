@@ -669,6 +669,18 @@ standard-library build pass. This is a smaller step than the original
 forwarding pass, but it is unusually clean: every workload moves forward and
 three of the four paired results are decisive.
 
+The inverse width-changing rule was tested and rejected. It replaced a narrow
+integer load from a covering wider stack value with a native-endian shift and
+reduction. In the same hot hashbrown copy, the body shrank by 84 bytes and its
+frame fell from 160 to 128 bytes. The binaries also shrank slightly: 0.07% for
+uv and 0.09% for Ruff and ty. That local cleanup did not survive the 20-run
+application screen. Paired changes were +0.30% for uv environment creation,
+-0.55% for uv resolution, effectively zero for Ruff, and +0.20% for ty, with
+9/20, 11/20, 10/20, and 10/20 wins respectively. All sign-test p-values were
+at least 0.82. Forwarding wider loads from adjacent narrow values removes an
+aggregate round trip; decomposing a wide value into scalar byte operations is
+only a different spelling of work the application already performs.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
