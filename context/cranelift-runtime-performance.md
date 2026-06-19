@@ -459,6 +459,33 @@ resolution regressed by 0.94% with only 5/20 wins (two-sided sign-test
 place. Closing this part of the LLVM gap therefore needs cross-CGU body import
 or a genuinely post-link optimizer, not a looser per-CGU size threshold.
 
+The bounded body-import experiment proved that the call boundary can be
+crossed, but also showed that doing so without a call-site model is not a
+runtime win. Each codegen unit recorded its referenced monomorphizations,
+translated only hinted MIR bodies with at most six blocks and 64 operations
+into an isolated catalogue, imported one dependency level, and admitted only
+the existing call-free, stack-free, global-free 32-instruction scalar subset.
+The composed candidate was capped at six CLIF blocks because one inlining step
+adds unconditional jump scaffolding around the otherwise straight-line body.
+
+This removed every direct `FxHasher::write_isize` call: 356 in uv, 149 in
+Ruff, and 359 in ty. The binaries shrank by 0.21%, 0.12%, and 0.24%,
+respectively, and the complete stage-2 backend and standard-library build
+passed. The 20-run application screen was nevertheless mixed:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +0.46% | 9/20 | 0.82380 |
+| `uv lock --check`, offline | -1.09% | 12/20 | 0.50344 |
+| `ruff check` over 1,592 fixtures | +1.61% | 8/20 | 0.50344 |
+| `ty check` over `scripts/ty_benchmark` | -0.92% | 12/20 | 0.50344 |
+
+All correctness digests matched, but none of the movements was decisive and
+Ruff moved in the wrong direction. The experiment was rejected. Cross-CGU
+availability is therefore not sufficient by itself; another attempt needs a
+hot-call-site or callee-specific profitability signal that can avoid broad
+layout perturbation.
+
 A second threshold probe targeted callable `dyn Fn` shims. Raising the hinted
 budget from 800 to 850 retained all 31 hot hashbrown probe copies; 900 and
 1,000 reduced the count to 20 but did not improve the application gate and
@@ -863,7 +890,10 @@ implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
 prominent Cranelift-only leaves while LLVM has absorbed them into callers.
-That makes cross-CGU post-monomorphization body import the immediate call arc.
+An untargeted, one-level post-monomorphization body-import experiment removed
+all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
+screen and was rejected. The immediate call arc is now a profile- or
+frequency-aware import policy, not broader body availability by itself.
 The remaining 1.5-2.6x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
