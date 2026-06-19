@@ -484,6 +484,17 @@ test now fixes the ceiling at a 64-byte, eight-register copy. The complete SRS
 build and the focused frontend tests pass, so eight registers is the retained
 ceiling.
 
+Two larger ceilings were screened and rejected. Nine registers grew uv,
+Ruff, and ty by 0.168%, 0.095%, and 0.098%, respectively, but its 20-run paired
+changes against eight registers were statistically neutral: -0.06% for uv
+environment creation (10/20 wins, `p = 1.0`), +0.59% for uv resolution (9/20,
+`p = 0.82380`), -1.83% for Ruff (12/20, `p = 0.50344`), and +0.34% for ty
+(9/20, `p = 0.82380`). Twelve registers cost substantially more code size:
+1.73% for uv, 3.17% for Ruff, and 0.54% for ty. Its 20-run screen was likewise
+neutral on all four workloads, with paired median changes of +0.60%, +0.17%,
+-1.57%, and -0.12%, respectively. The profile-supported ceiling therefore
+ends at eight registers; extending it speculatively does not pay for itself.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
