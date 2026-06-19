@@ -675,6 +675,19 @@ Against 16 registers it regressed uv environment creation by 1.19% (5/20 wins,
 were statistically neutral. Sixteen registers is therefore the retained
 stack-specific ceiling.
 
+A narrower follow-up isolated the hottest newly admitted bucket instead of
+raising the ceiling. Residual 152-byte stack-backed copies execute about 54.6
+million times in the amplified ty corpus and require 19 registers, so the
+candidate admitted exactly 19-register copies while still rejecting 17, 18,
+and 20. It grew uv, Ruff, and ty by only 0.06%, 0.08%, and 0.06%, but the
+20-run screen still regressed uv resolution by 1.83% with 5/20 wins
+(`p = 0.04139`). The paired changes for uv environment creation, Ruff, and ty
+were statistically neutral at -0.30%, -0.12%, and -0.47%. The isolated bucket
+was rejected. The 16-register boundary is not merely hiding one profitable
+larger size; the residual hot copies need a loop, vector, or forwarding
+strategy that does not materialize nineteen scalar load/store pairs at every
+call site.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
