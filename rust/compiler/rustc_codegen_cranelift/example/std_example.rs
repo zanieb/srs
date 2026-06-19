@@ -10,6 +10,7 @@ use std::arch::x86_64::*;
 use std::hint::black_box;
 use std::io::Write;
 use std::ops::Coroutine;
+use std::ptr::NonNull;
 
 fn main() {
     println!("{:?}", std::env::args().collect::<Vec<_>>());
@@ -58,6 +59,11 @@ fn main() {
     let pointer = black_box(&pointee as *const u64);
     assert_eq!(unsafe { *reference_through_raw_pointer(pointer) }, pointee);
     assert_eq!(unsafe { raw_pointer_through_raw_pointer(pointer).read() }, pointee);
+
+    let mut nonnull_pointee = 5678_u64;
+    let nonnull = NonNull::from(&mut nonnull_pointee);
+    assert_eq!(unsafe { nonnull_as_ptr(nonnull).read() }, nonnull_pointee);
+    assert_eq!(nonnull_dangling().as_ptr().addr(), 1);
 
     assert_eq!(-128i8, (-128i8).saturating_sub(1));
     assert_eq!(127i8, 127i8.saturating_sub(-128));
@@ -260,6 +266,16 @@ unsafe fn reference_through_raw_pointer<'a>(pointer: *const u64) -> &'a u64 {
 #[inline(never)]
 fn raw_pointer_through_raw_pointer(pointer: *const u64) -> *const u64 {
     &raw const *pointer
+}
+
+#[inline(never)]
+fn nonnull_as_ptr(pointer: NonNull<u64>) -> *mut u64 {
+    pointer.as_ptr()
+}
+
+#[inline(never)]
+fn nonnull_dangling() -> NonNull<u8> {
+    NonNull::dangling()
 }
 
 #[cfg(target_arch = "x86_64")]
