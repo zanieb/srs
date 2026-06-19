@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `176f13b24`, with:
+recorded at SRS `74a6a6dad`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -25,23 +25,23 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 50 timed trials after ten warmups. Lower is better. LLVM, the
+Each row is 50 timed trials after five warmups. Lower is better. LLVM, the
 preceding Cranelift policy, and the current Cranelift policy were run in the
 same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.1 ms | 67.1 ms | 2.02x |
-| `uv lock --check`, offline | 57.1 ms | 93.9 ms | 1.65x |
-| `ruff check` over 1,592 fixtures | 78.4 ms | 179.0 ms | 2.28x |
-| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 142.1 ms | 3.00x |
+| `uv venv --clear` | 32.7 ms | 59.5 ms | 1.82x |
+| `uv lock --check`, offline | 59.4 ms | 91.2 ms | 1.53x |
+| `ruff check` over 1,592 fixtures | 79.0 ms | 160.1 ms | 2.03x |
+| `ty check` over `scripts/ty_benchmark` | 47.5 ms | 128.7 ms | 2.71x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.7-3.0x faster for
+The conclusion is unambiguous: LLVM is currently about 1.5-2.7x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,15 +64,15 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 128.7 MB |
-| ty | 47.5 MB | 145.6 MB | 133.7 MB |
-| uv | 100.0 MB | 255.0 MB | 257.9 MB |
+| Ruff | 45.0 MB | 135.8 MB | 125.0 MB |
+| ty | 47.5 MB | 145.6 MB | 129.7 MB |
+| uv | 100.0 MB | 255.0 MB | 252.3 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
 complete answer: the final policy reduces Ruff and ty size, but the remaining
-output is still roughly three times LLVM's and uv remains nearly neutral on
-environment creation.
+output is still roughly 2.5-2.8 times LLVM's and uv environment creation is
+still more than 80% slower.
 
 ## Changes Implemented
 
@@ -171,6 +171,35 @@ The uv rows are statistically neutral, while Ruff and ty improve decisively.
 The candidate's uv, Ruff, and ty binaries are respectively 0.58%, 0.80%, and
 0.72% smaller. Correctness-probe exit codes and output digests match across all
 three lanes.
+
+### Scalar `NonZero` values in SSA
+
+A later ty profile put `boxcar::Index::location` among the hottest remaining
+pure-Rust leaves. LLVM emits a short register-only sequence for its `ilog2`,
+power-of-two bucket length, and index arithmetic. Cranelift used a 48-byte
+frame with repeated stack traffic for `NonZeroUsize` and
+`Option<NonZeroUsize>`, even though rustc describes both layouts as one scalar.
+
+An experiment that treated every scalar-layout ADT as an SSA value exposed
+invalid assumptions in aggregate field projection during the stage-2 standard
+library build. The retained change is deliberately narrower: only the
+diagnostic `NonZero` item and `Option<NonZero<_>>` use the scalar path. The
+exact kernel's frame fell from 48 to 16 bytes before the later stack-forwarding
+change, and its wrapper and niche values no longer round-trip through memory.
+
+The 50-run application gate measured small but consistently favorable effects:
+
+| Workload | Paired change | Wins | Sign p | Binary change |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -1.03% | 33/50 | 0.03284 | -0.034% |
+| `uv lock --check`, offline | -0.51% | 28/50 | 0.47989 | -0.034% |
+| `ruff check` over 1,592 fixtures | -1.43% | 32/50 | 0.06491 | -0.035% |
+| `ty check` over `scripts/ty_benchmark` | -0.48% | 32/50 | 0.06491 | -0.108% |
+
+Only uv environment creation reaches the sign-test threshold on its own, but
+all four medians improve and every binary shrinks. The focused regression,
+cg_clif check, complete stage-2 backend and standard-library build, and direct
+kernel execution pass, so the narrow scalar representation is retained.
 
 ### Higher hinted-call budget after scalarization
 
@@ -430,6 +459,15 @@ resolution regressed by 0.94% with only 5/20 wins (two-sided sign-test
 place. Closing this part of the LLVM gap therefore needs cross-CGU body import
 or a genuinely post-link optimizer, not a looser per-CGU size threshold.
 
+A second threshold probe targeted callable `dyn Fn` shims. Raising the hinted
+budget from 800 to 850 retained all 31 hot hashbrown probe copies; 900 and
+1,000 reduced the count to 20 but did not improve the application gate and
+worsened ty. A one-codegen-unit upper-bound build reduced ty's size by 9.5%
+but left the profiled `boxcar` helper count unchanged and only moved the probe
+count from 31 to 30. This reinforces the same roadmap conclusion: further
+progress needs cross-crate body import and stronger post-monomorphization
+optimization, not another local threshold increase.
+
 ### Profiled small constant copies
 
 A size histogram of the remaining Darwin libc copy traffic corrected an
@@ -520,6 +558,52 @@ Ty improves decisively, uv resolution improves directionally, and the other
 two rows are neutral. All three binaries shrink and every correctness digest
 matches, so the constant-size fill expansion is retained. Its focused
 frontend tests, cg_clif check, and complete SRS build pass.
+
+A nearby constant-comparison experiment was rejected. The remaining libc
+`memcmp` traffic comes from dynamic `compare_bytes` paths rather than
+constant-size `raw_eq`, so expanding `raw_eq` changed neither the relevant
+static call sites nor the dynamic census.
+
+### Pre-legalization stack-load forwarding
+
+Cranelift legalizes explicit `stack_load` and `stack_store` operations to
+ordinary memory operations before alias analysis. Its coarse memory version
+then treats an intervening store to a different offset as a clobber, hiding
+simple store-to-load forwarding opportunities that are still obvious while
+the stack-slot identity and offset are explicit.
+
+A new pre-legalization pass tracks exact slot, offset, and type within each
+block. It forwards only from non-address-taken slots, invalidates overlapping
+writes, and leaves escaped slots alone. User stack maps are also treated as
+external observations even when no `stack_addr` exists. Once every read from
+an unobserved slot has been forwarded, its dead stores are removed and an
+unkeyed empty slot is made size zero so it reserves no frame space. Focused
+filetests cover interleaved offsets, overlapping writes, a clobbering call,
+and GC stack-map preservation.
+
+The `boxcar::Index::location` reduction exposed the immediate benefit. Its
+interleaved `Option<usize>` discriminant and payload stores no longer block
+payload forwarding. The temporary stack traffic, redundant nonzero niche
+branch, jump table, and extra 16-byte frame allocation disappear. A companion
+fold recognizes that shifting the single set bit in integer `1` can never
+produce zero because CLIF masks shift counts to the value width.
+
+The final 50-run matched gate measured the committed policy against the scalar
+`NonZero` build:
+
+| Workload | LLVM | Previous Cranelift | Stack forwarding | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 32.7 ms | 64.8 ms | 59.5 ms | -7.87% | 47/50 | 0.000000000037 |
+| `uv lock --check`, offline | 59.4 ms | 96.6 ms | 91.2 ms | -5.63% | 45/50 | 0.0000000042 |
+| `ruff check` over 1,592 fixtures | 79.0 ms | 180.6 ms | 160.1 ms | -10.80% | 45/50 | 0.0000000042 |
+| `ty check` over `scripts/ty_benchmark` | 47.5 ms | 141.1 ms | 128.7 ms | -9.04% | 50/50 | 0.0000000000000018 |
+
+The uv, Ruff, and ty binaries shrink by 2.16%, 2.84%, and 2.87%, respectively.
+Correctness-probe exit codes and output digests match across LLVM, the previous
+Cranelift build, and the candidate. The focused filetest, all 184
+`cranelift-codegen` unit tests, and the complete stage-2 cg_clif and standard
+library build pass. This is the largest broadly positive retained runtime step
+in the investigation so far.
 
 ### Rejected native SIMD comparison expansion
 
@@ -633,7 +717,11 @@ check, pinned uv/Ruff/ty builds, and the 50-run correctness probes. The
 subsequent eight-register small-copy policy passed its focused frontend tests
 and another complete SRS build. The constant-size byte-fill policy passed its
 focused frontend tests, cg_clif check, and a complete SRS build. Every complete
-runtime gate preserved every correctness digest. A fresh full
+runtime gate preserved every correctness digest. The scalar `NonZero` change
+then passed its focused regression and complete stage-2 backend and standard
+library build. The stack-forwarding policy passed focused escaped-slot,
+overlap, and stack-map tests, all 184 `cranelift-codegen` unit tests, another
+complete stage-2 build, and the matched correctness probes. A fresh full
 uv/Ruff/ty suite pair is reserved for the finalization gate rather than
 repeated after every retained optimization. The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
@@ -707,6 +795,8 @@ The inlining result proves that call boundaries matter, but more indiscriminate
 inlining quickly becomes counterproductive. Continue with targeted policies:
 
 - incorporate call-site frequency and callee size into MIR defaults;
+- import small post-monomorphization bodies across codegen units instead of
+  repeatedly raising the local hinted-call threshold;
 - reduce and fix the broader cg_clif inliner miscompile before admitting
   callees with stack slots, global values, nested calls, or larger control-flow
   graphs;
@@ -721,9 +811,15 @@ The application gate is important here: the target-feature policy helped ty
 but regressed Ruff, while the subsequent depth increase recovered Ruff without
 giving back the ty win. Their hot paths will not all improve merely by buying
 more code size. Keeping thin
-`NonNull` iterator cursors in SSA completes one high-impact stack-slot case,
-but the remaining 2-4x LLVM gap shows that local representation fixes
-alone will not close the runtime difference.
+`NonNull` and `NonZero` values in SSA and forwarding exact explicit stack-slot
+traffic complete several high-impact local cases. The new forwarding pass also
+implements the safe nonescaped subset of the older unused-slot and dead-store
+roadmap items. A fresh matched profile still shows hashbrown's
+`find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
+prominent Cranelift-only leaves while LLVM has absorbed them into callers.
+That makes cross-CGU post-monomorphization body import the immediate call arc.
+The remaining 1.5-2.7x LLVM gap shows that local representation fixes alone
+will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
 
