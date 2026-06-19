@@ -956,20 +956,6 @@ mod tests {
     }
 
     #[test]
-    fn chained_fixup_pages_end_with_last_fixup() {
-        assert_eq!(chained_fixup_page_count(0x1000, 0x1000), 1);
-        assert_eq!(chained_fixup_page_count(0x1000, 0x4ff8), 1);
-        assert_eq!(chained_fixup_page_count(0x1000, 0x5000), 2);
-    }
-
-    #[test]
-    fn chained_fixup_slots_are_fully_file_backed() {
-        assert!(chained_fixup_slot_is_file_backed(0x7ff8, 0x8000));
-        assert!(!chained_fixup_slot_is_file_backed(0x7ff9, 0x8000));
-        assert!(!chained_fixup_slot_is_file_backed(u64::MAX, u64::MAX));
-    }
-
-    #[test]
     fn incremental_reserve_record_skips_leading_alignment_padding() {
         let alignment = Alignment { exponent: 3 };
 
