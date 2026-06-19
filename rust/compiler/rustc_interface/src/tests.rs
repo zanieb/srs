@@ -44,7 +44,7 @@ fn backend_mir_inliner_thresholds_apply_defaults() {
         &mut opts,
         Some(MirInlinerThresholds {
             cross_crate: 500,
-            top_down_depth: 8,
+            top_down_depth: 12,
             forwarder: 60,
             hint: 600,
             default: 100,
@@ -55,7 +55,7 @@ fn backend_mir_inliner_thresholds_apply_defaults() {
         opts.unstable_opts.cross_crate_inline_threshold,
         Some(InliningThreshold::Sometimes(500))
     );
-    assert_eq!(opts.unstable_opts.inline_mir_top_down_depth, Some(8));
+    assert_eq!(opts.unstable_opts.inline_mir_top_down_depth, Some(12));
     assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
     assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(600));
     assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
@@ -72,7 +72,7 @@ fn backend_mir_inliner_thresholds_preserve_explicit_options() {
         &mut opts,
         Some(MirInlinerThresholds {
             cross_crate: 500,
-            top_down_depth: 8,
+            top_down_depth: 12,
             forwarder: 60,
             hint: 600,
             default: 100,
