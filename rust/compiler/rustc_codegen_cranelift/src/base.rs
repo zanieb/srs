@@ -934,11 +934,17 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's
                     } else if fx.clif_type(operand.layout().ty) == Some(types::I8) {
-                        let times = fx.bcx.ins().iconst(fx.pointer_type, times as i64);
-                        // FIXME use emit_small_memset where possible
                         let addr = lval.to_ptr().get_addr(fx);
                         let val = operand.load_scalar(fx);
-                        fx.bcx.call_memset(fx.target_config, addr, val, times);
+                        let align = dest_layout.align.abi.bytes().try_into().unwrap_or(128);
+                        fx.bcx.emit_small_memset_value(
+                            fx.target_config,
+                            addr,
+                            val,
+                            times,
+                            align,
+                            MemFlags::new(),
+                        );
                     } else {
                         let loop_block = fx.bcx.create_block();
                         let loop_block2 = fx.bcx.create_block();
