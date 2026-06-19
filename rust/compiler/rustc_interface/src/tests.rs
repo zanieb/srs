@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use rustc_abi::Align;
+use rustc_codegen_ssa::traits::MirInlinerThresholds;
 use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::ColorConfig;
 use rustc_errors::emitter::HumanReadableErrorType;
@@ -31,7 +32,24 @@ use rustc_target::spec::{
     RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel,
 };
 
-use crate::interface::{initialize_checked_jobserver, parse_cfg};
+use crate::interface::{
+    apply_backend_mir_inliner_thresholds, initialize_checked_jobserver, parse_cfg,
+};
+
+#[test]
+fn backend_mir_inliner_thresholds_preserve_explicit_options() {
+    let mut opts = Options::default();
+    opts.unstable_opts.inline_mir_hint_threshold = Some(123);
+
+    apply_backend_mir_inliner_thresholds(
+        &mut opts,
+        Some(MirInlinerThresholds { forwarder: 60, hint: 200, default: 100 }),
+    );
+
+    assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
+    assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(123));
+    assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
+}
 
 fn sess_and_cfg<F>(args: &[&'static str], f: F)
 where
