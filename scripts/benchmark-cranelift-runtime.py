@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import itertools
 import json
+import math
 import os
 import platform
 import random
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ROOT_MARKER = ".srs-cranelift-runtime-benchmark-root"
 WORKLOADS = ("uv-venv", "uv-lock", "ruff-check", "ty-check")
 
@@ -232,6 +233,44 @@ def summarize(samples_ns: Sequence[int]) -> dict[str, float]:
     }
 
 
+def exact_sign_test(wins: int, losses: int) -> float:
+    observations = wins + losses
+    if observations == 0:
+        return 1.0
+    tail = sum(
+        math.comb(observations, successes)
+        for successes in range(min(wins, losses) + 1)
+    )
+    return min(1.0, 2 * tail / 2**observations)
+
+
+def compare_samples(
+    reference_ns: Sequence[int], candidate_ns: Sequence[int]
+) -> dict[str, Any]:
+    if len(reference_ns) != len(candidate_ns) or not reference_ns:
+        raise ValueError("paired samples must have the same nonzero length")
+    comparisons = list(zip(reference_ns, candidate_ns, strict=True))
+    changes = [
+        (candidate - reference) / reference * 100
+        for reference, candidate in comparisons
+    ]
+    median_change = statistics.median(changes)
+    wins = sum(candidate < reference for reference, candidate in comparisons)
+    losses = sum(candidate > reference for reference, candidate in comparisons)
+    ties = len(changes) - wins - losses
+    return {
+        "trials": len(changes),
+        "median_change_percent": median_change,
+        "median_absolute_deviation_percent": statistics.median(
+            abs(change - median_change) for change in changes
+        ),
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "two_sided_sign_test_p": exact_sign_test(wins, losses),
+    }
+
+
 def binary_metadata(path: Path) -> dict[str, Any]:
     completed = subprocess.run(
         [str(path), "--version"],
@@ -309,6 +348,7 @@ def run(args: argparse.Namespace) -> None:
     records: list[dict[str, Any]] = []
     probes: dict[str, dict[str, Any]] = {}
     summaries: dict[str, dict[str, Any]] = {}
+    pairwise: dict[str, dict[str, Any]] = {}
 
     for workload in workloads:
         commands = {
@@ -377,6 +417,14 @@ def run(args: argparse.Namespace) -> None:
             }
             for lane_name, lane_samples in samples.items()
         }
+        pairwise[workload] = {
+            f"{candidate}_vs_{reference}": {
+                "reference": reference,
+                "candidate": candidate,
+                **compare_samples(samples[reference], samples[candidate]),
+            }
+            for reference, candidate in itertools.combinations(lane_names, 2)
+        }
 
     result = {
         "schema": SCHEMA_VERSION,
@@ -399,6 +447,7 @@ def run(args: argparse.Namespace) -> None:
         "probes": probes,
         "trials": records,
         "summary": summaries,
+        "pairwise": pairwise,
     }
     write_json(args.output.resolve(), result, args.overwrite)
 

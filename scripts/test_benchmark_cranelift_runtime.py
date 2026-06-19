@@ -46,13 +46,31 @@ class BenchmarkCraneliftRuntimeTest(unittest.TestCase):
         self.assertEqual(summary["min_ms"], 1.0)
         self.assertEqual(summary["max_ms"], 3.0)
 
+    def test_comparison_uses_paired_changes(self) -> None:
+        comparison = benchmark.compare_samples(
+            [100, 100, 100, 100],
+            [90, 80, 110, 100],
+        )
+        self.assertEqual(comparison["median_change_percent"], -5.0)
+        self.assertEqual(comparison["median_absolute_deviation_percent"], 10.0)
+        self.assertEqual(comparison["wins"], 2)
+        self.assertEqual(comparison["losses"], 1)
+        self.assertEqual(comparison["ties"], 1)
+        self.assertEqual(comparison["two_sided_sign_test_p"], 1.0)
+
+    def test_exact_sign_test(self) -> None:
+        self.assertEqual(benchmark.exact_sign_test(8, 0), 0.0078125)
+        self.assertEqual(benchmark.exact_sign_test(0, 0), 1.0)
+
     def test_existing_unowned_scratch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             scratch = Path(temporary) / "scratch"
             scratch.mkdir()
             with self.assertRaises(benchmark.BenchmarkError):
                 benchmark.prepare_scratch(scratch)
-            (scratch / benchmark.ROOT_MARKER).write_text("schema=1\n")
+            (scratch / benchmark.ROOT_MARKER).write_text(
+                f"schema={benchmark.SCHEMA_VERSION}\n"
+            )
             benchmark.prepare_scratch(scratch)
 
 

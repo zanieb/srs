@@ -85,6 +85,42 @@ The retained moderate policy is the useful part of that curve: 13.9% faster
 Ruff and 3.7% faster ty in the final controlled run, without the aggressive
 variant's size or correctness risk.
 
+### Late aggregate scalarization and dereference-aware SSA
+
+Destination propagation can make an aggregate local stop escaping after the
+first SROA pass has already run. LLVM can often recover these values later,
+but Cranelift otherwise receives the aggregate as memory. Cranelift now asks
+the optimized MIR pipeline to run a second SROA pass after destination
+propagation. The pass is backend-scoped: an LLVM compilation does not run it.
+
+Cranelift's own SSA analysis also no longer stack-spills the base pointer for
+`&*pointer`. That expression takes the address of the pointee, not the address
+of the pointer local, so the pointer remains eligible for an SSA value.
+
+A reduced Ruff-style byte scan showed why both pieces matter. Late SROA splits
+the slice iterator into its pointer and end-pointer fields; the dereference-aware
+analysis then keeps those fields out of memory. The AArch64 stack frame shrank
+from 96 to 64 bytes and the scalar Cranelift loop improved by roughly 20%.
+LLVM still runs the reduction about two orders of magnitude faster because it
+processes 64 bytes per loop with NEON, so automatic loop vectorization remains
+the dominant long-term gap.
+
+The application gate used 20 balanced, randomized trials after five warmups.
+The paired change compares the candidate to the preceding Cranelift build from
+the same trial, and the sign-test p-value excludes ties.
+
+| Workload | LLVM | Previous Cranelift | Late SSA | LLVM lead | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 31.9 ms | 80.7 ms | 76.1 ms | 2.39x | -5.7% | 19/20 | 0.00004 |
+| `uv lock --check`, offline | 59.8 ms | 118.0 ms | 113.7 ms | 1.90x | -3.1% | 18/20 | 0.00040 |
+| `ruff check` over 1,592 fixtures | 77.6 ms | 281.8 ms | 277.0 ms | 3.57x | -2.0% | 17/20 | 0.00258 |
+| `ty check` over `scripts/ty_benchmark` | 46.1 ms | 197.7 ms | 188.4 ms | 4.09x | -4.3% | 20/20 | 0.000002 |
+
+The candidate's uv, Ruff, and ty binaries are respectively 1.02%, 1.14%, and
+1.04% smaller than the previous Cranelift binaries. Correctness-probe exit
+codes and stdout/stderr digests match across LLVM, the previous Cranelift
+build, and the candidate.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -132,6 +168,11 @@ This is the highest-upside arc for the parser-heavy Ruff and ty rows. Start
 with redundant checks over the same SSA index, then extend the analysis to
 affine index relationships. Use reduced CLIF extracted from the hot byte and
 token loops, but accept a change only after the application benchmarks move.
+
+The late scalarization work above is the first completed part of this arc: it
+removes memory traffic around iterator state, but does not transform the loop.
+The reduced scan confirms that vectorization and loop-wide range reasoning are
+now the next larger opportunities.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
@@ -201,8 +242,10 @@ Build the LLVM lane into a separate empty target with the same environment and
 workspace and keep output outside the timed path.
 
 The checked-in runner records repository revisions, executable hashes and
-sizes, correctness-probe output, randomized lane order, every trial, and a
-summary. It accepts a third baseline lane when comparing a new candidate with
+sizes, correctness-probe output, randomized lane order, every trial, and both
+per-lane and paired summaries. Paired summaries include the median relative
+change, median absolute deviation, wins/losses, and an exact two-sided sign
+test. It accepts a third baseline lane when comparing a new candidate with
 both LLVM and the previous Cranelift result:
 
 ```bash
