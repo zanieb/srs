@@ -21,6 +21,53 @@ pub(super) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
             fx.bcx.ins().fence();
         }
 
+        "llvm.aarch64.crc32b"
+        | "llvm.aarch64.crc32cb"
+        | "llvm.aarch64.crc32h"
+        | "llvm.aarch64.crc32ch"
+        | "llvm.aarch64.crc32w"
+        | "llvm.aarch64.crc32cw"
+        | "llvm.aarch64.crc32x"
+        | "llvm.aarch64.crc32cx" => {
+            intrinsic_args!(fx, args => (crc, data); intrinsic);
+
+            let crc = crc.load_scalar(fx);
+            let data = data.load_scalar(fx);
+            let asm = match intrinsic {
+                "llvm.aarch64.crc32b" => "crc32b w0, w0, w1",
+                "llvm.aarch64.crc32cb" => "crc32cb w0, w0, w1",
+                "llvm.aarch64.crc32h" => "crc32h w0, w0, w1",
+                "llvm.aarch64.crc32ch" => "crc32ch w0, w0, w1",
+                "llvm.aarch64.crc32w" => "crc32w w0, w0, w1",
+                "llvm.aarch64.crc32cw" => "crc32cw w0, w0, w1",
+                "llvm.aarch64.crc32x" => "crc32x w0, w0, x1",
+                "llvm.aarch64.crc32cx" => "crc32cx w0, w0, x1",
+                _ => unreachable!(),
+            };
+
+            codegen_inline_asm_inner(
+                fx,
+                &[InlineAsmTemplatePiece::String(asm.into())],
+                &[
+                    CInlineAsmOperand::InOut {
+                        reg: InlineAsmRegOrRegClass::Reg(InlineAsmReg::AArch64(
+                            AArch64InlineAsmReg::x0,
+                        )),
+                        _late: true,
+                        in_value: crc,
+                        out_place: Some(ret),
+                    },
+                    CInlineAsmOperand::In {
+                        reg: InlineAsmRegOrRegClass::Reg(InlineAsmReg::AArch64(
+                            AArch64InlineAsmReg::x1,
+                        )),
+                        value: data,
+                    },
+                ],
+                InlineAsmOptions::NOSTACK | InlineAsmOptions::PURE | InlineAsmOptions::NOMEM,
+            );
+        }
+
         "llvm.aarch64.neon.ld1x4.v16i8.p0" => {
             intrinsic_args!(fx, args => (ptr); intrinsic);
 

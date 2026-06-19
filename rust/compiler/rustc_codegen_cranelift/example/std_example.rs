@@ -1,6 +1,8 @@
 #![feature(core_intrinsics, coroutines, coroutine_trait, repr_simd, tuple_trait, unboxed_closures)]
 #![allow(internal_features)]
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::asm;
 #[cfg(target_arch = "x86_64")]
@@ -117,6 +119,11 @@ fn main() {
         test_simd();
     }
 
+    #[cfg(all(target_arch = "aarch64", not(jit)))]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        unsafe { test_aarch64_crc32() };
+    }
+
     Box::pin(
         #[coroutine]
         move |mut _task_context| {
@@ -222,6 +229,22 @@ unsafe fn test_crc32() {
     assert_eq!(_mm_crc32_u16(a, b as u16), 1200687288);
     assert_eq!(_mm_crc32_u32(a, b as u32), 2543798776);
     assert_eq!(_mm_crc32_u64(a as u64, b as u64), 241952147);
+}
+
+#[cfg(all(target_arch = "aarch64", not(jit)))]
+#[target_feature(enable = "crc")]
+unsafe fn test_aarch64_crc32() {
+    let crc = 42;
+    let data = 0xdead_beef_dead_beefu64;
+
+    assert_eq!(__crc32b(crc, data as u8), 3943577151);
+    assert_eq!(__crc32cb(crc, data as u8), 4135334616);
+    assert_eq!(__crc32h(crc, data as u16), 2589244800);
+    assert_eq!(__crc32ch(crc, data as u16), 1200687288);
+    assert_eq!(__crc32w(crc, data as u32), 4103204953);
+    assert_eq!(__crc32cw(crc, data as u32), 2543798776);
+    assert_eq!(__crc32d(crc, data), 3931439525);
+    assert_eq!(__crc32cd(crc, data), 133363847);
 }
 
 #[cfg(target_arch = "x86_64")]
