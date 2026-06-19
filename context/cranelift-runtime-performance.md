@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `51a7c38ad`, with:
+recorded at SRS `7a434bc55`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,10 +31,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.7 ms | 55.6 ms | 1.70x |
-| `uv lock --check`, offline | 58.7 ms | 84.5 ms | 1.44x |
-| `ruff check` over 1,592 fixtures | 79.2 ms | 145.3 ms | 1.83x |
-| `ty check` over `scripts/ty_benchmark` | 47.1 ms | 115.7 ms | 2.46x |
+| `uv venv --clear` | 31.0 ms | 52.6 ms | 1.70x |
+| `uv lock --check`, offline | 56.0 ms | 80.5 ms | 1.44x |
+| `ruff check` over 1,592 fixtures | 78.0 ms | 141.1 ms | 1.81x |
+| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 115.7 ms | 2.44x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -491,6 +491,30 @@ Ruff moved in the wrong direction. The experiment was rejected. Cross-CGU
 availability is therefore not sufficient by itself; another attempt needs a
 hot-call-site or callee-specific profitability signal that can avoid broad
 layout perturbation.
+
+The retained follow-up supplies a bounded static signal: an imported body is
+eligible only when the same caller contains at least four direct calls to that
+callee. Ordinary local scalar inlining is unchanged. This targets repeated
+enum hashing without importing bodies across every one-off call boundary.
+In ty, direct `FxHasher::write_isize` calls fall from 385 to 179, and every hot
+`Type::hash` copy falls from 25 calls to zero. The broader rejected experiment
+removed all 385 calls; the repeated-call policy deliberately leaves the
+one-off sites alone. Binary size changes are correspondingly tiny: uv, Ruff,
+and ty shrink by 0.0031%, 0.0011%, and 0.0018%.
+
+The 50-run matched gate measured:
+
+| Workload | Candidate vs previous Cranelift | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.49% | 30/50 | 0.20264 | +69.9% |
+| `uv lock --check`, offline | -0.09% | 26/50 | 0.88772 | +43.7% |
+| `ruff check` over 1,592 fixtures | -0.63% | 28/50 | 0.47989 | +80.9% |
+| `ty check` over `scripts/ty_benchmark` | -0.99% | 30/50 | 0.20264 | +144.5% |
+
+No row is individually decisive, but all four paired medians improve, every
+binary shrinks, and all correctness digests match. The focused backend check
+and complete stage-2 backend and standard-library build pass. The repeated-call
+policy is retained; one-off imports still require a stronger call-site signal.
 
 A second threshold probe targeted callable `dyn Fn` shims. Raising the hinted
 budget from 800 to 850 retained all 31 hot hashbrown probe copies; 900 and
@@ -1231,9 +1255,10 @@ those comparison results with direct conditional branches then removes the
 corresponding bounds checks, decisively improves Ruff and ty, and cuts another
 2.1-2.5% from binary size without moving uv. The forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
-roadmap items. A fresh matched profile still shows hashbrown's
-`find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
-prominent Cranelift-only leaves while LLVM has absorbed them into callers.
+roadmap items. A matched profile before the repeated-call import showed
+hashbrown's `find_or_find_insert_index_inner` and cross-CGU
+`FxHasher::write_isize` as prominent Cranelift-only leaves while LLVM had
+absorbed them into callers.
 Known-receiver devirtualization removed some copies of the hashbrown loop and
 replaced its indirect equality call in a reduction, but both the direct-only
 and targeted-inlining variants were runtime-neutral in 50-run application
@@ -1241,8 +1266,10 @@ gates and were rejected.
 
 An untargeted, one-level post-monomorphization body-import experiment removed
 all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
-screen and was rejected. The immediate call arc is now a profile- or
-frequency-aware import policy, not broader body availability by itself.
+screen and was rejected. Requiring four static call sites per caller retains
+the hot `Type::hash` transformation, improves every application median, and
+leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
+model is the next call arc, not broader body availability by itself.
 The remaining 1.4-2.5x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
