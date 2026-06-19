@@ -688,6 +688,16 @@ larger size; the residual hot copies need a loop, vector, or forwarding
 strategy that does not materialize nineteen scalar load/store pairs at every
 call site.
 
+An exact-size vector variant tested that alternative directly. It represented
+152 bytes as nine 16-byte vector values and one 8-byte tail, cutting the
+expanded value count from 19 to 10 while leaving every smaller retained copy
+unchanged. Binary growth fell to 0.04% for uv, 0.06% for Ruff, and 0.03% for
+ty, but the 20-run paired changes were +0.17%, +1.58%, +0.84%, and -0.10% for
+uv environment creation, uv resolution, Ruff, and ty. No movement was
+statistically decisive and three workloads moved backward, so the vector
+variant was also rejected. The residual 152-byte traffic needs elimination or
+loop-level reuse rather than a differently shaped call-site expansion.
+
 ### Rejected native SIMD comparison expansion
 
 An amplified ty profile showed scalarized AArch64 hash-table control-group
