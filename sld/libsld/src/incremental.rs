@@ -8138,6 +8138,21 @@ fn supports_preplanned_macho_unwind_reclaim(path: &Path) -> bool {
             .is_some_and(|extension| extension == "rlib")
 }
 
+fn can_replan_changed_macho_unwind_reclaim(
+    previous: &PersistedState,
+    changed_inputs: &[(usize, PathBuf)],
+) -> bool {
+    changed_inputs.iter().all(|(input_index, path)| {
+        supports_preplanned_macho_unwind_reclaim(path)
+            && previous.input_files.get(*input_index).is_some_and(|input| {
+                !input
+                    .patch
+                    .as_ref()
+                    .is_some_and(FilePatchState::has_historical_macho_unwind_ownership)
+            })
+    })
+}
+
 fn preplanned_changed_macho_unwind_reclaim(
     state_dir: &Path,
     previous_output_source: &Path,
@@ -8397,9 +8412,8 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
 ) -> Result<ChangedInputPatchResult> {
     timing_phase!("Patch changed incremental inputs");
 
-    let can_retry_macho_unwind_reclaim = changed_inputs
-        .iter()
-        .all(|(_, path)| supports_preplanned_macho_unwind_reclaim(path));
+    let can_retry_macho_unwind_reclaim =
+        can_replan_changed_macho_unwind_reclaim(&previous, changed_inputs);
     let retry_previous = reclaim_macho_unwind.is_none().then(|| previous.clone());
     let retry_current_link_start = current_link_start.clone();
     let retry_record_coverage = record_coverage.clone();
@@ -34305,7 +34319,7 @@ fn reactivated_macho_archive_text_activation_with_sections(
                 Err(reason) => return Ok(Err(reason)),
             }
         }
-        for rollback in &state.rollback_symbol_resolutions {
+        for rollback in &mut state.rollback_symbol_resolutions {
             let index =
                 match macho_symbol_resolution_index_for_name(resolutions, rollback.name.as_str()) {
                     Ok(Some(index)) => index,
@@ -34318,9 +34332,25 @@ fn reactivated_macho_archive_text_activation_with_sections(
                     Err(reason) => return Ok(Err(reason)),
                 };
             if resolutions[index] != *rollback {
-                return Ok(Err(
-                    "reactivated Mach-O archive rollback symbol changed while dormant".to_owned(),
-                ));
+                let target_input_changed = rollback
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.input_file == input_file_path)
+                    && resolutions[index]
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.input_file == input_file_path)
+                    && macho_definition_resolutions_match(
+                        std::slice::from_ref(rollback),
+                        std::slice::from_ref(&resolutions[index]),
+                    );
+                if !target_input_changed {
+                    return Ok(Err(
+                        "reactivated Mach-O archive rollback symbol changed while dormant"
+                            .to_owned(),
+                    ));
+                }
+                *rollback = resolutions[index].clone();
             }
         }
     }
@@ -40029,6 +40059,7 @@ fn added_macho_archive_indirect_dependencies(
                 );
             }
             let mut candidates = replay.current_relocation_target_candidates.clone();
+            candidates.retain(|candidate| *candidate != replay.current_target_value);
             candidates.sort_unstable();
             candidates.dedup();
             let [applied] = candidates.as_slice() else {
@@ -76364,8 +76395,8 @@ mod tests {
     }
 
     #[test]
-    fn historical_macho_unwind_ownership_disables_cohort_preplanning() {
-        let state = |kind, unwind_transaction| MachOArchiveActivationState {
+    fn historical_macho_unwind_ownership_disables_cohort_planning_and_replanning() {
+        let activation_state = |kind, unwind_transaction| MachOArchiveActivationState {
             kind,
             members: Vec::new(),
             active: true,
@@ -76388,7 +76419,7 @@ mod tests {
         };
 
         assert!(
-            patch(state(
+            patch(activation_state(
                 MachOArchiveActivationKind::ChangedDefinitionsWithUnwind,
                 None,
             ))
@@ -76399,7 +76430,7 @@ mod tests {
             eh_frame_reserve: MachOEhFrameReserveState { start: 0, end: 8 },
         };
         assert!(
-            patch(state(
+            patch(activation_state(
                 MachOArchiveActivationKind::AddedMembers,
                 Some(MachOArchiveUnwindTransactionState {
                     forward: version.clone(),
@@ -76409,9 +76440,27 @@ mod tests {
             .has_historical_macho_unwind_ownership()
         );
         assert!(
-            !patch(state(MachOArchiveActivationKind::AddedMembers, None))
-                .has_historical_macho_unwind_ownership()
+            !patch(activation_state(
+                MachOArchiveActivationKind::AddedMembers,
+                None,
+            ))
+            .has_historical_macho_unwind_ownership()
         );
+
+        let changed_inputs = [(0, PathBuf::from("crate.rlib"))];
+        let mut previous = state("args", b"output", &[("crate.rlib", b"archive")]);
+        assert!(can_replan_changed_macho_unwind_reclaim(
+            &previous,
+            &changed_inputs,
+        ));
+        previous.input_files[0].patch = Some(patch(activation_state(
+            MachOArchiveActivationKind::ChangedDefinitionsWithUnwind,
+            None,
+        )));
+        assert!(!can_replan_changed_macho_unwind_reclaim(
+            &previous,
+            &changed_inputs,
+        ));
     }
 
     #[test]
@@ -87219,7 +87268,7 @@ mod tests {
             }],
             active: false,
             sections: vec![FilePatchSectionState {
-                input: previous_input,
+                input: previous_input.clone(),
                 section_index: 1,
                 section_name: Some("__TEXT,__text".to_owned()),
                 input_size: 16,
@@ -87351,6 +87400,78 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(refreshed.identifier, current_identifier);
+
+        let mut refreshed_inputs = HashMap::new();
+        let current_input = refreshed_macho_archive_input_ref(
+            &input_file,
+            &previous_input,
+            &resolver,
+            &mut refreshed_inputs,
+        )
+        .unwrap()
+        .unwrap();
+        let rollback_with_previous_input = MachOSymbolResolutionRecord {
+            name: hex::encode("_rollback_refresh").into(),
+            direct_value: Some(first_target_value),
+            target: Some(RelocationTargetRecord {
+                input_file: input_file.clone().into(),
+                input: previous_input.into(),
+                section_index: 2,
+                section_offset: 4,
+            }),
+            ..rollback.clone()
+        };
+        let rollback_with_current_input = MachOSymbolResolutionRecord {
+            target: Some(RelocationTargetRecord {
+                input_file: input_file.clone().into(),
+                input: current_input.into(),
+                section_index: 2,
+                section_offset: 4,
+            }),
+            ..rollback_with_previous_input.clone()
+        };
+        let mut rollback_refresh_patch = patch.clone();
+        rollback_refresh_patch.macho_archive_members[0].rollback_symbol_resolutions =
+            vec![rollback_with_previous_input];
+        assert!(
+            reactivated_macho_archive_text_activation(
+                &current,
+                &input_file,
+                &[current_identifier.to_vec()],
+                &resolver,
+                &rollback_refresh_patch,
+                &dormant_output,
+                std::slice::from_ref(&rollback_with_current_input),
+                &[],
+                &[],
+                true,
+            )
+            .unwrap()
+            .unwrap()
+            .is_some()
+        );
+        let changed_rollback = MachOSymbolResolutionRecord {
+            direct_value: Some(first_target_value + 4),
+            ..rollback_with_current_input
+        };
+        assert!(
+            reactivated_macho_archive_text_activation(
+                &current,
+                &input_file,
+                &[current_identifier.to_vec()],
+                &resolver,
+                &rollback_refresh_patch,
+                &dormant_output,
+                std::slice::from_ref(&changed_rollback),
+                &[],
+                &[],
+                true,
+            )
+            .unwrap()
+            .err()
+            .unwrap()
+            .contains("rollback symbol changed while dormant")
+        );
 
         let mut reactivated = activation.reactivated_relocations.clone();
         reactivated[0].target_symbol_id = 0;
@@ -87736,7 +87857,7 @@ mod tests {
         let name: SharedText = hex::encode("_memcpy").into();
         let record = test_macho_import_branch_record(&mut output, "archive.rlib", "member.o", name);
         let replay =
-            test_macho_import_replay(&record, vec![output.stub_address, output.stub_address]);
+            test_macho_import_replay(&record, vec![output.stub_address, output.stub_address, 0]);
         let output_file = object::File::parse(&*output.bytes).unwrap();
 
         let reason = added_macho_archive_indirect_dependencies(
@@ -87770,6 +87891,19 @@ mod tests {
         .unwrap();
         assert_eq!(dependencies, vec![expected]);
         assert!(publish.is_empty());
+
+        let unresolved_only = test_macho_import_replay(&record, vec![0]);
+        assert!(
+            added_macho_archive_indirect_dependencies(
+                std::slice::from_ref(&unresolved_only),
+                &[],
+                true,
+                &output.bytes,
+                &output_file,
+            )
+            .unwrap_err()
+            .contains("no unique recorded target")
+        );
     }
 
     #[test]
