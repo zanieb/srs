@@ -37,15 +37,35 @@ use crate::interface::{
 };
 
 #[test]
+fn backend_mir_inliner_thresholds_apply_defaults() {
+    let mut opts = Options::default();
+
+    apply_backend_mir_inliner_thresholds(
+        &mut opts,
+        Some(MirInlinerThresholds { cross_crate: 500, forwarder: 60, hint: 600, default: 100 }),
+    );
+
+    assert_eq!(
+        opts.unstable_opts.cross_crate_inline_threshold,
+        Some(InliningThreshold::Sometimes(500))
+    );
+    assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
+    assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(600));
+    assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
+}
+
+#[test]
 fn backend_mir_inliner_thresholds_preserve_explicit_options() {
     let mut opts = Options::default();
+    opts.unstable_opts.cross_crate_inline_threshold = Some(InliningThreshold::Always);
     opts.unstable_opts.inline_mir_hint_threshold = Some(123);
 
     apply_backend_mir_inliner_thresholds(
         &mut opts,
-        Some(MirInlinerThresholds { forwarder: 60, hint: 200, default: 100 }),
+        Some(MirInlinerThresholds { cross_crate: 500, forwarder: 60, hint: 600, default: 100 }),
     );
 
+    assert_eq!(opts.unstable_opts.cross_crate_inline_threshold, Some(InliningThreshold::Always));
     assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
     assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(123));
     assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
@@ -799,7 +819,7 @@ fn test_unstable_options_tracking_hash() {
         }
     );
     tracked!(crate_attr, vec!["abc".to_string()]);
-    tracked!(cross_crate_inline_threshold, InliningThreshold::Always);
+    tracked!(cross_crate_inline_threshold, Some(InliningThreshold::Always));
     tracked!(debug_info_for_profiling, true);
     tracked!(debug_info_type_line_numbers, true);
     tracked!(default_visibility, Some(rustc_target::spec::SymbolVisibility::Hidden));

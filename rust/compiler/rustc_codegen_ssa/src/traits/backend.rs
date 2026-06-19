@@ -26,6 +26,7 @@ use crate::{CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
 /// options always take precedence over these defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MirInlinerThresholds {
+    pub cross_crate: usize,
     pub forwarder: usize,
     pub hint: usize,
     pub default: usize,
