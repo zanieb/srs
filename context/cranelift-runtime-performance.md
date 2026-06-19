@@ -754,6 +754,23 @@ rejected it: `uv venv --clear` regressed by 1.92% with 5/20 wins
 with 10/20 wins. Every correctness digest matched. Small-table encoding is
 therefore not a current runtime arc despite its local code-size win.
 
+A separate range-preservation experiment targeted the generic switch lowering
+seen in ty's large `Type::hash` body. Rust had already zero-extended an
+eight-bit discriminant before a later block used it, but the frontend passed
+the widened value to Cranelift's `Switch`. Recovering the original narrow
+source removed the generic greater-than-`u32::MAX` check and filtered explicit
+cases outside the source type's proven unsigned range. It shrank uv, Ruff, and
+ty by 0.17%, 0.23%, and 0.16%, respectively, and every correctness digest
+matched.
+
+The 50-run application gate found no runtime benefit, however. Paired changes
+were +0.09% for `uv venv --clear` (24/50 wins, `p = 0.888`), -0.13% for
+`uv lock --check` (26/50, `p = 0.888`), -0.09% for Ruff (25/50, `p = 1`),
+and +0.54% for ty (20/50, `p = 0.203`). The frontend-specific rewrite was
+therefore rejected. Carrying a narrow range only into generic switch lowering
+is a code-size opportunity; the runtime arc needs to eliminate checks inside
+hot loops or enable a larger control-flow transformation.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -993,9 +1010,13 @@ removes three bounds checks from the profiled hashbrown body, improves Ruff by
 1.97% and ty by 3.19%, and shrinks all three application binaries by more than
 2%. One separate two-entry discriminant table remains in that body, but direct
 small-table lowering lost the application gate despite shrinking code.
-Propagating scalar ranges through CFG edges and joins is the next concrete step
-before affine loop-index analysis. The reduced scan confirms that vectorization
-and loop-wide range reasoning remain the larger opportunities.
+Propagating scalar ranges through CFG edges and joins remains the next concrete
+step before affine loop-index analysis, but the rejected switch experiment
+narrows the target: preserving a range solely to remove a generic switch
+overflow check did not move runtime. The next candidate should consume the
+fact in repeated loop bounds or enable a larger control-flow simplification.
+The reduced scan confirms that vectorization and loop-wide range reasoning
+remain the larger opportunities.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
