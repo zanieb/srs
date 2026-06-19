@@ -174,7 +174,7 @@ impl Context {
         }
 
         if opt_level != OptLevel::None {
-            crate::stack_load_forwarding::forward_stack_loads(&mut self.func);
+            crate::stack_load_forwarding::forward_stack_loads(&mut self.func, isa.endianness());
         }
 
         self.legalize(isa)?;

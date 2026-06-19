@@ -1,0 +1,35 @@
+test optimize
+set opt_level=speed
+target s390x
+
+function %adjacent_narrow_stack_stores(i8, i8, i8, i8, i8, i8, i8, i8) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i8, v1: i8, v2: i8, v3: i8, v4: i8, v5: i8, v6: i8, v7: i8):
+  stack_store.i8 v0, ss0
+  stack_store.i8 v1, ss0+1
+  stack_store.i8 v2, ss0+2
+  stack_store.i8 v3, ss0+3
+  stack_store.i8 v4, ss0+4
+  stack_store.i8 v5, ss0+5
+  stack_store.i8 v6, ss0+6
+  stack_store.i8 v7, ss0+7
+  jump block1
+
+block1:
+  v8 = stack_load.i64 ss0
+  return v8
+}
+
+; check: function %adjacent_narrow_stack_stores(i8, i8, i8, i8, i8, i8, i8, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 0
+; check:  block0(v0: i8, v1: i8, v2: i8, v3: i8, v4: i8, v5: i8, v6: i8, v7: i8):
+; nextln:     jump block1
+; check:  block1:
+; nextln:     v9 = uextend.i64 v0
+; nextln:     v37 = iconst.i64 56
+; nextln:     v10 = ishl v9, v37  ; v37 = 56
+; check:      v29 = uextend.i64 v7
+; nextln:     v30 = bor v28, v29
+; nextln:     return v30
+; nextln: }

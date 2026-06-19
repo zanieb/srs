@@ -33,6 +33,66 @@ block0(v0: i64, v1: i64):
 ; nextln:     return v0
 ; nextln: }
 
+function %adjacent_narrow_stack_stores(i8, i8, i8, i8, i8, i8, i8, i8) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i8, v1: i8, v2: i8, v3: i8, v4: i8, v5: i8, v6: i8, v7: i8):
+  stack_store.i8 v0, ss0
+  stack_store.i8 v1, ss0+1
+  stack_store.i8 v2, ss0+2
+  stack_store.i8 v3, ss0+3
+  stack_store.i8 v4, ss0+4
+  stack_store.i8 v5, ss0+5
+  stack_store.i8 v6, ss0+6
+  stack_store.i8 v7, ss0+7
+  jump block1
+
+block1:
+  v8 = stack_load.i64 ss0
+  return v8
+}
+
+; check: function %adjacent_narrow_stack_stores(i8, i8, i8, i8, i8, i8, i8, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 0
+; check:  block0(v0: i8, v1: i8, v2: i8, v3: i8, v4: i8, v5: i8, v6: i8, v7: i8):
+; nextln:     jump block1
+; check:  block1:
+; check:      v31 = iconst.i64 56
+; nextln:     v29 = ishl v28, v31  ; v31 = 56
+; nextln:     v30 = bor v27, v29
+; nextln:     return v30
+; nextln: }
+
+function %multiple_stack_predecessors(i64, i64, i8) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i64, v1: i64, v2: i8):
+  brif v2, block1, block2
+
+block1:
+  stack_store.i64 v0, ss0
+  jump block3
+
+block2:
+  stack_store.i64 v1, ss0
+  jump block3
+
+block3:
+  v3 = stack_load.i64 ss0
+  return v3
+}
+
+; check: function %multiple_stack_predecessors(i64, i64, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 8
+; check:  block1:
+; check:      store.i64 notrap v0,
+; check:  block2:
+; check:      store.i64 notrap v1,
+; check:  block3:
+; check:      v3 = load.i64 notrap
+; nextln:     return v3
+; nextln: }
+
 function %overlapping_stack_store(i64, i32) -> i64 {
   ss0 = explicit_slot 8
 

@@ -1,7 +1,11 @@
 //! Store-to-load forwarding for explicit stack slots before legalization.
 
+use alloc::vec::Vec;
+
 use crate::cursor::{Cursor, CursorPosition, FuncCursor};
-use crate::ir::{Function, InstructionData, Opcode, StackSlot, Type, Value};
+use crate::ir::{
+    Block, Endianness, Function, InstBuilder, InstructionData, Opcode, StackSlot, Type, Value,
+};
 use crate::{FxHashMap, FxHashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -29,7 +33,7 @@ impl StackLoc {
 /// that point, an unrelated store to another offset advances the coarse `other` memory version
 /// and can hide an otherwise immediate store-to-load opportunity. Before legalization, distinct
 /// explicit slots and offsets are still available directly in the instruction data.
-pub(crate) fn forward_stack_loads(func: &mut Function) {
+pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
     let mut address_taken = FxHashSet::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
@@ -47,9 +51,32 @@ pub(crate) fn forward_stack_loads(func: &mut Function) {
         }
     }
 
+    let mut unique_predecessors = FxHashMap::<Block, Block>::default();
+    let mut multiple_predecessors = FxHashSet::default();
+    for block in func.layout.blocks() {
+        for successor in func.block_successors(block) {
+            if multiple_predecessors.contains(&successor) {
+                continue;
+            }
+            if let Some(&predecessor) = unique_predecessors.get(&successor) {
+                if predecessor != block {
+                    unique_predecessors.remove(&successor);
+                    multiple_predecessors.insert(successor);
+                }
+            } else {
+                unique_predecessors.insert(successor, block);
+            }
+        }
+    }
+
+    let mut outgoing_values = FxHashMap::<Block, FxHashMap<StackLoc, Value>>::default();
     let mut cursor = FuncCursor::new(func);
-    while cursor.next_block().is_some() {
-        let mut values = FxHashMap::<StackLoc, Value>::default();
+    while let Some(block) = cursor.next_block() {
+        let mut values = unique_predecessors
+            .get(&block)
+            .and_then(|predecessor| outgoing_values.get(predecessor))
+            .cloned()
+            .unwrap_or_default();
         while let Some(inst) = cursor.next_inst() {
             match cursor.func.dfg.insts[inst] {
                 InstructionData::StackStore {
@@ -88,6 +115,12 @@ pub(crate) fn forward_stack_loads(func: &mut Function) {
                         cursor.func.dfg.clear_results(inst);
                         cursor.func.dfg.change_to_alias(result, stored);
                         cursor.remove_inst_and_step_back();
+                    } else if let Some(stored) =
+                        assemble_integer_load(&mut cursor, loc, &values, endianness)
+                    {
+                        cursor.func.dfg.clear_results(inst);
+                        cursor.func.dfg.change_to_alias(result, stored);
+                        cursor.remove_inst_and_step_back();
                     } else {
                         values.insert(loc, result);
                     }
@@ -95,6 +128,7 @@ pub(crate) fn forward_stack_loads(func: &mut Function) {
                 _ => {}
             }
         }
+        outgoing_values.insert(block, values);
     }
 
     // Once every read from a non-address-taken slot was forwarded, its stores are unobservable.
@@ -135,4 +169,60 @@ pub(crate) fn forward_stack_loads(func: &mut Function) {
             }
         }
     }
+}
+
+/// Assemble a wider integer load from adjacent, completely covering integer values.
+///
+/// This handles aggregate lowering patterns such as eight `i8` stores followed by one `i64`
+/// load. Reject gaps, overlaps, partial coverage, and non-integer values.
+fn assemble_integer_load(
+    cursor: &mut FuncCursor<'_>,
+    load: StackLoc,
+    values: &FxHashMap<StackLoc, Value>,
+    endianness: Endianness,
+) -> Option<Value> {
+    if !load.ty.is_int() || load.ty.bytes() <= 1 || load.ty.bits() > 64 {
+        return None;
+    }
+
+    let mut pieces = values
+        .iter()
+        .filter_map(|(&loc, &value)| {
+            (loc.slot == load.slot
+                && loc.offset >= load.offset
+                && loc.end() <= load.end()
+                && loc.ty.is_int()
+                && loc.ty.bytes() < load.ty.bytes())
+            .then_some((loc, value))
+        })
+        .collect::<Vec<_>>();
+    pieces.sort_unstable_by_key(|(loc, _)| (loc.offset, loc.ty.bytes()));
+
+    let mut next_offset = i64::from(load.offset);
+    for (loc, _) in &pieces {
+        if i64::from(loc.offset) != next_offset {
+            return None;
+        }
+        next_offset = loc.end();
+    }
+    if pieces.is_empty() || next_offset != load.end() {
+        return None;
+    }
+
+    let mut assembled = None;
+    for (loc, value) in pieces {
+        let mut value = cursor.ins().uextend(load.ty, value);
+        let byte_shift = match endianness {
+            Endianness::Little => i64::from(loc.offset - load.offset),
+            Endianness::Big => load.end() - loc.end(),
+        };
+        if byte_shift != 0 {
+            value = cursor.ins().ishl_imm(value, byte_shift * 8);
+        }
+        assembled = Some(match assembled {
+            Some(previous) => cursor.ins().bor(previous, value),
+            None => value,
+        });
+    }
+    assembled
 }
