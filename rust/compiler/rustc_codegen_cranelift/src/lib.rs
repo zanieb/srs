@@ -157,7 +157,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
             cross_crate: 500,
             top_down_depth: 12,
             forwarder: 60,
-            hint: 600,
+            hint: 800,
             default: 100,
         })
     }
