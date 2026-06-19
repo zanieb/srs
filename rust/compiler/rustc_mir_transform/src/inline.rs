@@ -291,7 +291,14 @@ struct NormalInliner<'tcx> {
 
 impl<'tcx> NormalInliner<'tcx> {
     fn past_depth_limit(&self) -> bool {
-        self.history.len() > HISTORY_DEPTH_LIMIT || self.top_down_counter > TOP_DOWN_DEPTH_LIMIT
+        let top_down_depth_limit = self
+            .tcx
+            .sess
+            .opts
+            .unstable_opts
+            .inline_mir_top_down_depth
+            .unwrap_or(TOP_DOWN_DEPTH_LIMIT);
+        self.history.len() > HISTORY_DEPTH_LIMIT || self.top_down_counter > top_down_depth_limit
     }
 }
 

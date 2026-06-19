@@ -42,13 +42,20 @@ fn backend_mir_inliner_thresholds_apply_defaults() {
 
     apply_backend_mir_inliner_thresholds(
         &mut opts,
-        Some(MirInlinerThresholds { cross_crate: 500, forwarder: 60, hint: 600, default: 100 }),
+        Some(MirInlinerThresholds {
+            cross_crate: 500,
+            top_down_depth: 8,
+            forwarder: 60,
+            hint: 600,
+            default: 100,
+        }),
     );
 
     assert_eq!(
         opts.unstable_opts.cross_crate_inline_threshold,
         Some(InliningThreshold::Sometimes(500))
     );
+    assert_eq!(opts.unstable_opts.inline_mir_top_down_depth, Some(8));
     assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
     assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(600));
     assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
@@ -58,14 +65,22 @@ fn backend_mir_inliner_thresholds_apply_defaults() {
 fn backend_mir_inliner_thresholds_preserve_explicit_options() {
     let mut opts = Options::default();
     opts.unstable_opts.cross_crate_inline_threshold = Some(InliningThreshold::Always);
+    opts.unstable_opts.inline_mir_top_down_depth = Some(7);
     opts.unstable_opts.inline_mir_hint_threshold = Some(123);
 
     apply_backend_mir_inliner_thresholds(
         &mut opts,
-        Some(MirInlinerThresholds { cross_crate: 500, forwarder: 60, hint: 600, default: 100 }),
+        Some(MirInlinerThresholds {
+            cross_crate: 500,
+            top_down_depth: 8,
+            forwarder: 60,
+            hint: 600,
+            default: 100,
+        }),
     );
 
     assert_eq!(opts.unstable_opts.cross_crate_inline_threshold, Some(InliningThreshold::Always));
+    assert_eq!(opts.unstable_opts.inline_mir_top_down_depth, Some(7));
     assert_eq!(opts.unstable_opts.inline_mir_forwarder_threshold, Some(60));
     assert_eq!(opts.unstable_opts.inline_mir_hint_threshold, Some(123));
     assert_eq!(opts.unstable_opts.inline_mir_threshold, Some(100));
@@ -844,6 +859,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(indirect_branch_cs_prefix, true);
     tracked!(inline_mir, Some(true));
     tracked!(inline_mir_hint_threshold, Some(123));
+    tracked!(inline_mir_top_down_depth, Some(123));
     tracked!(inline_mir_threshold, Some(123));
     tracked!(instrument_mcount, true);
     tracked!(instrument_xray, Some(InstrumentXRay::default()));

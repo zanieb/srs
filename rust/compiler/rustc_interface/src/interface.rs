@@ -36,6 +36,7 @@ pub(crate) fn apply_backend_mir_inliner_thresholds(
     opts.unstable_opts
         .cross_crate_inline_threshold
         .get_or_insert(rustc_session::config::InliningThreshold::Sometimes(thresholds.cross_crate));
+    opts.unstable_opts.inline_mir_top_down_depth.get_or_insert(thresholds.top_down_depth);
     opts.unstable_opts.inline_mir_forwarder_threshold.get_or_insert(thresholds.forwarder);
     opts.unstable_opts.inline_mir_hint_threshold.get_or_insert(thresholds.hint);
     opts.unstable_opts.inline_mir_threshold.get_or_insert(thresholds.default);

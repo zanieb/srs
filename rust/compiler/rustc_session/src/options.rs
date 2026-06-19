@@ -2399,6 +2399,8 @@ options! {
         "inlining threshold when the caller is a simple forwarding function (default: 30)"),
     inline_mir_hint_threshold: Option<usize> = (None, parse_opt_number, [TRACKED],
         "inlining threshold for functions with inline hint (default: 100)"),
+    inline_mir_top_down_depth: Option<usize> = (None, parse_opt_number, [TRACKED],
+        "maximum number of nested multi-call MIR inlining expansions (default: 5)"),
     inline_mir_preserve_debug: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "when MIR inlining, whether to preserve debug info for callee variables \
         (default: preserve for debuginfo != None, otherwise remove)"),

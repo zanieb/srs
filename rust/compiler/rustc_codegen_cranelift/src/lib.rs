@@ -153,7 +153,13 @@ impl CodegenBackend for CraneliftCodegenBackend {
     }
 
     fn mir_inliner_thresholds(&self) -> Option<MirInlinerThresholds> {
-        Some(MirInlinerThresholds { cross_crate: 500, forwarder: 60, hint: 600, default: 100 })
+        Some(MirInlinerThresholds {
+            cross_crate: 500,
+            top_down_depth: 8,
+            forwarder: 60,
+            hint: 600,
+            default: 100,
+        })
     }
 
     fn run_late_mir_sroa(&self) -> bool {
