@@ -12,9 +12,102 @@ block0(v0: i64):
 }
 
 ; check: function %stack_load(i64) -> i64 fast {
-; nextln:    ss0 = explicit_slot 8
+; nextln:    ss0 = explicit_slot 0
 ; check:  block0(v0: i64):
-; nextln:     v3 = stack_addr.i64 ss0
-; nextln:     store notrap v0, v3
 ; nextln:     return v0
+; nextln: }
+
+function %interleaved_stack_stores(i64, i64) -> i64 {
+  ss0 = explicit_slot 16
+
+block0(v0: i64, v1: i64):
+  stack_store.i64 v0, ss0+8
+  stack_store.i64 v1, ss0
+  v2 = stack_load.i64 ss0+8
+  return v2
+}
+
+; check: function %interleaved_stack_stores(i64, i64) -> i64 fast {
+; nextln:    ss0 = explicit_slot 0
+; check:  block0(v0: i64, v1: i64):
+; nextln:     return v0
+; nextln: }
+
+function %overlapping_stack_store(i64, i32) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i64, v1: i32):
+  stack_store.i64 v0, ss0
+  stack_store.i32 v1, ss0+4
+  v2 = stack_load.i64 ss0
+  return v2
+}
+
+; check: function %overlapping_stack_store(i64, i32) -> i64 fast {
+; nextln:    ss0 = explicit_slot 8
+; check:  block0(v0: i64, v1: i32):
+; check:       store notrap v0,
+; check:       store notrap v1,
+; check:       v2 = load.i64 notrap
+; check:       return v2
+; nextln: }
+
+function %address_taken_stack_slot(i64) -> i64 {
+  ss0 = explicit_slot 8
+  sig0 = (i64) system_v
+  fn0 = %clobber sig0
+
+block0(v0: i64):
+  stack_store.i64 v0, ss0
+  v1 = stack_addr.i64 ss0
+  call fn0(v1)
+  v2 = stack_load.i64 ss0
+  return v2
+}
+
+; check: function %address_taken_stack_slot(i64) -> i64 fast {
+; nextln:    ss0 = explicit_slot 8
+; nextln:    sig0 = (i64) system_v
+; nextln:    fn0 = %clobber sig0
+; check:  block0(v0: i64):
+; check:       store notrap v0,
+; check:       call fn0(
+; check:       v2 = load.i64 notrap
+; check:       return v2
+; nextln: }
+
+function %stack_map_stack_slot(i64) {
+  ss0 = explicit_slot 8
+  sig0 = () system_v
+  fn0 = %safepoint sig0
+
+block0(v0: i64):
+  stack_store.i64 v0, ss0
+  call fn0(), stack_map=[i64 @ ss0+0]
+  return
+}
+
+; check: function %stack_map_stack_slot(i64) fast {
+; nextln:    ss0 = explicit_slot 8
+; nextln:    sig0 = () system_v
+; nextln:    fn0 = %safepoint sig0
+; check:  block0(v0: i64):
+; check:       store notrap v0,
+; check:       call fn0(), stack_map=[i64 @ ss0+0]
+; check:       return
+; nextln: }
+
+function %shifted_one_is_nonzero(i64) -> i8 {
+block0(v0: i64):
+  v1 = iconst.i64 1
+  v2 = ishl v1, v0
+  v3 = iconst.i64 0
+  v4 = icmp ne v2, v3
+  return v4
+}
+
+; check: function %shifted_one_is_nonzero(i64) -> i8 fast {
+; check:  block0(v0: i64):
+; nextln:     v5 = iconst.i8 1
+; nextln:     return v5  ; v5 = 1
 ; nextln: }

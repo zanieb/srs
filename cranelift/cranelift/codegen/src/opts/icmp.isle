@@ -176,6 +176,13 @@
        (if-let true (u64_eq y (ty_smax cty)))
        (eq bty x smax))
 
+;; Shift counts are masked to the value's width, so shifting the single set bit in `1` can never
+;; produce zero.
+(rule (simplify (eq bty (ishl ity (iconst_u ity 1) _) (iconst_u _ 0)))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (ne bty (ishl ity (iconst_u ity 1) _) (iconst_u _ 0)))
+      (subsume (iconst_u bty 1)))
+
 ;; `band`/`bor` of 2 comparisons:
 (rule (simplify (band (fits_in_64 ty) (icmp ty cc1 x y) (icmp ty cc2 x y)))
   (if-let signed (intcc_comparable cc1 cc2))
