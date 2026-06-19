@@ -20000,6 +20000,7 @@ struct MachOTextRelocationReplay {
     kind: u32,
     rel_info: RelocationKindInfo,
     previous_written_value: Option<u64>,
+    previous_target_value: Option<u64>,
     previous_applied_target_value: Option<u64>,
     previous_applied_target_is_reusable: bool,
     current_target_value: u64,
@@ -28061,6 +28062,22 @@ fn macho_aarch64_applied_target_addend(
     }
 }
 
+fn macho_aarch64_relocated_value_matches(
+    r_type: u8,
+    written_value: u64,
+    target_value: u64,
+    applied_target_value: u64,
+    addend: i64,
+    place: u64,
+) -> bool {
+    macho_aarch64_relocated_value(
+        r_type,
+        applied_target_value,
+        macho_aarch64_applied_target_addend(r_type, target_value, applied_target_value, addend),
+        place,
+    ) == Some(written_value)
+}
+
 fn rematerialized_macho_text_relocation_replay(
     relocations: &[RelocationRecord],
     resolutions: &[MachOSymbolResolutionRecord],
@@ -28307,6 +28324,7 @@ fn rematerialized_macho_text_relocation_replay(
         kind: encode_macho_aarch64_relocation_kind(raw_relocation),
         rel_info,
         previous_written_value: None,
+        previous_target_value: None,
         previous_applied_target_value: None,
         previous_applied_target_is_reusable: false,
         current_target_value,
@@ -29933,6 +29951,7 @@ fn macho_text_relocation_replays_for_input(
                     kind: relocation.kind,
                     rel_info,
                     previous_written_value: Some(previous_written_value),
+                    previous_target_value: Some(previous_relocation.target_value),
                     previous_applied_target_value: Some(previous_applied_target_value),
                     previous_applied_target_is_reusable,
                     current_target_value,
@@ -31664,11 +31683,13 @@ fn apply_macho_text_relocation_replays(
             Some(previous_output_offset),
             Some(previous_range),
             Some(previous_written_value),
+            Some(previous_target_value),
             Some(previous_applied_target_value),
         ) = (
             replay.previous_output_offset,
             replay.previous_range.as_ref(),
             replay.previous_written_value,
+            replay.previous_target_value,
             replay.previous_applied_target_value,
         ) {
             let recorded_previous_output_offset = replay
@@ -31705,18 +31726,14 @@ fn apply_macho_text_relocation_replays(
                     .ok_or_else(|| {
                         "previous Mach-O text relocation has no output address".to_owned()
                     })?;
-            if macho_aarch64_relocated_value(
+            if !macho_aarch64_relocated_value_matches(
                 replay.r_type,
+                previous_written_value,
+                previous_target_value,
                 previous_applied_target_value,
-                macho_aarch64_applied_target_addend(
-                    replay.r_type,
-                    replay.current_target_value,
-                    previous_applied_target_value,
-                    replay.addend,
-                ),
+                replay.addend,
                 previous_place,
-            ) != Some(previous_written_value)
-            {
+            ) {
                 return Err("previous Mach-O text relocation value changed".to_owned());
             }
         }
@@ -46154,6 +46171,7 @@ fn added_macho_archive_text_relocation_replays(
                 kind: encode_macho_aarch64_relocation_kind(raw_relocation),
                 rel_info,
                 previous_written_value: None,
+                previous_target_value: None,
                 previous_applied_target_value: None,
                 previous_applied_target_is_reusable: false,
                 current_target_value,
@@ -46337,6 +46355,7 @@ fn added_macho_archive_text_relocation_replays(
                     kind: encode_macho_aarch64_relocation_kind(raw_relocation),
                     rel_info,
                     previous_written_value: None,
+                    previous_target_value: None,
                     previous_applied_target_value: None,
                     previous_applied_target_is_reusable: false,
                     current_target_value,
@@ -86719,6 +86738,7 @@ mod tests {
                 )
                 .unwrap(),
             previous_written_value: None,
+            previous_target_value: None,
             previous_applied_target_value: None,
             previous_applied_target_is_reusable: false,
             current_target_value: record.target_value,
@@ -92552,6 +92572,7 @@ mod tests {
             kind: encode_macho_aarch64_relocation_kind(raw_relocation),
             rel_info,
             previous_written_value: None,
+            previous_target_value: None,
             previous_applied_target_value: None,
             previous_applied_target_is_reusable: false,
             current_target_value: target_value,
@@ -99627,6 +99648,39 @@ mod tests {
             ),
             4
         );
+    }
+
+    #[test]
+    fn previous_macho_branch_validation_uses_previous_logical_target() {
+        let previous_target = 0x4000;
+        let previous_thunk = 0x8000;
+        let current_target = previous_thunk;
+        let place = 0x1000;
+        let addend = 4;
+        let written_value = macho_aarch64_relocated_value(
+            object::macho::ARM64_RELOC_BRANCH26,
+            previous_thunk,
+            0,
+            place,
+        )
+        .unwrap();
+
+        assert!(macho_aarch64_relocated_value_matches(
+            object::macho::ARM64_RELOC_BRANCH26,
+            written_value,
+            previous_target,
+            previous_thunk,
+            addend,
+            place,
+        ));
+        assert!(!macho_aarch64_relocated_value_matches(
+            object::macho::ARM64_RELOC_BRANCH26,
+            written_value,
+            current_target,
+            previous_thunk,
+            addend,
+            place,
+        ));
     }
 
     #[test]
