@@ -809,6 +809,76 @@ one indirect equality call is insufficient on its own; a future candidate
 needs to expose a larger loop transformation or eliminate a repeated static
 leaf across the measured hot paths.
 
+### Rejected integer-constant rematerialization policy
+
+The next retained ty profile made `Type::hash` and
+`FxHasher::write_isize` the second and third largest active Rust leaves. The
+active Cranelift `Type::hash` copy is 6,780 bytes, calls `write_isize` 26
+times, and contains 213 `movk` instructions. The corresponding LLVM copy is
+664 bytes, contains no calls, materializes the FxHasher multiplier once, and
+keeps the hash state in a register across the discriminant arms.
+
+Cranelift's egraph rematerializes standalone integer constants in every use
+block without consulting the target. Because an arbitrary AArch64 64-bit
+constant can require a `mov` plus three `movk` instructions, a broad
+upper-bound experiment disabled that rule while preserving rematerialization
+of immediate-form arithmetic. This did not change any of the four retained
+`Type::hash` copies. The active copy remained 6,780 bytes with exactly the
+same opcode counts, including 213 `movk`, 77 `mul`, 26 `bl`, and 31 `ret`
+instructions. The constants are already distinct frontend IR values in
+separate enum arms; the generic egraph rematerialization rule does not create
+their duplication.
+
+The broad policy also lost the 20-run application screen:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +0.98% | 7/20 | 0.26318 |
+| `uv lock --check`, offline | +2.38% | 4/20 | 0.01182 |
+| `ruff check` over 1,592 fixtures | +1.13% | 7/20 | 0.26318 |
+| `ty check` over `scripts/ty_benchmark` | +1.47% | 4/20 | 0.01182 |
+
+Every correctness digest matched. The uv and Ruff binaries shrank by 0.01%
+and 0.07%, while ty grew by 0.08%. The candidate is rejected without a 50-run
+gate: it leaves the motivating function unchanged and decisively regresses uv
+resolution and ty. A target-specific refinement of this rematerialization
+rule is therefore not the next arc. Matching LLVM's hash shape instead needs
+a larger transformation that inlines and merges the repeated enum-arm tails.
+
+### Rejected repeated wide-constant entry hoisting
+
+A sharing-aware follow-up tested the strongest version of the constant-placement
+hypothesis. After egraph extraction, it counted uses of canonical values. An
+`i64` constant outside the signed 32-bit range with at least eight uses was
+materialized once in the entry block and exempted from per-block
+rematerialization. A reduced eight-arm function then emitted one multiplier
+definition shared by every arm.
+
+The real `Type::hash` body changed substantially. Its active copy shrank from
+6,780 to 5,784 bytes (-14.69%), `movk` fell from 213 to 3, and `mov` fell from
+385 to 314. Cranelift kept the repeated multiplier in callee-saved `x19`.
+That longer live range also increased loads from 227 to 258, stores from 77 to
+78, and added a saved `x28`. Whole-binary sizes remained nearly flat: uv,
+Ruff, and ty shrank by 0.01%, 0.02%, and 0.01%, respectively.
+
+The structural win did not move the 50-run application gate:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +1.17% | 22/50 | 0.47989 |
+| `uv lock --check`, offline | +0.89% | 21/50 | 0.32224 |
+| `ruff check` over 1,592 fixtures | -0.37% | 26/50 | 0.88772 |
+| `ty check` over `scripts/ty_benchmark` | +0.30% | 20/50 | 0.20264 |
+
+Every correctness digest matched. The focused sharing, rematerialization, and
+LICM filetests, all 185 `cranelift-codegen` unit tests, and the complete
+stage-2 cg_clif and standard-library build passed. The candidate is rejected:
+none of the representative workloads improved, while both uv rows and ty
+trended backward. Hoisting LLVM's multiplier in isolation is insufficient
+while Cranelift still retains 26 `write_isize` calls and fragmented enum-arm
+tails. Future work on this body needs to merge the complete hash update, not
+only share its literal.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -1076,7 +1146,14 @@ current roadmap includes:
 These are medium-to-high priority after the first loop/range work. Hashing,
 parsing, and small semantic-analysis kernels have dense data dependencies and
 many short target-specific sequences, making them better validation workloads
-than microbenchmarks alone.
+than microbenchmarks alone. The `Type::hash` experiments narrow this arc: the
+generic integer-constant rematerialization rule was not responsible for its
+repeated AArch64 literal sequences, and disabling the rule regressed two
+application rows. Explicitly sharing heavily reused wide constants across the
+CFG then removed nearly every repeated literal sequence and shrank the hot
+body by 14.69%, but remained runtime-neutral. Sharing-aware placement still
+matters generally, but this body needs the placement win coupled with call and
+tail merging rather than as an isolated extraction change.
 
 ### 4. Reduce call, register, and stack overhead
 
