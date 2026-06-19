@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use rustc_abi::{Float, Integer, Primitive};
+use rustc_hir::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeFoldable;
 use rustc_middle::ty::layout::{
@@ -110,6 +111,24 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
             } else {
                 pointer_ty(tcx)
             }
+        }
+        // `NonZero<T>` and its niche-encoded `Option` have a single scalar ABI representation.
+        // Keep that value in SSA rather than materializing the wrapper in a stack slot. Other
+        // scalar ADTs can contain fields at nonzero offsets or zero-sized fields that the current
+        // scalar-place projection does not support.
+        ty::Adt(def, args)
+            if tcx.is_diagnostic_item(sym::NonZero, def.did())
+                || (tcx.is_lang_item(def.did(), LangItem::Option)
+                    && matches!(
+                        args.type_at(0).kind(),
+                        ty::Adt(inner_def, _)
+                            if tcx.is_diagnostic_item(sym::NonZero, inner_def.did())
+                    )) =>
+        {
+            let layout =
+                tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).ok()?;
+            let BackendRepr::Scalar(scalar) = layout.backend_repr else { return None };
+            scalar_to_clif_type(tcx, scalar)
         }
         ty::Param(_) => bug!("ty param {:?}", ty),
         _ => return None,

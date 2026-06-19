@@ -7,8 +7,10 @@ use std::arch::aarch64::*;
 use std::arch::asm;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::convert::TryFrom;
 use std::hint::black_box;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::ops::Coroutine;
 use std::ptr::NonNull;
 
@@ -65,6 +67,12 @@ fn main() {
     let nonnull = NonNull::from(&mut nonnull_pointee);
     assert_eq!(unsafe { nonnull_as_ptr(nonnull).read() }, nonnull_pointee);
     assert_eq!(nonnull_dangling().as_ptr().addr(), 1);
+
+    for (raw, expected) in [(4, (0, 4, 0)), (7, (0, 4, 3)), (8, (1, 8, 0))] {
+        let inner = NonZeroUsize::new(black_box(raw)).unwrap();
+        let (bucket, bucket_len, entry) = nonzero_location(inner);
+        assert_eq!((bucket, bucket_len.get(), entry), expected);
+    }
 
     assert_eq!(-128i8, (-128i8).saturating_sub(1));
     assert_eq!(127i8, 127i8.saturating_sub(-128));
@@ -291,6 +299,14 @@ fn nonnull_as_ptr(pointer: NonNull<u64>) -> *mut u64 {
 #[inline(never)]
 fn nonnull_dangling() -> NonNull<u8> {
     NonNull::dangling()
+}
+
+#[inline(never)]
+fn nonzero_location(inner: NonZeroUsize) -> (usize, NonZeroUsize, usize) {
+    let bucket = usize::try_from(inner.ilog2()).unwrap();
+    let bucket_len = NonZeroUsize::new(1_usize.checked_shl(inner.ilog2()).unwrap()).unwrap();
+    let entry = inner.get() - bucket_len.get();
+    (bucket - 2, bucket_len, entry)
 }
 
 #[cfg(target_arch = "x86_64")]
