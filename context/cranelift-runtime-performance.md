@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `9415356b4`, with:
+recorded at SRS `4ee9f1170`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.9 ms | 55.2 ms | 1.68x |
-| `uv lock --check`, offline | 58.6 ms | 85.5 ms | 1.46x |
-| `ruff check` over 1,592 fixtures | 79.7 ms | 148.2 ms | 1.86x |
-| `ty check` over `scripts/ty_benchmark` | 47.8 ms | 122.2 ms | 2.55x |
+| `uv venv --clear` | 32.3 ms | 55.8 ms | 1.73x |
+| `uv lock --check`, offline | 59.1 ms | 85.4 ms | 1.44x |
+| `ruff check` over 1,592 fixtures | 80.2 ms | 148.2 ms | 1.85x |
+| `ty check` over `scripts/ty_benchmark` | 48.3 ms | 119.9 ms | 2.48x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.5-2.6x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.5x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,9 +64,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 135.8 MB | 121.6 MB |
-| ty | 47.5 MB | 145.6 MB | 126.2 MB |
-| uv | 100.0 MB | 255.0 MB | 246.1 MB |
+| Ruff | 45.0 MB | 135.8 MB | 120.3 MB |
+| ty | 47.5 MB | 145.6 MB | 124.9 MB |
+| uv | 100.0 MB | 255.0 MB | 243.7 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -681,6 +681,33 @@ at least 0.82. Forwarding wider loads from adjacent narrow values removes an
 aggregate round trip; decomposing a wide value into scalar byte operations is
 only a different spelling of work the application already performs.
 
+### Boolean-result range folding
+
+The next hot hashbrown reduction exposed an instruction-local range fact that
+the egraph did not use. A scalar integer comparison produces only zero or one,
+including after zero extension, yet later unsigned comparisons still checked
+that value against constants outside that range. Cranelift now folds `ugt`,
+`uge`, `ult`, and `ule` checks whose result is fixed for both possible values.
+The rules are explicitly scalar: vector comparisons produce all-ones lane
+masks, and a regression test confirms that those comparisons remain intact.
+
+The final 50-run matched gate measured the scalar-safe rules against the
+cross-block stack-forwarding policy:
+
+| Workload | LLVM | Previous Cranelift | Boolean range folding | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | 32.3 ms | 55.6 ms | 55.8 ms | +0.43% | 22/50 | 0.47989 |
+| `uv lock --check`, offline | 59.1 ms | 84.9 ms | 85.4 ms | +0.38% | 23/50 | 0.67181 |
+| `ruff check` over 1,592 fixtures | 80.2 ms | 148.0 ms | 148.2 ms | -0.10% | 26/50 | 0.88772 |
+| `ty check` over `scripts/ty_benchmark` | 48.3 ms | 122.3 ms | 119.9 ms | -1.61% | 43/50 | 0.000000210 |
+
+The uv, Ruff, and ty binaries shrink by 0.96%, 1.08%, and 1.04%, respectively.
+Every correctness digest matches. The focused scalar and vector filetests, all
+184 `cranelift-codegen` unit tests, cg_clif check, and complete stage-2 cg_clif
+and standard-library build pass. The runtime result is concentrated in ty;
+Ruff and both uv operations are statistically neutral rather than inheriting
+the apparent gains from an earlier vector-unsafe experiment.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -908,8 +935,14 @@ token loops, but accept a change only after the application benchmarks move.
 
 The late scalarization work above is the first completed part of this arc: it
 removes memory traffic around iterator state, but does not transform the loop.
-The reduced scan confirms that vectorization and loop-wide range reasoning are
-now the next larger opportunities.
+Boolean-result folding is the first retained range-reasoning step. It proves a
+small instruction-local fact through zero extension and improves ty by 1.61%,
+but it does not carry facts through block parameters or joins. The profiled
+hashbrown path still contains a later redundant comparison separated from its
+producer by control flow. Propagating bounded scalar ranges through simple CFG
+edges is therefore the next concrete step before affine loop-index analysis.
+The reduced scan confirms that vectorization and loop-wide range reasoning
+remain the larger opportunities.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
@@ -960,7 +993,9 @@ traffic, and exposing bounded stack-backed aggregate copies complete several
 high-impact local cases. Carrying nonescaped stack state through
 single-predecessor blocks and assembling adjacent narrow values completes the
 profiled hashbrown control-group case without the uv regressions from broad
-SIMD lowering. The forwarding pass also
+SIMD lowering. Folding impossible unsigned checks on scalar comparison results
+adds the first bounded value-range rule and produces a decisive ty improvement
+without a material uv or Ruff regression. The forwarding pass also
 implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
@@ -969,7 +1004,7 @@ An untargeted, one-level post-monomorphization body-import experiment removed
 all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
 screen and was rejected. The immediate call arc is now a profile- or
 frequency-aware import policy, not broader body availability by itself.
-The remaining 1.5-2.6x LLVM gap shows that local representation fixes alone
+The remaining 1.4-2.5x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
