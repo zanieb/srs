@@ -1,12 +1,17 @@
 //! Codegen of a single function
 
+use std::borrow::Cow;
+
 use cranelift_codegen::CodegenError;
+use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir::UserFuncName;
+use cranelift_codegen::ir::{ExternalName, Opcode};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_hir::attrs::InlineAttr;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -28,6 +33,7 @@ pub(crate) struct CodegenedFunction {
     clif_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
+    inline_hint: bool,
 }
 
 pub(crate) fn codegen_fn<'tcx>(
@@ -143,7 +149,104 @@ pub(crate) fn codegen_fn<'tcx>(
     // Verify function
     verify_func(tcx, &clif_comments, &func);
 
-    CodegenedFunction { symbol_name, func_id, func, clif_comments, func_debug_cx, inline_asm }
+    let inline_hint = matches!(
+        tcx.codegen_instance_attrs(instance.def).inline,
+        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. }
+    );
+
+    CodegenedFunction {
+        symbol_name,
+        func_id,
+        func,
+        clif_comments,
+        func_debug_cx,
+        inline_asm,
+        inline_hint,
+    }
+}
+
+pub(crate) fn inline_small_functions(
+    module: &dyn Module,
+    functions: &mut [CodegenedFunction],
+) -> Result<(), CodegenError> {
+    // The MIR inliner runs before monomorphization, so calls through generic traits can only
+    // become direct calls after cg_clif has translated them. Inline a conservative subset here
+    // to expose those calls to Cranelift's scalar optimizations without unbounded code growth.
+    //
+    // Keep this to call-free functions without stack slots or global values. Broader bodies have
+    // not yet proved safe under cg_clif's unwind, debug-info, and object-generation integration.
+    const MAX_INLINE_INSTRUCTIONS: usize = 32;
+    const MAX_INLINE_BLOCKS: usize = 3;
+
+    let mut callees = FxHashMap::default();
+    for function in functions.iter() {
+        if !function.inline_hint
+            || function.func.dfg.num_insts() > MAX_INLINE_INSTRUCTIONS
+            || function.func.layout.blocks().count() > MAX_INLINE_BLOCKS
+            || !function.func.sized_stack_slots.is_empty()
+            || !function.func.dynamic_stack_slots.is_empty()
+            || !function.func.global_values.is_empty()
+            || function.func.stack_limit.is_some()
+            || function.func.layout.blocks().any(|block| {
+                function
+                    .func
+                    .layout
+                    .block_insts(block)
+                    .any(|inst| function.func.dfg.insts[inst].opcode().is_call())
+            })
+        {
+            continue;
+        }
+
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.legalize(module.isa())?;
+        callees.insert(function.func_id.as_u32(), context.func);
+    }
+
+    struct SmallFunctionInliner<'a> {
+        callees: &'a FxHashMap<u32, Function>,
+    }
+
+    impl Inline for SmallFunctionInliner<'_> {
+        fn inline(
+            &mut self,
+            caller: &Function,
+            _call_inst: Inst,
+            _call_opcode: Opcode,
+            callee: FuncRef,
+            _call_args: &[Value],
+        ) -> InlineCommand<'_> {
+            let ExternalName::User(callee_name) = caller.dfg.ext_funcs[callee].name else {
+                return InlineCommand::KeepCall;
+            };
+            let callee_name = &caller.params.user_named_funcs()[callee_name];
+            if callee_name.namespace != 0
+                || caller.name.get_user().is_some_and(|caller_name| {
+                    caller_name.namespace == callee_name.namespace
+                        && caller_name.index == callee_name.index
+                })
+            {
+                return InlineCommand::KeepCall;
+            }
+
+            match self.callees.get(&callee_name.index) {
+                Some(callee) => {
+                    InlineCommand::Inline { callee: Cow::Borrowed(callee), visit_callee: false }
+                }
+                None => InlineCommand::KeepCall,
+            }
+        }
+    }
+
+    for function in functions {
+        let mut context = Context::new();
+        context.func = std::mem::replace(&mut function.func, Function::new());
+        context.inline(SmallFunctionInliner { callees: &callees })?;
+        function.func = context.func;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn compile_fn(
