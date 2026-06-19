@@ -771,6 +771,42 @@ therefore rejected. Carrying a narrow range only into generic switch lowering
 is a code-size opportunity; the runtime arc needs to eliminate checks inside
 hot loops or enable a larger control-flow transformation.
 
+### Rejected dominated equality propagation
+
+The remaining two-entry table in the hot hashbrown body was guarded by a
+comparison that an earlier branch had already proved: its true edge established
+that a loaded `u64` was one, but two intervening blocks prevented local
+constant propagation. A bounded egraph experiment recovered equality facts
+only when the true successor had that branch as its unique incoming edge and
+dominated the use. It then folded later `brif` and `br_table` skeleton
+instructions without changing pure values. In the profiled ty copy, the
+redundant `u32::MAX` guard and indirect table disappear and the symbol span
+falls from 1,624 to 1,572 bytes (-3.20%). The uv, Ruff, and ty binaries shrink
+by 0.04%, 0.03%, and 0.02%, respectively.
+
+Path facts must remain local to the control-flow skeleton. An initial prototype
+subsumed the later pure comparison's eclass with a constant. Because Cranelift's
+pure expressions can be shared with blocks outside the equality-controlled
+region, that incorrectly changed uses on the opposite path; the application
+correctness gate caught the resulting ty diagnostic explosion before timing.
+The edge-local candidate restores the exact LLVM and retained-Cranelift
+digests. A dedicated regression confirmed that a shared comparison remained
+live on the false path while only the true path's branch was folded.
+
+The safe candidate still failed its 20-run application screen:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.40% | 10/20 | 1.00000 |
+| `uv lock --check`, offline | +0.65% | 4/20 | 0.01182 |
+| `ruff check` over 1,592 fixtures | +1.54% | 9/20 | 0.82380 |
+| `ty check` over `scripts/ty_benchmark` | +1.03% | 5/20 | 0.04139 |
+
+Both uv resolution and ty regress decisively, so the candidate is rejected
+without a 50-run gate. Dominated scalar facts remain useful for a future
+range-analysis framework, but this isolated late control-flow cleanup is
+another local size win whose layout effects outweigh its removed dispatches.
+
 ### Rejected known-receiver devirtualization
 
 A fresh sample of the retained ty binary made hashbrown's
