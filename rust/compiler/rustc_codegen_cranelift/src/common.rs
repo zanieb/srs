@@ -322,6 +322,7 @@ pub(crate) fn create_wrapper_function(
 
 pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) module: &'m mut dyn Module,
+    pub(crate) referenced_functions: &'m mut FxHashMap<FuncId, Instance<'tcx>>,
     pub(crate) debug_context: Option<&'clif mut DebugContext>,
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) target_config: TargetFrontendConfig, // Cached from module
