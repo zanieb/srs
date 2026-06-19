@@ -32,10 +32,10 @@ single block-balanced estimate.
 
 | Workload | LLVM | Final Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.8 ms | 73.3 ms | 2.24x |
-| `uv lock --check`, offline | 62.2 ms | 108.3 ms | 1.74x |
-| `ruff check` over 1,592 fixtures | 80.1 ms | 215.8 ms | 2.69x |
-| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 168.0 ms | 3.61x |
+| `uv venv --clear` | 32.8 ms | 72.4 ms | 2.21x |
+| `uv lock --check`, offline | 62.2 ms | 106.2 ms | 1.71x |
+| `ruff check` over 1,592 fixtures | 80.1 ms | 205.0 ms | 2.56x |
+| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 166.4 ms | 3.57x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -54,9 +54,9 @@ than distribution sizes.
 
 | Binary | LLVM | Cranelift baseline | Final Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 39.4 MB | 135.8 MB | 128.5 MB |
-| ty | 39.4 MB | 145.6 MB | 133.3 MB |
-| uv | 87.2 MB | 255.0 MB | 259.2 MB |
+| Ruff | 39.4 MB | 135.8 MB | 128.1 MB |
+| ty | 39.4 MB | 145.6 MB | 133.1 MB |
+| uv | 87.2 MB | 255.0 MB | 258.7 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -77,9 +77,10 @@ raised the local thresholds from 30/100/50 to 60/200/100 for forwarders,
 hinted calls, and ordinary calls. After the scalarization work exposed more
 small iterator calls, the hinted-call threshold moved to 500. The final policy
 uses local thresholds of 60/600/100 and raises the cross-crate eligibility
-threshold from 100 to 500. LLVM keeps its existing cross-crate default and
-does not receive Cranelift's local defaults. Explicit command-line thresholds
-always win.
+threshold from 100 to 500. It also expands the top-down multi-call inlining
+limit from 5 to 8. LLVM keeps its existing cross-crate and top-down defaults
+and does not receive Cranelift's local defaults. Explicit command-line
+thresholds always win.
 
 Two controls bounded the policy:
 
@@ -216,6 +217,36 @@ probes have identical exit codes and output digests between the 60/500/100 and
 500-cross-crate/60/600/100 lanes. The size effect is effectively flat, so the
 broader policy is retained.
 
+### Deeper top-down iterator inlining
+
+After the broader cross-crate policy removed `Style::eq`, a fresh Ruff profile
+showed `[char]::contains` and its iterator adapters among the hottest remaining
+pure-Rust leaves. The standard library deliberately expresses this operation
+as `chunks_exact`, `fold`, and `any`, expecting the optimizer to flatten the
+chain. Cranelift inlined the outer bodies but reached the MIR inliner's default
+top-down multi-call limit before the final equality closure, leaving a function
+call inside each scalar comparison of short character sets.
+
+Cranelift now uses a top-down limit of 8 instead of 5. A reduced
+`[char]::contains` check falls from three functions and 412 bytes to one
+276-byte leaf, removes the call in the comparison loop, and shrinks its frame
+from 96 to 80 bytes. Setting `-Zinline-mir-top-down-depth=5` restores the old
+assembly, confirming that an explicit override still wins. The complete
+balanced gate measured:
+
+| Workload | Paired change | Wins | Sign p | Binary change |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -1.8% | 18/20 | 0.00040 | -0.159% |
+| `uv lock --check`, offline | +0.3% | 7/20 | 0.26318 | -0.159% |
+| `ruff check` over 1,592 fixtures | -2.8% | 19/20 | 0.00004 | -0.295% |
+| `ty check` over `scripts/ty_benchmark` | -0.2% | 12/20 | 0.50344 | -0.184% |
+
+A separate 50-trial Ruff/ty check measured Ruff at -1.7% with 37/50 wins
+(two-sided sign-test p = 0.00094) and ty at +0.08% with 24/50 wins. Ruff and uv
+environment creation improve decisively; ty and uv resolution are neutral.
+All correctness digests match, and all three binaries become smaller, so the
+policy is retained.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -265,13 +296,14 @@ remains the decision gate for generated-code runtime.
 
 The subsequent 500-cross-crate/60/600/100 policy passed a complete two-stage
 SRS build, all 18 `rustc_interface` unit tests, a matching standalone cg_clif
-backend build, and cg_clif's no-sysroot AOT smoke. Its complete runtime gate
-also preserved every correctness digest. A fresh full uv/Ruff/ty suite pair is
-reserved for the next finalization gate rather than repeated after every
-retained threshold step. The current cg_clif sysroot harness cannot provide
-additional coverage: its stdlib patch no longer applies to this Rust snapshot,
-and its standalone JIT smoke aborts in rustc query TLS before entering the test
-program.
+backend build, and cg_clif's no-sysroot AOT smoke. The current depth-8 policy
+also passed the complete SRS build and all 18 interface tests. Both complete
+runtime gates preserved every correctness digest. A fresh full uv/Ruff/ty
+suite pair is reserved for the next finalization gate rather than repeated
+after every retained threshold step. The current cg_clif sysroot harness
+cannot provide additional coverage: its stdlib patch no longer applies to this
+Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS before
+entering the test program.
 
 ## Performance Roadmap
 
@@ -347,8 +379,8 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
 - pass or retain stack arguments without unnecessary entry-block loads where
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
-The application gate is important here: the latest policy helps uv environment
-creation and ty, but uv resolution and Ruff remain statistically neutral.
+The application gate is important here: the latest policy helps Ruff and uv
+environment creation, but uv resolution and ty remain statistically neutral.
 Their hot paths will not all improve merely by buying more code size. Keeping
 thin `NonNull` iterator cursors in SSA completes one high-impact stack-slot
 case, but the remaining 2-4x LLVM gap shows that local representation fixes
