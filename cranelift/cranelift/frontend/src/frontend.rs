@@ -870,8 +870,8 @@ impl<'a> FunctionBuilder<'a> {
         non_overlapping: bool,
         mut flags: MemFlagsData,
     ) {
-        // Currently the result of guess work, not actual profiling.
-        const THRESHOLD: u64 = 4;
+        // Profiled on the uv, Ruff, and ty application workloads.
+        const THRESHOLD: u64 = 5;
 
         if size == 0 {
             return;
@@ -1410,7 +1410,7 @@ block0:
 
             let src = builder.use_var(x);
             let dest = builder.use_var(y);
-            let size = 8;
+            let size = 40;
             builder.emit_small_memory_copy(
                 frontend_config,
                 dest,
@@ -1431,12 +1431,20 @@ block0:
             &func,
             "function %sample() -> i32 system_v {
 block0:
-    v4 = iconst.i64 0
-    v1 -> v4
-    v3 = iconst.i64 0
-    v0 -> v3
+    v8 = iconst.i64 0
+    v1 -> v8
+    v7 = iconst.i64 0
+    v0 -> v7
     v2 = load.i64 aligned v0  ; v0 = 0
+    v3 = load.i64 aligned v0+8  ; v0 = 0
+    v4 = load.i64 aligned v0+16  ; v0 = 0
+    v5 = load.i64 aligned v0+24  ; v0 = 0
+    v6 = load.i64 aligned v0+32  ; v0 = 0
     store aligned v2, v1  ; v1 = 0
+    store aligned v3, v1+8  ; v1 = 0
+    store aligned v4, v1+16  ; v1 = 0
+    store aligned v5, v1+24  ; v1 = 0
+    store aligned v6, v1+32  ; v1 = 0
     return v1  ; v1 = 0
 }
 ",
