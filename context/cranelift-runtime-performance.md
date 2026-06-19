@@ -93,11 +93,17 @@ limit from 5 to 12. LLVM keeps its existing cross-crate and top-down defaults
 and does not receive Cranelift's local defaults. Explicit command-line
 thresholds always win.
 
-Two controls bounded the policy:
+Three controls bounded the policy:
 
 - Raising only the cross-crate threshold from 100 to 200 on top of the
   60/500/100 policy added no measurable Ruff or ty benefit and slightly grew
   both binaries, so that candidate was rejected.
+- Raising the forwarder and post-depth fallback from 60 to 100 targeted the 25
+  remaining `Hasher::write_isize` calls in ty's active `Type::hash` body. The
+  calls remained, although other newly admitted forwarders shrank Ruff and ty
+  by 0.13% and 0.11%. A focused 20-run screen measured Ruff at +0.02% with
+  10/20 wins (`p = 1`) and ty at +0.65% with 7/20 wins (`p = 0.26318`), so the
+  broader fallback was rejected without building the uv lane.
 - An aggressive always-inline experiment improved Ruff by 19.2%, but produced
   a 235 MB Ruff binary and a 559 MB ty binary, as well as unsupported-intrinsic
   and linker-pressure warnings. It is not a viable default.
