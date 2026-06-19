@@ -1117,6 +1117,33 @@ is rejected. The next profitable vector-stack step must remove the
 address-taken group load or loop-invariant vector spill, or keep a larger
 region vector-shaped, rather than only replacing result materialization.
 
+### Rejected `i8x8` splat rematerialization
+
+After same-width stack forwarding, the active hashbrown body still created a
+dynamic `i8x8` hash-byte splat before an indirect equality call. Regalloc kept
+the vector live across the call by spilling `q0` and reloading it in the probe
+loop. A deliberately narrow egraph experiment marked only `i8x8` splats as
+rematerializable. It kept the scalar byte live and recreated the vector beside
+its comparison, eliminating that vector spill and reload and reducing the
+local frame from 208 to 192 bytes.
+
+The trade was not free. The hot body grew from 764 to 784 bytes because the
+scalar lane occupied another callee-saved GPR and each loop iteration gained a
+`dup`; Ruff grew by 7,056 bytes and ty by 5,440 bytes. A 20-run matched screen
+against the retained native-`i8x8` policy measured:
+
+| Workload | Previous Cranelift | Candidate | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `ruff check` over 1,592 fixtures | 144.37 ms | 143.82 ms | -0.06% | 10/20 | 1.00000 |
+| `ty check` over `scripts/ty_benchmark` | 110.10 ms | 109.80 ms | +0.57% | 8/20 | 0.50344 |
+
+Both correctness-probe digests matched. The change is neutral for Ruff and
+trends backward for ty while growing both binaries, so it was rejected before
+paying for the uv build. Removing one loop-invariant vector spill merely
+exchanges vector pressure for scalar pressure and repeated work. The next
+hashbrown stack candidate should eliminate the address-taken group load or
+keep the whole group producer-consumer path in registers.
+
 ### Rejected backend-specific UB-check inlining
 
 Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
@@ -1342,8 +1369,9 @@ implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. Forwarding same-width, differently typed stores and loads with
 native-endian bitcasts removed four more vector materializations and cut the
 hot hashbrown frame by 64 bytes, but the complete 50-run gate was neutral.
-Further stack work in this loop must target the address-taken group load or the
-loop-invariant vector spill rather than another local transmute. A matched
+Further stack work in this loop must target the address-taken group load or
+keep the whole group producer-consumer path in registers rather than another
+local transmute or rematerialization policy. A matched
 profile before the repeated-call import showed
 hashbrown's `find_or_find_insert_index_inner` and cross-CGU
 `FxHasher::write_isize` as prominent Cranelift-only leaves while LLVM had
@@ -1379,9 +1407,11 @@ code and significantly regress another application. Removing four exact
 vector-to-scalar stack round-trips after the narrow lowering improved local
 code without moving any application, so the next expansion must keep a larger
 producer-consumer region vector-shaped rather than add another isolated
-conversion. Expand coverage by
-profiled vector shape and operation cluster, and require the complete matched
-application gate before making any shape global.
+conversion. Rematerializing the loop-invariant `i8x8` splat likewise removed
+its vector spill but exchanged it for another live scalar register and a
+per-iteration `dup`; Ruff was neutral and ty trended backward. Expand coverage
+by profiled vector shape and operation cluster, and require the complete
+matched application gate before making any shape global.
 
 ## Reproduction Shape
 
