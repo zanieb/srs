@@ -24,41 +24,44 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 20 timed `hyperfine` trials after 5 warmups. Lower is better.
-"Patched" includes the Cranelift-specific MIR inlining defaults described
-below.
+Each row is 20 timed trials after 5 warmups. Lower is better. The uv rows are
+from the final four-workload matrix. Ruff and ty are from a focused rerun of
+the same candidate artifacts because an overlapping host workload made the ty
+samples in the four-workload run noisy.
 
-| Workload | LLVM | Cranelift baseline | Cranelift patched | LLVM lead after patch | Patch change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `uv venv --clear` | 32.6 ms | 83.6 ms | 83.2 ms | 2.55x | -0.5% |
-| `uv lock --check`, offline | 58.3 ms | 118.9 ms | 120.4 ms | 2.06x | +1.3% |
-| `ruff check` over 1,592 fixtures | 80.8 ms | 316.0 ms | 272.0 ms | 3.37x | -13.9% |
-| `ty check` over `scripts/ty_benchmark` | 47.0 ms | 214.5 ms | 206.5 ms | 4.40x | -3.7% |
+| Workload | LLVM | Final Cranelift | LLVM lead |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | 32.8 ms | 77.3 ms | 2.36x |
+| `uv lock --check`, offline | 62.2 ms | 112.1 ms | 1.80x |
+| `ruff check` over 1,592 fixtures | 80.1 ms | 222.9 ms | 2.78x |
+| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 172.7 ms | 3.71x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 2-4.4x faster for
-these user-visible operations. The MIR inlining change recovers meaningful
-ground for Ruff and some for ty, but it does not address uv's dominant costs.
+The conclusion is unambiguous: LLVM is currently about 1.8-3.7x faster for
+these user-visible operations. The implemented changes recover meaningful
+ground for Ruff and ty and a smaller amount for uv lock, but they do not close
+the remaining loop-optimization and code-quality gap.
 
 ### Binary size
 
 The profiling binaries retain full debuginfo, so these are comparative rather
 than distribution sizes.
 
-| Binary | LLVM | Cranelift baseline | Cranelift patched |
+| Binary | LLVM | Cranelift baseline | Final Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 39.4 MB | 135.8 MB | 134.4 MB |
-| ty | 39.4 MB | 145.6 MB | 143.7 MB |
-| uv | 87.2 MB | 255.0 MB | 266.5 MB |
+| Ruff | 39.4 MB | 135.8 MB | 128.5 MB |
+| ty | 39.4 MB | 145.6 MB | 133.9 MB |
+| uv | 87.2 MB | 255.0 MB | 259.1 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
-complete answer: the moderate policy is nearly size-neutral for Ruff and ty,
-but grows uv by 4.5% without improving its measured operations.
+complete answer: the final policy reduces Ruff and ty size, but the remaining
+output is still roughly three times LLVM's and uv remains nearly neutral on
+environment creation.
 
 ## Changes Implemented
 
@@ -68,9 +71,11 @@ Cranelift has no later, function-level inliner comparable to LLVM's. The
 shared MIR inliner is therefore its only opportunity to expose optimization
 across many call boundaries.
 
-The codegen backend can now supply MIR inlining defaults. Cranelift raises the
-local thresholds from 30/100/50 to 60/200/100 for forwarders, hinted calls,
-and ordinary calls. Other backends are unchanged, and explicit command-line
+The codegen backend can now supply MIR inlining defaults. Cranelift initially
+raised the local thresholds from 30/100/50 to 60/200/100 for forwarders,
+hinted calls, and ordinary calls. After the scalarization work exposed more
+small iterator calls, the final policy raises only the hinted-call threshold
+again, to 60/500/100. Other backends are unchanged, and explicit command-line
 thresholds always win.
 
 Two controls bounded the policy:
@@ -151,6 +156,32 @@ The candidate's uv, Ruff, and ty binaries are respectively 0.58%, 0.80%, and
 0.72% smaller. Correctness-probe exit codes and output digests match across all
 three lanes.
 
+### Higher hinted-call budget after scalarization
+
+A fresh Ruff profile after the `NonNull` change still showed
+`core::str::validations::next_code_point` calling the small, hinted
+`slice::Iter<u8>::next` helper four times. LLVM folded the iterator operations
+into a 160-byte leaf; Cranelift emitted a 648-byte function with repeated
+calls, niche checks, and spills. This is exactly the kind of call boundary the
+hinted MIR threshold is intended to remove.
+
+Raising only that threshold from 200 to 500 produced the following paired
+result in the complete four-workload gate:
+
+| Workload | Paired change | Wins | Sign p | Binary change |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.6% | 12/20 | 0.50344 | -1.20% |
+| `uv lock --check`, offline | -3.0% | 17/20 | 0.00258 | -1.20% |
+| `ruff check` over 1,592 fixtures | -11.6% | 19/20 | 0.00004 | -2.53% |
+| `ty check` over `scripts/ty_benchmark` | -7.1% | 16/20 | 0.01182 | -5.15% |
+
+The ty row overlapped an unrelated host workload, so a focused Ruff/ty rerun
+was used as a variance check. It measured Ruff at -11.1% and ty at -7.1%, with
+20/20 wins and a two-sided sign-test p-value of 0.000002 for each. Correctness
+digests match the previous Cranelift and LLVM lanes. Unlike indiscriminate
+inlining, the higher hinted-call budget also makes every application binary
+smaller, so it is retained as the default.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -164,6 +195,39 @@ assembly:
 The Cranelift standard example checks every intrinsic against a known result.
 This is primarily a coverage and correctness change, but it is required for
 ty to become a usable performance benchmark.
+
+## Full-Suite Backend Validation
+
+The final candidate also ran the repositories' complete macOS test commands
+from clean target directories under both LLVM and Cranelift. These are
+single-run operational timings, not block-balanced runtime benchmarks: they
+mix compilation, thousands of short subprocesses, filesystem work, and test
+execution. They are useful as a broad correctness gate and as a directional
+measure of the entire developer operation.
+
+| Suite and boundary | LLVM | Cranelift | Cranelift change | Outcome in both lanes |
+| --- | ---: | ---: | ---: | --- |
+| uv cold build + Nextest | 579.10 s | 608.28 s | +5.0% | 3,866 tests run: 3,773 passed, 90 failed, 3 timed out, 3 skipped |
+| uv Nextest phase | 527.251 s | 499.409 s | -5.3% | Same exact failing-test set |
+| Ruff/ty cold build + Nextest | 197.77 s | 201.29 s | +1.8% | 7,962 tests run: 7,960 passed, 2 failed, 44 skipped |
+| Ruff/ty Nextest phase | 95.414 s | 97.383 s | +2.1% | Same two failing tests |
+| Ruff/ty cold build + doctests | 75.23 s | 98.55 s | +31.0% | 194 passed, 12 ignored, 0 failed across 48 crates |
+
+The pinned uv snapshots have drifted under the current SRS compiler and host
+environment. Both lanes therefore used scratch worktrees with Insta updates
+forced to pass so all tests could execute. The 90 failure names and three
+timeouts are identical, and the tracked snapshot diff is byte-identical;
+parallel warning order and the local registry URL still vary in untracked
+pending-snapshot metadata. Ruff/ty used the same scratch policy but left both
+worktrees clean. Its shared failures are the format error-diagnostics test and
+the deliberately panicking markdown rule, which aborts while initiating its
+panic on this host. No Cranelift-only failure appeared in either repository.
+
+The uv execution-phase result is I/O-heavy and comes from one full run, so its
+apparent Cranelift lead should not be treated as an application-runtime win.
+Conversely, the doctest operation launches many compiler processes and shows a
+substantial cold rustdoc/build gap. The balanced application matrix above
+remains the decision gate for generated-code runtime.
 
 ## Performance Roadmap
 
