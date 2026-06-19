@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `9b5883937`, with:
+recorded at SRS `d4dc3d54b`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.3 ms | 73.0 ms | 2.19x |
-| `uv lock --check`, offline | 61.3 ms | 106.9 ms | 1.74x |
-| `ruff check` over 1,592 fixtures | 79.8 ms | 206.7 ms | 2.59x |
-| `ty check` over `scripts/ty_benchmark` | 47.7 ms | 160.1 ms | 3.35x |
+| `uv venv --clear` | 33.0 ms | 72.1 ms | 2.18x |
+| `uv lock --check`, offline | 61.7 ms | 107.7 ms | 1.75x |
+| `ruff check` over 1,592 fixtures | 80.2 ms | 204.9 ms | 2.55x |
+| `ty check` over `scripts/ty_benchmark` | 48.2 ms | 161.9 ms | 3.36x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.7-3.6x faster for
+The conclusion is unambiguous: LLVM is currently about 1.7-3.4x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -77,7 +77,7 @@ hinted calls, and ordinary calls. After the scalarization work exposed more
 small iterator calls, the hinted-call threshold moved to 500. The final policy
 uses local thresholds of 60/600/100 and raises the cross-crate eligibility
 threshold from 100 to 500. It also expands the top-down multi-call inlining
-limit from 5 to 8. LLVM keeps its existing cross-crate and top-down defaults
+limit from 5 to 12. LLVM keeps its existing cross-crate and top-down defaults
 and does not receive Cranelift's local defaults. Explicit command-line
 thresholds always win.
 
@@ -226,7 +226,7 @@ chain. Cranelift inlined the outer bodies but reached the MIR inliner's default
 top-down multi-call limit before the final equality closure, leaving a function
 call inside each scalar comparison of short character sets.
 
-Cranelift now uses a top-down limit of 8 instead of 5. A reduced
+Cranelift first moved to a top-down limit of 8 instead of 5. A reduced
 `[char]::contains` check falls from three functions and 412 bytes to one
 276-byte leaf, removes the call in the comparison loop, and shrinks its frame
 from 96 to 80 bytes. Setting `-Zinline-mir-top-down-depth=5` restores the old
@@ -281,6 +281,26 @@ resolution neutral, and regresses Ruff. It is retained as a net improvement
 across the representative set, with the Ruff regression explicitly carried
 into the next optimization gate rather than hidden by the aggregate result.
 
+After removing the hot AArch64 wrappers, a fresh Ruff profile still found the
+same iterator chain active below the eighth inlining level. The current policy
+therefore raises the limit from 8 to 12. The named slice/iterator symbols in
+Ruff fall from 153 to 136, while Ruff, ty, and uv shrink by 9,584, 16,240, and
+40,016 bytes respectively. The complete three-lane gate measured:
+
+| Workload | Candidate vs depth 8 | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.7% | 14/20 | 0.11532 | +116.9% | -0.015% |
+| `uv lock --check`, offline | -1.4% | 12/20 | 0.50344 | +75.8% | -0.015% |
+| `ruff check` over 1,592 fixtures | -1.3% | 13/20 | 0.26318 | +160.4% | -0.007% |
+| `ty check` over `scripts/ty_benchmark` | +0.9% | 7/20 | 0.26318 | +236.6% | -0.012% |
+
+A separate 50-trial Ruff/ty gate measured Ruff at -0.9% with 34/50 wins
+(two-sided sign-test p = 0.01535) and ty at +0.02% with 25/50 wins. This
+recovers the target-feature change's Ruff regression without sacrificing its
+ty improvement. The broader gate is directionally favorable for both uv
+operations and Ruff, ty is neutral across the higher-powered focused gate,
+and every binary becomes smaller, so the depth-12 policy is retained.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -330,11 +350,12 @@ remains the decision gate for generated-code runtime.
 
 The subsequent 500-cross-crate/60/600/100 policy passed a complete two-stage
 SRS build, all 18 `rustc_interface` unit tests, a matching standalone cg_clif
-backend build, and cg_clif's no-sysroot AOT smoke. The current depth-8 policy
-also passed the complete SRS build and all 18 interface tests. The subsequent
+backend build, and cg_clif's no-sysroot AOT smoke. The depth-8 policy also
+passed the complete SRS build and all 18 interface tests. The subsequent
 target-feature policy passed another complete SRS build and its dedicated
-AArch64 MIR test. Every complete runtime gate preserved every correctness
-digest. A fresh full uv/Ruff/ty suite pair is reserved for the next
+AArch64 MIR test. The current depth-12 policy passed a complete SRS build and
+all 18 interface tests. Every complete runtime gate preserved every
+correctness digest. A fresh full uv/Ruff/ty suite pair is reserved for the next
 finalization gate rather than repeated after every retained optimization. The
 current cg_clif sysroot harness cannot provide additional coverage: its stdlib
 patch no longer applies to this Rust snapshot, and its standalone JIT smoke
@@ -414,9 +435,10 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
 - pass or retain stack arguments without unnecessary entry-block loads where
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
-The application gate is important here: the latest policy helps ty and uv
-environment creation, leaves uv resolution neutral, and regresses Ruff. Their
-hot paths will not all improve merely by buying more code size. Keeping thin
+The application gate is important here: the target-feature policy helped ty
+but regressed Ruff, while the subsequent depth increase recovered Ruff without
+giving back the ty win. Their hot paths will not all improve merely by buying
+more code size. Keeping thin
 `NonNull` iterator cursors in SSA completes one high-impact stack-slot case,
 but the remaining 2-4x LLVM gap shows that local representation fixes
 alone will not close the runtime difference.
