@@ -771,6 +771,44 @@ therefore rejected. Carrying a narrow range only into generic switch lowering
 is a code-size opportunity; the runtime arc needs to eliminate checks inside
 hot loops or enable a larger control-flow transformation.
 
+### Rejected known-receiver devirtualization
+
+A fresh sample of the retained ty binary made hashbrown's
+`RawTableInner::find_or_find_insert_index_inner` the dominant active Rust leaf.
+Hashbrown deliberately shares this non-generic probe loop by passing its
+generic equality closure as `&mut dyn FnMut`; LLVM later inlines the loop and
+devirtualizes the closure call, while Cranelift retains both boundaries. A
+reduced hashbrown insertion binary reproduced the shape.
+
+The first candidate resolved a virtual method directly when optimized MIR had
+exactly one nonescaped whole-local unsizing coercion for the receiver. The
+vtable query then supplied the same concrete method instance that the dynamic
+slot would contain. In the reduced binary, the indirect `blr` became a direct
+`bl` to the closure shim. A second, narrowly triggered MIR budget admitted an
+`#[inline]` body up to cost 1,200 only when inlining that body exposed such a
+receiver. In the pinned applications, the complete candidate reduced retained
+copies of `find_or_find_insert_index_inner` from 50 to 41 in uv, 30 to 23 in
+Ruff, and 31 to 20 in ty.
+
+The structural result did not translate into a stable application runtime
+gain. Both variants used a matched 50-run LLVM/baseline/candidate gate:
+
+| Workload | Direct-only change | Wins | Sign p | With targeted inlining | Wins | Sign p |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.26% | 26/50 | 0.88772 | +0.36% | 22/50 | 0.47989 |
+| `uv lock --check`, offline | -0.28% | 26/50 | 0.88772 | -0.65% | 26/50 | 0.88772 |
+| `ruff check` over 1,592 fixtures | +0.48% | 21/50 | 0.32224 | +0.64% | 21/50 | 0.32224 |
+| `ty check` over `scripts/ty_benchmark` | -0.58% | 30/50 | 0.20264 | +0.33% | 24/50 | 0.88772 |
+
+The direct-only uv, Ruff, and ty binaries were 0.98%, 0.21%, and 0.55%
+smaller; the complete candidate changed them by -1.01%, -0.21%, and -0.50%.
+Every correctness digest matched. Neither variant meets the runtime bar, so
+both were rejected despite their code-size and local control-flow wins. The
+result narrows the call-overhead arc: removing one shared hash-table call and
+one indirect equality call is insufficient on its own; a future candidate
+needs to expose a larger loop transformation or eliminate a repeated static
+leaf across the measured hot paths.
+
 ### Bounded stack-backed aggregate copies
 
 The first profile after stack forwarding still showed Darwin's
@@ -1077,6 +1115,11 @@ implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. A fresh matched profile still shows hashbrown's
 `find_or_find_insert_index_inner` and cross-CGU `FxHasher::write_isize` as
 prominent Cranelift-only leaves while LLVM has absorbed them into callers.
+Known-receiver devirtualization removed some copies of the hashbrown loop and
+replaced its indirect equality call in a reduction, but both the direct-only
+and targeted-inlining variants were runtime-neutral in 50-run application
+gates and were rejected.
+
 An untargeted, one-level post-monomorphization body-import experiment removed
 all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
 screen and was rejected. The immediate call arc is now a profile- or
