@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `6760396b1`, with:
+recorded at SRS `1ce2acef4`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -16,7 +16,8 @@ recorded at SRS `6760396b1`, with:
 - Ruff/ty `e0eb28d6345b`;
 - the repositories' `profiling` profile, with LTO disabled for both backends;
 - `CARGO_INCREMENTAL=0`;
-- the SRS artifact cache and incremental linker disabled; and
+- the SRS artifact cache and incremental linker disabled;
+- cg_clif's opt-in unwinding support enabled for Apple silicon; and
 - `/usr/bin/clang` as the linker.
 
 Ruff's production release profile uses fat LTO. Disabling it makes the
@@ -31,48 +32,53 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 34.1 ms | 56.6 ms | 1.66x |
-| `uv lock --check`, offline | 60.5 ms | 86.2 ms | 1.42x |
-| `ruff check` over 1,592 fixtures | 78.1 ms | 143.9 ms | 1.84x |
-| `ty check` over `scripts/ty_benchmark` | 45.4 ms | 107.5 ms | 2.37x |
+| `uv venv --clear` | 32.0 ms | 54.7 ms | 1.71x |
+| `uv lock --check`, offline | 57.4 ms | 84.0 ms | 1.46x |
+| `ruff check` over 1,592 fixtures | 78.2 ms | 141.3 ms | 1.81x |
+| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 109.0 ms | 2.34x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.4x faster for
+The conclusion is unambiguous: LLVM is currently about 1.5-2.3x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
 
+Every Cranelift trial was slower than its paired LLVM trial in all four rows
+(0/50 wins per workload; two-sided sign-test `p = 1.78e-15`). Exit codes and
+stdout/stderr digests match between backends for every correctness probe.
+
 ### Final acceptance gate
 
 The final gate is the complete repository test suite under matched LLVM and
-Cranelift toolchains, not just the four timing operations. The matched macOS
-commands and their established 3,866-test uv, 7,962-test Ruff/ty, and doctest
-results are recorded under [Full-Suite Backend Validation](#full-suite-backend-validation).
-This expensive matrix is reserved for a policy that is otherwise ready to
-finalize; the randomized application gate remains the inner loop. It will be
-rerun on the eventual final policy once the runtime gap is close enough to call
-the work complete.
+Cranelift toolchains, not just the four timing operations. The final policy ran
+the matched macOS 3,866-test uv suite, 7,962-test Ruff/ty suite, and complete
+doctest set. The commands, results, and host-environment failures are recorded
+under [Full-Suite Backend Validation](#full-suite-backend-validation). The
+randomized application gate remains the runtime decision boundary because the
+complete suites include compilation, network and filesystem work, fixed
+timeouts, and thousands of short subprocesses.
 
 ### Binary size
 
 The profiling binaries retain full debuginfo, so these are comparative rather
 than distribution sizes.
 
-| Binary | LLVM | Previous Cranelift | Current Cranelift |
+| Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 117.1 MB | 116.9 MB |
-| ty | 47.5 MB | 121.4 MB | 121.2 MB |
-| uv | 100.0 MB | 238.2 MB | 238.0 MB |
+| Ruff | 45.0 MB | 141.3 MB | 3.14x |
+| ty | 47.5 MB | 145.5 MB | 3.07x |
+| uv | 100.0 MB | 293.8 MB | 2.94x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
-dead-code elimination, and code-layout opportunities. More inlining is not a
-complete answer: the final policy reduces Ruff and ty size, but the remaining
-output is still roughly 2.4-2.6 times LLVM's and uv environment creation is
-still about 70% slower.
+dead-code elimination, and code-layout opportunities. Correctly enabling
+cg_clif unwinding on Apple silicon adds another 20.9% to Ruff, 20.0% to ty,
+and 23.5% to uv relative to the same policy without exception tables. More
+inlining is not a complete answer: output is now roughly three times LLVM's,
+and uv environment creation is still about 70% slower.
 
 ## Changes Implemented
 
@@ -1211,6 +1217,33 @@ larger call, range, and code-layout gap, not a profitable isolated exception to
 `rustc_no_mir_inline`. The later bounded CLIF inliner deliberately excludes
 these call-bearing helpers.
 
+### Finalization correctness fixes
+
+The final whole-suite gate found two backend correctness gaps that the
+application probes did not exercise.
+
+First, compiling `zeroize 1.8.2` at optimization level 1 reached an invalid
+`iconst.i128` and made the Cranelift verifier panic. Primitive `i128` and
+`u128` constants already used two `i64` constants plus `iconcat`, but a scalar
+niche newtype such as `NonZero<i128>` fell through the generic scalar path.
+cg_clif now uses the same two-half construction for scalar-layout `i128`
+newtypes. The verifier also reports an invalid `iconst` controlling type as a
+normal verifier error instead of panicking while calculating its bounds. The
+exact `zeroize` reproduction, a `NonZeroI128` volatile-write regression, the
+focused verifier tests, cg_clif check, and complete stage-2 build pass.
+
+Second, SRS bootstrap enabled cg_clif's opt-in unwinding feature only on
+`x86_64-unknown-linux-gnu`. On Apple silicon, `std::intrinsics::catch_unwind`
+therefore lowered its callback as a plain indirect call. Three uv async tests
+that intentionally catch a debug assertion passed under LLVM and failed under
+Cranelift. Bootstrap now enables unwinding for `aarch64-apple-darwin` as well.
+A fresh Cranelift build of the exact `uv-auth` reproduction catches the panic,
+and the three tests pass in the final complete suite.
+
+These are prerequisites, not performance wins. The final runtime and size
+numbers use the corrected unwinding-enabled backend; the earlier Apple-silicon
+Cranelift binaries are not valid correctness controls.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -1226,6 +1259,71 @@ This is primarily a coverage and correctness change, but it is required for
 ty to become a usable performance benchmark.
 
 ## Full-Suite Backend Validation
+
+### Final policy
+
+The final unwinding-enabled policy ran from clean target directories at SRS
+`1ce2acef4`. These are single-run operational timings rather than
+block-balanced generated-code benchmarks: they include a cold build, thousands
+of short subprocesses, filesystem work, live-network failures, and fixed test
+timeouts.
+
+| Suite and boundary | LLVM | Cranelift | Cranelift change |
+| --- | ---: | ---: | ---: |
+| uv cold build + Nextest | 1,046.07 s | 2,663.75 s | +154.6% |
+| uv Nextest phase | 902.769 s | 2,536.885 s | +181.0% |
+| Ruff/ty cold build + Nextest | 1,435.69 s | 1,417.33 s | -1.3% |
+| Ruff/ty Nextest phase | 1,276.496 s | 1,274.531 s | -0.2% |
+| Ruff/ty post-Nextest doctests | 22.49 s | 25.15 s | +11.8% |
+
+The uv lane completed all 3,866 tests in both backends. LLVM reported 3,749
+passed, 112 failed, five timed out, and three skipped. Cranelift reported 3,606
+passed, 242 failed, 18 timed out, and three skipped. The 117 LLVM failure or
+timeout names are all present in the Cranelift set; Cranelift has 143
+additional names and LLVM has none that are absent under Cranelift. This host
+cannot reach PyPI, the packse fixture site, and several other live endpoints,
+and macOS keychain operations return `Operation not permitted`. The additional
+Cranelift failures are dominated by those operations reaching command or
+Nextest deadlines under slower generated code. They are an important
+operational effect, but not evidence by themselves of a miscompile. The four
+tracked uv snapshot updates are byte-identical between lanes. Most
+importantly, the `uv-auth` expected-panic tests that exposed missing unwinding
+now pass.
+
+The Ruff/ty lane completed all 7,962 tests in both backends with the exact same
+failure set: 7,922 passed, 40 failed, and 44 skipped. All 40 failures are ty
+file-watching tests whose FSEvents sentinel is not delivered in this sandbox;
+each waits roughly 30 seconds. Those fixed waits consume almost the entire
+Nextest phase and make the apparent tie unsuitable as a runtime-performance
+claim. The complete doctest command passes in both lanes.
+
+The Nextest plugin must be invoked directly with the SRS Cargo wrapper in
+`CARGO`. `cargo +toolchain nextest` lets the plugin invoke `cargo-srs-real`
+directly and bypasses the wrapper's target-codegen flags, silently turning the
+purported LLVM lane into Cranelift. With `BACKEND` set separately to `llvm`
+and `cranelift`, the matched command shape was:
+
+```bash
+CARGO="$HOME/.rustup/toolchains/srs-cranelift-small-copy-stage2/bin/cargo" \
+SRS_TARGET_CODEGEN_BACKEND="$BACKEND" \
+SRS_CARGO_ARTIFACT_CACHE=0 \
+SRS_ARTIFACT_CACHE=0 \
+SRS_INCREMENTAL_LINKER=0 \
+SLD_INCREMENTAL=0 \
+CARGO_INCREMENTAL=0 \
+CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang \
+RUSTC="$SRS/rust/build/aarch64-apple-darwin/stage2/bin/rustc" \
+    cargo-nextest nextest run <repository arguments>
+```
+
+uv used its complete no-default-feature CI feature set, `--workspace`, and
+`--profile ci-macos`. Ruff/ty used `--all-features --profile ci`, followed by
+`cargo test --all-features --doc` with the matched stage-2 rustdoc and backend.
+The balanced four-operation matrix above remains the decision gate for
+generated-code runtime; the full uv operation is nevertheless a useful warning
+that the 1.5-2.3x application gap can cross real test deadlines.
+
+### Earlier 60/500/100 policy
 
 An earlier 60/500/100 candidate also ran the repositories' complete macOS test
 commands from clean target directories under both LLVM and Cranelift. These are
@@ -1296,7 +1394,10 @@ tests, its direct-access and branch-argument escape filetests, standalone
 `Iterator::position` and clap reproductions, a complete stage-2 cg_clif,
 standard-library, and proc-macro build, pinned application builds, and the
 matched four-workload 50-run gate.
-The final complete-suite matrix is still pending for the eventual final policy.
+The final policy then passed the complete matched application probes and the
+full Ruff/ty doctest set, and ran both full Nextest suites to completion without
+a compiler crash. Its full-suite gate also found and fixed the scalar `i128`
+newtype constant and Apple-silicon unwinding defects described above.
 The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
 to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
@@ -1321,6 +1422,12 @@ Use workloads that exercise real work:
 - Ruff parsing, indexing, semantic analysis, and diagnostics over a fixed
   source corpus; and
 - ty project discovery, typeshed loading, indexing, and type checking.
+
+Run the expensive final suite on a host with its required network, keychain,
+filesystem, and FSEvents capabilities. When that is impossible, compare exact
+failure identities and tracked snapshot diffs, and report deadline crossings
+as operational performance failures rather than silently excluding them or
+calling them compiler miscompiles.
 
 ### 2. Build loop and range optimization before chasing isolated peepholes
 
@@ -1353,6 +1460,15 @@ overflow check did not move runtime. The next candidate should consume the
 fact in repeated loop bounds or enable a larger control-flow simplification.
 The reduced scan confirms that vectorization and loop-wide range reasoning
 remain the larger opportunities.
+
+A final CLIF audit of hashbrown's
+`find_or_find_insert_index` did not find that consumer: its inner iteration is
+a nonzero bitmask plus count-trailing-zeros operation, not a repeated scalar
+bound that an isolated CFG range fact can remove. The visible pointer
+precondition checks also cross call boundaries, so they need profitable body
+import or interprocedural reasoning rather than another local range rule. Do
+not manufacture a generic CFG-range patch without a newly profiled repeated
+consumer.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
@@ -1397,7 +1513,9 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
 - investigate the open work to let
   [regalloc manage callee-saved registers](https://github.com/bytecodealliance/wasmtime/issues/7727);
 - remove [unused stack slots](https://github.com/bytecodealliance/wasmtime/issues/6661)
-  and [dead stores](https://github.com/bytecodealliance/wasmtime/issues/4167); and
+  and [dead stores](https://github.com/bytecodealliance/wasmtime/issues/4167);
+- emit personalities and LSDA only for functions that need them, then reduce
+  redundant cleanup metadata; and
 - pass or retain stack arguments without unnecessary entry-block loads where
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
@@ -1441,7 +1559,15 @@ screen and was rejected. Requiring four static call sites per caller retains
 the hot `Type::hash` transformation, improves every application median, and
 leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
 model is the next call arc, not broader body availability by itself.
-The remaining 1.4-2.3x LLVM gap shows that local representation fixes alone
+The final unwinding gate makes the size side of this arc urgent. cg_clif's
+current unwind writer intentionally attaches a personality and LSDA broadly;
+enabling it grew the final application binaries by 20-23% and left them about
+three times LLVM's size. Narrowing exception metadata to functions and call
+sites that can actually unwind is a concrete, measurable next step. It needs
+the `catch_unwind` regression and full suite as correctness gates because
+disabling metadata indiscriminately recreates the defect fixed above.
+
+The remaining 1.5-2.3x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously
