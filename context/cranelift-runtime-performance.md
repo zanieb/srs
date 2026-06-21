@@ -526,6 +526,15 @@ binary shrinks, and all correctness digests match. The focused backend check
 and complete stage-2 backend and standard-library build pass. The repeated-call
 policy is retained; one-off imports still require a stronger call-site signal.
 
+Allowing one-off hinted imports only when the composed body had at most eight
+CLIF instructions tested the smallest plausible exception. It still grew uv,
+Ruff, and ty by 16,928, 7,104, and 4,496 bytes. In a 50-run matched gate, uv
+environment creation regressed by 2.32% with 13/50 wins (`p = 0.00094`), while
+uv resolution (+0.05%), Ruff (-0.87%), and ty (-0.04%) were neutral. All
+correctness digests matched. The exception is rejected: even tiny one-off
+imports perturb enough layout to hurt uv, so repeated calls remain the minimum
+static hotness signal.
+
 A second threshold probe targeted callable `dyn Fn` shims. Raising the hinted
 budget from 800 to 850 retained all 31 hot hashbrown probe copies; 900 and
 1,000 reduced the count to 20 but did not improve the application gate and
@@ -954,6 +963,40 @@ trended backward. Hoisting LLVM's multiplier in isolation is insufficient
 while Cranelift still retains 26 `write_isize` calls and fragmented enum-arm
 tails. Future work on this body needs to merge the complete hash update, not
 only share its literal.
+
+### Rejected dominator-sibling LICM restoration
+
+The `hash_bytes` profile exposed a second placement issue while investigating
+its loop-local AArch64 multiplier. Egraph elaboration tracks active loops in a
+mutable stack during dominator-tree traversal. Visiting an exit child pops the
+loop, but the old iterative traversal restores only the scoped value map when
+returning to the parent. If a loop-body sibling is visited afterward, it is
+elaborated with an empty loop stack and misses LICM. A focused `vconst`
+regression demonstrated that changing only the branch-child order changed
+whether the constant was hoisted.
+
+A correct prototype saved the loop entries popped on block entry and restored
+them when that dominator scope closed. It fixed the reduced case, but also
+broadened LICM across the applications enough to grow uv by 410,464 bytes
+(0.15%), Ruff by 259,168 bytes (0.19%), and ty by 289,680 bytes (0.21%). The
+20-run matched screen measured:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +1.91% | 7/20 | 0.26318 |
+| `uv lock --check`, offline | +0.42% | 7/20 | 0.26318 |
+| `ruff check` over 1,592 fixtures | -0.93% | 11/20 | 0.82380 |
+| `ty check` over `scripts/ty_benchmark` | +2.08% | 6/20 | 0.11532 |
+
+Every correctness probe matched, but three workloads and every binary moved
+backward, with ty showing the largest regression. The restoration is rejected
+before a 50-run gate. This is a real order-dependent optimizer defect, but
+turning all previously missed cases into unconditional LICM is not a runtime
+win. A future repair needs a placement cost model that accounts for longer
+live ranges, register pressure, duplication, and loop frequency rather than
+restoring the old heuristic globally. A simultaneous target-specific attempt
+to keep wide AArch64 `i64` constants invariant did not hoist the multiplier in
+the exact optimized `hash_bytes` CLIF and was also dropped.
 
 ### Bounded stack-backed aggregate copies
 
@@ -1691,6 +1734,9 @@ Cranelift explicitly; otherwise a purported Cranelift comparison is actually
 LLVM.
 
 ```bash
+SRS_ROOT=/path/to/srs
+RUSTC="$SRS_ROOT/rust/build/host/stage2/bin/rustc" \
+RUSTDOC="$SRS_ROOT/rust/build/host/stage2/bin/rustdoc" \
 SRS_TARGET_CODEGEN_BACKEND=cranelift \
 SRS_ARTIFACT_CACHE=0 \
 SRS_INCREMENTAL_LINKER=0 \
@@ -1700,6 +1746,14 @@ CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang \
 CARGO_TARGET_DIR="$HOME/code/tmp/cranelift-runtime/ruff-cranelift" \
     cargo +srs build --profile profiling --bin ruff --bin ty
 ```
+
+The explicit `RUSTC` and `RUSTDOC` are required when testing an uninstalled
+worktree backend. `cargo +srs` alone selects the installed SRS snapshot; it
+does not automatically use a freshly rebuilt compiler in another worktree.
+Reusing only `+srs` silently produced a stale candidate during the LICM
+experiment, which the ty correctness probe caught because that snapshot lacked
+the retained AArch64 CRC lowering. That result was discarded and the valid
+screen above was rebuilt from fresh targets with the worktree stage-2 paths.
 
 Build the LLVM lane into a separate empty target with the same environment and
 `SRS_TARGET_CODEGEN_BACKEND=llvm`. Run each command repeatedly from the same
