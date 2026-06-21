@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `09ad5c3dc`, with:
+recorded at SRS `6760396b1`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -31,17 +31,17 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.6 ms | 55.0 ms | 1.69x |
-| `uv lock --check`, offline | 59.8 ms | 84.1 ms | 1.41x |
-| `ruff check` over 1,592 fixtures | 78.4 ms | 143.7 ms | 1.83x |
-| `ty check` over `scripts/ty_benchmark` | 48.3 ms | 110.0 ms | 2.28x |
+| `uv venv --clear` | 34.1 ms | 56.6 ms | 1.66x |
+| `uv lock --check`, offline | 60.5 ms | 86.2 ms | 1.42x |
+| `ruff check` over 1,592 fixtures | 78.1 ms | 143.9 ms | 1.84x |
+| `ty check` over `scripts/ty_benchmark` | 45.4 ms | 107.5 ms | 2.37x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.3x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.4x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,9 +64,9 @@ than distribution sizes.
 
 | Binary | LLVM | Previous Cranelift | Current Cranelift |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 117.4 MB | 117.1 MB |
-| ty | 47.5 MB | 122.2 MB | 121.4 MB |
-| uv | 100.0 MB | 238.7 MB | 238.2 MB |
+| Ruff | 45.0 MB | 117.1 MB | 116.9 MB |
+| ty | 47.5 MB | 121.4 MB | 121.2 MB |
+| uv | 100.0 MB | 238.2 MB | 238.0 MB |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. More inlining is not a
@@ -1144,6 +1144,52 @@ exchanges vector pressure for scalar pressure and repeated work. The next
 hashbrown stack candidate should eliminate the address-taken group load or
 keep the whole group producer-consumer path in registers.
 
+### Nonescaping direct stack-access forwarding
+
+Rust's `ptr::read_unaligned` lowering materializes a `MaybeUninit` temporary by
+taking its address, writing through an ordinary `store`, and reading it through
+an ordinary `load`. Cranelift's pre-legalization stack pass previously treated
+every `stack_addr` as an escape, so it could not see through that sequence even
+when the address never left the function or the direct memory operations. In
+the profiled hashbrown loop, this left the control-group value on the stack and
+prevented the otherwise neutral same-width bitcast from removing the complete
+round-trip.
+
+The retained pass recognizes bounded ordinary loads and stores whose address
+is exactly a `stack_addr`. It permits only those direct memory operands; calls,
+stored pointers, derived addresses, stack maps, branch arguments, exception
+contexts, and every other use still make the whole slot escape. Known values
+now flow between explicit stack operations and direct memory operations, and
+exact same-byte-range type changes use a target-endian `bitcast`. Ordinary
+stores and the slot allocation are removed only when every read was forwarded.
+
+The escape scan deliberately visits all instruction values rather than only
+ordinary instruction arguments. An early version missed `BlockCall` arguments,
+deleted a slot whose address flowed through a block parameter, and caused
+`Iterator::position` to return a stack address as its index. A dedicated
+control-flow regression now preserves that slot. The corrected backend also
+passes standalone `position()` and clap `--version` reproductions that failed
+under the broken version.
+
+The hot `RawTableInner::find_or_find_insert_index_inner` frame falls from 208
+to 96 bytes and its body from 764 to 700 bytes. The complete matched 50-run
+gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.58% | 24/50 | 0.88772 | +66.70% | -0.095% |
+| `uv lock --check`, offline | -0.19% | 26/50 | 0.88772 | +42.76% | -0.095% |
+| `ruff check` over 1,592 fixtures | -1.46% | 30/50 | 0.20264 | +84.62% | -0.141% |
+| `ty check` over `scripts/ty_benchmark` | -1.43% | 35/50 | 0.00660 | +138.25% | -0.112% |
+
+Both uv operations and Ruff are statistically neutral, ty improves
+decisively, every binary shrinks, and all correctness-probe digests match. The
+focused little- and big-endian filetests, the branch-argument escape
+regression, all 185 `cranelift-codegen` unit tests and 21 passing doctests, and
+the complete stage-2 cg_clif, standard-library, and proc-macro build pass. This
+is retained: the address-taken group load was the missing larger context that
+turned isolated, runtime-neutral bitcast forwarding into an application win.
+
 ### Rejected backend-specific UB-check inlining
 
 Rust's unsafe-precondition helpers are deliberately `#[rustc_no_mir_inline]`
@@ -1245,6 +1291,11 @@ matched application correctness probes. The rejected same-width stack
 reinterpretation experiment then passed endian-specific filetests, the
 Cranelift codegen unit and doc tests, cg_clif check, another complete stage-2
 cg_clif and standard-library build, and matched application correctness probes.
+The retained nonescaping direct-stack policy then passed the same unit and doc
+tests, its direct-access and branch-argument escape filetests, standalone
+`Iterator::position` and clap reproductions, a complete stage-2 cg_clif,
+standard-library, and proc-macro build, pinned application builds, and the
+matched four-workload 50-run gate.
 The final complete-suite matrix is still pending for the eventual final policy.
 The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
@@ -1369,8 +1420,11 @@ implements the safe nonescaped subset of the older unused-slot and dead-store
 roadmap items. Forwarding same-width, differently typed stores and loads with
 native-endian bitcasts removed four more vector materializations and cut the
 hot hashbrown frame by 64 bytes, but the complete 50-run gate was neutral.
-Further stack work in this loop must target the address-taken group load or
-keep the whole group producer-consumer path in registers rather than another
+Extending the same analysis to nonescaping direct accesses then removes the
+address-taken group round-trip, cuts the frame from 208 to 96 bytes, and
+improves ty by 1.43% without moving the other workloads. Further stack work in
+this loop should keep a still larger producer-consumer region in registers or
+reduce pressure across the indirect equality call rather than add another
 local transmute or rematerialization policy. A matched
 profile before the repeated-call import showed
 hashbrown's `find_or_find_insert_index_inner` and cross-CGU
@@ -1405,9 +1459,12 @@ body and improves ty by 5.79% without moving uv or Ruff. The rejected broad
 piecemeal can add vector-to-lane materialization in surrounding scalarized
 code and significantly regress another application. Removing four exact
 vector-to-scalar stack round-trips after the narrow lowering improved local
-code without moving any application, so the next expansion must keep a larger
-producer-consumer region vector-shaped rather than add another isolated
-conversion. Rematerializing the loop-invariant `i8x8` splat likewise removed
+code without moving any application. Combining it with nonescaping direct
+stack-access forwarding removes the full control-group round-trip and improves
+ty by another 1.43%, demonstrating that conversion removal needs enough
+surrounding context. The next expansion must keep a larger producer-consumer
+region vector-shaped rather than add another isolated conversion.
+Rematerializing the loop-invariant `i8x8` splat likewise removed
 its vector spill but exchanged it for another live scalar register and a
 per-iteration `dup`; Ruff was neutral and ty trended backward. Expand coverage
 by profiled vector shape and operation cluster, and require the complete
