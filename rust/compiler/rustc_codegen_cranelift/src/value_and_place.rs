@@ -344,6 +344,14 @@ impl<'tcx> CValue<'tcx> {
                     .insert(Ieee128::with_bits(u128::from(const_val)).into());
                 fx.bcx.ins().f128const(value)
             }
+            _ if clif_ty == types::I128
+                && matches!(layout.backend_repr, BackendRepr::Scalar(_)) =>
+            {
+                let const_val = const_val.to_bits(layout.size);
+                let lsb = fx.bcx.ins().iconst(types::I64, const_val as u64 as i64);
+                let msb = fx.bcx.ins().iconst(types::I64, (const_val >> 64) as u64 as i64);
+                fx.bcx.ins().iconcat(lsb, msb)
+            }
             _ if clif_ty.is_int() && matches!(layout.backend_repr, BackendRepr::Scalar(_)) => {
                 let raw_val = const_val.size().truncate(const_val.to_bits(layout.size));
                 fx.bcx.ins().iconst(clif_ty, raw_val as i64)

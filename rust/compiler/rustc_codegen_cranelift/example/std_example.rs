@@ -10,7 +10,7 @@ use std::arch::x86_64::*;
 use std::convert::TryFrom;
 use std::hint::black_box;
 use std::io::Write;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroI128, NonZeroUsize};
 use std::ops::Coroutine;
 use std::ptr::NonNull;
 
@@ -91,6 +91,12 @@ fn main() {
     assert!(0i128.checked_div(2i128).is_some());
     assert!(0u128.checked_div(2u128).is_some());
     assert_eq!(1u128 + 2, 3);
+
+    let mut nonzero_i128 = NonZeroI128::new(2).unwrap();
+    unsafe {
+        std::ptr::write_volatile(&mut nonzero_i128, NonZeroI128::new(1).unwrap());
+    }
+    assert_eq!(nonzero_i128.get(), 1);
 
     assert_eq!(0b100010000000000000000000000000000u128 >> 10, 0b10001000000000000000000u128);
     assert_eq!(0xFEDCBA987654321123456789ABCDEFu128 >> 64, 0xFEDCBA98765432u128);
