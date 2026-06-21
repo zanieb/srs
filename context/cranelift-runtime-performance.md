@@ -8,7 +8,7 @@ rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
 The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `1ce2acef4`, with:
+recorded at SRS `131741680`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -32,10 +32,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.0 ms | 54.7 ms | 1.71x |
-| `uv lock --check`, offline | 57.4 ms | 84.0 ms | 1.46x |
-| `ruff check` over 1,592 fixtures | 78.2 ms | 141.3 ms | 1.81x |
-| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 109.0 ms | 2.34x |
+| `uv venv --clear` | 31.0 ms | 53.3 ms | 1.72x |
+| `uv lock --check`, offline | 57.0 ms | 82.8 ms | 1.45x |
+| `ruff check` over 1,592 fixtures | 78.1 ms | 140.8 ms | 1.80x |
+| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 108.3 ms | 2.29x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -47,20 +47,22 @@ these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
 
-Every Cranelift trial was slower than its paired LLVM trial in all four rows
-(0/50 wins per workload; two-sided sign-test `p = 1.78e-15`). Exit codes and
-stdout/stderr digests match between backends for every correctness probe.
+Cranelift lost every paired LLVM trial in three rows and 49/50 uv-lock trials
+(two-sided sign-test `p <= 9.06e-14`). Exit codes and stdout/stderr digests
+match between backends for every correctness probe.
 
 ### Final acceptance gate
 
 The final gate is the complete repository test suite under matched LLVM and
 Cranelift toolchains, not just the four timing operations. The final policy ran
 the matched macOS 3,866-test uv suite, 7,962-test Ruff/ty suite, and complete
-doctest set. The commands, results, and host-environment failures are recorded
-under [Full-Suite Backend Validation](#full-suite-backend-validation). The
-randomized application gate remains the runtime decision boundary because the
-complete suites include compilation, network and filesystem work, fixed
-timeouts, and thousands of short subprocesses.
+doctest set. The selective-LSDA policy then reran the complete Cranelift lane
+against that pinned LLVM control. The commands, results, and host-environment
+failures are recorded under
+[Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
+application gate remains the runtime decision boundary because the complete
+suites include compilation, network and filesystem work, fixed timeouts, and
+thousands of short subprocesses.
 
 ### Binary size
 
@@ -69,15 +71,17 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 141.3 MB | 3.14x |
-| ty | 47.5 MB | 145.5 MB | 3.07x |
-| uv | 100.0 MB | 293.8 MB | 2.94x |
+| Ruff | 45.0 MB | 133.2 MB | 2.96x |
+| ty | 47.5 MB | 136.7 MB | 2.88x |
+| uv | 100.0 MB | 276.9 MB | 2.77x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
-cg_clif unwinding on Apple silicon adds another 20.9% to Ruff, 20.0% to ty,
-and 23.5% to uv relative to the same policy without exception tables. More
-inlining is not a complete answer: output is now roughly three times LLVM's,
+cg_clif unwinding on Apple silicon initially added 20.9% to Ruff, 20.0% to ty,
+and 23.5% to uv relative to the same policy without exception tables.
+Restricting personality and LSDA metadata to catching functions recovers
+5.7-6.1% of the complete binaries without changing machine text. More
+inlining is not a complete answer: output remains roughly three times LLVM's,
 and uv environment creation is still about 70% slower.
 
 ## Changes Implemented
@@ -1244,6 +1248,49 @@ These are prerequisites, not performance wins. The final runtime and size
 numbers use the corrected unwinding-enabled backend; the earlier Apple-silicon
 Cranelift binaries are not valid correctness controls.
 
+### Selective exception metadata
+
+The initial unwinding implementation attached a personality-bearing CIE and
+an LSDA to every function whenever cg_clif's `unwinding` feature was enabled.
+Functions without exception handlers still need ordinary frame descriptions
+so a panic can unwind through them, but they do not need a personality or
+language-specific data area. cg_clif now keeps separate plain and augmented
+CIEs and selects the augmented CIE only when a finalized machine call site has
+an exception handler. LSDA generation follows the same condition.
+
+This changes metadata rather than machine text. The pinned profiling binaries
+shrunk substantially while their `__text` section sizes remained identical:
+
+| Binary | Previous Cranelift | Selective LSDA | Change | Candidate / LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| uv | 293.8 MB | 276.9 MB | -5.76% | 2.77x |
+| Ruff | 141.3 MB | 133.2 MB | -5.72% | 2.96x |
+| ty | 145.5 MB | 136.7 MB | -6.08% | 2.88x |
+
+For example, Ruff's `__gcc_except_tab` falls from 5.66 MB to 3.09 MB,
+`__unwind_info` from 2.99 MB to 1.91 MB, `__eh_frame` from 7.98 MB to
+7.24 MB, and `__LINKEDIT` from 69.73 MB to 66.03 MB. uv's exception table
+falls from 12.52 MB to 7.41 MB, and ty's from 5.54 MB to 2.77 MB.
+
+The complete 50-run runtime gate is neutral, as expected for metadata that is
+not read on the successful benchmark paths:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.66% | 28/50 | 0.47989 |
+| `uv lock --check`, offline | +0.20% | 22/50 | 0.47989 |
+| `ruff check` over 1,592 fixtures | +0.11% | 24/50 | 0.88772 |
+| `ty check` over `scripts/ty_benchmark` | +0.15% | 22/50 | 0.47989 |
+
+Every application correctness probe retains the exact LLVM and preceding
+Cranelift exit code and output digests. A mixed object-level probe contains a
+plain `zR` CIE used by 25 ordinary FDEs and an augmented `zLPR` CIE used by
+only the five handler-bearing FDEs; its panic is still caught. The complete
+stage-2 cg_clif, standard-library, proc-macro, and rustdoc build passes, as does
+uv's exact
+`keyring::tests::fetch_url_no_host` expected-panic regression. The full
+repository-suite rerun is recorded separately below.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -1259,6 +1306,41 @@ This is primarily a coverage and correctness change, but it is required for
 ty to become a usable performance benchmark.
 
 ## Full-Suite Backend Validation
+
+### Selective-LSDA post-change gate
+
+The selective-LSDA backend reran the complete Cranelift application gate from
+fresh target directories at SRS `131741680`. The LLVM source, compiler,
+profile, and application revisions are unchanged, and the compiler change is
+isolated to `rustc_codegen_cranelift`, so the earlier pinned LLVM lane remains
+the control. The operation timings below are useful for detecting gross drift,
+not as generated-code measurements.
+
+| Suite and boundary | LLVM control | Previous Cranelift | Selective LSDA |
+| --- | ---: | ---: | ---: |
+| uv cold build + Nextest | 1,046.07 s | 2,663.75 s | 2,484.31 s |
+| uv Nextest phase | 902.769 s | 2,536.885 s | 2,375.965 s |
+| Ruff/ty cold build + Nextest | 1,435.69 s | 1,417.33 s | 1,384.31 s |
+| Ruff/ty Nextest phase | 1,276.496 s | 1,274.531 s | 1,277.983 s |
+| Ruff/ty post-Nextest doctests | 22.49 s | 25.15 s | 24.65 s |
+
+Ruff/ty is the clean invariant. The selective lane completed all 7,962 tests
+with the exact same failure-name set as both controls: 7,922 passed, 40 failed,
+and 44 skipped. All 40 failures are the known 30-second FSEvents sentinel
+waits. The complete doctest command again passes 194 tests, ignores 12, and
+has no failures across 48 crates.
+
+uv also completed all 3,866 tests without a compiler crash, but the external
+environment had degraded since the pinned control run. It reported 2,932
+passed, 927 failed, seven timed out, and three skipped. All 260 previous
+Cranelift failure or timeout names are present, plus 674 new names dominated
+by blocked package endpoints waiting roughly 40-53 seconds and their resulting
+snapshot differences. Those additions give no evidence of a backend
+regression, but the environmental drift prevents direct attribution. The three
+`uv-auth` expected-panic tests that originally exposed missing Apple-silicon
+unwinding all pass in the complete run. The full uv result is therefore a
+useful no-crash and unwind-correctness gate, but its failure count and wall
+time are not a valid LLVM comparison under the changed network behavior.
 
 ### Final policy
 
@@ -1398,6 +1480,10 @@ The final policy then passed the complete matched application probes and the
 full Ruff/ty doctest set, and ran both full Nextest suites to completion without
 a compiler crash. Its full-suite gate also found and fixed the scalar `i128`
 newtype constant and Apple-silicon unwinding defects described above.
+The subsequent selective-LSDA policy passed a complete stage-2 build, a mixed
+plain/catching object-level unwind probe, uv's exact expected-panic regression,
+fresh pinned application builds, the matched four-workload 50-run gate, all
+three complete application suites, and the complete Ruff/ty doctest set.
 The current cg_clif sysroot
 harness cannot provide additional coverage: its stdlib patch no longer applies
 to this Rust snapshot, and its standalone JIT smoke aborts in rustc query TLS
@@ -1514,8 +1600,8 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
   [regalloc manage callee-saved registers](https://github.com/bytecodealliance/wasmtime/issues/7727);
 - remove [unused stack slots](https://github.com/bytecodealliance/wasmtime/issues/6661)
   and [dead stores](https://github.com/bytecodealliance/wasmtime/issues/4167);
-- emit personalities and LSDA only for functions that need them, then reduce
-  redundant cleanup metadata; and
+- reduce redundant cleanup metadata now that personalities and LSDA are
+  limited to functions with machine exception handlers; and
 - pass or retain stack arguments without unnecessary entry-block loads where
   [possible](https://github.com/bytecodealliance/wasmtime/issues/6301).
 
@@ -1559,13 +1645,15 @@ screen and was rejected. Requiring four static call sites per caller retains
 the hot `Type::hash` transformation, improves every application median, and
 leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
 model is the next call arc, not broader body availability by itself.
-The final unwinding gate makes the size side of this arc urgent. cg_clif's
-current unwind writer intentionally attaches a personality and LSDA broadly;
-enabling it grew the final application binaries by 20-23% and left them about
-three times LLVM's size. Narrowing exception metadata to functions and call
-sites that can actually unwind is a concrete, measurable next step. It needs
-the `catch_unwind` regression and full suite as correctness gates because
-disabling metadata indiscriminately recreates the defect fixed above.
+The final unwinding gate made the size side of this arc urgent. Narrowing
+personality and LSDA emission to functions with machine exception handlers is
+now complete: it cuts 5.7-6.1% from the full profiling binaries, leaves their
+machine text unchanged, and is runtime-neutral in the application gate. The
+plain CIE remains on every unwinding function, while the augmented CIE and
+LSDA are reserved for catching functions. Further unwind-size work should
+profile redundant cleanup call sites and compact-unwind conversion rather
+than risk removing the frame descriptions needed to unwind through ordinary
+functions.
 
 The remaining 1.5-2.3x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
