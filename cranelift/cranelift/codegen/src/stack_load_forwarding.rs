@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 
 use crate::cursor::{Cursor, CursorPosition, FuncCursor};
 use crate::ir::{
-    Block, Endianness, Function, InstBuilder, InstructionData, Opcode, StackSlot, Type, Value,
+    Block, Endianness, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode,
+    StackSlot, Type, Value,
 };
 use crate::{FxHashMap, FxHashSet};
 
@@ -13,6 +14,58 @@ struct StackLoc {
     slot: StackSlot,
     offset: i32,
     ty: Type,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DirectStackAccess {
+    Load {
+        loc: StackLoc,
+        addr: Value,
+    },
+    Store {
+        loc: StackLoc,
+        addr: Value,
+        value: Value,
+    },
+}
+
+fn direct_stack_access(
+    func: &Function,
+    inst: Inst,
+    stack_addrs: &FxHashMap<Value, (StackSlot, i32)>,
+) -> Option<DirectStackAccess> {
+    let (addr, offset, ty, value) = match func.dfg.insts[inst] {
+        InstructionData::Load {
+            opcode: Opcode::Load,
+            arg,
+            offset,
+            ..
+        } => {
+            let result = func.dfg.first_result(inst);
+            (arg, offset, func.dfg.value_type(result), None)
+        }
+        InstructionData::Store {
+            opcode: Opcode::Store,
+            args,
+            offset,
+            ..
+        } => {
+            let stored = func.dfg.resolve_aliases(args[0]);
+            (args[1], offset, func.dfg.value_type(stored), Some(stored))
+        }
+        _ => return None,
+    };
+    let addr = func.dfg.resolve_aliases(addr);
+    let &(slot, base_offset) = stack_addrs.get(&addr)?;
+    let offset = base_offset.checked_add(offset.into())?;
+    let loc = StackLoc { slot, offset, ty };
+    if offset < 0 || loc.end() > i64::from(func.sized_stack_slots[slot].size) {
+        return None;
+    }
+    Some(match value {
+        Some(value) => DirectStackAccess::Store { loc, addr, value },
+        None => DirectStackAccess::Load { loc, addr },
+    })
 }
 
 impl StackLoc {
@@ -27,6 +80,31 @@ impl StackLoc {
     }
 }
 
+fn forward_known_load(
+    cursor: &mut FuncCursor<'_>,
+    inst: Inst,
+    loc: StackLoc,
+    values: &mut FxHashMap<StackLoc, Value>,
+    endianness: Endianness,
+) {
+    let result = cursor.func.dfg.first_result(inst);
+    if loc.ty.bytes() == 0 {
+        return;
+    }
+    let stored = values
+        .get(&loc)
+        .copied()
+        .or_else(|| reinterpret_exact_load(cursor, loc, values, endianness))
+        .or_else(|| assemble_integer_load(cursor, loc, values, endianness));
+    if let Some(stored) = stored {
+        cursor.func.dfg.clear_results(inst);
+        cursor.func.dfg.change_to_alias(result, stored);
+        cursor.remove_inst_and_step_back();
+    } else {
+        values.insert(loc, result);
+    }
+}
+
 /// Forward loads from preceding stores to non-address-taken stack slots.
 ///
 /// Stack-slot operations are legalized to ordinary loads and stores before alias analysis. At
@@ -34,16 +112,42 @@ impl StackLoc {
 /// and can hide an otherwise immediate store-to-load opportunity. Before legalization, distinct
 /// explicit slots and offsets are still available directly in the instruction data.
 pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
-    let mut address_taken = FxHashSet::default();
+    let mut stack_addrs = FxHashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if let InstructionData::StackLoad {
                 opcode: Opcode::StackAddr,
                 stack_slot,
-                ..
+                offset,
             } = func.dfg.insts[inst]
             {
-                address_taken.insert(stack_slot);
+                stack_addrs.insert(func.dfg.first_result(inst), (stack_slot, offset.into()));
+            }
+        }
+    }
+
+    let mut address_taken = FxHashSet::default();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let access = direct_stack_access(func, inst, &stack_addrs);
+            let allowed_address = access.map(|access| match access {
+                DirectStackAccess::Load { addr, .. } | DirectStackAccess::Store { addr, .. } => {
+                    addr
+                }
+            });
+            if let Some(DirectStackAccess::Store { value, .. }) = access
+                && let Some(&(slot, _)) = stack_addrs.get(&value)
+            {
+                address_taken.insert(slot);
+            }
+            for arg in func.dfg.inst_values(inst) {
+                let arg = func.dfg.resolve_aliases(arg);
+                if Some(arg) == allowed_address {
+                    continue;
+                }
+                if let Some(&(slot, _)) = stack_addrs.get(&arg) {
+                    address_taken.insert(slot);
+                }
             }
             if let Some(entries) = func.dfg.user_stack_map_entries(inst) {
                 address_taken.extend(entries.iter().map(|entry| entry.slot));
@@ -78,6 +182,7 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
             .cloned()
             .unwrap_or_default();
         while let Some(inst) = cursor.next_inst() {
+            let direct_access = direct_stack_access(cursor.func, inst, &stack_addrs);
             match cursor.func.dfg.insts[inst] {
                 InstructionData::StackStore {
                     opcode: Opcode::StackStore,
@@ -108,24 +213,25 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
                         offset: offset.into(),
                         ty: cursor.func.dfg.value_type(result),
                     };
-                    if loc.ty.bytes() == 0 {
-                        continue;
-                    }
-                    if let Some(&stored) = values.get(&loc) {
-                        cursor.func.dfg.clear_results(inst);
-                        cursor.func.dfg.change_to_alias(result, stored);
-                        cursor.remove_inst_and_step_back();
-                    } else if let Some(stored) =
-                        assemble_integer_load(&mut cursor, loc, &values, endianness)
-                    {
-                        cursor.func.dfg.clear_results(inst);
-                        cursor.func.dfg.change_to_alias(result, stored);
-                        cursor.remove_inst_and_step_back();
-                    } else {
-                        values.insert(loc, result);
-                    }
+                    forward_known_load(&mut cursor, inst, loc, &mut values, endianness);
                 }
-                _ => {}
+                _ => match direct_access {
+                    Some(DirectStackAccess::Store { loc, value, .. })
+                        if !address_taken.contains(&loc.slot) =>
+                    {
+                        if loc.ty.bytes() == 0 {
+                            continue;
+                        }
+                        values.retain(|known, _| !known.overlaps(loc));
+                        values.insert(loc, value);
+                    }
+                    Some(DirectStackAccess::Load { loc, .. })
+                        if !address_taken.contains(&loc.slot) =>
+                    {
+                        forward_known_load(&mut cursor, inst, loc, &mut values, endianness);
+                    }
+                    _ => {}
+                },
             }
         }
         outgoing_values.insert(block, values);
@@ -142,16 +248,11 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
             } = cursor.func.dfg.insts[inst]
             {
                 observed.insert(stack_slot);
+            } else if let Some(DirectStackAccess::Load { loc, .. }) =
+                direct_stack_access(cursor.func, inst, &stack_addrs)
+            {
+                observed.insert(loc.slot);
             }
-        }
-    }
-
-    // `PrimaryMap` stack-slot indices cannot be removed without renumbering every remaining slot.
-    // An unobserved, unkeyed slot can instead be made empty so it does not reserve stack-frame
-    // space. Keep keyed slots intact because embedders may use their metadata externally.
-    for (slot, data) in cursor.func.sized_stack_slots.iter_mut() {
-        if !observed.contains(&slot) && data.key.is_none() {
-            data.size = 0;
         }
     }
 
@@ -166,9 +267,41 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
                 && !observed.contains(&stack_slot)
             {
                 cursor.remove_inst_and_step_back();
+            } else if let Some(DirectStackAccess::Store { loc, .. }) =
+                direct_stack_access(cursor.func, inst, &stack_addrs)
+                && !observed.contains(&loc.slot)
+            {
+                cursor.remove_inst_and_step_back();
             }
         }
     }
+
+    // `PrimaryMap` stack-slot indices cannot be removed without renumbering every remaining slot.
+    // An unobserved, unkeyed slot can instead be made empty so it does not reserve stack-frame
+    // space. Keep keyed slots intact because embedders may use their metadata externally.
+    for (slot, data) in cursor.func.sized_stack_slots.iter_mut() {
+        if !observed.contains(&slot) && data.key.is_none() {
+            data.size = 0;
+        }
+    }
+}
+
+/// Reinterpret a value already covering exactly the bytes requested by a load.
+fn reinterpret_exact_load(
+    cursor: &mut FuncCursor<'_>,
+    load: StackLoc,
+    values: &FxHashMap<StackLoc, Value>,
+    endianness: Endianness,
+) -> Option<Value> {
+    let stored = values.iter().find_map(|(&loc, &value)| {
+        (loc.slot == load.slot
+            && loc.offset == load.offset
+            && loc.end() == load.end()
+            && loc.ty != load.ty)
+            .then_some(value)
+    })?;
+    let flags = MemFlagsData::new().with_endianness(endianness);
+    Some(cursor.ins().bitcast(load.ty, flags, stored))
 }
 
 /// Assemble a wider integer load from adjacent, completely covering integer values.

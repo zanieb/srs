@@ -33,3 +33,19 @@ block1:
 ; nextln:     v30 = bor v28, v29
 ; nextln:     return v30
 ; nextln: }
+
+function %reinterpreted_stack_load(i8x8) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i8x8):
+  stack_store.i8x8 v0, ss0
+  v1 = stack_load.i64 ss0
+  return v1
+}
+
+; check: function %reinterpreted_stack_load(i8x8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 0
+; check:  block0(v0: i8x8):
+; nextln:     v2 = bitcast.i64 big v0
+; nextln:     return v2
+; nextln: }
