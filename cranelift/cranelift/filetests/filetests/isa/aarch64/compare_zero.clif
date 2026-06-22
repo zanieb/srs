@@ -857,4 +857,3 @@ block0(v0: f32x4):
 ; block0: ; offset 0x0
 ;   fcmlt v0.4s, v0.4s, #0.0
 ;   ret
-

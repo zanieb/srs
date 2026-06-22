@@ -1187,6 +1187,38 @@ was rejected. Native SIMD should therefore expand one profiled shape at a time,
 with surrounding operations moved to vectors before a shape is enabled
 globally.
 
+### Rejected bitcast-zero vector comparisons
+
+A fresh matched LLVM build made the remaining loop gap concrete. LLVM emits no
+standalone `RawTableInner::find_or_find_insert_index_inner` copies in ty; it
+inlines the probe into callers, devirtualizes the equality closure, and keeps
+the group and probe state in registers. Cranelift retains 31 local copies. The
+active 636-byte copy also built a zero `i8x8` through `mov` and `fmov` before
+each of two signed byte comparisons, while LLVM used AArch64's one-instruction
+`cmlt.8b ..., #0` form.
+
+Cranelift already selects the immediate-zero comparison when it can see a
+`splat` or vector constant. Stack reinterpretation forwarding changed these
+particular zeroes into `bitcast.i8x8` values, hiding the same fact from
+lowering. A prototype carried zero recognition through a bitcast. It replaced
+both instruction pairs in the active probe and shrank the body from 636 to 620
+bytes. Across ty, 562 three-register `cmgt` sites became `cmlt ..., #0`.
+
+The initial 20-run ty screen was neutral: -0.67% paired, 12/20 wins, and
+`p = 0.50344`. At 50 runs the direction reversed to a 0.78% regression with
+18/50 wins (`p = 0.06491`). The candidate and baseline medians were 108.08 ms
+and 107.49 ms, while the fresh LLVM control was 48.42 ms; all correctness-probe
+digests matched. Restricting the recognition to `i8x8` did not reduce the blast
+radius: all 562 changed ty sites already had that result type, and the broad
+and narrow candidates had identical machine text.
+
+This is rejected. Re-spelling two comparisons cannot compensate for the
+retained call boundary, vector spills, and loop-state traffic. Further work on
+this probe needs a larger loop or call/register transformation, not another
+isolated compare encoding. The 20- and 50-run evidence is recorded in
+`bench-bitcast-zero-ty20/results.json` and
+`bench-bitcast-zero-ty50/results.json` under the benchmark scratch directory.
+
 ### Rejected same-width stack reinterpretation forwarding
 
 The retained `i8x8` lowering exposed four remaining vector-to-integer
