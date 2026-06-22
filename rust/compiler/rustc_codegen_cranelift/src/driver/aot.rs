@@ -19,9 +19,10 @@ use rustc_data_structures::sync::{IntoDynSyncSend, par_map};
 use rustc_hir::attrs::Linkage as RLinkage;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mono::{CodegenUnit, MonoItem, MonoItemData, Visibility};
+use rustc_middle::mono::{CodegenUnit, InstantiationMode, MonoItem, MonoItemData, Visibility};
 use rustc_session::Session;
 use rustc_session::config::{OutputFilenames, OutputType};
+use rustc_span::Symbol;
 
 use crate::base::CodegenedFunction;
 use crate::concurrency_limiter::{ConcurrencyLimiter, ConcurrencyLimiterToken};
@@ -318,7 +319,13 @@ fn codegen_cgu_content<'tcx>(
     tcx: TyCtxt<'tcx>,
     module: &mut dyn Module,
     cgu_name: rustc_span::Symbol,
-) -> (Option<DebugContext>, Vec<CodegenedFunction>, FxHashMap<FuncId, Instance<'tcx>>, String) {
+) -> (
+    Option<DebugContext>,
+    TypeDebugContext<'tcx>,
+    Vec<CodegenedFunction>,
+    FxHashMap<FuncId, Instance<'tcx>>,
+    String,
+) {
     let _timer = tcx.prof.generic_activity_with_arg("codegen cgu", cgu_name.as_str());
 
     let cgu = tcx.codegen_unit(cgu_name);
@@ -363,7 +370,8 @@ fn codegen_cgu_content<'tcx>(
                 codegened_functions.push(codegened_function);
             }
             MonoItem::Static(def_id) => {
-                let data_id = crate::constant::codegen_static(tcx, module, def_id);
+                let data_id =
+                    crate::constant::codegen_static(tcx, module, def_id, &mut referenced_functions);
                 if let Some(debug_context) = debug_context.as_mut() {
                     debug_context.define_static(tcx, &mut type_dbg, def_id, data_id);
                 }
@@ -376,9 +384,89 @@ fn codegen_cgu_content<'tcx>(
             }
         }
     }
+
+    materialize_referenced_functions(
+        tcx,
+        module,
+        cgu_name,
+        &mut debug_context,
+        &mut type_dbg,
+        &mut codegened_functions,
+        &mut referenced_functions,
+        false,
+    );
     crate::main_shim::maybe_create_entry_wrapper(tcx, module, false, cgu.is_primary());
 
-    (debug_context, codegened_functions, referenced_functions, global_asm)
+    (debug_context, type_dbg, codegened_functions, referenced_functions, global_asm)
+}
+
+/// Define functions that Cranelift leaves referenced without another available definition.
+fn materialize_referenced_functions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    module: &mut dyn Module,
+    cgu_name: Symbol,
+    debug_context: &mut Option<DebugContext>,
+    type_dbg: &mut TypeDebugContext<'tcx>,
+    codegened_functions: &mut Vec<CodegenedFunction>,
+    referenced_functions: &mut FxHashMap<FuncId, Instance<'tcx>>,
+    materialize_post_monomorphization_references: bool,
+) {
+    // Optimized Rust compilation permits LocalCopy instances and conflict-mangled global copies
+    // to be omitted from the CGU on the assumption that the backend will inline every reference.
+    // Cranelift may deliberately retain a call or function address, so materialize their
+    // transitive closure. References introduced by the post-monomorphization inliner are too late
+    // for CGU partitioning, so also materialize available non-external item definitions there.
+    let mut defined_functions = codegened_functions
+        .iter()
+        .map(|function| (function.func_id, ()))
+        .collect::<FxHashMap<_, _>>();
+    loop {
+        let mut pending = referenced_functions
+            .iter()
+            .filter_map(|(&func_id, &instance)| {
+                let can_materialize_post_monomorphization_reference =
+                    materialize_post_monomorphization_references
+                        && matches!(instance.def, InstanceKind::Item(_))
+                        && tcx.is_mir_available(instance.def_id())
+                        && {
+                            let attrs = tcx.codegen_instance_attrs(instance.def);
+                            !attrs.contains_extern_indicator()
+                                && !attrs.flags.contains(CodegenFnAttrFlags::NAKED)
+                        };
+                (!defined_functions.contains_key(&func_id)
+                    && (can_materialize_post_monomorphization_reference
+                        || matches!(
+                            MonoItem::Fn(instance).instantiation_mode(tcx),
+                            InstantiationMode::LocalCopy
+                                | InstantiationMode::GloballyShared { may_conflict: true }
+                        )))
+                .then_some((func_id, instance))
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
+        if pending.is_empty() {
+            break;
+        }
+
+        for (func_id, instance) in pending {
+            defined_functions.insert(func_id, ());
+            let name = instance_symbol_name_for_object(tcx, instance);
+            let sig = get_function_sig(tcx, module.target_config().default_call_conv, instance);
+            let declared_func_id =
+                module.declare_function(&name, Linkage::HiddenWeak, &sig).unwrap();
+            debug_assert_eq!(declared_func_id, func_id);
+            codegened_functions.push(crate::base::codegen_fn(
+                tcx,
+                cgu_name,
+                debug_context.as_mut(),
+                type_dbg,
+                Function::new(),
+                module,
+                instance,
+                referenced_functions,
+            ));
+        }
+    }
 }
 
 fn module_codegen(
@@ -389,12 +477,17 @@ fn module_codegen(
 ) -> OngoingModuleCodegen {
     let mut module = make_module(tcx.sess, cgu_name.as_str().to_string());
 
-    let (mut debug_context, mut codegened_functions, referenced_functions, mut global_asm) =
-        codegen_cgu_content(tcx, &mut module, cgu_name);
+    let (
+        mut debug_context,
+        mut type_dbg,
+        mut codegened_functions,
+        referenced_functions,
+        mut global_asm,
+    ) = codegen_cgu_content(tcx, &mut module, cgu_name);
 
     let mut inline_catalog_module =
         make_module(tcx.sess, format!("{}.inline-catalog", cgu_name.as_str()));
-    let post_monomorphization_candidates =
+    let (post_monomorphization_candidates, mut post_monomorphization_references) =
         match crate::base::codegen_post_monomorphization_inline_candidates(
             tcx,
             cgu_name,
@@ -417,6 +510,16 @@ fn module_codegen(
     }) {
         tcx.dcx().fatal(format!("failed to inline Cranelift functions: {err}"));
     }
+    materialize_referenced_functions(
+        tcx,
+        &mut module,
+        cgu_name,
+        &mut debug_context,
+        &mut type_dbg,
+        &mut codegened_functions,
+        &mut post_monomorphization_references,
+        true,
+    );
 
     let cgu_name = cgu_name.as_str().to_owned();
 

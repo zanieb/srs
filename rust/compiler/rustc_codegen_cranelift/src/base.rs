@@ -30,7 +30,7 @@ use crate::{codegen_f16_f128, enable_verifier};
 
 pub(crate) struct CodegenedFunction {
     symbol_name: String,
-    func_id: FuncId,
+    pub(crate) func_id: FuncId,
     func: Function,
     clif_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
@@ -172,7 +172,8 @@ fn codegen_fn_with_id<'tcx>(
     let inline_asm = fx.inline_asm;
 
     if existing_func_id.is_none() {
-        fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+        let constant_references = fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+        fx.referenced_functions.extend(constant_references);
     }
 
     if existing_func_id.is_none() && crate::pretty_clif::should_write_ir(tcx.sess) {
@@ -211,7 +212,7 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
     module: &mut dyn Module,
     catalog_module: &mut dyn Module,
     referenced_functions: FxHashMap<FuncId, Instance<'tcx>>,
-) -> Result<Vec<CodegenedFunction>, CodegenError> {
+) -> Result<(Vec<CodegenedFunction>, FxHashMap<FuncId, Instance<'tcx>>), CodegenError> {
     const MAX_INLINE_MIR_OPERATIONS: usize = 64;
     const MAX_INLINE_MIR_BLOCKS: usize = 6;
     const MAX_IMPORT_DEPTH: usize = 1;
@@ -314,6 +315,7 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
     inline_small_functions(catalog_module, &[], &mut translated)?;
 
     let mut candidates = Vec::new();
+    let mut module_references = FxHashMap::default();
     for mut candidate in translated {
         let Some(&func_id) = roots.get(&candidate.func_id.as_u32()) else {
             continue;
@@ -331,7 +333,11 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
                 let remapped = (name.namespace == 0)
                     .then(|| instances.get(&name.index))
                     .flatten()
-                    .map(|&instance| import_function(tcx, module, instance).as_u32());
+                    .map(|&instance| {
+                        let func_id = import_function(tcx, module, instance);
+                        module_references.entry(func_id).or_insert(instance);
+                        func_id.as_u32()
+                    });
                 (name_ref, name.namespace, remapped)
             })
             .collect::<Vec<_>>();
@@ -349,7 +355,7 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         candidate.func.name = UserFuncName::user(0, func_id.as_u32());
         candidates.push(candidate);
     }
-    Ok(candidates)
+    Ok((candidates, module_references))
 }
 
 pub(crate) fn inline_small_functions(
