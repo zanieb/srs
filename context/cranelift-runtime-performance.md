@@ -33,10 +33,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.5 ms | 54.9 ms | 1.64x |
-| `uv lock --check`, offline | 60.5 ms | 85.3 ms | 1.41x |
-| `ruff check` over 1,592 fixtures | 80.6 ms | 142.1 ms | 1.76x |
-| `ty check` over `scripts/ty_benchmark` | 48.0 ms | 109.9 ms | 2.29x |
+| `uv venv --clear` | 34.0 ms | 55.6 ms | 1.64x |
+| `uv lock --check`, offline | 62.2 ms | 88.3 ms | 1.42x |
+| `ruff check` over 1,592 fixtures | 83.7 ms | 144.6 ms | 1.73x |
+| `ty check` over `scripts/ty_benchmark` | 48.4 ms | 109.0 ms | 2.25x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -55,15 +55,16 @@ for every correctness probe.
 ### Final acceptance gate
 
 The final gate is the complete repository test suite under matched LLVM and
-Cranelift toolchains, not just the four timing operations. The final policy ran
-the matched macOS 3,866-test uv suite, 7,962-test Ruff/ty suite, and complete
-doctest set. The selective-LSDA policy then reran the complete Cranelift lane
-against that pinned LLVM control. The commands, results, and host-environment
-failures are recorded under
+Cranelift toolchains, not just the four timing operations. The earlier
+finalization policy ran the matched macOS 3,866-test uv suite, 7,962-test
+Ruff/ty suite, and complete doctest set. The selective-LSDA policy then reran
+the complete Cranelift lane against that pinned LLVM control. The commands,
+results, and host-environment failures are recorded under
 [Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
 application gate remains the runtime decision boundary because the complete
 suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses.
+thousands of short subprocesses. The retained readonly/DSE policy still needs
+that complete matched suite rerun before it can be called the final policy.
 
 ### Binary size
 
@@ -83,7 +84,7 @@ and 23.5% to uv relative to the same policy without exception tables.
 Restricting personality and LSDA metadata to catching functions recovers
 5.7-6.1% of the complete binaries without changing machine text. More
 inlining is not a complete answer: output remains roughly three times LLVM's,
-and uv environment creation is still about 70% slower.
+and uv environment creation is still about 60% slower.
 
 ## Changes Implemented
 
@@ -1384,6 +1385,52 @@ The complete stage-2 backend, standard-library, and proc-macro build, all 186
 filetests pass. This is retained as a broadly useful dead-code and code-size
 improvement with one demonstrated application-runtime win.
 
+### Local dead-store elimination across readonly loads
+
+Cranelift's alias analysis documented dead-store elimination as future work,
+but the general transform is constrained by trapping stores and by loads that
+may observe the overwritten state. A retained local subset now removes an
+earlier ordinary store only when a later nontrapping store in the same block
+has the exact same SSA address, offset, and type. Any ordinary load, other
+store, call, trap, fence, or opaque side effect ends the proof. A nontrapping
+`readonly` load may remain between the stores because its memory cannot alias
+the write and it cannot expose the earlier state by trapping.
+
+cg_clif supplies the missing Rust alias fact conservatively. Direct shared
+function arguments whose pointee is `Freeze` already receive `ReadOnly` and
+`NoAlias` ABI attributes under the LLVM backend. cg_clif now preserves the
+same fact on the direct dereference and its derived field/index pointers, so
+their loads carry Cranelift's `readonly` flag. Copies of the reference, raw
+pointers, mutable references, non-`Freeze` pointees, and indirect ABI shapes
+remain unqualified.
+
+The complete 50-run matched gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -2.41% | 33/50 | 0.03284 | +62.4% | -0.004% |
+| `uv lock --check`, offline | -1.57% | 33/50 | 0.03284 | +41.2% | -0.004% |
+| `ruff check` over 1,592 fixtures | -0.30% | 27/50 | 0.67181 | +76.0% | -0.019% |
+| `ty check` over `scripts/ty_benchmark` | -0.86% | 32/50 | 0.06491 | +125.9% | -0.017% |
+
+Both uv workloads improve decisively, Ruff remains neutral, ty trends toward
+an improvement, and all application exit codes and output digests match. The
+binaries shrink by 10,384 bytes for uv, 25,104 bytes for Ruff, and 23,232
+bytes for ty.
+
+The profiled `Type::hash` body identifies the boundary of this subset. Its
+shared `Type` loads are now correctly `readonly`, but every imported hash
+update is separated from the next by a real branch with a return or trap path.
+Following unconditional jump scaffolding across blocks therefore removes none
+of its 102 stores and was rejected. Collapsing that body toward LLVM's 664-byte
+shape needs store sinking or memory-SSA promotion that carries the hasher
+state through branches and materializes it at observers, not a broader local
+dead-store rule.
+
+The focused barrier filetest, all 1,218 Cranelift filetests, all 186
+`cranelift-codegen` unit tests, 21 passing doctests, a complete cg_clif check,
+and the full stage-2 backend, standard-library, and proc-macro build pass.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
@@ -1763,6 +1810,17 @@ growing Ruff by 14,320 bytes and ty by 11,136 bytes. The experiment therefore
 stopped before a runtime gate: the tiny source dependency did not make the
 root an eligible call-free import, and admitting more unhinted dependencies
 would recreate the rejected broad-availability policy.
+Aggregating the repeated-call signal across the whole codegen unit was also
+rejected. Allowing an otherwise eligible imported body after eight direct
+calls across all callers removed another 570 direct calls from ty and shrank
+Ruff and ty by 32,544 and 56,416 bytes, respectively, but did not remove the
+profiled `BuildHasherDefault<FxHasher>::build_hasher` boundary. In a 20-run
+application screen, the candidate was neutral on ty (+0.20% paired median,
+9/20 wins) while Ruff moved backward (+3.82%, 8/20 wins). This leaves the
+per-caller repeated-call signal intact; a useful extension needs to price the
+specific call boundary instead of treating aggregate popularity as
+profitability.
+
 The final unwinding gate made the size side of this arc urgent. Narrowing
 personality and LSDA emission to functions with machine exception handlers is
 now complete: it cuts 5.7-6.1% from the full profiling binaries, leaves their

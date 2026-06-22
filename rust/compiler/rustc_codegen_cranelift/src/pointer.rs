@@ -11,6 +11,7 @@ use crate::prelude::*;
 pub(crate) struct Pointer {
     base: PointerBase,
     offset: Offset32,
+    readonly: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -22,15 +23,20 @@ pub(crate) enum PointerBase {
 
 impl Pointer {
     pub(crate) fn new(addr: Value) -> Self {
-        Pointer { base: PointerBase::Addr(addr), offset: Offset32::new(0) }
+        Pointer { base: PointerBase::Addr(addr), offset: Offset32::new(0), readonly: false }
+    }
+
+    /// Create a pointer whose loads access memory immutable for this function invocation.
+    pub(crate) fn new_readonly(addr: Value) -> Self {
+        Pointer { base: PointerBase::Addr(addr), offset: Offset32::new(0), readonly: true }
     }
 
     pub(crate) fn stack_slot(stack_slot: StackSlot) -> Self {
-        Pointer { base: PointerBase::Stack(stack_slot), offset: Offset32::new(0) }
+        Pointer { base: PointerBase::Stack(stack_slot), offset: Offset32::new(0), readonly: false }
     }
 
     pub(crate) fn dangling(align: Align) -> Self {
-        Pointer { base: PointerBase::Dangling(align), offset: Offset32::new(0) }
+        Pointer { base: PointerBase::Dangling(align), offset: Offset32::new(0), readonly: false }
     }
 
     pub(crate) fn debug_base_and_offset(self) -> (PointerBase, Offset32) {
@@ -58,7 +64,7 @@ impl Pointer {
 
     pub(crate) fn offset_i64(self, fx: &mut FunctionCx<'_, '_, '_>, extra_offset: i64) -> Self {
         if let Some(new_offset) = self.offset.try_add_i64(extra_offset) {
-            Pointer { base: self.base, offset: new_offset }
+            Pointer { base: self.base, offset: new_offset, readonly: self.readonly }
         } else {
             let base_offset: i64 = self.offset.into();
             if let Some(new_offset) = base_offset.checked_add(extra_offset) {
@@ -72,7 +78,11 @@ impl Pointer {
                     }
                 };
                 let addr = fx.bcx.ins().iadd_imm(base_addr, new_offset);
-                Pointer { base: PointerBase::Addr(addr), offset: Offset32::new(0) }
+                Pointer {
+                    base: PointerBase::Addr(addr),
+                    offset: Offset32::new(0),
+                    readonly: self.readonly,
+                }
             } else {
                 panic!(
                     "self.offset ({}) + extra_offset ({}) not representable in i64",
@@ -87,12 +97,14 @@ impl Pointer {
             PointerBase::Addr(addr) => Pointer {
                 base: PointerBase::Addr(fx.bcx.ins().iadd(addr, extra_offset)),
                 offset: self.offset,
+                readonly: self.readonly,
             },
             PointerBase::Stack(stack_slot) => {
                 let base_addr = fx.bcx.ins().stack_addr(fx.pointer_type, stack_slot, self.offset);
                 Pointer {
                     base: PointerBase::Addr(fx.bcx.ins().iadd(base_addr, extra_offset)),
                     offset: Offset32::new(0),
+                    readonly: self.readonly,
                 }
             }
             PointerBase::Dangling(align) => {
@@ -101,12 +113,21 @@ impl Pointer {
                 Pointer {
                     base: PointerBase::Addr(fx.bcx.ins().iadd(addr, extra_offset)),
                     offset: self.offset,
+                    readonly: self.readonly,
                 }
             }
         }
     }
 
-    pub(crate) fn load(self, fx: &mut FunctionCx<'_, '_, '_>, ty: Type, flags: MemFlags) -> Value {
+    pub(crate) fn load(
+        self,
+        fx: &mut FunctionCx<'_, '_, '_>,
+        ty: Type,
+        mut flags: MemFlags,
+    ) -> Value {
+        if self.readonly {
+            flags.set_readonly();
+        }
         match self.base {
             PointerBase::Addr(base_addr) => fx.bcx.ins().load(ty, flags, base_addr, self.offset),
             PointerBase::Stack(stack_slot) => fx.bcx.ins().stack_load(ty, stack_slot, self.offset),

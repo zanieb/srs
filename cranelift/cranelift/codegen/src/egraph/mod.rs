@@ -756,6 +756,9 @@ impl<'a> EgraphPass<'a> {
 
         self.elaborate();
 
+        // Elaboration leaves side-effecting stores in program order, ready for local DSE.
+        crate::alias_analysis::eliminate_local_dead_stores(self.func);
+
         log::trace!("stats: {:#?}", self.stats);
     }
 

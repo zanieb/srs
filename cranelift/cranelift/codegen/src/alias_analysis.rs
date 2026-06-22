@@ -71,6 +71,7 @@ use crate::{
     ir::{AliasRegion, Block, Function, Inst, Opcode, Type, Value, immediates::Offset32},
     trace,
 };
+use alloc::vec::Vec;
 use cranelift_entity::{EntityRef, packed_option::PackedOption};
 
 /// For a given program point, the vector of last-store instruction
@@ -440,5 +441,78 @@ fn get_ext_opcode(op: Opcode) -> Option<Opcode> {
     match op {
         Opcode::Load | Opcode::Store => None,
         _ => Some(op),
+    }
+}
+
+/// Eliminate overwritten nontrapping stores within a basic block.
+///
+/// This deliberately keeps a single candidate and stops at any memory operation that could
+/// observe or alias it. Nontrapping readonly loads are the exception: their memory cannot be
+/// changed by the candidate store, and they cannot expose the removed state by trapping. Keeping
+/// this local and requiring an exact address, offset, and type match avoids needing a broader
+/// must-alias analysis.
+pub(crate) fn eliminate_local_dead_stores(func: &mut Function) {
+    let blocks: Vec<_> = func.layout.blocks().collect();
+    let mut dead = vec![];
+
+    for block in blocks {
+        let insts: Vec<_> = func.layout.block_insts(block).collect();
+        let mut later_store: Option<(Value, Offset32, Type, Inst)> = None;
+
+        for inst in insts.into_iter().rev() {
+            let opcode = func.dfg.insts[inst].opcode();
+
+            if opcode == Opcode::Store {
+                let Some(flags) = func.dfg.insts[inst].memflags() else {
+                    later_store = None;
+                    continue;
+                };
+                if !flags.notrap() {
+                    later_store = None;
+                    continue;
+                }
+
+                let Some((address, offset, ty)) = inst_addr_offset_type(func, inst) else {
+                    later_store = None;
+                    continue;
+                };
+                let address = func.dfg.resolve_aliases(address);
+                let key = (address, offset, ty);
+
+                if later_store.is_some_and(|(later_address, later_offset, later_ty, _)| {
+                    key == (later_address, later_offset, later_ty)
+                }) {
+                    trace!(
+                        "alias analysis: removing dead store inst{} overwritten by inst{}",
+                        inst.index(),
+                        later_store.unwrap().3.index()
+                    );
+                    dead.push(inst);
+                } else {
+                    later_store = Some((address, offset, ty, inst));
+                }
+                continue;
+            }
+
+            if opcode.can_load()
+                && func.dfg.insts[inst]
+                    .memflags()
+                    .is_some_and(|flags| flags.readonly() && flags.notrap())
+            {
+                continue;
+            }
+
+            if opcode.can_load()
+                || opcode.can_store()
+                || has_memory_fence_semantics(opcode)
+                || opcode.other_side_effects()
+            {
+                later_store = None;
+            }
+        }
+    }
+
+    for inst in dead {
+        func.layout.remove_inst(inst);
     }
 }

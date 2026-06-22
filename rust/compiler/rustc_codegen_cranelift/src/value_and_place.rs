@@ -848,11 +848,25 @@ impl<'tcx> CPlace<'tcx> {
 
     pub(crate) fn place_deref(self, fx: &mut FunctionCx<'_, '_, 'tcx>) -> CPlace<'tcx> {
         let inner_layout = fx.layout_of(self.layout().ty.builtin_deref(true).unwrap());
+        // A direct shared argument whose pointee is `Freeze` is protected for the duration of
+        // the call. Preserve that fact on its direct dereference so Cranelift can distinguish
+        // these reads from writes through other reference arguments.
+        let readonly = matches!(
+            self.inner,
+            CPlaceInner::Var(local, _) | CPlaceInner::VarPair(local, _, _)
+                if (1..=fx.mir.arg_count).contains(&local.index())
+        ) && matches!(
+            self.layout().ty.kind(),
+            ty::Ref(_, pointee, Mutability::Not) if pointee.is_freeze(fx.tcx, fx.typing_env())
+        );
+        let pointer = |addr| {
+            if readonly { Pointer::new_readonly(addr) } else { Pointer::new(addr) }
+        };
         if fx.tcx.type_has_metadata(inner_layout.ty, ty::TypingEnv::fully_monomorphized()) {
             let (addr, extra) = self.to_cvalue(fx).load_scalar_pair(fx);
-            CPlace::for_ptr_with_extra(Pointer::new(addr), extra, inner_layout)
+            CPlace::for_ptr_with_extra(pointer(addr), extra, inner_layout)
         } else {
-            CPlace::for_ptr(Pointer::new(self.to_cvalue(fx).load_scalar(fx)), inner_layout)
+            CPlace::for_ptr(pointer(self.to_cvalue(fx).load_scalar(fx)), inner_layout)
         }
     }
 
