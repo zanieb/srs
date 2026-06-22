@@ -1552,6 +1552,33 @@ they are not the measured runtime bottleneck. Further `Type::hash` work should
 reduce dynamic hasher stores, branches, or observer traffic rather than share
 another literal.
 
+### Rejected one-off tail-wrapper import
+
+The same retained profile put `Type::eq` among the hottest Rust leaves. Its
+dominant nominal-instance arm calls a 24-byte
+`NominalInstanceType::eq` wrapper whose only work is to call
+`NominalInstanceInner::eq`, normalize the boolean result, and return. A
+bounded post-monomorphization experiment tried to import one-off wrappers with
+exactly one direct call and otherwise only `nop`, jump, and return
+instructions. It deliberately left the real callee out of line.
+
+The first two-block post-translation gate admitted nothing because cg_clif's
+synthetic entry and MIR blocks make even this wrapper three CLIF blocks.
+Allowing the existing composed-block ceiling reached the intended wrappers,
+but the stage-2 compiler build then failed while linking libc's build script:
+the imported wrapper referenced a local cross-CGU
+`SpecToString::spec_to_string` symbol that was declared but not materialized
+in the caller CGU. The candidate stopped before application builds or timing.
+
+This validates the call-free invariant on imported catalogue bodies. A local
+callee cannot safely survive cross-CGU composition merely because the wrapper
+is trivial. Cranelift's existing `return_call` is not a drop-in alternative:
+it requires the special `tail` calling convention, while cg_clif emits Rust's
+system ABI and explicitly does not support Rust tail calls. Removing this
+boundary requires a proven system-ABI sibling-call subset, or a complete
+availability and emission model for the transitive callee; relaxing the
+one-off import structure is rejected.
+
 The focused barrier filetest, all 1,218 Cranelift filetests, all 186
 `cranelift-codegen` unit tests, 21 passing doctests, a complete cg_clif check,
 and the full stage-2 backend, standard-library, and proc-macro build pass.
