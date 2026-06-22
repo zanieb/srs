@@ -5,9 +5,10 @@ use std::collections::VecDeque;
 
 use cranelift_codegen::CodegenError;
 use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir::UserFuncName;
-use cranelift_codegen::ir::{ExternalName, Opcode, UserExternalName};
+use cranelift_codegen::ir::{ExternalName, InstructionData, Opcode, UserExternalName, ValueDef};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
@@ -36,6 +37,7 @@ pub(crate) struct CodegenedFunction {
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
     inline_hint: bool,
+    guarded_import_candidate: bool,
 }
 
 const MAX_INLINE_INSTRUCTIONS: usize = 32;
@@ -43,6 +45,10 @@ const MAX_INLINE_BLOCKS: usize = 3;
 const MAX_COMPOSED_INLINE_BLOCKS: usize = 2 * MAX_INLINE_BLOCKS;
 const MAX_TRIVIAL_IMPORT_MIR_OPERATIONS: usize = 4;
 const MAX_TRIVIAL_IMPORT_MIR_BLOCKS: usize = 2;
+const MAX_GUARDED_IMPORT_MIR_OPERATIONS: usize = 96;
+const MAX_GUARDED_IMPORT_MIR_BLOCKS: usize = 10;
+const MAX_GUARDED_IMPORT_INSTRUCTIONS: usize = 64;
+const MAX_GUARDED_IMPORT_BLOCKS: usize = 10;
 // Repeated direct call sites provide a static profitability signal and avoid importing tiny
 // bodies across every one-off call boundary in the codegen unit.
 const MIN_REPEATED_IMPORT_CALLS: usize = 4;
@@ -203,6 +209,7 @@ fn codegen_fn_with_id<'tcx>(
         func_debug_cx,
         inline_asm,
         inline_hint,
+        guarded_import_candidate: false,
     }
 }
 
@@ -217,11 +224,11 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
     const MAX_INLINE_MIR_BLOCKS: usize = 6;
     const MAX_IMPORT_DEPTH: usize = 1;
 
-    let is_source_candidate = |instance: Instance<'tcx>| {
+    let source_candidate_kind = |instance: Instance<'tcx>| {
         if !matches!(instance.def, InstanceKind::Item(_))
             || !tcx.is_mir_available(instance.def_id())
         {
-            return false;
+            return (false, false);
         }
         let attrs = tcx.codegen_instance_attrs(instance.def);
         let inline_hint = matches!(
@@ -234,7 +241,7 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
                 .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED)
             || !attrs.target_features.is_empty()
         {
-            return false;
+            return (false, false);
         }
         let mir = tcx.instance_mir(instance.def);
         // Hinted imports retain the wider existing limits. Only translate an unhinted root when
@@ -242,24 +249,39 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         let blocks = mir.basic_blocks.len();
         let operations =
             mir.basic_blocks.iter().map(|block| block.statements.len() + 1).sum::<usize>();
-        (inline_hint && blocks <= MAX_INLINE_MIR_BLOCKS && operations <= MAX_INLINE_MIR_OPERATIONS)
+        let ordinary = (inline_hint
+            && blocks <= MAX_INLINE_MIR_BLOCKS
+            && operations <= MAX_INLINE_MIR_OPERATIONS)
             || (!inline_hint
                 && blocks <= MAX_TRIVIAL_IMPORT_MIR_BLOCKS
-                && operations <= MAX_TRIVIAL_IMPORT_MIR_OPERATIONS)
+                && operations <= MAX_TRIVIAL_IMPORT_MIR_OPERATIONS);
+        let guarded = inline_hint
+            && blocks <= MAX_GUARDED_IMPORT_MIR_BLOCKS
+            && operations <= MAX_GUARDED_IMPORT_MIR_OPERATIONS;
+        (ordinary, guarded)
     };
 
     let mut referenced_functions = referenced_functions.into_iter().collect::<Vec<_>>();
     referenced_functions.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
 
     let mut roots = FxHashMap::default();
+    let mut ordinary_roots = FxHashMap::default();
+    let mut guarded_roots = FxHashMap::default();
     let mut instances = FxHashMap::default();
     let mut pending = VecDeque::new();
     for (func_id, instance) in referenced_functions {
-        if !is_source_candidate(instance) {
+        let (ordinary, guarded) = source_candidate_kind(instance);
+        if !ordinary && !guarded {
             continue;
         }
         let catalog_func_id = import_function(tcx, catalog_module, instance);
         roots.insert(catalog_func_id.as_u32(), func_id);
+        if ordinary {
+            ordinary_roots.insert(catalog_func_id.as_u32(), ());
+        }
+        if guarded {
+            guarded_roots.insert(catalog_func_id.as_u32(), ());
+        }
         instances.insert(catalog_func_id.as_u32(), instance);
         pending.push_back((catalog_func_id, instance, 0));
     }
@@ -288,9 +310,16 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         candidate_references.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
         for (referenced_func_id, referenced_instance) in candidate_references {
             instances.entry(referenced_func_id.as_u32()).or_insert(referenced_instance);
-            if depth < MAX_IMPORT_DEPTH && is_source_candidate(referenced_instance) {
+            if depth < MAX_IMPORT_DEPTH && source_candidate_kind(referenced_instance).0 {
                 pending.push_back((referenced_func_id, referenced_instance, depth + 1));
             }
+        }
+    }
+
+    for function in &mut translated {
+        if guarded_roots.contains_key(&function.func_id.as_u32()) {
+            function.guarded_import_candidate =
+                prepare_guarded_import_candidate(catalog_module, function);
         }
     }
 
@@ -320,16 +349,35 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         let Some(&func_id) = roots.get(&candidate.func_id.as_u32()) else {
             continue;
         };
-        if !is_composed_inline_candidate(&candidate) && !is_trivial_import_candidate(&candidate) {
+        let ordinary_candidate = ordinary_roots.contains_key(&candidate.func_id.as_u32())
+            && (is_composed_inline_candidate(&candidate)
+                || is_trivial_import_candidate(&candidate));
+        if !ordinary_candidate && !is_guarded_import_candidate(&candidate) {
             continue;
         }
 
-        let name_updates = candidate
-            .func
-            .params
-            .user_named_funcs()
-            .iter()
-            .map(|(name_ref, name)| {
+        let mut referenced_name_refs = Vec::new();
+        for block in candidate.func.layout.blocks() {
+            for inst in candidate.func.layout.block_insts(block) {
+                let func_ref = match candidate.func.dfg.insts[inst] {
+                    InstructionData::Call { func_ref, .. }
+                    | InstructionData::TryCall { func_ref, .. }
+                    | InstructionData::FuncAddr { func_ref, .. } => func_ref,
+                    _ => continue,
+                };
+                let ExternalName::User(name_ref) = candidate.func.dfg.ext_funcs[func_ref].name
+                else {
+                    continue;
+                };
+                if !referenced_name_refs.contains(&name_ref) {
+                    referenced_name_refs.push(name_ref);
+                }
+            }
+        }
+        let name_updates = referenced_name_refs
+            .into_iter()
+            .map(|name_ref| {
+                let name = &candidate.func.params.user_named_funcs()[name_ref];
                 let remapped = (name.namespace == 0)
                     .then(|| instances.get(&name.index))
                     .flatten()
@@ -367,8 +415,9 @@ pub(crate) fn inline_small_functions(
     // become direct calls after cg_clif has translated them. Inline a conservative subset here
     // to expose those calls to Cranelift's scalar optimizations without unbounded code growth.
     //
-    // Keep this to call-free functions without stack slots or global values. Broader bodies have
-    // not yet proved safe under cg_clif's unwind, debug-info, and object-generation integration.
+    // Keep ordinary candidates call-free and without stack slots or global values. Guarded
+    // imports are the one exception: their pure hot body calls back to the canonical helper on
+    // the original cold failure edge, so panic formatting and globals are never cloned.
     let mut callees = FxHashMap::default();
     for function in functions.iter() {
         if !is_small_inline_candidate(function) {
@@ -382,10 +431,14 @@ pub(crate) fn inline_small_functions(
     }
     let mut imported_callees = FxHashMap::default();
     let mut trivial_imports = FxHashMap::default();
+    let mut guarded_imports = FxHashMap::default();
     for function in post_monomorphization_candidates {
         let func_id = function.func_id.as_u32();
         let trivial = is_trivial_import_candidate(function);
-        if callees.contains_key(&func_id) || (!is_composed_inline_candidate(function) && !trivial) {
+        let guarded = is_guarded_import_candidate(function);
+        if callees.contains_key(&func_id)
+            || (!is_composed_inline_candidate(function) && !trivial && !guarded)
+        {
             continue;
         }
 
@@ -397,12 +450,16 @@ pub(crate) fn inline_small_functions(
         if trivial {
             trivial_imports.insert(func_id, ());
         }
+        if guarded {
+            guarded_imports.insert(func_id, ());
+        }
     }
 
     struct SmallFunctionInliner<'a> {
         callees: &'a FxHashMap<u32, Function>,
         imported_callees: &'a FxHashMap<u32, ()>,
         trivial_imports: &'a FxHashMap<u32, ()>,
+        guarded_imports: &'a FxHashMap<u32, ()>,
         allowed_imports: &'a FxHashMap<u32, ()>,
     }
 
@@ -413,12 +470,28 @@ pub(crate) fn inline_small_functions(
             _call_inst: Inst,
             _call_opcode: Opcode,
             callee: FuncRef,
-            _call_args: &[Value],
+            call_args: &[Value],
         ) -> InlineCommand<'_> {
             let ExternalName::User(callee_name) = caller.dfg.ext_funcs[callee].name else {
                 return InlineCommand::KeepCall;
             };
             let callee_name = &caller.params.user_named_funcs()[callee_name];
+            let guarded_specialization = self.guarded_imports.contains_key(&callee_name.index)
+                && call_args
+                    .iter()
+                    .filter(|&&arg| {
+                        matches!(
+                            caller.dfg.value_def(arg),
+                            ValueDef::Result(inst, 0)
+                                if matches!(
+                                    caller.dfg.insts[inst],
+                                    InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }
+                                )
+                        )
+                    })
+                    .take(2)
+                    .count()
+                    == 2;
             if callee_name.namespace != 0
                 || caller.name.get_user().is_some_and(|caller_name| {
                     caller_name.namespace == callee_name.namespace
@@ -426,7 +499,8 @@ pub(crate) fn inline_small_functions(
                 })
                 || (self.imported_callees.contains_key(&callee_name.index)
                     && !self.trivial_imports.contains_key(&callee_name.index)
-                    && !self.allowed_imports.contains_key(&callee_name.index))
+                    && !self.allowed_imports.contains_key(&callee_name.index)
+                    && !guarded_specialization)
             {
                 return InlineCommand::KeepCall;
             }
@@ -473,6 +547,7 @@ pub(crate) fn inline_small_functions(
             callees: &callees,
             imported_callees: &imported_callees,
             trivial_imports: &trivial_imports,
+            guarded_imports: &guarded_imports,
             allowed_imports: &allowed_imports,
         })?;
         function.func = context.func;
@@ -505,6 +580,99 @@ fn is_trivial_import_candidate(function: &CodegenedFunction) -> bool {
             })
             .count()
             <= 1
+}
+
+/// Replace an imported helper's cold failure body with a call to the canonical helper.
+///
+/// Helpers such as those marked `#[rustc_no_mir_inline]` keep optional UB checks out of MIR
+/// inlining so LLVM can specialize them after monomorphization. Cloning only the pure guard into
+/// constant-heavy call sites gives Cranelift the same opportunity without duplicating panic
+/// formatting or globals.
+fn prepare_guarded_import_candidate(
+    module: &mut dyn Module,
+    function: &mut CodegenedFunction,
+) -> bool {
+    if !function.func.signature.returns.is_empty()
+        || function.func.layout.blocks().count() > MAX_GUARDED_IMPORT_BLOCKS
+        || function.func.dfg.num_insts() > MAX_GUARDED_IMPORT_INSTRUCTIONS
+    {
+        return false;
+    }
+
+    let Some(entry_block) = function.func.layout.entry_block() else {
+        return false;
+    };
+    let entry_args = function.func.dfg.block_params(entry_block).to_vec();
+    if entry_args.len() != function.func.signature.params.len() {
+        return false;
+    }
+
+    let mut failure = None;
+    for block in function.func.layout.blocks() {
+        for inst in function.func.layout.block_insts(block) {
+            let opcode = function.func.dfg.insts[inst].opcode();
+            if opcode.is_call() {
+                if failure.is_some()
+                    || !function.func.layout.is_cold(block)
+                    || !function.func.dfg.inst_results(inst).is_empty()
+                {
+                    return false;
+                }
+                failure = Some(block);
+            }
+        }
+    }
+    let Some(failure) = failure else {
+        return false;
+    };
+    if function.func.layout.blocks().any(|block| {
+        block != failure
+            && function.func.layout.block_insts(block).any(|inst| {
+                let opcode = function.func.dfg.insts[inst].opcode();
+                opcode.can_load()
+                    || opcode.can_store()
+                    || opcode.can_trap()
+                    || opcode.other_side_effects()
+            })
+    }) {
+        return false;
+    }
+    if !function.func.dfg.block_params(failure).is_empty() {
+        return false;
+    }
+    let Some(last_inst) = function.func.layout.last_inst(failure) else {
+        return false;
+    };
+    let InstructionData::Trap { code, .. } = function.func.dfg.insts[last_inst] else {
+        return false;
+    };
+
+    let self_ref = module.declare_func_in_func(function.func_id, &mut function.func);
+    let failure_insts = function.func.layout.block_insts(failure).collect::<Vec<_>>();
+    for inst in failure_insts {
+        function.func.layout.remove_inst(inst);
+    }
+    let mut cursor = FuncCursor::new(&mut function.func).at_bottom(failure);
+    cursor.ins().call(self_ref, &entry_args);
+    cursor.ins().trap(code);
+    true
+}
+
+fn is_guarded_import_candidate(function: &CodegenedFunction) -> bool {
+    function.guarded_import_candidate
+        && function.inline_asm.is_empty()
+        && function.func.dfg.num_insts() <= MAX_GUARDED_IMPORT_INSTRUCTIONS
+        && function.func.layout.blocks().count() <= MAX_GUARDED_IMPORT_BLOCKS
+        && function.func.sized_stack_slots.values().all(|slot| slot.size == 0)
+        && function.func.dynamic_stack_slots.is_empty()
+        && function.func.stack_limit.is_none()
+        && !function.func.layout.blocks().any(|block| {
+            function
+                .func
+                .layout
+                .block_insts(block)
+                .any(|inst| matches!(function.func.dfg.insts[inst].opcode(), Opcode::GlobalValue))
+        })
 }
 
 fn is_inline_candidate_with_block_limit(function: &CodegenedFunction, max_blocks: usize) -> bool {

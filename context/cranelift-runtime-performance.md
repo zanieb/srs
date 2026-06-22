@@ -34,10 +34,10 @@ were built from fresh target directories.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.8 ms | 53.1 ms | 1.62x |
-| `uv lock --check`, offline | 60.2 ms | 82.9 ms | 1.38x |
-| `ruff check` over 1,592 fixtures | 79.6 ms | 141.2 ms | 1.77x |
-| `ty check` over `scripts/ty_benchmark` | 48.7 ms | 106.8 ms | 2.19x |
+| `uv venv --clear` | 32.4 ms | 51.5 ms | 1.59x |
+| `uv lock --check`, offline | 56.9 ms | 79.4 ms | 1.39x |
+| `ruff check` over 1,592 fixtures | 77.5 ms | 137.5 ms | 1.77x |
+| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 100.1 ms | 2.15x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -64,7 +64,7 @@ results, and host-environment failures are recorded under
 [Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
 application gate remains the runtime decision boundary because the complete
 suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses. The current coalesced-local-copy policy still
+thousands of short subprocesses. The guarded precondition-import policy still
 needs that complete matched suite rerun before it can be called the final
 policy.
 
@@ -75,9 +75,9 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 107.5 MB | 2.39x |
-| ty | 47.5 MB | 112.9 MB | 2.38x |
-| uv | 100.0 MB | 180.4 MB | 1.80x |
+| Ruff | 45.0 MB | 106.5 MB | 2.37x |
+| ty | 47.5 MB | 110.9 MB | 2.33x |
+| uv | 100.0 MB | 179.8 MB | 1.80x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
@@ -1522,6 +1522,91 @@ Reopening this arc requires a first-class partial-inlining or guarded-call
 specialization facility tied directly to the caller's `FuncRef`; another MIR,
 CLIF, or import threshold change is not a plausible next step.
 
+### Guarded post-monomorphization precondition import
+
+The pointer-precondition profile remained the strongest concrete call-boundary
+gap after the loop-wrapper experiment. Mutable-pointer `add` and `sub` helpers
+accounted for roughly 3,150 active Cranelift samples and did not appear as
+leaves in the matched LLVM profile. The earlier guarded prototype had already
+identified the right semantic split, but its imported candidate was rejected
+because dead panic-allocation names survived in the function parameter table.
+
+The retained implementation makes that split first-class. Hinted source roots
+up to ten MIR blocks and 96 operations are translated only as possible guarded
+candidates; roots beyond the ordinary six-block/64-operation limits cannot
+fall into the existing repeated-call policy. A guarded candidate must have at
+most ten CLIF blocks and 64 instructions, return no value, have exactly one
+result-free call in a cold trap block, and contain no load, store, or trap in
+its hot region. Instructions with other side effects are rejected there too.
+The cold block is replaced with a call back to the canonical helper using the
+original entry arguments, followed by the original trap. Optimization then
+removes its dead stack slot. The candidate remains eligible only without live
+stack state or a surviving global-value instruction.
+
+At the call site, this guarded body bypasses the repeated-call requirement only
+when at least two arguments are integer constants. This is the
+post-monomorphization count-and-element-size shape that LLVM sees for pointer
+checks. Dynamic-count calls retain the canonical helper. Candidate remapping
+now visits only function names attached to surviving `call`, `try_call`, or
+`func_addr` instructions, so dead panic-message allocation names neither block
+the import nor cause unrelated definitions to be materialized. The stage-2
+bootstrap caught the required `func_addr` case before benchmarking: omitting
+it produced unresolved formatting implementations, while the final mapping
+links and runs the same formatting probe correctly.
+
+The reduced pointer probe demonstrates both paths. A dynamic count retains its
+direct helper call. Constant count and element size clone the pure arithmetic
+guard, and only its cold failure edge calls the canonical helper. Valid
+`add(1)`/`sub(1)` operations produce the expected pointers; an overflowing
+`add(1)` reaches the original non-unwinding panic and aborts with the same
+message. In the full ty binary, symbolized precondition-helper definitions and
+branch references fall from 7,093 to 4,172.
+
+The complete 50-run three-lane gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.05% | 25/50 | 1.00000 | +58.9% | +0.070% |
+| `uv lock --check`, offline | +0.88% | 19/50 | 0.11892 | +39.4% | +0.070% |
+| `ruff check` over 1,592 fixtures | +0.60% | 21/50 | 0.32224 | +77.4% | -0.714% |
+| `ty check` over `scripts/ty_benchmark` | -1.02% | 32/50 | 0.06491 | +115.0% | -1.621% |
+
+Higher-powered focused gates resolved the three noisy rows. uv lock was
+-0.02% with 51/100 wins (`p = 0.92041`), Ruff was -0.58% with 58/100 wins
+(`p = 0.13321`), and ty was -0.79% with 65/100 wins (`p = 0.00352`). uv
+environment creation remained statistically neutral in the complete gate.
+Every LLVM, preceding-Cranelift, and candidate exit code and output digest
+matched. cg_clif check, the complete stage-2 backend build, the matching stage-2
+standard-library and proc-macro build, and all three fresh application builds
+passed. A final review tightened the hot-path purity check to reject every
+other side-effecting instruction. The exact stage-2 rebuild is saved as
+`candidate-v5-reviewed.dylib` with SHA-256
+`4e5ecc82b065a5b1a839a33f452360165b991d0d1f38e0f066508c3befd522a4`;
+its four optimized pointer-probe bodies are identical to the benchmarked
+candidate after normalizing generated function and allocation numbering.
+Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/guarded-precondition-all50.json`
+and the adjacent `guarded-precondition-*-100.json` focused runs.
+
+The guarded import is retained. It removes measured helper traffic and
+decisively improves ty while both uv operations and Ruff remain neutral. The
+canonical cold helper preserves panic formatting, location, and failure
+semantics without cloning its globals into every caller.
+
+A follow-up constant fold for `umulhi` of two integer constants removed the
+multiply-high overflow test from the reduced inlined guard and cut another
+100,976 bytes from uv, 76,160 bytes from Ruff, and 77,824 bytes from ty. The
+focused egraph filetest passed, but the application gate rejected the fold.
+Against the import-only policy, Ruff regressed by 1.18% paired with 40/100 wins
+(`p = 0.05689`); against the preceding Cranelift baseline it regressed by
+0.82% with 38/100 wins (`p = 0.02098`). ty, uv lock, and uv environment
+creation were neutral relative to the import-only policy. The fold is not
+retained: deleting the local constant branch changes surrounding extraction
+or layout in a way that costs more in Ruff than it saves in the pointer guard.
+Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/guarded-precondition-umulhi-all50.json`
+and `guarded-precondition-umulhi-ruff100.json`.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
@@ -2267,11 +2352,12 @@ remain the larger opportunities.
 A final CLIF audit of hashbrown's
 `find_or_find_insert_index` did not find that consumer: its inner iteration is
 a nonzero bitmask plus count-trailing-zeros operation, not a repeated scalar
-bound that an isolated CFG range fact can remove. The visible pointer
-precondition checks also cross call boundaries, so they need profitable body
-import or interprocedural reasoning rather than another local range rule. Do
-not manufacture a generic CFG-range patch without a newly profiled repeated
-consumer.
+bound that an isolated CFG range fact can remove. Guarded
+post-monomorphization import now removes the constant-heavy pointer
+precondition boundaries without cloning their panic paths. Remaining dynamic
+count calls need a different interprocedural proof, not another local range
+rule. Do not manufacture a generic CFG-range patch without a newly profiled
+repeated consumer.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
@@ -2327,7 +2413,7 @@ inlining quickly becomes counterproductive. Continue with targeted policies:
   repeatedly raising the local hinted-call threshold;
 - reduce and fix the broader cg_clif inliner miscompile before admitting
   callees with stack slots, global values, nested calls, or larger control-flow
-  graphs;
+  graphs beyond the guarded cold-fallback subset;
 - investigate the open work to let
   [regalloc manage callee-saved registers](https://github.com/bytecodealliance/wasmtime/issues/7727);
 - remove [unused stack slots](https://github.com/bytecodealliance/wasmtime/issues/6661)
