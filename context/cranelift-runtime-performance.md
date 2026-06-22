@@ -1838,6 +1838,40 @@ its caller. The next attempt at this boundary needs a later optimized-body
 inliner or a larger loop transformation rather than another
 primitive-specific call expansion.
 
+### Rejected transparent SIMD-wrapper SSA
+
+The next experiment attacked the remaining copy rather than the Core helper.
+It allowed only non-SIMD AArch64 wrappers with an eight-byte SIMD backend
+representation to use one Cranelift variable. True SIMD locals stayed
+stack-backed, transparent field projections reused the wrapper variable, and
+static lane reads used `extractlane`; dynamic lane reads retained a safe spill
+fallback. This was intended to keep hashbrown's `Group(uint8x8_t)` in SSA while
+leaving the `read_unaligned` call result in its existing return slot.
+
+The complete stage-2 backend, standard-library, and proc-macro build passed,
+as did a fresh hashbrown build and execution probe and fresh uv, Ruff, and ty
+profiling builds. The candidate backend is preserved as
+`transparent-simd-wrapper-ssa/candidate.dylib` with SHA-256
+`bda5ea38df9961dc4a61a80b1bb79c3b2b478bc2916a95193f69e5f26fec4280`.
+The application binaries changed by +24,320 bytes for uv, +24,016 bytes for
+Ruff, and +20,896 bytes for ty, confirming that the rule reached other
+wrappers.
+
+It did not reach the measured boundary. Both profiled ty copies of
+`find_or_find_insert_index_inner` retained the same 80-byte frame, the same
+688- and 608-byte body sizes, the `read_unaligned` result slot, the copy into
+the `Group` slot, and the subsequent vector reloads. The source passes
+`&group` to `find_insert_index_in_group`. cg_clif's SSA analysis treats that
+immutable reference as address observation and marks the entire local
+non-SSA before its representation is considered.
+
+The prototype is therefore rejected without a runtime screen: it changed
+unrelated code but removed none of the measured instructions. A viable
+follow-up must either materialize a read-only address-taken local only at its
+borrow use while retaining an SSA value elsewhere, or eliminate/import the
+small by-reference helper. Simply admitting more SIMD-backed types to the
+existing all-or-nothing local policy cannot affect this loop.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
