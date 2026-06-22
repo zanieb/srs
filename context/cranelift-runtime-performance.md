@@ -551,6 +551,21 @@ stack-free safety boundary. The 20-run ty screen was neutral at -0.02% paired,
 application gate. The target call boundary first needs a stack-free callee;
 loop membership alone is not enough reason to perturb every eligible call.
 
+A direct-tag integer `Option<T>` return experiment then kept the pair ABI
+result in SSA when MIR proved the return place's address was unobserved. It
+removed `find_insert_index_in_group`'s 16-byte return slot and stores, shrinking
+that helper from 140 to 120 bytes. The caller nevertheless retained both the
+call and its 80-byte frame. The broader representation change shrank uv by
+40,960 bytes, Ruff by 875,728 bytes, and ty by 1,986,704 bytes, but the 20-run
+application gate moved backward: uv environment creation +1.22% with 6/20
+wins (`p = 0.11532`), uv resolution +1.09% with 7/20 wins (`p = 0.26318`),
+Ruff +0.17% with 10/20 wins (`p = 1.0`), and ty +0.72% with 7/20 wins
+(`p = 0.26318`). All correctness digests matched and the complete stage-2
+backend and standard-library build passed. The experiment is rejected despite
+the code-size win: scalarizing the callee return does not by itself remove the
+profiled boundary or improve application runtime. Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/bench-direct-option-pair-return-all20/results.json`.
+
 An even narrower one-off exception is retained for bodies that become trivial
 forwarders or constructors only after monomorphization. Unhinted source MIR is
 considered only with at most two blocks and four operations. After importing
