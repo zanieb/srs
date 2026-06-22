@@ -1676,6 +1676,42 @@ binary growth. Results are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/results/guarded-precondition-one-constant-all50.json`
 and `guarded-precondition-one-constant-ty100.json`.
 
+### Rejected module-frequency guarded precondition import
+
+The retained policy still left 2,316 direct ty branches to precondition
+helpers. Many had dynamic arguments but repeated across generated wrappers:
+1,304 targeted `NonNull::new_unchecked`, 549 targeted
+`unreachable_unchecked`, and 47 targeted `NonZero::new_unchecked`. A narrow
+follow-up counted only calls to already-vetted guarded candidates across the
+codegen unit and admitted a dynamic-argument guard after eight calls. Ordinary
+import eligibility and profitability were unchanged.
+
+The policy performed the intended transform. Direct precondition branches in
+ty fell from 2,316 to 682. The three targeted families fell from 1,304 to 85,
+549 to 155, and 47 to 26, respectively. A complete stage-2 backend,
+standard-library, and proc-macro build and fresh uv, Ruff, and ty builds passed.
+The candidate preserved all LLVM and retained-Cranelift application exit codes
+and output digests. Its backend is saved as
+`frequent-guarded-imports/candidate.dylib` with SHA-256
+`4bb8090a330db437bd2facef2bccd293b30ecbabb467fb3e7979a6802d513e9c`.
+
+The 20-run application screen rejected the tradeoff:
+
+| Workload | Paired change | Wins | Sign p | Binary change |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.24% | 12/20 | 0.50344 | -0.007% |
+| `uv lock --check`, offline | +1.92% | 7/20 | 0.26318 | -0.007% |
+| `ruff check` over 1,592 fixtures | +0.20% | 9/20 | 0.82380 | +0.782% |
+| `ty check` over `scripts/ty_benchmark` | -0.14% | 10/20 | 1.00000 | +1.765% |
+
+No workload shows a directional statistical result, while the applications
+that contain most of the removed branches grow materially. The module-frequency
+exception is rejected without a 50-run gate. Aggregate static popularity is
+not a sufficient profitability signal even for pure guarded imports; the next
+extension needs execution frequency or a more precise caller-side cost model.
+Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/frequent-guarded-imports-screen20.json`.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
