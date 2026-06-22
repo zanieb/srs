@@ -661,6 +661,34 @@ count from 31 to 30. This reinforces the same roadmap conclusion: further
 progress needs cross-crate body import and stronger post-monomorphization
 optimization, not another local threshold increase.
 
+A later post-fix profile made the `boxcar` boundary more concrete. The retained
+ty binary had 253 direct calls to `Index<58>::location` spread across ten
+CGU-local copies; the hottest copy had 184 callers, even though the generated
+wrappers generally called it only once each. `Index<58>::new_unchecked` had
+another 137 direct calls across nine copies. This is exactly the shape that the
+four-calls-in-one-caller import rule cannot detect.
+
+A module-wide experiment therefore admitted an unhinted import only after at
+least eight direct calls across the CGU. The broad form left all 253 `location`
+calls in place and grew ty by 1,879,280 bytes (1.69%). Restricting the exception
+to indirect aggregate returns with one replaceable cold failure edge still left
+all 253 calls and grew ty by 1,946,160 bytes (1.75%); only eight incidental
+`new_unchecked` calls disappeared. The original `location` CLIF explains the
+miss: before normal optimization it has nine blocks, four sized stack slots,
+and two cold `unwrap_failed` calls. Catalogue preparation did not make it
+eligible under the existing stack-free and single-failure-edge boundary.
+
+Both module-frequency variants are rejected before timing or multi-application
+builds because they failed the structural target and caused large code growth.
+The complete stage-2 backend, standard-library, and proc-macro build passed.
+The final narrowed backend is saved as
+`/Users/zanie/code/tmp/cranelift-runtime-performance/backends/frequent-sret-guarded-import/candidate.dylib`
+with SHA-256
+`5ba7c6bad11259b8a33e138e20ae1f9b46e220ac2f1d03502c3cd5ebc3520e2d`.
+Revisiting this cluster requires a representation change that makes the helper
+stack-free before import; weakening the catalogue safety boundary or importing
+all frequent one-off wrappers is not promising.
+
 ### Profiled small constant copies
 
 A size histogram of the remaining Darwin libc copy traffic corrected an
