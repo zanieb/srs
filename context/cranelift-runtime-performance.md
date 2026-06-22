@@ -1707,6 +1707,23 @@ must promote or forward the hasher value across the active branch region and
 materialize it only at true observers; terminal tail sharing alone optimizes
 the wrong boundary.
 
+A direct audit of the retained optimized CLIF later showed that this proposed
+whole-CFG promotion is already present in the relevant sense. Each
+`Type::hash` copy has one initial load of the `FxHasher` state, then carries
+that value through SSA computations across its dispatch tree. The 102 stores
+are on mutually exclusive leaf paths, so an ordinary invocation executes only
+one of them. The body has one nested call that genuinely observes and mutates
+the hasher, one cold trap, 31 returns, 15 branch tables, and roughly 650 blocks.
+Adding a state block parameter to every non-entry block would therefore remove
+no repeated hot-path load and would merely move the leaf materializations to
+returns, traps, and the real call boundary. That converges on the rejected
+terminal-store experiment while adding far more value-carrying edges. The
+whole-CFG memory-state prototype is rejected before a rebuild on structural
+grounds. Closing the remaining `Type::hash` gap needs better enum dispatch,
+tail/code-layout compaction, or a machine-level transform that does not add
+hot branch edges; generic memory-SSA promotion is not the missing optimization
+for this body.
+
 ### Rejected call-bounded wide-constant sharing
 
 The earlier whole-function multiplier hoist had kept the value in a
