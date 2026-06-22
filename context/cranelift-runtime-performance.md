@@ -1502,6 +1502,56 @@ must promote or forward the hasher value across the active branch region and
 materialize it only at true observers; terminal tail sharing alone optimizes
 the wrong boundary.
 
+### Rejected call-bounded wide-constant sharing
+
+The earlier whole-function multiplier hoist had kept the value in a
+callee-saved register, added spills, and left 26 calls in `Type::hash`. After
+the retained repeated-call and trivial-import policies removed those call
+boundaries, the fresh active copy still contained 306 `movk` instructions.
+A follow-up therefore reused only a highly repeated wide `i64` constant's
+nearest dominating definition and discarded all available definitions at
+every call. It did not move an instruction to the entry block, preserve a
+value across a call, or change the CFG.
+
+This was a much stronger local result than entry hoisting. The active
+`Type::hash` copy fell from 6,100 to 4,484 bytes (-26.5%) and from 1,525 to
+1,121 instructions. `movk` fell from 306 to 3 and `mov` from 264 to 163,
+while the 102 stores, 31 returns, and frame/link-register-only prologue were
+unchanged. A focused AArch64 filetest verified that eight repeated constants
+share one definition on each side of a call, while the call remains a hard
+boundary.
+
+The broad call-bounded candidate nevertheless remained runtime-neutral in the
+complete 50-run gate:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +0.04% | 24/50 | 0.88772 |
+| `uv lock --check`, offline | +0.66% | 23/50 | 0.67181 |
+| `ruff check` over 1,592 fixtures | +0.26% | 22/50 | 0.47989 |
+| `ty check` over `scripts/ty_benchmark` | -0.45% | 30/50 | 0.20264 |
+
+A target-cost refinement limited the transform to AArch64 constants that
+need all four 16-bit materialization pieces: every lane differs from both the
+zero and all-ones bases. It preserved the complete `Type::hash` structural
+win and stopped changing cheaper constants, but only reshuffled neutral
+signals:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +1.27% | 20/50 | 0.20264 |
+| `uv lock --check`, offline | +0.01% | 25/50 | 1.00000 |
+| `ruff check` over 1,592 fixtures | -0.72% | 27/50 | 0.67181 |
+| `ty check` over `scripts/ty_benchmark` | +0.75% | 21/50 | 0.32224 |
+
+All application exit codes and output digests matched. Both prototypes passed
+their focused filetest, `cranelift-codegen` check, stage-2 backend build, and
+standard-library/proc-macro build. Neither improves a representative workload,
+so both are rejected. The repeated literals are substantial static bloat, but
+they are not the measured runtime bottleneck. Further `Type::hash` work should
+reduce dynamic hasher stores, branches, or observer traffic rather than share
+another literal.
+
 The focused barrier filetest, all 1,218 Cranelift filetests, all 186
 `cranelift-codegen` unit tests, 21 passing doctests, a complete cg_clif check,
 and the full stage-2 backend, standard-library, and proc-macro build pass.
