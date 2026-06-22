@@ -1712,6 +1712,39 @@ extension needs execution frequency or a more precise caller-side cost model.
 Results are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/results/frequent-guarded-imports-screen20.json`.
 
+### Rejected `umulhi` zero-and-one folding
+
+The retained dynamic-count guard import exposed a redundant arithmetic check
+inside the hottest hashbrown loop. A pointer offset by one-byte elements still
+lowered `umulhi(position, 1)` and branched on its result, although the high
+half of any unsigned integer multiplied by zero or one is always zero. A
+narrow egraph experiment folded only those two identities.
+
+The focused optimizer test and complete stage-2 backend, standard-library, and
+proc-macro build passed. In a fresh ty build, `umulh` instructions fell from
+7,160 to 5,928 (-17.2%). The exact hot hashbrown body lost the multiply-high,
+its constant materialization, and the associated branch. All LLVM,
+retained-Cranelift, and candidate application exit codes and output digests
+matched. The candidate backend is saved as
+`umulhi-zero-one/candidate.dylib` with SHA-256
+`3fee386cf1485dbaa879ed22d29f716f4bef6d0f1291ea01536bfbcbbe32367b`.
+
+The 20-run application screen nevertheless moved backward in every paired
+median:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +1.29% | 9/20 | 0.82380 |
+| `uv lock --check`, offline | +2.68% | 9/20 | 0.82380 |
+| `ruff check` over 1,592 fixtures | +0.26% | 10/20 | 1.00000 |
+| `ty check` over `scripts/ty_benchmark` | +0.88% | 9/20 | 0.82380 |
+
+The identity is rejected without a 50-run gate. Removing a locally redundant
+overflow check perturbs extraction or layout without relieving the remaining
+hashbrown frame, indirect equality call, or loop-carried stack traffic. Results
+are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/umulhi-zero-one-screen20.json`.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
