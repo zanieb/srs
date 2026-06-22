@@ -1641,6 +1641,21 @@ body by 14.69%, but remained runtime-neutral. Sharing-aware placement still
 matters generally, but this body needs the placement win coupled with call and
 tail merging rather than as an isolated extraction change.
 
+Marking indirect CTFE constant loads as generally pure was also tested and
+rejected. The safe prototype eagerly loaded only scalar and scalar-pair
+constants already accepted by cg_clif's direct CLIF type helpers, with
+`readonly`, `notrap`, and `can_move`; other ABI shapes remained by-reference.
+This qualification matters: broader representation-based versions found both
+missing CLIF type cases during the stage-2 build and a direct-value versus pair
+ABI mismatch while building ty. The narrowed version passed the stage-2
+compiler build, removed dead literal-pool loads from the hot hashbrown probe,
+and cut that body from 700 to 668 bytes. Ruff shrank by 579,360 bytes and ty by
+262,496 bytes, although uv grew by 20,832 bytes. The complete 20-run screen
+still moved every workload backward: uv environment creation +0.79%, uv
+resolution +2.03%, Ruff +1.85%, and ty +0.72%, with no sign-test below 0.26.
+Purity therefore needs a placement or dead-use criterion; exposing every
+eligible immutable load to the egraph is not profitable by itself.
+
 ### 4. Reduce call, register, and stack overhead
 
 The inlining result proves that call boundaries matter, but more indiscriminate
