@@ -1688,6 +1688,16 @@ screen and was rejected. Requiring four static call sites per caller retains
 the hot `Type::hash` transformation, improves every application median, and
 leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
 model is the next call arc, not broader body availability by itself.
+A narrower follow-up also rejected static body size as a substitute for that
+profitability signal. It allowed one-off imported bodies with at most one live
+non-control Cranelift instruction and composed them through one unhinted MIR
+dependency with at most two blocks and four operations, targeting the hot
+`BuildHasherDefault<FxHasher>::build_hasher` forwarder. A fresh stage-2 build
+left the 91 matching ty definitions and branch references unchanged while
+growing Ruff by 14,320 bytes and ty by 11,136 bytes. The experiment therefore
+stopped before a runtime gate: the tiny source dependency did not make the
+root an eligible call-free import, and admitting more unhinted dependencies
+would recreate the rejected broad-availability policy.
 The final unwinding gate made the size side of this arc urgent. Narrowing
 personality and LSDA emission to functions with machine exception handlers is
 now complete: it cuts 5.7-6.1% from the full profiling binaries, leaves their
