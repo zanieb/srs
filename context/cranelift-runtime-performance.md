@@ -1743,6 +1743,51 @@ compiler, cg_clif, standard-library, and proc-macro builds and all three fresh
 application builds pass. The optimization is retained; the full matched
 repository-suite rerun remains the finalization gate.
 
+### Rejected immutable aggregate vector copies
+
+The profile after direct return construction still sampled
+`ConstraintSetBuilder::new` 568 times as an active leaf. Its remaining 628-byte
+body copied the same immutable 32-byte aggregate constant into thirteen return
+fields using four integer loads and four stores per field. LLVM's 240-byte body
+uses two 128-bit loads and stores. Merely preserving the constant allocation's
+read-only provenance did not change Cranelift's machine code: its load
+optimization does not currently reuse those values across the intervening
+stores.
+
+An Apple-AArch64 experiment used 128-bit vector registers for immutable
+16-128-byte copies. The constructor fell to 420 bytes, but the exact 20-run
+application screen was mixed:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.86% | 13/20 | 0.26318 |
+| `uv lock --check`, offline | +0.11% | 10/20 | 1.00000 |
+| `ruff check` over 1,592 fixtures | +1.31% | 7/20 | 0.26318 |
+| `ty check` over `scripts/ty_benchmark` | -0.71% | 12/20 | 0.50344 |
+
+The uv, Ruff, and ty binary changes were -29,776, +6,272, and -24,032
+bytes. Narrowing the rule to the exact profiled 32-byte size made every binary
+smaller by 9,472, 7,520, and 5,376 bytes, respectively, but reversed the
+runtime signal:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +1.55% | 7/20 | 0.26318 |
+| `uv lock --check`, offline | -0.23% | 10/20 | 1.00000 |
+| `ruff check` over 1,592 fixtures | +0.17% | 10/20 | 1.00000 |
+| `ty check` over `scripts/ty_benchmark` | +0.80% | 7/20 | 0.26318 |
+
+Neither policy proceeds to 50 runs. The structurally attractive constructor
+change is too local, and the broader policy trends backward for Ruff. This
+experiment also exposed a benchmark provenance requirement: spelling the candidate
+backend as `cranelift` and the control as an absolute path changes crate
+disambiguators and produced false megabyte-scale size differences. The valid
+pairs loaded both backend dylibs through the same fixed path and have matching
+Rust symbol hashes. Results are in
+`bench-readonly-vector-exact-all20/results.json` and
+`bench-readonly-vector32-exact-all20/results.json` under the benchmark scratch
+directory.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
@@ -2107,6 +2152,13 @@ single-definition, single-use memory-backed temporaries whose address is never
 observed. Extending destination reuse to tuples, enum variants, or non-return
 roots requires a separately proven alias and lifetime model rather than
 broadening this rule by shape alone.
+Read-only provenance alone did not let Cranelift reuse the repeated constant
+loads left in that constructor. Replacing immutable 16-128-byte copies with
+AArch64 vectors made the constructor substantially smaller but trended
+backward for Ruff; an exact 32-byte rule then moved uv environment creation
+and ty backward. Both were rejected. The next aggregate arc needs to eliminate
+or share the complete initialization rather than only use wider registers for
+each independent copy.
 
 An untargeted, one-level post-monomorphization body-import experiment removed
 all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
