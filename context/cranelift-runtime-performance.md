@@ -1745,6 +1745,39 @@ hashbrown frame, indirect equality call, or loop-carried stack traffic. Results
 are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/results/umulhi-zero-one-screen20.json`.
 
+### Rejected loop memory-forwarder import
+
+The next retained profile still showed a real call to
+`ptr::read_unaligned<uint8x8_t>` inside the hottest hashbrown probe loop. Its
+final machine body is only one load through the source pointer and one store
+through the implicit return pointer. A deliberately narrow
+post-monomorphization exception therefore recognized already-safe imported
+bodies with exactly that load-to-store shape and allowed a one-off import only
+when the call instruction was in a natural loop.
+
+The complete stage-2 backend, standard-library, and proc-macro build and fresh
+Ruff and ty builds passed, but the intended transform did not fire. The hot ty
+body was instruction-for-instruction unchanged: it retained the
+`read_unaligned` call, the `sp+0x40` result slot, the copy to `sp+0x20`, and
+the subsequent vector reload. Instrumenting the isolated catalogue explains
+the mismatch between source and final machine shape. The monomorphized
+`read_unaligned<uint8x8_t>` source has eight MIR blocks and 38 operations, so
+it exceeds the ordinary six-block import limit. Its initial CLIF has nine
+blocks, two eight-byte explicit stack slots, one global value, and two calls
+for the precondition and copy path. It becomes a six-instruction machine
+wrapper only after the normal complete optimization pipeline, too late for
+the bounded catalogue selector.
+
+The prototype is rejected before a runtime screen because it did not remove
+the measured boundary. Its backend is preserved as
+`loop-memory-forwarder/candidate.dylib` with SHA-256
+`aabc9778d5dfabec22eae4cc6e12ef5fa8a4237f5ec941314485e02e2bfd6479`.
+Reaching this helper through body import would require a broader multi-call,
+stack-bearing catalogue pipeline, recreating already-rejected safety and
+profitability territory. A future attempt should instead expose the final
+optimized body to a later inliner or lower this primitive directly; another
+one-off source-shape exception cannot see the profitable form.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
