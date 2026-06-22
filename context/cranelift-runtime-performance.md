@@ -805,6 +805,44 @@ reaching-value analysis through the loop's predecessor region; adding block
 parameters at progressively broader syntactic joins has no demonstrated hot
 consumer.
 
+A complementary acyclic extension did survive the application gate. When a
+join has exactly two incoming `jump` or `brif` edges from distinct blocks, both
+immediate predecessors explicitly store the same nonescaping integer stack
+location, and all existing address-escape checks pass, the pass adds at most
+four block parameters and forwards subsequent loads from them. The bound keeps
+register-pressure risk small and the exact two-edge requirement avoids trying
+to synthesize arguments for exception or jump-table control flow.
+
+That last restriction is correctness-critical. The first prototype counted
+only eligible predecessor edges and therefore added parameters to blocks that
+also had `br_table` or `try_call` inputs, producing verifier failures when
+those uncounted edges supplied no arguments. The retained implementation
+counts every branch destination and skips the join unless both of its only two
+incoming edges are eligible. Focused tests cover the positive diamond, a
+predecessor with no matching store, and joins reached by both `br_table` and
+`try_call`.
+
+The original hot `hashbrown::find_or_find_insert_index_inner` body remained
+byte-for-byte unchanged, including its 80-byte frame and terminal result
+stores. The optimization instead generalized broadly enough to shrink all
+three applications and produced a decisive Ruff improvement in the 50-run
+matched gate:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.33% | 27/50 | 0.67181 |
+| `uv lock --check`, offline | -0.70% | 28/50 | 0.47989 |
+| `ruff check` over 1,592 fixtures | -2.11% | 40/50 | 0.0000239 |
+| `ty check` over `scripts/ty_benchmark` | -0.21% | 32/50 | 0.06491 |
+
+The uv, Ruff, and ty binaries shrink by 343,568 bytes (0.19%), 101,744 bytes
+(0.09%), and 34,688 bytes (0.03%), respectively. Every correctness-probe exit
+code and output digest matches. All 186 `cranelift-codegen` unit tests, all
+1,218 CLIF filetests, the focused regression file, Clippy for
+`cranelift-codegen`, and the complete stage-2 backend and standard-library
+build pass. The complete measurement record is in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/bench-two-way-stack-join-all50/results.json`.
+
 ### Boolean-result range folding
 
 The next hot hashbrown reduction exposed an instruction-local range fact that

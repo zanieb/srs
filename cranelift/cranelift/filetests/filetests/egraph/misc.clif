@@ -83,11 +83,108 @@ block3:
 }
 
 ; check: function %multiple_stack_predecessors(i64, i64, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 0
+; check:  block1:
+; nextln:     jump block3(v0)
+; check:  block2:
+; nextln:     jump block3(v1)
+; check:  block3(v4: i64):
+; nextln:     return v4
+; nextln: }
+
+function %join_with_incomplete_store(i64, i8) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i64, v1: i8):
+  brif v1, block1, block2
+
+block1:
+  stack_store.i64 v0, ss0
+  jump block3
+
+block2:
+  jump block3
+
+block3:
+  v2 = stack_load.i64 ss0
+  return v2
+}
+
+; check: function %join_with_incomplete_store(i64, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 8
+; check:  block1:
+; check:      store.i64 notrap v0,
+; check:  block3:
+; check:      v2 = load.i64 notrap
+; nextln:     return v2
+; nextln: }
+
+function %join_with_br_table_predecessor(i64, i64, i8, i32) -> i64 {
+  ss0 = explicit_slot 8
+
+block0(v0: i64, v1: i64, v2: i8, v3: i32):
+  brif v2, block1, block2
+
+block1:
+  stack_store.i64 v0, ss0
+  jump block3
+
+block2:
+  stack_store.i64 v1, ss0
+  br_table v3, block3, [block4]
+
+block3:
+  v4 = stack_load.i64 ss0
+  return v4
+
+block4:
+  return v1
+}
+
+; check: function %join_with_br_table_predecessor(i64, i64, i8, i32) -> i64 fast {
 ; nextln:    ss0 = explicit_slot 8
 ; check:  block1:
 ; check:      store.i64 notrap v0,
 ; check:  block2:
 ; check:      store.i64 notrap v1,
+; check:      br_table v3, block3, [block4]
+; check:  block3:
+; check:      v4 = load.i64 notrap
+; nextln:     return v4
+; check:  block4:
+; nextln:     return v1
+; nextln: }
+
+function %join_with_try_call_predecessor(i64, i64, i8) -> i64 {
+  ss0 = explicit_slot 8
+  sig0 = () system_v
+  fn0 = %callee sig0
+
+block0(v0: i64, v1: i64, v2: i8):
+  brif v2, block1, block2
+
+block1:
+  stack_store.i64 v0, ss0
+  jump block3
+
+block2:
+  stack_store.i64 v1, ss0
+  try_call fn0(), sig0, block3, []
+
+block3:
+  v3 = stack_load.i64 ss0
+  return v3
+}
+
+; check: function %join_with_try_call_predecessor(i64, i64, i8) -> i64 fast {
+; nextln:    ss0 = explicit_slot 8
+; nextln:    sig0 = () system_v
+; nextln:    fn0 = %callee sig0
+; check:  block1:
+; check:      store.i64 notrap v0,
+; check:  block2:
+; check:      store.i64 notrap v1,
+; check:      try_call fn0(), sig0, block3, []
 ; check:  block3:
 ; check:      v3 = load.i64 notrap
 ; nextln:     return v3

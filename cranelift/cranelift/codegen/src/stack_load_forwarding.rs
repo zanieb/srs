@@ -29,6 +29,14 @@ enum DirectStackAccess {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PredecessorEdge {
+    block: Block,
+    inst: Inst,
+    branch_index: usize,
+    eligible: bool,
+}
+
 fn direct_stack_access(
     func: &Function,
     inst: Inst,
@@ -105,6 +113,118 @@ fn forward_known_load(
     }
 }
 
+fn block_stack_stores(
+    func: &Function,
+    block: Block,
+    stack_addrs: &FxHashMap<Value, (StackSlot, i32)>,
+    address_taken: &FxHashSet<StackSlot>,
+) -> FxHashMap<StackLoc, Value> {
+    let mut values = FxHashMap::<StackLoc, Value>::default();
+    for inst in func.layout.block_insts(block) {
+        let store = match func.dfg.insts[inst] {
+            InstructionData::StackStore {
+                opcode: Opcode::StackStore,
+                arg,
+                stack_slot,
+                offset,
+            } if !address_taken.contains(&stack_slot) => {
+                let value = func.dfg.resolve_aliases(arg);
+                Some((
+                    StackLoc {
+                        slot: stack_slot,
+                        offset: offset.into(),
+                        ty: func.dfg.value_type(value),
+                    },
+                    value,
+                ))
+            }
+            _ => match direct_stack_access(func, inst, stack_addrs) {
+                Some(DirectStackAccess::Store { loc, value, .. })
+                    if !address_taken.contains(&loc.slot) =>
+                {
+                    Some((loc, value))
+                }
+                _ => None,
+            },
+        };
+        if let Some((loc, value)) = store {
+            values.retain(|known, _| !known.overlaps(loc));
+            values.insert(loc, value);
+        }
+    }
+    values
+}
+
+/// Promote a bounded set of stack values stored by both sides of a two-way join.
+fn add_two_way_join_stack_params(
+    func: &mut Function,
+    stack_addrs: &FxHashMap<Value, (StackSlot, i32)>,
+    address_taken: &FxHashSet<StackSlot>,
+) -> FxHashMap<Block, FxHashMap<StackLoc, Value>> {
+    const MAX_JOIN_STACK_PARAMS: usize = 4;
+
+    // Count every incoming edge before deciding whether a join is eligible. In particular, a
+    // `br_table` or `try_call` edge cannot be ignored: adding a block parameter without adding an
+    // argument to that edge would make the function invalid.
+    let mut predecessors = FxHashMap::<Block, Vec<PredecessorEdge>>::default();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let eligible = matches!(func.dfg.insts[inst].opcode(), Opcode::Jump | Opcode::Brif);
+            for (branch_index, destination) in func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                predecessors
+                    .entry(destination.block(&func.dfg.value_lists))
+                    .or_default()
+                    .push(PredecessorEdge {
+                        block,
+                        inst,
+                        branch_index,
+                        eligible,
+                    });
+            }
+        }
+    }
+
+    let mut join_values = FxHashMap::default();
+    for (join, edges) in predecessors {
+        if edges.len() != 2
+            || edges[0].block == edges[1].block
+            || edges.iter().any(|edge| !edge.eligible)
+            || func.layout.entry_block() == Some(join)
+        {
+            continue;
+        }
+
+        let first = block_stack_stores(func, edges[0].block, stack_addrs, address_taken);
+        let second = block_stack_stores(func, edges[1].block, stack_addrs, address_taken);
+        let mut locations = first
+            .keys()
+            .filter(|loc| loc.ty.is_int() && second.contains_key(loc))
+            .copied()
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|loc| (loc.slot.as_u32(), loc.offset, loc.ty.bits()));
+        locations.truncate(MAX_JOIN_STACK_PARAMS);
+
+        for loc in locations {
+            let param = func.dfg.append_block_param(join, loc.ty);
+            for (edge, value) in [(&edges[0], first[&loc]), (&edges[1], second[&loc])] {
+                let dfg = &mut func.dfg;
+                let destinations = dfg.insts[edge.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+                destinations[edge.branch_index].append_argument(value, &mut dfg.value_lists);
+            }
+            join_values
+                .entry(join)
+                .or_insert_with(FxHashMap::default)
+                .insert(loc, param);
+        }
+    }
+    join_values
+}
+
 /// Forward loads from preceding stores to non-address-taken stack slots.
 ///
 /// Stack-slot operations are legalized to ordinary loads and stores before alias analysis. At
@@ -155,6 +275,8 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
         }
     }
 
+    let join_values = add_two_way_join_stack_params(func, &stack_addrs, &address_taken);
+
     let mut unique_predecessors = FxHashMap::<Block, Block>::default();
     let mut multiple_predecessors = FxHashSet::default();
     for block in func.layout.blocks() {
@@ -181,6 +303,9 @@ pub(crate) fn forward_stack_loads(func: &mut Function, endianness: Endianness) {
             .and_then(|predecessor| outgoing_values.get(predecessor))
             .cloned()
             .unwrap_or_default();
+        if let Some(incoming) = join_values.get(&block) {
+            values.extend(incoming);
+        }
         while let Some(inst) = cursor.next_inst() {
             let direct_access = direct_stack_access(cursor.func, inst, &stack_addrs);
             match cursor.func.dfg.insts[inst] {
