@@ -1411,23 +1411,8 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                 args.should_normalize_rust_archive_patch_inputs(),
             )?;
         let result = if changed_archive_member_set {
-            let Some(mut full_previous) = PersistedState::read(&state_dir)? else {
-                append_log(
-                    &state_dir,
-                    "changed-input patch unavailable before loading inputs: complete state is missing",
-                )?;
-                return Ok(false);
-            };
-            refresh_snapshotted_rewritten_input_metadata(
-                &state_dir,
-                &mut full_previous,
-                &rewritten_inputs,
-                &rewritten_input_contents,
-            );
-            apply_preclassified_unchanged_rustc_rlibs(
-                &mut full_previous,
-                &preclassified_unchanged_inputs,
-            );
+            let mut full_previous = previous.clone();
+            full_previous.load_all_records_in_place(&state_dir)?;
             append_log(
                 &state_dir,
                 "loaded complete records for changed archive member set before loading inputs",
@@ -3126,6 +3111,24 @@ fn matching_macho_symbol_resolution_move_with_normalization<'a>(
     current_section_offset: u64,
     normalize_rust_archive_patch_inputs: bool,
 ) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
+    matching_macho_symbol_resolution_move_from_candidates(
+        resolution_moves.iter(),
+        target_name,
+        previous_target,
+        previous_target_value,
+        current_section_offset,
+        normalize_rust_archive_patch_inputs,
+    )
+}
+
+fn matching_macho_symbol_resolution_move_from_candidates<'a>(
+    resolution_moves: impl IntoIterator<Item = &'a MachOSymbolResolutionMove>,
+    target_name: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_target_value: u64,
+    current_section_offset: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
     let mut matching_move = None;
     for moved in resolution_moves {
         if moved.name.as_str() != target_name
@@ -3154,6 +3157,22 @@ fn matching_macho_symbol_resolution_move_for_previous_with_normalization<'a>(
     previous_target_value: u64,
     normalize_rust_archive_patch_inputs: bool,
 ) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
+    matching_macho_symbol_resolution_move_for_previous_from_candidates(
+        resolution_moves.iter(),
+        target_name,
+        previous_target,
+        previous_target_value,
+        normalize_rust_archive_patch_inputs,
+    )
+}
+
+fn matching_macho_symbol_resolution_move_for_previous_from_candidates<'a>(
+    resolution_moves: impl IntoIterator<Item = &'a MachOSymbolResolutionMove>,
+    target_name: &str,
+    previous_target: &RelocationTargetRecord,
+    previous_target_value: u64,
+    normalize_rust_archive_patch_inputs: bool,
+) -> std::result::Result<Option<&'a MachOSymbolResolutionMove>, String> {
     let mut matching_move = None;
     for moved in resolution_moves {
         if moved.name.as_str() != target_name
@@ -3172,6 +3191,30 @@ fn matching_macho_symbol_resolution_move_for_previous_with_normalization<'a>(
         matching_move = Some(moved);
     }
     Ok(matching_move)
+}
+
+struct MachOSymbolResolutionMoveLookup<'a> {
+    by_name: HashMap<&'a str, Vec<&'a MachOSymbolResolutionMove>>,
+}
+
+impl<'a> MachOSymbolResolutionMoveLookup<'a> {
+    fn new(resolution_moves: &'a [MachOSymbolResolutionMove]) -> Self {
+        let mut by_name = HashMap::new();
+        for moved in resolution_moves {
+            by_name
+                .entry(moved.name.as_str())
+                .or_insert_with(Vec::new)
+                .push(moved);
+        }
+        Self { by_name }
+    }
+
+    fn candidates(&self, name: &str) -> &[&'a MachOSymbolResolutionMove] {
+        self.by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
 }
 
 fn resolved_macho_relocation_target(
@@ -3450,41 +3493,93 @@ fn finish_macho_cross_input_target_moves(
     Ok(Ok(()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn retained_macho_section_owner_mapping(
-    previous_bytes: &[u8],
-    input_file_path: &str,
-    current_input: &str,
-    current_file: &object::File<'_>,
-    section_index: u32,
-    section_records: &[SectionRecord],
-    claimed_sections: &[MatchedPatchSection],
-    supplemental_sections: &[MatchedPatchSection],
-) -> Result<std::result::Result<Option<MatchedPatchSection>, String>> {
-    if claimed_sections
-        .iter()
-        .chain(supplemental_sections)
-        .any(|section| {
-            section.current.input == current_input && section.current.section_index == section_index
-        })
-    {
-        return Ok(Ok(None));
+struct RetainedMachOSectionRecordLookup<'a> {
+    by_input_file_and_section: HashMap<(&'a str, u32), Vec<&'a SectionRecord>>,
+}
+
+impl<'a> RetainedMachOSectionRecordLookup<'a> {
+    fn new(section_records: &'a [SectionRecord]) -> Self {
+        let mut by_input_file_and_section = HashMap::new();
+        for record in section_records {
+            by_input_file_and_section
+                .entry((record.input_file.as_str(), record.section_index))
+                .or_insert_with(Vec::new)
+                .push(record);
+        }
+        Self {
+            by_input_file_and_section,
+        }
     }
 
-    let mut matching_records = Vec::new();
-    for record in section_records {
-        if record.input_file == input_file_path
-            && record.section_index == section_index
-            && (record.input == current_input
+    fn matching_records(
+        &self,
+        input_file_path: &str,
+        current_input: &str,
+        section_index: u32,
+    ) -> Result<Vec<&'a SectionRecord>> {
+        let Some(records) = self
+            .by_input_file_and_section
+            .get(&(input_file_path, section_index))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut matching = Vec::new();
+        for record in records {
+            if record.input == current_input
                 || normalized_archive_input_refs_match(
                     input_file_path,
                     record.input.as_str(),
                     current_input,
-                )?)
-        {
-            matching_records.push(record);
+                )?
+            {
+                matching.push(*record);
+            }
         }
+        Ok(matching)
     }
+}
+
+fn retained_macho_section_owner_is_claimed(
+    current_input: &str,
+    section_index: u32,
+    claimed_sections: &[MatchedPatchSection],
+    claimed_section_to_skip: Option<usize>,
+    supplemental_sections: &[MatchedPatchSection],
+) -> bool {
+    claimed_sections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != claimed_section_to_skip)
+        .map(|(_, section)| section)
+        .chain(supplemental_sections)
+        .any(|section| {
+            section.current.input == current_input && section.current.section_index == section_index
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retained_macho_section_owner_mapping<'data>(
+    previous_bytes: &'data [u8],
+    previous_resolver: &mut Option<PatchInputResolver<'data>>,
+    input_file_path: &str,
+    current_input: &str,
+    current_file: &object::File<'_>,
+    section_index: u32,
+    matching_records: &[&SectionRecord],
+    claimed_sections: &[MatchedPatchSection],
+    claimed_section_to_skip: Option<usize>,
+    supplemental_sections: &[MatchedPatchSection],
+) -> Result<std::result::Result<Option<MatchedPatchSection>, String>> {
+    if retained_macho_section_owner_is_claimed(
+        current_input,
+        section_index,
+        claimed_sections,
+        claimed_section_to_skip,
+        supplemental_sections,
+    ) {
+        return Ok(Ok(None));
+    }
+
     let Some(record) = matching_records.first().copied() else {
         return Ok(Ok(None));
     };
@@ -3494,8 +3589,10 @@ fn retained_macho_section_owner_mapping(
         ));
     }
 
-    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
-    let Some(previous_input) = previous_resolver.resolve(
+    if previous_resolver.is_none() {
+        *previous_resolver = Some(PatchInputResolver::new(previous_bytes, true)?);
+    }
+    let Some(previous_input) = previous_resolver.as_ref().unwrap().resolve(
         input_file_path,
         record.input.as_str(),
         PatchInputLookup::MatchArchiveMember,
@@ -3533,7 +3630,13 @@ fn retained_macho_section_owner_mapping(
             "retained Mach-O section owner output range overflowed".to_owned()
         ));
     };
-    for claimed in claimed_sections.iter().chain(supplemental_sections) {
+    for claimed in claimed_sections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != claimed_section_to_skip)
+        .map(|(_, section)| section)
+        .chain(supplemental_sections)
+    {
         let Some(claimed_end) = claimed
             .previous
             .output_offset
@@ -3584,7 +3687,7 @@ fn retained_macho_section_owner_mapping(
 }
 
 fn retained_macho_local_const_cohort_changed(
-    previous_bytes: &[u8],
+    previous_resolver: &PatchInputResolver<'_>,
     input_file_path: &str,
     current_bytes: &[u8],
     mapping: &MatchedPatchSection,
@@ -3594,7 +3697,6 @@ fn retained_macho_local_const_cohort_changed(
     {
         return Ok(Ok(false));
     }
-    let previous_resolver = PatchInputResolver::new(previous_bytes, true)?;
     let Some(previous_input) = previous_resolver.resolve(
         input_file_path,
         mapping.previous.input.as_str(),
@@ -3630,6 +3732,8 @@ fn retained_macho_output_owner_mappings(
     section_records: &[SectionRecord],
     matched_sections: &[MatchedPatchSection],
 ) -> Result<std::result::Result<Vec<MatchedPatchSection>, String>> {
+    let mut previous_resolver = None;
+    let section_record_lookup = RetainedMachOSectionRecordLookup::new(section_records);
     let mut current_inputs = matched_sections
         .iter()
         .map(|section| (section.current.input.clone(), true))
@@ -3637,7 +3741,6 @@ fn retained_macho_output_owner_mappings(
     current_inputs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     current_inputs.dedup_by(|left, right| left.0 == right.0);
 
-    let mut previous_resolver = None;
     let mut normalized_record_inputs = HashSet::new();
     for record in section_records {
         if !current_resolver.normalize_rust_archive_patch_inputs
@@ -3745,14 +3848,30 @@ fn retained_macho_output_owner_mappings(
                 continue;
             }
             let section_index = patch_section_record_index(&current_file, section.index())?;
+            if retained_macho_section_owner_is_claimed(
+                &current_input,
+                section_index,
+                matched_sections,
+                None,
+                &mappings,
+            ) {
+                continue;
+            }
+            let matching_records = section_record_lookup.matching_records(
+                input_file_path,
+                &current_input,
+                section_index,
+            )?;
             let mapping = match retained_macho_section_owner_mapping(
                 previous_bytes,
+                &mut previous_resolver,
                 input_file_path,
                 &current_input,
                 &current_file,
                 section_index,
-                section_records,
+                &matching_records,
                 matched_sections,
+                None,
                 &mappings,
             )? {
                 Ok(mapping) => mapping,
@@ -3760,7 +3879,7 @@ fn retained_macho_output_owner_mappings(
             };
             if let Some(mapping) = mapping {
                 let local_const_cohort_changed = match retained_macho_local_const_cohort_changed(
-                    previous_bytes,
+                    previous_resolver.as_ref().unwrap(),
                     input_file_path,
                     input_bytes.bytes,
                     &mapping,
@@ -3807,6 +3926,7 @@ fn retained_macho_text_target_move_owner_mappings(
     target_moves: &[MachORelocationTargetMove],
     trace: &mut Vec<String>,
 ) -> Result<std::result::Result<Vec<RetainedMachOTextTargetMoveOwnerMapping>, String>> {
+    let section_record_lookup = RetainedMachOSectionRecordLookup::new(section_records);
     trace.push(format!(
         "pending moved Mach-O target sources: {}",
         target_moves.len()
@@ -3870,6 +3990,10 @@ fn retained_macho_text_target_move_owner_mappings(
 
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort_unstable();
+    if candidates.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let mut previous_resolver = None;
     let mut mappings = Vec::<RetainedMachOTextTargetMoveOwnerMapping>::new();
     for (current_input, section_index) in candidates {
         let Some(input_bytes) = current_resolver.resolve(
@@ -3922,48 +4046,49 @@ fn retained_macho_text_target_move_owner_mappings(
             ));
             continue;
         }
-        let matching_records = section_records
-            .iter()
-            .filter(|record| {
-                record.input_file == input_file_path
-                    && record.section_index == section_index
-                    && (record.input == current_input
-                        || normalized_archive_input_refs_match(
-                            input_file_path,
-                            record.input.as_str(),
-                            &current_input,
-                        )
-                        .unwrap_or(false))
-            })
-            .count();
         let matched_section_index = matched_sections.iter().position(|section| {
             section.current.input == current_input && section.current.section_index == section_index
         });
         let already_claimed = matched_section_index.is_some();
-        trace.push(format!(
-            "candidate {} section {} proof inputs: records={} already-claimed={already_claimed}",
-            display_hex_path(&current_input).replace('\0', "\\0"),
-            section_index,
-            matching_records,
-        ));
-        let claimed_sections = matched_sections
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| Some(*index) != matched_section_index)
-            .map(|(_, section)| section.clone())
-            .collect::<Vec<_>>();
         let supplemental_sections = mappings
             .iter()
             .map(|mapping| mapping.mapping.clone())
             .collect::<Vec<_>>();
+        if retained_macho_section_owner_is_claimed(
+            &current_input,
+            section_index,
+            matched_sections,
+            matched_section_index,
+            &supplemental_sections,
+        ) {
+            trace.push(format!(
+                "candidate {} section {} not recovered: output owner already claimed",
+                display_hex_path(&current_input).replace('\0', "\\0"),
+                section_index,
+            ));
+            continue;
+        }
+        let matching_records = section_record_lookup.matching_records(
+            input_file_path,
+            &current_input,
+            section_index,
+        )?;
+        trace.push(format!(
+            "candidate {} section {} proof inputs: records={} already-claimed={already_claimed}",
+            display_hex_path(&current_input).replace('\0', "\\0"),
+            section_index,
+            matching_records.len(),
+        ));
         let mapping = match retained_macho_section_owner_mapping(
             previous_bytes,
+            &mut previous_resolver,
             input_file_path,
             &current_input,
             &current_file,
             section_index,
-            section_records,
-            &claimed_sections,
+            &matching_records,
+            matched_sections,
+            matched_section_index,
             &supplemental_sections,
         )? {
             Ok(mapping) => mapping,
@@ -4042,6 +4167,8 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
     let mut symbol_bindings = HashMap::new();
     let mut changed = false;
     let mut requested_names = Vec::new();
+    let mut previous_resolver = None;
+    let mut previous_section_records = None;
     for resolution in resolutions.iter() {
         let Some(target) = resolution
             .target
@@ -4218,9 +4345,7 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
             {
                 current_value = Some(previous_value);
             }
-            if current_value.is_none()
-                && let Some((previous_bytes, section_records)) = reuse_context
-            {
+            if current_value.is_none() && reuse_context.is_some() {
                 let section_index =
                     patch_section_record_index(&indexed_input.file, current.section_index)?;
                 let existing_mapping = section_mappings.iter().find(|mapping| {
@@ -4230,15 +4355,39 @@ fn update_macho_symbol_resolutions_for_input_with_reuse(
                 let mapping_was_existing = existing_mapping.is_some();
                 let mapping = if let Some(mapping) = existing_mapping {
                     Some(mapping.clone())
+                } else if retained_macho_section_owner_is_claimed(
+                    indexed_input.current_input.as_str(),
+                    section_index,
+                    output_context.map_or(&[], |(sections, _)| sections),
+                    None,
+                    &section_mappings,
+                ) {
+                    None
                 } else {
+                    let (previous_bytes, section_records) = reuse_context
+                        .expect("reuse context was checked before retained owner recovery");
+                    if previous_section_records.is_none() {
+                        previous_section_records =
+                            Some(RetainedMachOSectionRecordLookup::new(section_records));
+                    }
+                    let matching_records = previous_section_records
+                        .as_ref()
+                        .expect("reuse context requires previous section records")
+                        .matching_records(
+                            input.path.as_str(),
+                            indexed_input.current_input.as_str(),
+                            section_index,
+                        )?;
                     match retained_macho_section_owner_mapping(
                         previous_bytes,
+                        &mut previous_resolver,
                         input.path.as_str(),
                         indexed_input.current_input.as_str(),
                         &indexed_input.file,
                         section_index,
-                        section_records,
+                        &matching_records,
                         output_context.map_or(&[], |(sections, _)| sections),
+                        None,
                         &section_mappings,
                     )? {
                         Ok(mapping) => mapping,
@@ -7683,6 +7832,18 @@ fn unique_macho_output_symbol_value_by_name(
     Ok(Ok(Some(value)))
 }
 
+fn unique_macho_output_symbol_value_by_name_with_lookup(
+    lookup: &MachOLocalOutputSymbolLookup,
+    bytes: &[u8],
+    file: &object::File<'_>,
+    encoded_name: &str,
+) -> Result<std::result::Result<Option<u64>, String>> {
+    if let Some(value) = lookup.unique_defined_symbol_value(encoded_name)? {
+        return Ok(value);
+    }
+    unique_macho_output_symbol_value_by_name(bytes, file, encoded_name)
+}
+
 fn normalized_macho_local_target_has_output_witness(
     bytes: &[u8],
     file: &object::File<'_>,
@@ -9441,9 +9602,11 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
                     Ok(mappings) => mappings,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 };
-                for entry in target_move_owner_trace {
-                    append_log(state_dir, &format!("moved-target owner trace: {entry}"))?;
-                }
+                append_log_entries(
+                    state_dir,
+                    "moved-target owner trace: ",
+                    &target_move_owner_trace,
+                )?;
                 for recovered in mappings {
                     let mapping = recovered.mapping;
                     if let Some(changed_sections) = &mut matched_changed_sections {
@@ -9723,19 +9886,22 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
                 added_archive_member_identifiers.as_deref()
             {
                 let reactivated = if let Some(stored_patch) = input.patch.as_ref() {
-                    match reactivated_macho_archive_text_activation_with_sections(
-                        &bytes,
-                        input.path.as_str(),
-                        added_identifiers,
-                        &current_resolver,
-                        stored_patch,
-                        &current_sections,
-                        previous_output.get()?,
-                        &previous.macho_symbol_resolutions,
-                        &reactivation_retiring_names,
-                        activation_reserved_ranges,
-                        record_coverage.has_complete_macho_symbol_resolutions(),
-                    )? {
+                    match {
+                        timing_phase!("Reactivate dormant Mach-O archive members");
+                        reactivated_macho_archive_text_activation_with_sections(
+                            &bytes,
+                            input.path.as_str(),
+                            added_identifiers,
+                            &current_resolver,
+                            stored_patch,
+                            &current_sections,
+                            previous_output.get()?,
+                            &previous.macho_symbol_resolutions,
+                            &reactivation_retiring_names,
+                            activation_reserved_ranges,
+                            record_coverage.has_complete_macho_symbol_resolutions(),
+                        )?
+                    } {
                         Ok(activation) => activation,
                         Err(reason)
                             if !record_coverage.has_complete_macho_symbol_resolutions()
@@ -11164,16 +11330,19 @@ fn patch_changed_inputs_with_macho_unwind_cohort_reclaim(
                 let replay_previous_output = materialized_previous_output
                     .as_deref()
                     .unwrap_or(previous_output_bytes);
-                match apply_macho_text_relocation_replays(
-                    &mut resolved_patches,
-                    &macho_text_relocation_replays,
-                    replay_previous_output,
-                    &mut previous.relocations,
-                    &mut previous.macho_symbol_resolutions,
-                    remaining_reserved_ranges,
-                    &mut macho_reserved_thunk_patches,
-                    &mut macho_local_symbol_cohort_patches,
-                ) {
+                match {
+                    timing_phase!("Apply changed Mach-O text relocation replays");
+                    apply_macho_text_relocation_replays(
+                        &mut resolved_patches,
+                        &macho_text_relocation_replays,
+                        replay_previous_output,
+                        &mut previous.relocations,
+                        &mut previous.macho_symbol_resolutions,
+                        remaining_reserved_ranges,
+                        &mut macho_reserved_thunk_patches,
+                        &mut macho_local_symbol_cohort_patches,
+                    )
+                } {
                     Ok(changed) => changed,
                     Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
                 }
@@ -15580,6 +15749,26 @@ impl<'data> PatchInputResolver<'data> {
             archive_identifier: None,
         }))
     }
+
+    fn resolve_archive_member_identifier(
+        &self,
+        identifier: &[u8],
+    ) -> Result<ArchiveMemberMatch<'data>> {
+        if identifier.is_empty() {
+            return Ok(ArchiveMemberMatch::Unavailable);
+        }
+        if !self.normalize_rust_archive_patch_inputs {
+            return patch_archive_member_bytes(self.bytes, identifier);
+        }
+        let Some(archive_members) = self.archive_members.as_ref() else {
+            return Ok(ArchiveMemberMatch::Unavailable);
+        };
+        Ok(archive_members
+            .get(identifier)
+            .or_else(|| archive_members.get(&archive_member_patch_identifier(identifier)))
+            .copied()
+            .unwrap_or(ArchiveMemberMatch::Unavailable))
+    }
 }
 
 fn resolved_patch_input_ref(
@@ -16997,6 +17186,51 @@ impl PersistedState {
         };
         timing_phase!("Read incremental Mach-O resolutions");
         self.macho_symbol_resolutions = read_macho_resolutions_sidecar(state_dir, file_name)?;
+        Ok(())
+    }
+
+    fn load_all_records_in_place(&mut self, state_dir: &Path) -> Result {
+        self.materialize_patch_record_locations()?;
+
+        let mut parsed_patch_sections = Vec::new();
+        for (input_index, input) in self.input_files.iter().enumerate() {
+            let Some(patch) = input.patch.as_ref() else {
+                continue;
+            };
+            let Some(raw_sections) = patch.raw_sections.as_deref() else {
+                continue;
+            };
+            parsed_patch_sections.push((
+                input_index,
+                parse_patch_sections(&input.path, raw_sections)?,
+            ));
+        }
+        for (input_index, sections) in parsed_patch_sections {
+            let patch = self.input_files[input_index]
+                .patch
+                .as_mut()
+                .expect("patch metadata was present above");
+            patch.sections = sections;
+            patch.raw_sections = None;
+        }
+
+        if self.sections_file == self.patch_records_file && self.patch_records_file.is_some() {
+            let records = self.read_all_indexed_records(state_dir)?;
+            self.sections = records.sections;
+            self.relocations = records.relocations;
+            self.fdes = records.fdes;
+            self.dynamic_relocations = records.dynamic_relocations;
+        } else if let Some(sections_file) = self.sections_file.clone() {
+            let contents = read_sections_sidecar(state_dir, &sections_file)?;
+            let records = parse_compact_records_block(contents.lines())?;
+            self.sections = records.sections;
+            self.relocations = records.relocations;
+            self.fdes = records.fdes;
+            self.dynamic_relocations = records.dynamic_relocations;
+        }
+        self.macho_symbol_resolutions.clear();
+        self.apply_record_overrides(state_dir, None)?;
+        validate_reserved_ranges_against_sections(&self.reserved_ranges, &self.sections)?;
         Ok(())
     }
 
@@ -22198,6 +22432,7 @@ struct MachOLocalOutputSymbol {
 
 struct MachOLocalOutputSymbolLookup {
     symbols: Option<HashMap<Vec<u8>, Option<MachOLocalOutputSymbol>>>,
+    defined_symbol_values: Option<HashMap<Vec<u8>, Option<u64>>>,
 }
 
 impl MachOLocalOutputSymbolLookup {
@@ -22211,7 +22446,10 @@ impl MachOLocalOutputSymbolLookup {
             .endian()
             .context("Failed to read Mach-O output endianness")?;
         if endian != object::Endianness::Little {
-            return Ok(Self { symbols: None });
+            return Ok(Self {
+                symbols: None,
+                defined_symbol_values: None,
+            });
         }
         let mut commands = header
             .load_commands(endian, output, 0)
@@ -22228,18 +22466,23 @@ impl MachOLocalOutputSymbolLookup {
                 continue;
             };
             if symbol_table.replace(command).is_some() {
-                return Ok(Self { symbols: None });
+                return Ok(Self {
+                    symbols: None,
+                    defined_symbol_values: None,
+                });
             }
         }
         let Some(symbol_table) = symbol_table else {
             return Ok(Self {
                 symbols: Some(HashMap::new()),
+                defined_symbol_values: Some(HashMap::new()),
             });
         };
         let table = symbol_table
             .symbols::<object::macho::MachHeader64<_>, _>(endian, output)
             .context("Failed to parse Mach-O output symbols")?;
         let mut symbols = HashMap::new();
+        let mut defined_symbol_values = HashMap::new();
         for (symbol_index, symbol) in table.iter().enumerate() {
             let name = symbol
                 .name(endian, table.strings())
@@ -22251,6 +22494,15 @@ impl MachOLocalOutputSymbolLookup {
                 section_index: symbol.n_sect(),
                 value: symbol.n_value(endian),
             };
+            if symbol.n_type() & object::macho::N_STAB == 0
+                && symbol.n_type() & object::macho::N_TYPE == object::macho::N_SECT
+                && symbol.n_sect() != 0
+            {
+                defined_symbol_values
+                    .entry(name.clone())
+                    .and_modify(|value| *value = None)
+                    .or_insert(Some(metadata.value));
+            }
             match symbols.entry(name) {
                 hashbrown::hash_map::Entry::Vacant(entry) => {
                     entry.insert(Some(metadata));
@@ -22262,6 +22514,7 @@ impl MachOLocalOutputSymbolLookup {
         }
         Ok(Self {
             symbols: Some(symbols),
+            defined_symbol_values: Some(defined_symbol_values),
         })
     }
 
@@ -22307,6 +22560,22 @@ impl MachOLocalOutputSymbolLookup {
             Some(None) => Err("ambiguous Mach-O output symbol for slot recycling".to_owned()),
             None => Err("missing Mach-O output symbol for slot recycling".to_owned()),
         }
+    }
+
+    fn unique_defined_symbol_value(
+        &self,
+        encoded_name: &str,
+    ) -> Result<Option<std::result::Result<Option<u64>, String>>> {
+        let name =
+            hex::decode(encoded_name).context("Malformed incremental relocation target name")?;
+        let Some(values) = self.defined_symbol_values.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(match values.get(&name) {
+            Some(Some(value)) => Ok(Some(*value)),
+            Some(None) => Err("ambiguous cross-input Mach-O relocation target symbol".to_owned()),
+            None => Ok(None),
+        }))
     }
 }
 
@@ -29298,6 +29567,7 @@ fn macho_text_relocation_replays_for_input(
         .iter()
         .map(|target_move| (target_move.relocation_index, target_move.clone()))
         .collect::<HashMap<_, _>>();
+    let resolution_move_lookup = MachOSymbolResolutionMoveLookup::new(resolution_moves);
     let mut target_resolution_moves = HashMap::new();
     for target_move in &target_patches.macho_target_moves {
         let Some(relocation) = relocations.get(target_move.relocation_index) else {
@@ -29318,8 +29588,11 @@ fn macho_text_relocation_replays_for_input(
                 display_hex_path(&input.path)
             )));
         };
-        match matching_macho_symbol_resolution_move_with_normalization(
-            resolution_moves,
+        match matching_macho_symbol_resolution_move_from_candidates(
+            resolution_move_lookup
+                .candidates(target_name)
+                .iter()
+                .copied(),
             target_name,
             previous_target,
             relocation.target_value,
@@ -30278,8 +30551,11 @@ fn macho_text_relocation_replays_for_input(
                     previous_relocation.target_name.as_deref(),
                     previous_relocation.target.as_ref(),
                 ) {
-                    match matching_macho_symbol_resolution_move_for_previous_with_normalization(
-                        resolution_moves,
+                    match matching_macho_symbol_resolution_move_for_previous_from_candidates(
+                        resolution_move_lookup
+                            .candidates(target_name)
+                            .iter()
+                            .copied(),
                         target_name,
                         previous_target,
                         previous_relocation.target_value,
@@ -30323,7 +30599,8 @@ fn macho_text_relocation_replays_for_input(
                         .as_deref()
                         .context("Missing recorded Mach-O relocation target name")?;
                     let previous_target_value = if current_target_is_global {
-                        match unique_macho_output_symbol_value_by_name(
+                        match unique_macho_output_symbol_value_by_name_with_lookup(
+                            &output_symbols,
                             previous_output,
                             &output_file,
                             target_name,
@@ -30359,11 +30636,14 @@ fn macho_text_relocation_replays_for_input(
                     && previous_applied_target_value == relocation.target_value
                     && let Some(target_name) = relocation.target_name.as_deref()
                 {
-                    let mut matching_current_moves = resolution_moves.iter().filter(|moved| {
-                        moved.name == target_name
-                            && moved.current_value == relocation.target_value
-                            && relocation.target.as_ref() == Some(&moved.current_target)
-                    });
+                    let mut matching_current_moves = resolution_move_lookup
+                        .candidates(target_name)
+                        .iter()
+                        .copied()
+                        .filter(|moved| {
+                            moved.current_value == relocation.target_value
+                                && relocation.target.as_ref() == Some(&moved.current_target)
+                        });
                     let matching_current_move = matching_current_moves.next();
                     if matching_current_moves.next().is_some() {
                         return Ok(Err(
@@ -30372,20 +30652,22 @@ fn macho_text_relocation_replays_for_input(
                         ));
                     }
                     if let Some(moved) = matching_current_move {
-                        let previous_output_value = match unique_macho_output_symbol_value_by_name(
-                            previous_output,
-                            &output_file,
-                            target_name,
-                        )? {
-                            Ok(Some(value)) => value,
-                            Ok(None) => {
-                                return Ok(Err(
+                        let previous_output_value =
+                            match unique_macho_output_symbol_value_by_name_with_lookup(
+                                &output_symbols,
+                                previous_output,
+                                &output_file,
+                                target_name,
+                            )? {
+                                Ok(Some(value)) => value,
+                                Ok(None) => {
+                                    return Ok(Err(
                                     "moved Mach-O text relocation has no previous output symbol"
                                         .to_owned(),
                                 ));
-                            }
-                            Err(reason) => return Ok(Err(reason)),
-                        };
+                                }
+                                Err(reason) => return Ok(Err(reason)),
+                            };
                         if previous_output_value != moved.previous_value {
                             return Ok(Err(
                                 "moved Mach-O text relocation previous output value changed"
@@ -31349,7 +31631,7 @@ fn validate_macho_data_relocations_are_stable(
                     && renamed_local_target_is_stable
                 {
                     match retained_macho_local_const_cohort_changed(
-                        previous_resolver.bytes,
+                        previous_resolver,
                         input.path.as_str(),
                         current_input_bytes.bytes,
                         target_section,
@@ -32121,6 +32403,21 @@ fn apply_macho_text_relocation_replays(
     let thunk_size = <crate::macho_aarch64::MachOAArch64 as crate::platform::Arch>::thunk_config()
         .ok_or_else(|| "Mach-O text thunks are unavailable for this architecture".to_owned())?
         .thunk_size as usize;
+    let mut resolution_indices_by_name = HashMap::with_capacity(resolutions.len());
+    for (index, resolution) in resolutions.iter().enumerate() {
+        resolution_indices_by_name
+            .entry(resolution.name.clone())
+            .and_modify(|value| *value = None)
+            .or_insert(Some(index));
+    }
+    let mut patch_indices = HashMap::<String, HashMap<u32, usize>>::new();
+    for (index, patch) in patches.iter().enumerate() {
+        patch_indices
+            .entry(patch.section.input.clone())
+            .or_default()
+            .entry(patch.section.section_index)
+            .or_insert(index);
+    }
     let mut records_changed = false;
     let mut local_thunks = Vec::<(usize, u64, u64, std::ops::Range<usize>)>::new();
     for replay in &replays.replays {
@@ -32132,10 +32429,11 @@ fn apply_macho_text_relocation_replays(
         }) else {
             continue;
         };
-        let Some(patch_index) = patches.iter().position(|patch| {
-            patch.section.input == replay.input
-                && patch.section.section_index == replay.section_index
-        }) else {
+        let Some(patch_index) = patch_indices
+            .get(replay.input.as_str())
+            .and_then(|sections| sections.get(&replay.section_index))
+            .copied()
+        else {
             return Err("missing changed Mach-O text section for relocation replay".to_owned());
         };
         let Some(range) = materialize_recorded_macho_text_thunk(
@@ -32172,10 +32470,11 @@ fn apply_macho_text_relocation_replays(
     }
     let mut rematerialized_records = Vec::new();
     for replay in &replays.replays {
-        let Some(patch_index) = patches.iter().position(|patch| {
-            patch.section.input == replay.input
-                && patch.section.section_index == replay.section_index
-        }) else {
+        let Some(patch_index) = patch_indices
+            .get(replay.input.as_str())
+            .and_then(|sections| sections.get(&replay.section_index))
+            .copied()
+        else {
             return Err("missing changed Mach-O text section for relocation replay".to_owned());
         };
         let patch = &mut patches[patch_index];
@@ -32258,9 +32557,17 @@ fn apply_macho_text_relocation_replays(
             && replay.target_is_global
             && let Some(target_name) = replay.target_name.as_deref()
         {
-            macho_symbol_resolution_index_for_name(resolutions, target_name)?.filter(|index| {
-                resolutions[*index].direct_value == Some(replay.current_target_value)
-            })
+            match resolution_indices_by_name.get(target_name).copied() {
+                Some(Some(index))
+                    if resolutions[index].direct_value == Some(replay.current_target_value) =>
+                {
+                    Some(index)
+                }
+                Some(Some(_)) | None => None,
+                Some(None) => {
+                    return Err("ambiguous Mach-O symbol resolution catalog entry".to_owned());
+                }
+            }
         } else {
             None
         };
@@ -34193,7 +34500,7 @@ fn refreshed_macho_archive_input_ref(
 }
 
 fn reactivated_macho_archive_text_activation_with_sections(
-    current_bytes: &[u8],
+    _current_bytes: &[u8],
     input_file_path: &str,
     added_identifiers: &[Vec<u8>],
     current_resolver: &PatchInputResolver<'_>,
@@ -34259,16 +34566,16 @@ fn reactivated_macho_archive_text_activation_with_sections(
             ));
         }
         for member in &state.members {
-            let matched =
-                match patch_archive_member_bytes(current_bytes, &member.normalized_identifier)? {
-                    ArchiveMemberMatch::Unique(member) => member,
-                    ArchiveMemberMatch::Unavailable | ArchiveMemberMatch::Ambiguous => {
-                        return Ok(Err(
-                            "could not validate reactivated Mach-O archive member ownership"
-                                .to_owned(),
-                        ));
-                    }
-                };
+            let matched = match current_resolver
+                .resolve_archive_member_identifier(&member.normalized_identifier)?
+            {
+                ArchiveMemberMatch::Unique(member) => member,
+                ArchiveMemberMatch::Unavailable | ArchiveMemberMatch::Ambiguous => {
+                    return Ok(Err(
+                        "could not validate reactivated Mach-O archive member ownership".to_owned(),
+                    ));
+                }
+            };
             if hash_bytes(matched.bytes) != member.object_hash {
                 return Ok(Err(
                     "reactivated Mach-O archive member changed while dormant".to_owned(),
@@ -55324,6 +55631,24 @@ fn append_log(state_dir: &Path, message: &str) -> Result {
     Ok(())
 }
 
+fn append_log_entries(state_dir: &Path, prefix: &str, messages: &[String]) -> Result {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join(LOG_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open incremental log `{}`", path.display()))?;
+    for message in messages {
+        writeln!(file, "{prefix}{message}")?;
+    }
+    let _ = append_global_log_entries(state_dir, prefix, messages);
+    Ok(())
+}
+
 fn log_incremental_link_options_if_requested(
     args: &impl platform::Args,
     state_dir: &Path,
@@ -55350,6 +55675,31 @@ fn append_global_log(state_dir: &Path, message: &str) -> Result {
         return Ok(());
     };
     append_global_log_to(&log_dir, state_dir, message)
+}
+
+fn append_global_log_entries(state_dir: &Path, prefix: &str, messages: &[String]) -> Result {
+    let Some(log_dir) = user_state_dir() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&log_dir)?;
+    let path = global_log_path_in(&log_dir);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open incremental global log `{}`", path.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for message in messages {
+        writeln!(
+            file,
+            "{timestamp}\t{}\t{prefix}{message}",
+            state_dir.display()
+        )?;
+    }
+    Ok(())
 }
 
 fn append_global_log_to(log_dir: &Path, state_dir: &Path, message: &str) -> Result {
@@ -63641,6 +63991,117 @@ mod tests {
     }
 
     #[test]
+    fn retained_macho_owner_noops_do_not_parse_previous_archive() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(
+                &ar::Header::new(b"member.o".to_vec(), 4),
+                b"data".as_slice(),
+            )
+            .unwrap();
+        let mut malformed_previous = builder.into_inner().unwrap();
+        malformed_previous.truncate(malformed_previous.len() - 2);
+
+        let current = [];
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+        let mappings = retained_macho_output_owner_mappings(
+            &malformed_previous,
+            "input.rlib",
+            &current_resolver,
+            &[],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mappings.is_empty());
+
+        let mut trace = Vec::new();
+        let mappings = retained_macho_text_target_move_owner_mappings(
+            &malformed_previous,
+            "input.rlib",
+            &current_resolver,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut trace,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mappings.is_empty());
+
+        let current = test_macho_object(b"text", b"data", 0);
+        let current_file = object::File::parse(current.as_slice()).unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let current_data = current_file.section_by_name("__data").unwrap();
+        let input_file = hex::encode("input.rlib");
+        let section_index =
+            patch_section_record_index(&current_file, current_text.index()).unwrap();
+        let seed = MatchedPatchSection::same(PatchSection {
+            input: input_file.clone(),
+            section_index: patch_section_record_index(&current_file, current_data.index()).unwrap(),
+            section_name: Some("__DATA,__data".to_owned()),
+            input_size: current_data.size(),
+            output_offset: 0x200,
+            output_size: current_data.size(),
+            data_hash: Some(hash_bytes(current_data.data().unwrap())),
+            cstring_nul_boundaries_hash: None,
+        });
+        let current_resolver = PatchInputResolver::new(&current, true).unwrap();
+        let mappings = retained_macho_output_owner_mappings(
+            &malformed_previous,
+            &input_file,
+            &current_resolver,
+            &[],
+            &[seed],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mappings.is_empty());
+
+        let claimed = MatchedPatchSection::same(PatchSection {
+            input: input_file.clone(),
+            section_index,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: current_text.size(),
+            output_offset: 0x100,
+            output_size: current_text.size(),
+            data_hash: Some(hash_bytes(current_text.data().unwrap())),
+            cstring_nul_boundaries_hash: None,
+        });
+        let mappings = retained_macho_output_owner_mappings(
+            &malformed_previous,
+            &input_file,
+            &current_resolver,
+            &[],
+            &[claimed],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mappings.is_empty());
+
+        let input = FileState {
+            path: input_file,
+            content: FileContentState::from_bytes(&[]),
+            snapshot_identity: None,
+            rustc_link_content_digest: None,
+            rustc_raw_object_manifest: None,
+            patch: None,
+        };
+        let updates = update_macho_symbol_resolutions_for_input_with_reuse(
+            &mut [],
+            &input,
+            &[],
+            false,
+            None,
+            Some((&malformed_previous, &[])),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!updates.changed);
+    }
+
+    #[test]
     fn macho_symbol_resolution_reuses_proven_section_owner() {
         let object = test_macho_object(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08", 0);
         let current_file = object::File::parse(object.as_slice()).unwrap();
@@ -63679,14 +64140,21 @@ mod tests {
             size: text.size(),
         }];
 
+        let mut previous_resolver = None;
+        let record_lookup = RetainedMachOSectionRecordLookup::new(&records);
+        let matching_records = record_lookup
+            .matching_records(&input_file_path, &previous_input, section_index)
+            .unwrap();
         let mapping = retained_macho_section_owner_mapping(
             &previous,
+            &mut previous_resolver,
             &input_file_path,
             &previous_input,
             &current_file,
             section_index,
-            &records,
+            &matching_records,
             &[],
+            None,
             &[],
         )
         .unwrap()
@@ -64682,14 +65150,22 @@ mod tests {
             output_offset: 0x100,
             size: 32,
         };
+        let mut previous_resolver = None;
+        let records = [record];
+        let record_lookup = RetainedMachOSectionRecordLookup::new(&records);
+        let matching_records = record_lookup
+            .matching_records(&input, &input, section_index)
+            .unwrap();
         let mapping = retained_macho_section_owner_mapping(
             &previous,
+            &mut previous_resolver,
             &input,
             &input,
             &current_file,
             section_index,
-            std::slice::from_ref(&record),
+            &matching_records,
             &[],
+            None,
             &[],
         )
         .unwrap()
@@ -66511,6 +66987,24 @@ mod tests {
                 .contains("ambiguous")
         );
 
+        let mut live_and_stab = duplicate.clone();
+        live_and_stab[symoff + 4] |= object::macho::N_STAB;
+        let live_and_stab_file = object::File::parse(live_and_stab.as_slice()).unwrap();
+        let encoded_data = hex::encode("_data");
+        assert_eq!(
+            MachOLocalOutputSymbolLookup::new(&live_and_stab)
+                .unwrap()
+                .unique_defined_symbol_value(&encoded_data)
+                .unwrap()
+                .unwrap(),
+            unique_macho_output_symbol_value_by_name(
+                &live_and_stab,
+                &live_and_stab_file,
+                &encoded_data,
+            )
+            .unwrap()
+        );
+
         let mut stab = test_macho_object(b"\0\0\0\0", b"\0\0\0\0", 0);
         stab[symoff + 4] |= object::macho::N_STAB;
         let stab_file = object::File::parse(stab.as_slice()).unwrap();
@@ -66520,6 +67014,15 @@ mod tests {
                 .unwrap()
                 .unique_symbol_index(b"_text", 0)
                 .is_err()
+        );
+        let encoded_text = hex::encode("_text");
+        assert_eq!(
+            MachOLocalOutputSymbolLookup::new(&stab)
+                .unwrap()
+                .unique_defined_symbol_value(&encoded_text)
+                .unwrap()
+                .unwrap(),
+            unique_macho_output_symbol_value_by_name(&stab, &stab_file, &encoded_text).unwrap()
         );
     }
 
@@ -98113,6 +98616,23 @@ mod tests {
     fn read_records_for_input_files_filters_sections_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = state("args", b"output", &[("a.o", b"a"), ("b.o", b"b")]);
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "fingerprint".to_owned(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: vec![FilePatchSectionState {
+                input: hex::encode("a.o"),
+                section_index: 1,
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: 8,
+                output_offset: 100,
+                output_size: 8,
+                data_hash: None,
+                cstring_nul_boundaries_hash: None,
+            }],
+            raw_sections: None,
+        });
         state.sections.push(section_record("a.o", 1, 100, 8));
         state.sections.push(section_record("b.o", 1, 200, 8));
         state.relocations.push(relocation_record(
@@ -98152,6 +98672,7 @@ mod tests {
             .dynamic_relocations
             .push(dynamic_relocation_record("b.o", 1, 0, 600, 24));
         state.write(dir.path()).unwrap();
+        let expected = PersistedState::read(dir.path()).unwrap().unwrap();
         let mut metadata = PersistedState::read_metadata(dir.path()).unwrap().unwrap();
         let input_files = [hex::encode("a.o")].into_iter().collect::<HashSet<_>>();
 
@@ -98188,6 +98709,9 @@ mod tests {
                 .iter()
                 .all(|record| record.input_file == hex::encode("a.o"))
         );
+
+        metadata.load_all_records_in_place(dir.path()).unwrap();
+        assert_eq!(metadata, expected);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
