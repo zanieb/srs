@@ -541,6 +541,16 @@ correctness digests matched. The exception is rejected: even tiny one-off
 imports perturb enough layout to hurt uv, so repeated calls remain the minimum
 static hotness signal.
 
+A later profile-derived exception allowed otherwise eligible one-off imports
+only when the exact call instruction was inside a natural loop. The policy
+shrunk ty by 43,456 bytes, but it did not inline the target
+`RawTableInner::find_insert_index_in_group` call: that callee still has a live
+16-byte aggregate-return stack slot and therefore fails the existing
+stack-free safety boundary. The 20-run ty screen was neutral at -0.02% paired,
+11/20 wins, and `p = 0.82380`. The exception is rejected without broadening the
+application gate. The target call boundary first needs a stack-free callee;
+loop membership alone is not enough reason to perturb every eligible call.
+
 An even narrower one-off exception is retained for bodies that become trivial
 forwarders or constructors only after monomorphization. Unhinted source MIR is
 considered only with at most two blocks and four operations. After importing
