@@ -591,6 +591,30 @@ traffic remain. Further work on this body should eliminate that traffic rather
 than broaden inlining. Results are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/bench-loop-option-usize-all50/results.json`.
 
+Promoting every non-address-observed direct `Option<usize>` local to a pair of
+SSA variables tested the caller traffic directly, without changing inlining
+policy. The hot caller stopped storing and reloading the result at stack
+offsets 48 and 56, and its local allocation fell from 80 to 64 bytes. Register
+allocation used an additional x27/x28 callee-saved pair, however, leaving the
+total frame footprint unchanged. The candidate shrank uv, Ruff, and ty by
+584,336, 1,293,328, and 2,537,680 bytes. A strong ty-only screen (-1.58%,
+16/20 wins, `p = 0.01182`) again washed out in the 50-run application gate:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.25% | 26/50 | 0.88772 |
+| `uv lock --check`, offline | +0.64% | 21/50 | 0.32224 |
+| `ruff check` over 1,592 fixtures | -1.84% | 30/50 | 0.20264 |
+| `ty check` over `scripts/ty_benchmark` | -0.02% | 25/50 | 1.0 |
+
+All correctness digests matched and the complete stage-2 build passed. This
+representation is rejected for runtime: it trades stack loads and stores for
+callee-saved register pressure rather than reducing the complete frame. A
+future aggregate-promotion attempt needs to reduce the vector and probe-state
+traffic together so the promoted values fit without another saved register
+pair. Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/bench-option-usize-local-ssa-all50/results.json`.
+
 An even narrower one-off exception is retained for bodies that become trivial
 forwarders or constructors only after monomorphization. Unhinted source MIR is
 considered only with at most two blocks and four operations. After importing
