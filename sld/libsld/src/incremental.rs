@@ -22573,8 +22573,30 @@ struct MachOLocalOutputSymbolLookup {
     defined_symbol_values: Option<HashMap<Vec<u8>, Option<u64>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn lazy_macho_local_output_symbols<'a>(
+    lookup: &'a std::cell::OnceCell<MachOLocalOutputSymbolLookup>,
+    output: &[u8],
+) -> Result<&'a MachOLocalOutputSymbolLookup> {
+    if let Some(lookup) = lookup.get() {
+        return Ok(lookup);
+    }
+    let initialized = MachOLocalOutputSymbolLookup::new(output)?;
+    Ok(lookup.get_or_init(|| initialized))
+}
+
 impl MachOLocalOutputSymbolLookup {
     fn new(output: &[u8]) -> Result<Self> {
+        #[cfg(test)]
+        MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|constructions| {
+            constructions.set(constructions.get() + 1);
+        });
+
         use object::read::macho::MachHeader as _;
         use object::read::macho::Nlist as _;
 
@@ -27347,7 +27369,7 @@ fn supplemental_macho_local_symbol_sources_changed_with_index(
 fn changed_macho_local_symbol_cohort_plan(
     relocations: &[RelocationRecord],
     relocation_index: Option<&MachORelocationSectionIndex>,
-    output_symbols: Option<&MachOLocalOutputSymbolLookup>,
+    output_symbols: Option<&std::cell::OnceCell<MachOLocalOutputSymbolLookup>>,
     symbol_resolutions: &[MachOSymbolResolutionRecord],
     liveness_resolution_moves: &[MachOSymbolResolutionMove],
     liveness_output_symbol_patches: &[RelocationTargetSymbolPatch],
@@ -27441,6 +27463,13 @@ fn changed_macho_local_symbol_cohort_plan(
         Ok(false) | Ok(true) => {}
         Err(reason) => return Ok(Err(reason)),
     }
+    let output_symbols = match output_symbols {
+        Some(output_symbols) => Some(lazy_macho_local_output_symbols(
+            output_symbols,
+            previous_output,
+        )?),
+        None => None,
+    };
     plan_macho_local_symbol_cohort(
         relocations,
         relocation_index,
@@ -29699,7 +29728,7 @@ fn macho_text_relocation_replays_for_input(
     }
     let normalize_rust_archive_patch_inputs = previous_resolver.normalize_rust_archive_patch_inputs
         && current_resolver.normalize_rust_archive_patch_inputs;
-    let output_symbols = MachOLocalOutputSymbolLookup::new(previous_output)?;
+    let output_symbols = std::cell::OnceCell::new();
     let target_moves = target_patches
         .macho_target_moves
         .iter()
@@ -30272,7 +30301,7 @@ fn macho_text_relocation_replays_for_input(
                             previous_context,
                             current_context,
                             previous_output,
-                            &output_symbols,
+                            lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
                             &output_file,
                             &rematerialized_sections,
                             &recorded_local_cohort_edges,
@@ -30440,7 +30469,7 @@ fn macho_text_relocation_replays_for_input(
                         previous_context,
                         current_context,
                         previous_output,
-                        &output_symbols,
+                        lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
                         &output_file,
                         &rematerialized_sections,
                         &recorded_local_cohort_edges,
@@ -30738,7 +30767,7 @@ fn macho_text_relocation_replays_for_input(
                         .context("Missing recorded Mach-O relocation target name")?;
                     let previous_target_value = if current_target_is_global {
                         match unique_macho_output_symbol_value_by_name_with_lookup(
-                            &output_symbols,
+                            lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
                             previous_output,
                             &output_file,
                             target_name,
@@ -30792,7 +30821,7 @@ fn macho_text_relocation_replays_for_input(
                     if let Some(moved) = matching_current_move {
                         let previous_output_value =
                             match unique_macho_output_symbol_value_by_name_with_lookup(
-                                &output_symbols,
+                                lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
                                 previous_output,
                                 &output_file,
                                 target_name,
@@ -93345,6 +93374,232 @@ mod tests {
         push_macho_undefined_symbol(&mut bytes, target_name_offset as u32);
         bytes.extend_from_slice(&strings);
         bytes
+    }
+
+    fn invalidate_test_macho_output_symbol_name(bytes: &mut [u8]) {
+        let command_count = read_u32_le(&bytes[16..20]).unwrap();
+        let mut command_offset = 32;
+        let mut symbol_table_offset = None;
+        for _ in 0..command_count {
+            let command = read_u32_le(&bytes[command_offset..command_offset + 4]).unwrap();
+            let command_size =
+                read_u32_le(&bytes[command_offset + 4..command_offset + 8]).unwrap() as usize;
+            if command == object::macho::LC_SYMTAB {
+                symbol_table_offset = Some(
+                    read_u32_le(&bytes[command_offset + 8..command_offset + 12]).unwrap() as usize,
+                );
+                break;
+            }
+            command_offset += command_size;
+        }
+        let symbol_table_offset = symbol_table_offset.unwrap();
+        bytes[symbol_table_offset..symbol_table_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        object::File::parse(&*bytes).unwrap();
+    }
+
+    #[test]
+    fn changed_relocation_free_macho_archive_member_skips_output_symbol_lookup() {
+        let previous_identifier = b"crate-hash.cgu.previous.rcgu.o";
+        let current_identifier = b"crate-hash.cgu.current.rcgu.o";
+        let previous_object = test_macho_object(&[0; 4], &[0; 4], 0);
+        let current_object = test_macho_object(&[1, 0, 0, 0], &[0; 4], 0);
+        let archive = |identifier: &[u8], object: &[u8]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(identifier.to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let previous_archive = archive(previous_identifier, &previous_object);
+        let current_archive = archive(current_identifier, &current_object);
+        let input_path = hex::encode("input.rlib");
+        let ArchiveMemberMatch::Unique(previous_member) =
+            patch_archive_member_bytes(&previous_archive, previous_identifier).unwrap()
+        else {
+            panic!("expected previous archive member");
+        };
+        let ArchiveMemberMatch::Unique(current_member) =
+            patch_archive_member_bytes(&current_archive, current_identifier).unwrap()
+        else {
+            panic!("expected current archive member");
+        };
+        let previous_input =
+            resolved_patch_input_ref(&input_path, &input_path, previous_member).unwrap();
+        let current_input =
+            resolved_patch_input_ref(&input_path, &input_path, current_member).unwrap();
+        let previous_file = object::File::parse(previous_object.as_slice()).unwrap();
+        let current_file = object::File::parse(current_object.as_slice()).unwrap();
+        let previous_text = previous_file.section_by_name("__text").unwrap();
+        let current_text = current_file.section_by_name("__text").unwrap();
+        let previous_output = previous_object.clone();
+        let output_text = test_macho_section_range(&previous_output, "__text");
+        let input = state(
+            "args",
+            &previous_output,
+            &[("input.rlib", &previous_archive)],
+        )
+        .input_files
+        .remove(0);
+        let matched = [MatchedPatchSection {
+            previous: PatchSection {
+                input: previous_input,
+                section_index: patch_section_record_index(&previous_file, previous_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: previous_text.size(),
+                output_offset: output_text.start as u64,
+                output_size: previous_text.size(),
+                data_hash: Some("previous".to_owned()),
+                cstring_nul_boundaries_hash: None,
+            },
+            current: PatchSection {
+                input: current_input,
+                section_index: patch_section_record_index(&current_file, current_text.index())
+                    .unwrap(),
+                section_name: Some("__TEXT,__text".to_owned()),
+                input_size: current_text.size(),
+                output_offset: output_text.start as u64,
+                output_size: current_text.size(),
+                data_hash: Some("current".to_owned()),
+                cstring_nul_boundaries_hash: None,
+            },
+        }];
+        let previous_resolver = PatchInputResolver::new(&previous_archive, true).unwrap();
+        let current_resolver = PatchInputResolver::new(&current_archive, true).unwrap();
+        let mut resolutions = Vec::new();
+        let mut target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
+            validated_macho_local_text_retargets: Vec::new(),
+            changed_relocation_indices: Vec::new(),
+        };
+
+        MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
+        let replays = macho_text_relocation_replays_for_input(
+            &[],
+            &HistoricalMachORelocationRecords::new(),
+            &mut resolutions,
+            &[],
+            &input,
+            Some(&HashSet::new()),
+            &matched,
+            &previous_resolver,
+            &current_resolver,
+            &previous_output,
+            &mut target_patches,
+            &[],
+            &[],
+            &[],
+            &DirectMachOCguLivenessProof::default(),
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(replays.replays.is_empty());
+        assert_eq!(
+            MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
+            0
+        );
+    }
+
+    #[test]
+    fn macho_text_relocation_lazily_preserves_output_symbol_lookup_error() {
+        let source = test_macho_import_branch_object(b"_data");
+        let source_file = object::File::parse(source.as_slice()).unwrap();
+        let source_text = source_file.section_by_name("__text").unwrap();
+        let (mut previous_output, output_text, written_value) = recorded_branch_output(0, 0, 0);
+        invalidate_test_macho_output_symbol_name(&mut previous_output);
+        let input = state("args", &previous_output, &[("caller.o", &source)])
+            .input_files
+            .remove(0);
+        let section_index = patch_section_record_index(&source_file, source_text.index()).unwrap();
+        let matched = [MatchedPatchSection::same(PatchSection {
+            input: input.path.clone(),
+            section_index,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: source_text.size(),
+            output_offset: output_text.start as u64,
+            output_size: source_text.size(),
+            data_hash: Some("unchanged".to_owned()),
+            cstring_nul_boundaries_hash: None,
+        })];
+        let relocation = relocation_record(
+            "caller.o",
+            section_index,
+            1,
+            Some(written_value),
+            0,
+            Some("_data"),
+            None,
+            0,
+            output_text.start as u64,
+            4,
+            encode_macho_aarch64_relocation_kind(object::macho::RelocationInfo {
+                r_address: 0,
+                r_symbolnum: 1,
+                r_pcrel: true,
+                r_length: 2,
+                r_extern: true,
+                r_type: object::macho::ARM64_RELOC_BRANCH26,
+            }),
+            0,
+        );
+        let previous_resolver = PatchInputResolver::new(&source, false).unwrap();
+        let current_resolver = PatchInputResolver::new(&source, false).unwrap();
+        let mut resolutions = Vec::new();
+        let mut target_patches = RelocationTargetPatches {
+            input_ranges: Vec::new(),
+            output_patches: Vec::new(),
+            output_symbols: Vec::new(),
+            macho_target_moves: Vec::new(),
+            macho_cross_input_target_moves: Vec::new(),
+            validated_macho_local_retargets: Vec::new(),
+            validated_macho_local_text_retargets: Vec::new(),
+            changed_relocation_indices: Vec::new(),
+        };
+
+        MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
+        let error = match macho_text_relocation_replays_for_input(
+            std::slice::from_ref(&relocation),
+            &HistoricalMachORelocationRecords::new(),
+            &mut resolutions,
+            &[],
+            &input,
+            Some(&HashSet::new()),
+            &matched,
+            &previous_resolver,
+            &current_resolver,
+            &previous_output,
+            &mut target_patches,
+            &[],
+            &[],
+            &[],
+            &DirectMachOCguLivenessProof::default(),
+            true,
+            true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("required output symbol lookup should preserve its parse error"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse Mach-O output symbol name\n  Caused by:\n    Invalid Mach-O symbol name offset\n"
+        );
+        assert_eq!(
+            MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
+            1
+        );
     }
 
     #[test]
