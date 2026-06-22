@@ -150,6 +150,11 @@ const RUSTC_RLIB_LINK_METADATA_MEMBER: &[u8] = b"lib.rmeta-link";
 const RUSTC_RLIB_LINK_METADATA_SECTION: &str = ".rmeta-link";
 const RUSTC_RLIB_LINK_METADATA_WRAPPER_MAX_LEN: u64 = 16 * 1024 * 1024;
 const RUSTC_SERIALIZED_METADATA_END: &[u8] = b"rust-end-file";
+// The first measured losing Ruff transition affected 8 of 256 raw objects while patching 113
+// sections. Use that boundary as the initial stop-loss, while requiring the affected share to scale
+// for larger archives.
+const BROAD_RUST_ARCHIVE_MIN_AFFECTED_OBJECTS: usize = 8;
+const BROAD_RUST_ARCHIVE_AFFECTED_FRACTION_DENOMINATOR: usize = 32;
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const STATE_LOCK_FILE: &str = "state.lock";
@@ -1404,12 +1409,57 @@ fn maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(
                     &previous,
                     &changed_inputs_to_patch,
                 ));
-        let changed_archive_member_set = should_start_with_filtered_records
-            && changed_inputs_have_archive_member_set_changes(
-                &previous,
-                &changed_inputs_to_patch,
-                args.should_normalize_rust_archive_patch_inputs(),
+        let archive_transition = should_start_with_filtered_records
+            .then(|| {
+                changed_inputs_archive_transition(
+                    &previous,
+                    &changed_inputs_to_patch,
+                    args.should_normalize_rust_archive_patch_inputs(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        for measured in archive_transition.measured_rust_archives {
+            if measured.cost.is_broad_member_set_transition() {
+                append_log(
+                    &state_dir,
+                    &format!(
+                        "declined broad Rust archive changed-input patch before loading complete \
+                         records: affects {} of {} raw objects across {} input file{} (first `{}`; \
+                         changed {}, added {}, removed {}; threshold {})",
+                        measured.cost.affected_objects,
+                        measured.cost.total_objects,
+                        measured.input_count,
+                        if measured.input_count == 1 { "" } else { "s" },
+                        measured.first_path.display(),
+                        measured.cost.changed_objects,
+                        measured.cost.added_objects,
+                        measured.cost.removed_objects,
+                        measured.cost.broad_threshold,
+                    ),
+                )?;
+                return Ok(false);
+            }
+            append_log(
+                &state_dir,
+                &format!(
+                    "classified Rust archive transition by raw-object delta: affects {} of {} raw \
+                     objects across {} input file{} (first `{}`; changed {}, added {}, removed {}; \
+                     member-set churn {}; broad threshold {})",
+                    measured.cost.affected_objects,
+                    measured.cost.total_objects,
+                    measured.input_count,
+                    if measured.input_count == 1 { "" } else { "s" },
+                    measured.first_path.display(),
+                    measured.cost.changed_objects,
+                    measured.cost.added_objects,
+                    measured.cost.removed_objects,
+                    measured.cost.has_member_set_churn(),
+                    measured.cost.broad_threshold,
+                ),
             )?;
+        }
+        let changed_archive_member_set = archive_transition.member_set_changed;
         let result = if changed_archive_member_set {
             let mut full_previous = previous.clone();
             full_previous.load_all_records_in_place(&state_dir)?;
@@ -2735,11 +2785,76 @@ fn changed_inputs_have_macho_text_patch_sections(
     })
 }
 
-fn changed_inputs_have_archive_member_set_changes(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustArchiveTransitionCost {
+    total_objects: usize,
+    changed_objects: usize,
+    added_objects: usize,
+    removed_objects: usize,
+    affected_objects: usize,
+    broad_threshold: usize,
+}
+
+impl RustArchiveTransitionCost {
+    fn from_manifests(
+        previous: &RustcRlibRawObjectManifest,
+        current: &RustcRlibRawObjectManifest,
+    ) -> Option<Self> {
+        let delta = rustc_rlib_raw_object_delta(previous, current)?;
+        let total_objects = previous
+            .ordered_objects
+            .len()
+            .max(current.ordered_objects.len());
+        let affected_objects = delta
+            .changed
+            .len()
+            .saturating_add(delta.added.len())
+            .saturating_add(delta.removed.len());
+        let proportional_threshold = total_objects
+            .saturating_add(BROAD_RUST_ARCHIVE_AFFECTED_FRACTION_DENOMINATOR - 1)
+            / BROAD_RUST_ARCHIVE_AFFECTED_FRACTION_DENOMINATOR;
+        Some(Self {
+            total_objects,
+            changed_objects: delta.changed.len(),
+            added_objects: delta.added.len(),
+            removed_objects: delta.removed.len(),
+            affected_objects,
+            broad_threshold: proportional_threshold.max(BROAD_RUST_ARCHIVE_MIN_AFFECTED_OBJECTS),
+        })
+    }
+
+    fn is_broad(&self) -> bool {
+        self.affected_objects >= self.broad_threshold
+    }
+
+    fn has_member_set_churn(&self) -> bool {
+        self.added_objects != 0 || self.removed_objects != 0
+    }
+
+    fn is_broad_member_set_transition(&self) -> bool {
+        self.has_member_set_churn() && self.is_broad()
+    }
+}
+
+#[derive(Debug)]
+struct MeasuredRustArchiveTransition {
+    first_path: PathBuf,
+    input_count: usize,
+    cost: RustArchiveTransitionCost,
+}
+
+#[derive(Debug, Default)]
+struct ChangedInputsArchiveTransition {
+    member_set_changed: bool,
+    measured_rust_archives: Vec<MeasuredRustArchiveTransition>,
+}
+
+fn changed_inputs_archive_transition(
     previous: &PersistedState,
     changed_inputs: &[(usize, PathBuf)],
     normalize_rust_archive_patch_inputs: bool,
-) -> Result<bool> {
+) -> Result<ChangedInputsArchiveTransition> {
+    let mut transition = ChangedInputsArchiveTransition::default();
     for (input_index, path) in changed_inputs {
         let previous_input = &previous.input_files[*input_index];
         let previous_proof = previous_input
@@ -2750,23 +2865,46 @@ fn changed_inputs_have_archive_member_set_changes(
             continue;
         }
         let Some((bytes, _)) = read_file_with_stable_identity(path)? else {
-            return Ok(true);
+            transition.member_set_changed = true;
+            continue;
         };
         let current_manifest =
             rustc_rlib_provenance(&bytes).and_then(|provenance| provenance.raw_object_manifest);
         if let (Some(previous_manifest), Some(current_manifest)) = (
             previous_input.rustc_raw_object_manifest.as_ref(),
             current_manifest.as_ref(),
-        ) && rustc_rlib_raw_object_delta(previous_manifest, current_manifest)
-            .is_some_and(|delta| !delta.added.is_empty() || !delta.removed.is_empty())
-        {
-            return Ok(true);
+        ) {
+            if let Some(cost) =
+                RustArchiveTransitionCost::from_manifests(previous_manifest, current_manifest)
+            {
+                transition.member_set_changed |= cost.has_member_set_churn();
+                if cost.affected_objects != 0 {
+                    if cost.is_broad_member_set_transition() {
+                        transition
+                            .measured_rust_archives
+                            .push(MeasuredRustArchiveTransition {
+                                first_path: path.clone(),
+                                input_count: 1,
+                                cost,
+                            });
+                        return Ok(transition);
+                    }
+                    transition
+                        .measured_rust_archives
+                        .push(MeasuredRustArchiveTransition {
+                            first_path: path.clone(),
+                            input_count: 1,
+                            cost,
+                        });
+                }
+            }
         }
         let Some(previous_proof) = previous_proof else {
             continue;
         };
         let Some(current_proof) = archive_member_set_proof(&bytes)? else {
-            return Ok(true);
+            transition.member_set_changed = true;
+            continue;
         };
         let hashes_match = if normalize_rust_archive_patch_inputs {
             previous_proof.normalized_ordered_hash == current_proof.normalized_ordered_hash
@@ -2774,10 +2912,10 @@ fn changed_inputs_have_archive_member_set_changes(
             previous_proof.raw_ordered_hash == current_proof.raw_ordered_hash
         };
         if previous_proof.member_count != current_proof.member_count || !hashes_match {
-            return Ok(true);
+            transition.member_set_changed = true;
         }
     }
-    Ok(false)
+    Ok(transition)
 }
 
 fn changed_inputs_need_records_to_derive_patch_metadata(
@@ -90123,6 +90261,70 @@ mod tests {
         )
     }
 
+    fn test_rustc_raw_object_manifest(
+        object_indices: &[usize],
+        invocation: &str,
+        changed_objects: &[usize],
+    ) -> RustcRlibRawObjectManifest {
+        let ordered_objects = object_indices
+            .iter()
+            .map(|index| {
+                let version = usize::from(changed_objects.contains(index));
+                RustcRlibRawObjectDigest {
+                    identifier: format!("crate-hash.cgu.{index}.{invocation}.rcgu.o").into_bytes(),
+                    digest: hash_bytes(format!("object-{index}-version-{version}").as_bytes()),
+                }
+            })
+            .collect::<Vec<_>>();
+        RustcRlibRawObjectManifest {
+            link_content_digest: rustc_rlib_link_content_digest_from_raw_objects(&ordered_objects)
+                .unwrap(),
+            ordered_objects,
+        }
+    }
+
+    fn test_rustc_rlib_archive(
+        object_count: usize,
+        invocation: &str,
+        changed_objects: &[usize],
+    ) -> (Vec<u8>, RustcRlibRawObjectManifest) {
+        let indices = (0..object_count).collect::<Vec<_>>();
+        test_rustc_rlib_archive_with_indices(&indices, invocation, changed_objects)
+    }
+
+    fn test_rustc_rlib_archive_with_indices(
+        object_indices: &[usize],
+        invocation: &str,
+        changed_objects: &[usize],
+    ) -> (Vec<u8>, RustcRlibRawObjectManifest) {
+        let manifest = test_rustc_raw_object_manifest(object_indices, invocation, changed_objects);
+        let contents = object_indices
+            .iter()
+            .map(|index| {
+                format!(
+                    "object-{index}-version-{}",
+                    usize::from(changed_objects.contains(index))
+                )
+                .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let objects = manifest
+            .ordered_objects
+            .iter()
+            .zip(&contents)
+            .map(|(object, contents)| {
+                (
+                    object.identifier.as_slice(),
+                    object.digest.as_str(),
+                    contents.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (archive, parsed_manifest) = rustc_rlib_with_raw_object_manifest(&objects);
+        assert_eq!(parsed_manifest, manifest);
+        (archive, manifest)
+    }
+
     #[test]
     fn rustc_rlib_provenance_validates_raw_object_manifest_against_archive() {
         let digest_a = "a".repeat(blake3::OUT_LEN * 2);
@@ -90387,6 +90589,252 @@ mod tests {
             (b"crate-hash.a.new.rcgu.o", digest_a.as_str(), b"a"),
         ]);
         assert!(rustc_rlib_raw_object_delta(&previous, &reordered).is_none());
+    }
+
+    #[test]
+    fn rust_archive_transition_cost_preserves_narrow_changes() {
+        let previous_indices = (0..16).collect::<Vec<_>>();
+        let previous = test_rustc_raw_object_manifest(&previous_indices, "old", &[]);
+        let one_changed = test_rustc_raw_object_manifest(&previous_indices, "new", &[0]);
+        let one_changed_cost =
+            RustArchiveTransitionCost::from_manifests(&previous, &one_changed).unwrap();
+
+        assert_eq!(one_changed_cost.affected_objects, 1);
+        assert_eq!(one_changed_cost.broad_threshold, 8);
+        assert!(!one_changed_cost.is_broad());
+
+        let current_indices = (0..14).chain([16, 17]).collect::<Vec<_>>();
+        let small_exchange = test_rustc_raw_object_manifest(&current_indices, "new", &[]);
+        let small_exchange_cost =
+            RustArchiveTransitionCost::from_manifests(&previous, &small_exchange).unwrap();
+
+        assert_eq!(small_exchange_cost.changed_objects, 0);
+        assert_eq!(small_exchange_cost.added_objects, 2);
+        assert_eq!(small_exchange_cost.removed_objects, 2);
+        assert_eq!(small_exchange_cost.affected_objects, 4);
+        assert!(!small_exchange_cost.is_broad());
+        assert!(!small_exchange_cost.is_broad_member_set_transition());
+    }
+
+    #[test]
+    fn rust_archive_transition_cost_requires_measured_breadth() {
+        let indices = (0..256).collect::<Vec<_>>();
+        let previous = test_rustc_raw_object_manifest(&indices, "old", &[]);
+        let seven = test_rustc_raw_object_manifest(&indices, "new", &(0..7).collect::<Vec<_>>());
+        let observed_indices = (0..253).chain(256..259).collect::<Vec<_>>();
+        let eight = test_rustc_raw_object_manifest(&observed_indices, "new", &[0, 1]);
+
+        let below = RustArchiveTransitionCost::from_manifests(&previous, &seven).unwrap();
+        let at = RustArchiveTransitionCost::from_manifests(&previous, &eight).unwrap();
+
+        assert_eq!(below.broad_threshold, 8);
+        assert!(!below.is_broad());
+        assert_eq!(at.changed_objects, 2);
+        assert_eq!(at.added_objects, 3);
+        assert_eq!(at.removed_objects, 3);
+        assert_eq!(at.affected_objects, 8);
+        assert!(at.is_broad());
+        assert!(at.is_broad_member_set_transition());
+
+        let large_indices = (0..1_000).collect::<Vec<_>>();
+        let large_previous = test_rustc_raw_object_manifest(&large_indices, "old", &[]);
+        let thirty_one =
+            test_rustc_raw_object_manifest(&large_indices, "new", &(0..31).collect::<Vec<_>>());
+        let thirty_two =
+            test_rustc_raw_object_manifest(&large_indices, "new", &(0..32).collect::<Vec<_>>());
+        let below_fraction =
+            RustArchiveTransitionCost::from_manifests(&large_previous, &thirty_one).unwrap();
+        let at_fraction =
+            RustArchiveTransitionCost::from_manifests(&large_previous, &thirty_two).unwrap();
+        assert_eq!(below_fraction.broad_threshold, 32);
+        assert!(!below_fraction.is_broad());
+        assert_eq!(at_fraction.broad_threshold, 32);
+        assert!(at_fraction.is_broad());
+        assert!(!at_fraction.is_broad_member_set_transition());
+    }
+
+    #[test]
+    fn rust_archive_transition_cost_treats_reordering_as_unknown() {
+        let indices = (0..128).collect::<Vec<_>>();
+        let previous = test_rustc_raw_object_manifest(&indices, "old", &[]);
+        let mut reordered_indices = indices.clone();
+        reordered_indices.reverse();
+        let reordered = test_rustc_raw_object_manifest(&reordered_indices, "new", &[]);
+
+        assert!(RustArchiveTransitionCost::from_manifests(&previous, &reordered).is_none());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn unknown_rust_archive_cost_keeps_structural_member_set_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("libcrate.rlib");
+        let (previous_bytes, previous_manifest) = test_rustc_rlib_archive(128, "old", &[]);
+        let mut reordered_indices = (0..128).collect::<Vec<_>>();
+        reordered_indices.reverse();
+        let reordered_manifest = test_rustc_raw_object_manifest(&reordered_indices, "new", &[]);
+        let contents = reordered_indices
+            .iter()
+            .map(|index| format!("object-{index}-version-0").into_bytes())
+            .collect::<Vec<_>>();
+        let objects = reordered_manifest
+            .ordered_objects
+            .iter()
+            .zip(&contents)
+            .map(|(object, contents)| {
+                (
+                    object.identifier.as_slice(),
+                    object.digest.as_str(),
+                    contents.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (reordered_bytes, _) = rustc_rlib_with_raw_object_manifest(&objects);
+        std::fs::write(&input, reordered_bytes).unwrap();
+
+        let mut previous = state("args", b"output", &[]);
+        previous.input_files = vec![FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_bytes(&previous_bytes),
+            snapshot_identity: None,
+            rustc_link_content_digest: Some(previous_manifest.link_content_digest.clone()),
+            rustc_raw_object_manifest: Some(previous_manifest),
+            patch: Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: archive_member_set_proof(&previous_bytes).unwrap(),
+                archive_member_patch_fingerprints: None,
+                macho_archive_members: Vec::new(),
+                sections: Vec::new(),
+                raw_sections: None,
+            }),
+        }];
+
+        let transition = changed_inputs_archive_transition(&previous, &[(0, input)], true).unwrap();
+
+        assert!(transition.member_set_changed);
+        assert!(transition.measured_rust_archives.is_empty());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn pure_changed_rust_archive_at_breadth_threshold_remains_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("libcrate.rlib");
+        let (previous_bytes, previous_manifest) = test_rustc_rlib_archive(256, "old", &[]);
+        let (current_bytes, _) = test_rustc_rlib_archive(256, "new", &(0..8).collect::<Vec<_>>());
+        std::fs::write(&input, current_bytes).unwrap();
+        let mut previous = state("args", b"output", &[]);
+        previous.input_files = vec![FileState {
+            path: encode_path(&input),
+            content: FileContentState::from_bytes(&previous_bytes),
+            snapshot_identity: None,
+            rustc_link_content_digest: Some(previous_manifest.link_content_digest.clone()),
+            rustc_raw_object_manifest: Some(previous_manifest),
+            patch: None,
+        }];
+
+        let transition = changed_inputs_archive_transition(&previous, &[(0, input)], true).unwrap();
+        let measured = &transition.measured_rust_archives[0];
+
+        assert!(!transition.member_set_changed);
+        assert!(measured.cost.is_broad());
+        assert!(!measured.cost.is_broad_member_set_transition());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn separate_narrow_member_set_transitions_do_not_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut previous = state("args", b"output", &[]);
+        let mut changed_inputs = Vec::new();
+        let current_indices = (0..98).chain(100..102).collect::<Vec<_>>();
+        for input_index in 0..2 {
+            let path = dir.path().join(format!("libcrate{input_index}.rlib"));
+            let (previous_bytes, previous_manifest) = test_rustc_rlib_archive(100, "old", &[]);
+            let (current_bytes, _) =
+                test_rustc_rlib_archive_with_indices(&current_indices, "new", &[]);
+            std::fs::write(&path, current_bytes).unwrap();
+            previous.input_files.push(FileState {
+                path: encode_path(&path),
+                content: FileContentState::from_bytes(&previous_bytes),
+                snapshot_identity: None,
+                rustc_link_content_digest: Some(previous_manifest.link_content_digest.clone()),
+                rustc_raw_object_manifest: Some(previous_manifest),
+                patch: None,
+            });
+            changed_inputs.push((input_index, path));
+        }
+
+        let transition =
+            changed_inputs_archive_transition(&previous, &changed_inputs, true).unwrap();
+        assert!(transition.member_set_changed);
+        assert_eq!(transition.measured_rust_archives.len(), 2);
+        for measured in &transition.measured_rust_archives {
+            assert_eq!(measured.cost.affected_objects, 4);
+            assert!(!measured.cost.is_broad_member_set_transition());
+        }
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn individually_broad_rust_archive_stops_before_later_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let broad_path = dir.path().join("libbroad.rlib");
+        let unreadable_path = dir.path().join("libunreadable.rlib");
+        let (broad_previous_bytes, broad_previous_manifest) =
+            test_rustc_rlib_archive(256, "old", &[]);
+        let current_indices = (0..253).chain(256..259).collect::<Vec<_>>();
+        let (broad_current_bytes, _) =
+            test_rustc_rlib_archive_with_indices(&current_indices, "new", &[0, 1]);
+        let (unreadable_previous_bytes, unreadable_previous_manifest) =
+            test_rustc_rlib_archive(1, "old", &[]);
+        std::fs::write(&broad_path, broad_current_bytes).unwrap();
+        std::fs::create_dir(&unreadable_path).unwrap();
+
+        let mut previous = state("args", b"output", &[]);
+        previous.input_files = vec![
+            FileState {
+                path: encode_path(&broad_path),
+                content: FileContentState::from_bytes(&broad_previous_bytes),
+                snapshot_identity: None,
+                rustc_link_content_digest: Some(
+                    broad_previous_manifest.link_content_digest.clone(),
+                ),
+                rustc_raw_object_manifest: Some(broad_previous_manifest),
+                patch: None,
+            },
+            FileState {
+                path: encode_path(&unreadable_path),
+                content: FileContentState::from_bytes(&unreadable_previous_bytes),
+                snapshot_identity: None,
+                rustc_link_content_digest: Some(
+                    unreadable_previous_manifest.link_content_digest.clone(),
+                ),
+                rustc_raw_object_manifest: Some(unreadable_previous_manifest),
+                patch: None,
+            },
+        ];
+
+        let transition = changed_inputs_archive_transition(
+            &previous,
+            &[(0, broad_path), (1, unreadable_path)],
+            true,
+        )
+        .unwrap();
+
+        assert!(transition.member_set_changed);
+        assert_eq!(transition.measured_rust_archives.len(), 1);
+        assert_eq!(
+            transition.measured_rust_archives[0].cost,
+            RustArchiveTransitionCost {
+                total_objects: 256,
+                changed_objects: 2,
+                added_objects: 3,
+                removed_objects: 3,
+                affected_objects: 8,
+                broad_threshold: 8,
+            }
+        );
     }
 
     #[test]
@@ -91341,6 +91789,75 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn preloading_declines_broad_rust_archive_before_complete_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let input = dir.path().join("libcrate.rlib");
+        let (previous_bytes, previous_manifest) = test_rustc_rlib_archive(256, "old", &[]);
+        let current_indices = (0..253).chain(256..259).collect::<Vec<_>>();
+        let (current_bytes, _) =
+            test_rustc_rlib_archive_with_indices(&current_indices, "new", &[0, 1]);
+        std::fs::write(&output, vec![0; 128]).unwrap();
+        std::fs::write(&input, &previous_bytes).unwrap();
+
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        args.should_emit_code_signature = false;
+        let state_dir = state_dir_for_output(&output);
+        let input_path = encode_path(&input);
+        let section = PatchSection {
+            input: input_path.clone(),
+            section_index: 1,
+            section_name: Some("__TEXT,__text".to_owned()),
+            input_size: 1,
+            output_offset: 0,
+            output_size: 1,
+            data_hash: Some(hash_bytes(b"previous")),
+            cstring_nul_boundaries_hash: None,
+        };
+        let mut previous = publishing_metadata_state(&args, &output, &input);
+        previous.input_files[0].rustc_link_content_digest =
+            Some(previous_manifest.link_content_digest.clone());
+        previous.input_files[0].rustc_raw_object_manifest = Some(previous_manifest);
+        previous.input_files[0].patch = Some(FilePatchState {
+            fingerprint: hash_bytes(&previous_bytes),
+            archive_member_set_proof: archive_member_set_proof(&previous_bytes).unwrap(),
+            archive_member_patch_fingerprints: None,
+            macho_archive_members: Vec::new(),
+            sections: vec![file_patch_section_state(&section)],
+            raw_sections: None,
+        });
+        previous
+            .sections
+            .push(section_record(input.to_str().unwrap(), 1, 0, 1));
+        previous.write(&state_dir).unwrap();
+
+        let metadata = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        let records_file = metadata.patch_records_file.unwrap();
+        std::fs::remove_file(state_dir.join(records_file)).unwrap();
+        let replacement = dir.path().join("libcrate.replacement.rlib");
+        std::fs::write(&replacement, current_bytes).unwrap();
+        std::fs::rename(replacement, &input).unwrap();
+
+        assert!(
+            !maybe_reuse_output_before_loading_with_rustc_link_content_digest_trust(&args, true)
+                .unwrap()
+        );
+
+        let log = std::fs::read_to_string(state_dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains(
+            "declined broad Rust archive changed-input patch before loading complete records"
+        ));
+        assert!(log.contains("affects 8 of 256 raw objects"));
+        assert!(log.contains("changed 2, added 3, removed 3"));
+        assert!(!log.contains("loaded complete records for changed archive member set"));
+        assert!(!update_marker_path(&state_dir).exists());
+        assert_eq!(std::fs::read(output).unwrap(), vec![0; 128]);
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn preclassified_link_content_digest_rechecks_input_identity() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("libcrate.rlib");
@@ -91560,31 +92077,30 @@ mod tests {
         previous_state.input_files = vec![input.clone()];
         std::fs::write(&current_path, &renamed).unwrap();
         assert!(
-            !changed_inputs_have_archive_member_set_changes(
+            !changed_inputs_archive_transition(
                 &previous_state,
                 &[(0, current_path.clone())],
                 true,
             )
-            .unwrap(),
+            .unwrap()
+            .member_set_changed,
             "normalized Rust invocation churn should keep filtered records",
         );
         assert!(
-            changed_inputs_have_archive_member_set_changes(
+            changed_inputs_archive_transition(
                 &previous_state,
                 &[(0, current_path.clone())],
                 false,
             )
-            .unwrap(),
+            .unwrap()
+            .member_set_changed,
             "raw archive identity changes should load complete records",
         );
         std::fs::write(&current_path, &reordered).unwrap();
         assert!(
-            changed_inputs_have_archive_member_set_changes(
-                &previous_state,
-                &[(0, current_path)],
-                true,
-            )
-            .unwrap(),
+            changed_inputs_archive_transition(&previous_state, &[(0, current_path)], true,)
+                .unwrap()
+                .member_set_changed,
             "member-set changes should load complete records",
         );
 
@@ -91620,22 +92136,20 @@ mod tests {
         }];
         std::fs::write(&manifest_path, changed_rlib).unwrap();
         assert!(
-            !changed_inputs_have_archive_member_set_changes(
+            !changed_inputs_archive_transition(
                 &manifest_state,
                 &[(0, manifest_path.clone())],
                 true,
             )
-            .unwrap(),
+            .unwrap()
+            .member_set_changed,
             "same-member content changes should keep filtered records",
         );
         std::fs::write(&manifest_path, removed_rlib).unwrap();
         assert!(
-            changed_inputs_have_archive_member_set_changes(
-                &manifest_state,
-                &[(0, manifest_path)],
-                true,
-            )
-            .unwrap(),
+            changed_inputs_archive_transition(&manifest_state, &[(0, manifest_path)], true,)
+                .unwrap()
+                .member_set_changed,
             "raw-object removal should load complete records",
         );
 
