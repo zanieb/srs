@@ -6,7 +6,9 @@
 // top of it, e.g. the side-effect/coloring analysis and the scan support.
 
 use crate::entity::SecondaryMap;
-use crate::inst_predicates::{has_lowering_side_effect, is_constant_64bit};
+use crate::inst_predicates::{
+    has_lowering_side_effect, has_observable_side_effect, is_constant_64bit,
+};
 use crate::ir::{
     ArgumentPurpose, Block, BlockArg, Constant, ConstantData, DataFlowGraph, ExternalName,
     Function, GlobalValue, GlobalValueData, Immediate, Inst, InstructionData, MemFlagsData,
@@ -745,7 +747,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // each IR instruction.
         for inst in self.f.layout.block_insts(block).rev() {
             let data = &self.f.dfg.insts[inst];
-            let has_side_effect = has_lowering_side_effect(self.f, inst);
+            // Loads participate in lowering's side-effect ordering even when
+            // they are nontrapping. Keep that ordering separate from whether
+            // an unused instruction has an observable side effect and must be
+            // emitted.
+            let has_lowering_side_effect = has_lowering_side_effect(self.f, inst);
+            let has_observable_side_effect = has_observable_side_effect(self.f, inst);
             // If  inst has been sunk to another location, skip it.
             if self.is_inst_sunk(inst) {
                 continue;
@@ -753,19 +760,20 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // Are any outputs used at least once?
             let value_needed = self.is_any_inst_result_needed(inst);
             trace!(
-                "lower_clif_block: block {} inst {} ({:?}) is_branch {} side_effect {} value_needed {}",
+                "lower_clif_block: block {} inst {} ({:?}) is_branch {} lowering_side_effect {} observable_side_effect {} value_needed {}",
                 block,
                 inst,
                 data,
                 data.opcode().is_branch(),
-                has_side_effect,
+                has_lowering_side_effect,
+                has_observable_side_effect,
                 value_needed,
             );
 
             // Update scan state to color prior to this inst (as we are scanning
             // backward).
             self.cur_inst = Some(inst);
-            if has_side_effect {
+            if has_lowering_side_effect {
                 let entry_color = *self
                     .side_effect_inst_entry_colors
                     .get(&inst)
@@ -783,11 +791,14 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // order, and therefore **before** in reversed order.
             // Only emit value label aliases if the instruction will be lowered
             // (otherwise we want to keep using the earlier label instead).
-            self.emit_value_label_live_range_start_for_inst(inst, has_side_effect || value_needed);
+            self.emit_value_label_live_range_start_for_inst(
+                inst,
+                has_observable_side_effect || value_needed,
+            );
 
             // Normal instruction: codegen if the instruction is side-effecting
             // or any of its outputs is used.
-            if has_side_effect || value_needed {
+            if has_observable_side_effect || value_needed {
                 trace!("lowering: inst {}: {}", inst, self.f.dfg.display_inst(inst));
                 let temp_regs = match backend.lower(self, inst) {
                     Some(regs) => regs,

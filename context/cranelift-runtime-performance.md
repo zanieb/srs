@@ -7,8 +7,9 @@ Cranelift, not Cranelift compile time. LLVM and Cranelift use the same SRS
 rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
-The latest comparison was collected on aarch64 macOS from the source tree now
-recorded at SRS `131741680`, with:
+The latest comparison was collected on aarch64 macOS from the current SRS
+worktree, based on `131741680` with the subsequent performance commits recorded
+in this document, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -32,24 +33,24 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 31.0 ms | 53.3 ms | 1.72x |
-| `uv lock --check`, offline | 57.0 ms | 82.8 ms | 1.45x |
-| `ruff check` over 1,592 fixtures | 78.1 ms | 140.8 ms | 1.80x |
-| `ty check` over `scripts/ty_benchmark` | 47.3 ms | 108.3 ms | 2.29x |
+| `uv venv --clear` | 33.5 ms | 54.9 ms | 1.64x |
+| `uv lock --check`, offline | 60.5 ms | 85.3 ms | 1.41x |
+| `ruff check` over 1,592 fixtures | 80.6 ms | 142.1 ms | 1.76x |
+| `ty check` over `scripts/ty_benchmark` | 48.0 ms | 109.9 ms | 2.29x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.5-2.3x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.3x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
 
-Cranelift lost every paired LLVM trial in three rows and 49/50 uv-lock trials
-(two-sided sign-test `p <= 9.06e-14`). Exit codes and stdout/stderr digests
-match between backends for every correctness probe.
+Cranelift lost every paired LLVM trial in all four rows (two-sided sign-test
+`p = 1.78e-15`). Exit codes and stdout/stderr digests match between backends
+for every correctness probe.
 
 ### Final acceptance gate
 
@@ -71,9 +72,9 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 133.2 MB | 2.96x |
-| ty | 47.5 MB | 136.7 MB | 2.88x |
-| uv | 100.0 MB | 276.9 MB | 2.77x |
+| Ruff | 45.0 MB | 132.4 MB | 2.95x |
+| ty | 47.5 MB | 135.8 MB | 2.86x |
+| uv | 100.0 MB | 275.7 MB | 2.76x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
@@ -1346,6 +1347,42 @@ stage-2 cg_clif, standard-library, proc-macro, and rustdoc build passes, as does
 uv's exact
 `keyring::tests::fetch_url_no_host` expected-panic regression. The full
 repository-suite rerun is recorded separately below.
+
+### Dead nontrapping load elimination
+
+Machine lowering previously treated every load as a side-effecting root. That
+is necessary for lowering's memory-order colors and its rules for folding and
+sinking live loads, but it is too conservative for root emission: an unused
+load marked `notrap` has no observable effect. The retained change separates
+those two decisions. Every load keeps the existing lowering-side-effect color
+and live-load behavior, while an instruction is emitted as an unused root only
+when it has an observable side effect. Unused potentially trapping loads still
+execute and preserve their trap.
+
+A focused AArch64 filetest covers both sides of the boundary: an unused
+`notrap` load compiles to `ret`, while an otherwise identical trapping load
+still emits `ldr` with its heap-out-of-bounds trap. In the profiled ty binary,
+the representative hot
+`RawTableInner::find_or_find_insert_index_inner` body shrinks from 700 to 640
+bytes by dropping dead literal-pool loads without changing the placement of
+live loads.
+
+The complete 50-run matched gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -2.16% | 34/50 | 0.01535 | +65.2% | -0.424% |
+| `uv lock --check`, offline | -0.07% | 25/50 | 1.00000 | +42.0% | -0.424% |
+| `ruff check` over 1,592 fixtures | -0.22% | 26/50 | 0.88772 | +79.7% | -0.612% |
+| `ty check` over `scripts/ty_benchmark` | +0.32% | 21/50 | 0.32224 | +129.4% | -0.679% |
+
+uv environment creation improves decisively; the other three runtime rows are
+statistically neutral; and every binary shrinks by 0.4-0.7%. All application
+exit codes and output digests match LLVM and the preceding Cranelift build.
+The complete stage-2 backend, standard-library, and proc-macro build, all 186
+`cranelift-codegen` unit tests, 21 passing doctests, and all 1,217 Cranelift
+filetests pass. This is retained as a broadly useful dead-code and code-size
+improvement with one demonstrated application-runtime win.
 
 ### AArch64 CRC intrinsics
 
