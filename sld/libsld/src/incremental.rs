@@ -21716,7 +21716,7 @@ fn matched_macho_local_text_target_ownership(
     previous_context: &MachOTextRelocationContext,
     current_context: &MachOTextRelocationContext,
     previous_output: &[u8],
-    output_symbols: &MachOLocalOutputSymbolLookup,
+    output_symbols: &std::cell::OnceCell<MachOLocalOutputSymbolLookup>,
     output_file: &object::File<'_>,
     rematerialized_sections: &[(SharedText, String, u32, String, u32)],
     recorded_incoming_edges: &[RecordedMachOLocalCohortEdge],
@@ -21732,6 +21732,7 @@ fn matched_macho_local_text_target_ownership(
     else {
         return Ok(Ok(None));
     };
+    let output_symbols = lazy_macho_local_output_symbols(output_symbols, previous_output)?;
     if matches!(
         previous_context.r_type,
         object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
@@ -30313,7 +30314,7 @@ fn macho_text_relocation_replays_for_input(
                             previous_context,
                             current_context,
                             previous_output,
-                            lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
+                            &output_symbols,
                             &output_file,
                             &rematerialized_sections,
                             &recorded_local_cohort_edges,
@@ -30481,7 +30482,7 @@ fn macho_text_relocation_replays_for_input(
                         previous_context,
                         current_context,
                         previous_output,
-                        lazy_macho_local_output_symbols(&output_symbols, previous_output)?,
+                        &output_symbols,
                         &output_file,
                         &rematerialized_sections,
                         &recorded_local_cohort_edges,
@@ -82139,7 +82140,7 @@ mod tests {
             true,
             records_complete,
         )
-        .unwrap()
+        .map_err(|error| error.to_string())?
         .map_err(|reason| reason.to_string())?;
         assert!(target_patches.output_symbols.is_empty());
         if !matched_macho_local_retarget_fingerprint_matches(
@@ -82279,6 +82280,33 @@ mod tests {
         assert_eq!(reapplied_b, output_b);
         assert_eq!(records_b2, expected_records_b);
         assert_eq!(retargets_b2, retargets_b);
+    }
+
+    #[test]
+    fn demanded_local_macho_text_target_preserves_output_symbol_lookup_error() {
+        let mut fixture = local_text_target_transition_fixture(
+            b"l_a.1",
+            b"l_b.2",
+            b"A-target",
+            b"B-target",
+            0,
+            4,
+        );
+        invalidate_test_macho_output_symbol_name(&mut fixture.previous_output);
+
+        MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
+        let error =
+            apply_local_text_target_transition(&fixture, vec![fixture.relocation.clone()], true)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Failed to parse Mach-O output symbol name\n  Caused by:\n    Invalid Mach-O symbol name offset\n"
+        );
+        assert_eq!(
+            MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
+            1
+        );
     }
 
     #[test]
@@ -93530,7 +93558,7 @@ mod tests {
     }
 
     #[test]
-    fn macho_text_relocation_lazily_preserves_output_symbol_lookup_error() {
+    fn unchanged_global_macho_text_relocation_skips_output_symbol_lookup() {
         let source = test_macho_import_branch_object(b"_data");
         let source_file = object::File::parse(source.as_slice()).unwrap();
         let source_text = source_file.section_by_name("__text").unwrap();
@@ -93586,7 +93614,7 @@ mod tests {
         };
 
         MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
-        let error = match macho_text_relocation_replays_for_input(
+        let replays = macho_text_relocation_replays_for_input(
             std::slice::from_ref(&relocation),
             &HistoricalMachORelocationRecords::new(),
             &mut resolutions,
@@ -93604,18 +93632,14 @@ mod tests {
             &DirectMachOCguLivenessProof::default(),
             true,
             true,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("required output symbol lookup should preserve its parse error"),
-        };
+        )
+        .unwrap()
+        .unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "Failed to parse Mach-O output symbol name\n  Caused by:\n    Invalid Mach-O symbol name offset\n"
-        );
+        assert!(replays.replays.is_empty());
         assert_eq!(
             MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
-            1
+            0
         );
     }
 
