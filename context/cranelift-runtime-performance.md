@@ -1724,6 +1724,53 @@ tail/code-layout compaction, or a machine-level transform that does not add
 hot branch edges; generic memory-SSA promotion is not the missing optimization
 for this body.
 
+### Rejected loop-wrapper body import
+
+The matched Cranelift and LLVM profiles ruled out the apparent `memmove` lead
+as a backend-specific lowering gap. Both binaries call Darwin's tuned routine
+with dynamic byte counts for real vector and table relocation, and the LLVM ty
+binary contains more static `memmove` references than the retained Cranelift
+binary. The sharper difference was parameter hashing: retained Cranelift kept
+an 88-byte `Parameter::hash_slice` loop wrapper and called a roughly 736-byte
+`Parameter::hash` body on every iteration, while LLVM fused the parameter hash
+into its slice loop.
+
+A bounded post-monomorphization import prototype targeted exactly that shape.
+It recognized void wrappers with at most 24 blocks and 96 live instructions,
+exactly one direct result-free call in a natural loop, and no other call. Only
+that call could import a larger callee: source MIR remained capped at 64 blocks
+and 512 operations, and optimized CLIF at 160 blocks and 384 instructions with
+no live stack slot, dynamic stack slot, global value, stack limit, or inline
+assembly. Existing repeated-call and trivial-import rules remained unchanged.
+
+The intended transformation fired. The standalone `Parameter::hash` symbol
+and loop call disappeared, and its dispatch body moved into
+`Parameter::hash_slice`. The policy also shrank uv by 47,200 bytes (0.03%),
+Ruff by 898,496 bytes (0.84%), and ty by 1,948,752 bytes (1.73%). A 20-run
+ty-only screen initially measured -1.81% paired with 13/20 wins, but a
+100-run screen settled at -0.65% with 59/100 wins (`p = 0.08863`). The
+complete 50-run three-lane application gate then measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.55% | 23/50 | 0.67181 | +63.9% |
+| `uv lock --check`, offline | +0.51% | 23/50 | 0.67181 | +37.7% |
+| `ruff check` over 1,592 fixtures | -0.22% | 26/50 | 0.88772 | +77.8% |
+| `ty check` over `scripts/ty_benchmark` | -0.44% | 29/50 | 0.32224 | +117.4% |
+
+Every LLVM, retained-Cranelift, and candidate exit code and output digest
+matched. cg_clif check, the complete stage-2 backend build, and the matching
+stage-2 standard-library and proc-macro build passed. Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/loop-wrapper-import-all50.json`.
+
+The policy is rejected for runtime. It makes a genuine size improvement, but
+neither the target ty operation nor any other workload improves decisively,
+and both uv rows move slightly backward. Importing a large dispatch body into
+a hot loop is therefore not justified by loop placement alone. The remaining
+call arc needs a stronger dynamic frequency and cost signal, or a transform
+that also reduces the imported body's branches and observer calls rather than
+only deleting the outer call boundary.
+
 ### Rejected call-bounded wide-constant sharing
 
 The earlier whole-function multiplier hoist had kept the value in a
