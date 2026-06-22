@@ -1872,6 +1872,50 @@ borrow use while retaining an SSA value elsewhere, or eliminate/import the
 small by-reference helper. Simply admitting more SIMD-backed types to the
 existing all-or-nothing local policy cannot affect this loop.
 
+### Rejected shared-borrow and native `i8x8` SSA
+
+The follow-up implemented both missing pieces from the wrapper-only result.
+An eight-byte transparent wrapper borrowed immutably kept a Cranelift variable
+plus synchronized stack storage for the borrow, and native AArch64 `i8x8`
+locals used Cranelift variables with explicit lane extraction and insertion.
+SIMD locals constructed through aggregate field writes remained memory-backed;
+that narrow exclusion was required because cg_clif's aggregate writer treats a
+SIMD value as a struct containing an array rather than as one vector value.
+
+The complete stage-2 backend, standard-library, and proc-macro build passed,
+as did a fresh hashbrown build and execution probe and fresh uv, Ruff, and ty
+profiling builds. The candidate backend is preserved as
+`shared-borrow-i8x8-ssa/candidate.dylib` with SHA-256
+`7bf8824a6bda9cf44825aae523ca1d420a355b40a866f8fca5a12a26178b230e`.
+The candidate grew uv by 13,136 bytes, Ruff by 10,048 bytes, and ty by 11,008
+bytes.
+
+This version did reach the intended boundary, but only partially. In each
+application, one hashbrown `find_or_find_insert_index_inner` body fell from
+608 to 600 bytes while the companion 688-byte body was unchanged. The focused
+hashbrown probe fell from 664 to 656 bytes and stopped reloading its control
+group from an eight-byte scalar stack slot. Keeping the vector live across the
+indirect equality callback instead required a vector spill, however, and grew
+that probe's frame from 80 to 96 bytes.
+
+The matched 20-run application gate found no runtime benefit:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -1.05% | 11/20 | 0.82380 |
+| `uv lock --check`, offline | -0.76% | 11/20 | 0.82380 |
+| `ruff check` over 1,592 fixtures | +2.26% | 7/20 | 0.26318 |
+| `ty check` over `scripts/ty_benchmark` | +1.05% | 9/20 | 0.82380 |
+
+Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/bench-shared-borrow-i8x8-ssa-all20/results.json`.
+The prototype is rejected without a 50-run gate. Replacing one scalar reload
+with a larger live vector did not reduce total pressure across the callback,
+and the broad local-representation machinery increased both implementation
+complexity and binary size. The next vector-region attempt needs to remove or
+devirtualize that callback, or keep enough surrounding state in registers to
+avoid exchanging one spill form for another.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
