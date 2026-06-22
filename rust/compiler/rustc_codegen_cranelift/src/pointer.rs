@@ -43,6 +43,18 @@ impl Pointer {
         (self.base, self.offset)
     }
 
+    /// Compare represented storage locations. `readonly` is an access fact, not part of the
+    /// address identity.
+    pub(crate) fn has_same_location(self, other: Pointer) -> bool {
+        let same_base = match (self.base, other.base) {
+            (PointerBase::Addr(a), PointerBase::Addr(b)) => a == b,
+            (PointerBase::Stack(a), PointerBase::Stack(b)) => a == b,
+            (PointerBase::Dangling(a), PointerBase::Dangling(b)) => a == b,
+            _ => false,
+        };
+        same_base && self.offset == other.offset
+    }
+
     pub(crate) fn get_addr(self, fx: &mut FunctionCx<'_, '_, '_>) -> Value {
         match self.base {
             PointerBase::Addr(base_addr) => {

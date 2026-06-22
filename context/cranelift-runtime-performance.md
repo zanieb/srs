@@ -1673,6 +1673,76 @@ stage-2 cg_clif, standard-library, and proc-macro build and all three pinned
 application builds also pass. The evidence is recorded in
 `bench-hidden-weak-all50/results.json` under the benchmark scratch directory.
 
+### Materialized post-monomorphization references
+
+The rejected one-off tail-wrapper experiment exposed a correctness hole that
+was independent of its profitability policy. Optimized CGU partitioning may
+omit local copies and conflict-mangled global copies on the assumption that
+the backend will inline every reference. cg_clif's bounded inliner may retain
+one of those calls or function addresses. It may also introduce a reference
+only after partitioning, when no CGU has been assigned responsibility for its
+definition. Function references nested in constants and allocations were not
+part of cg_clif's existing direct-call census either.
+
+cg_clif now records direct function constants and nested allocation
+references, carries references introduced while remapping imported bodies
+back to the destination module, and materializes the transitive closure of
+available definitions that cannot otherwise be assumed to exist. The emitted
+fallback definitions use the same hidden weak linkage as other partitioner
+local copies, so duplicate CGUs may still coalesce them. Naked and explicitly
+external functions remain outside this fallback.
+
+This fixes the undefined `Display::fmt` references that appeared while linking
+the `psm` and `libc` build scripts with Apple's linker. Both reproductions and
+the complete stage-2 compiler and cg_clif build now pass. The change is kept as
+a correctness prerequisite and committed independently from the aggregate
+optimization below.
+
+### Direct construction into indirect aggregate returns
+
+A fresh amplified ty profile after CGU-local coalescing again put Darwin
+`memmove` near the top. Interposition attributed three copies of 488, 488, and
+496 bytes to `ConstraintSetBuilder::new`. Optimized MIR first constructed a
+`ConstraintSetStorage` temporary, copied it into `UnsafeCell`, copied that into
+`RefCell`, and finally copied the wrapper into the indirect return place.
+LLVM's later SROA removes the chain; cg_clif previously allocated every MIR
+temporary independently and preserved it.
+
+cg_clif now recognizes a conservative destination chain for memory-backed
+temporaries. The source must have exactly one whole-local definition and one
+use, its address must never be observed, its type must exactly match the
+nonzero field layout, and the chain must terminate at an indirect return
+place. Scalar and scalar-pair SSA values are explicitly excluded. Eligible
+temporaries are allocated directly in the final nested return field. The
+ordinary by-reference assignment recognizes the resulting identical source
+and destination pointer and omits the self-copy. Tuples, enum variants,
+unions, address-observed locals, direct returns, and ambiguous use chains keep
+the existing path.
+
+In the exact profiled constructor, machine code falls from 1,048 to 628 bytes,
+the 1,760-byte frame disappears, and all three libc copies are gone. Fresh,
+matched application binaries shrink by 314,048 bytes for uv (0.174%), 86,736
+bytes for Ruff (0.081%), and 152,256 bytes for ty (0.135%). A 4,096-copy
+amplified ty corpus produces the identical diagnostic-stream checksum in the
+control and candidate.
+
+The complete 50-run matched operation gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.80% | 30/50 | 0.20264 | 1.61x | -0.174% |
+| `uv lock --check`, offline | -0.17% | 26/50 | 0.88772 | 1.40x | -0.174% |
+| `ruff check` over 1,592 fixtures | +0.06% | 24/50 | 0.88772 | 1.78x | -0.081% |
+| `ty check` over `scripts/ty_benchmark` | -1.76% | 33/50 | 0.03284 | 2.19x | -0.135% |
+
+Ty reaches the sign-test threshold independently, both uv rows are favorable
+or neutral, Ruff is neutral, every binary shrinks, and every
+correctness-probe exit code and output digest matches. A separate 20-run
+three-lane screen supplies the LLVM ratios in the table. The complete stage-2
+compiler, cg_clif, standard-library, and proc-macro builds and all three fresh
+application builds pass. The optimization is retained; the full matched
+repository-suite rerun remains the finalization gate.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
@@ -2028,6 +2098,15 @@ Known-receiver devirtualization removed some copies of the hashbrown loop and
 replaced its indirect equality call in a reduction, but both the direct-only
 and targeted-inlining variants were runtime-neutral in 50-run application
 gates and were rejected.
+Direct construction into nested indirect-return fields completes another
+profiled stack arc: it removes three 488-496-byte copies and the complete
+1,760-byte frame from `ConstraintSetBuilder::new`, shrinks all three binaries,
+improves ty decisively, leaves both uv operations favorable or neutral, and is
+neutral for Ruff. The retained proof is deliberately limited to
+single-definition, single-use memory-backed temporaries whose address is never
+observed. Extending destination reuse to tuples, enum variants, or non-return
+roots requires a separately proven alias and lifetime model rather than
+broadening this rule by shape alone.
 
 An untargeted, one-level post-monomorphization body-import experiment removed
 all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime

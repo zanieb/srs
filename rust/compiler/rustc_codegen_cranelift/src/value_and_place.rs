@@ -625,6 +625,11 @@ impl<'tcx> CPlace<'tcx> {
                 if dst_layout.size == Size::ZERO {
                     return;
                 }
+                if let CValueInner::ByRef(from_ptr, None) = from.0
+                    && to_ptr.has_same_location(from_ptr)
+                {
+                    return;
+                }
 
                 let mut flags = MemFlags::new();
                 flags.set_notrap();

@@ -15,6 +15,7 @@ use cranelift_module::ModuleError;
 use rustc_abi::{CanonAbi, ExternAbi, X86Call};
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_codegen_ssa::errors::CompilerBuiltinsCannotCall;
+use rustc_index::IndexVec;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::layout::FnAbiOf;
@@ -229,6 +230,33 @@ fn make_local_place<'tcx>(
     place
 }
 
+fn aggregate_destination_place<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    local: Local,
+    destinations: &IndexVec<Local, Option<crate::analyze::AggregateDestination>>,
+) -> Option<CPlace<'tcx>> {
+    let mut current = local;
+    let mut fields = SmallVec::<[FieldIdx; 4]>::new();
+    while let Some(destination) = destinations[current] {
+        fields.push(destination.field);
+        current = destination.parent;
+        if fields.len() > destinations.len() {
+            return None;
+        }
+    }
+    if current != RETURN_PLACE {
+        return None;
+    }
+
+    let mut place = fx.get_local_place(RETURN_PLACE);
+    place.try_to_ptr()?;
+    for field in fields.into_iter().rev() {
+        place = place.place_field(fx, field);
+    }
+    debug_assert_eq!(place.layout().ty, fx.monomorphize(fx.mir.local_decls[local].ty));
+    Some(place)
+}
+
 pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_block: Block) {
     fx.bcx.append_block_params_for_function_params(start_block);
 
@@ -236,6 +264,7 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
     fx.bcx.ins().nop();
 
     let ssa_analyzed = crate::analyze::analyze(fx);
+    let aggregate_destinations = crate::analyze::aggregate_destinations(fx);
 
     self::comments::add_args_header_comment(fx);
 
@@ -358,7 +387,8 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
 
         let is_ssa = ssa_analyzed[local].is_ssa(fx, ty);
 
-        let place = make_local_place(fx, local, layout, is_ssa);
+        let place = aggregate_destination_place(fx, local, &aggregate_destinations)
+            .unwrap_or_else(|| make_local_place(fx, local, layout, is_ssa));
         assert_eq!(fx.local_map.push(place), local);
     }
 
