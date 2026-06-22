@@ -1352,6 +1352,45 @@ larger call, range, and code-layout gap, not a profitable isolated exception to
 `rustc_no_mir_inline`. The later bounded CLIF inliner deliberately excludes
 these call-bearing helpers.
 
+### Rejected constant-specialized precondition import
+
+A later amplified ty profile made the remaining boundary more precise. The
+mutable-pointer `add` and `sub` precondition helpers accounted for roughly
+3,150 active samples combined and were absent as leaves from the matched LLVM
+profile. Machine-code inspection showed a shared 88-byte helper with three hot
+range checks and one cold panic tail. Of 4,080 direct calls to the three
+profiled helper copies, 2,388 supplied constant count and element-size
+arguments; 319 supplied a zero count. This is the post-monomorphization shape
+that LLVM can specialize but the MIR inliner intentionally cannot see.
+
+The source and CLIF bounds were measured rather than guessed. The pointer
+helper has nine MIR blocks and 76 operations, then ten CLIF blocks and 42
+instructions with one call in a terminal trap block. A first CLIF policy using
+the existing six-block/32-instruction import limit changed none of the 4,646
+mutable- and const-pointer `add`/`sub` calls in the complete ty binary. Raising
+the cold-call-only instruction budget to 64 also changed none. The two exact
+ty binaries moved by -2,176 and +3,312 bytes respectively, confirming unrelated
+layout noise rather than the intended transform.
+
+A guarded-specialization prototype then admitted only `#[rustc_no_mir_inline]`
+source bodies up to ten blocks and 96 operations, required exactly one call in
+a terminal trap block, and required at least two integer constants at the call
+site. To avoid importing the panic-message global, it replaced the cold block
+in the candidate with a call back to the canonical helper. The hot checks could
+then be cloned and folded while a failing path would re-run the shared helper
+and panic. The prototype also promoted matching one-level catalogue
+dependencies and remapped only function names still referenced by attached
+instructions.
+
+The exact pointer probe still retained the original helper call and identical
+caller machine code. The current post-monomorphization catalogue does not
+preserve a usable candidate identity at this dependency call boundary, even
+after the dependency is promoted. The experiment is rejected before an
+application timing screen because it does not perform the intended transform.
+Reopening this arc requires a first-class partial-inlining or guarded-call
+specialization facility tied directly to the caller's `FuncRef`; another MIR,
+CLIF, or import threshold change is not a plausible next step.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
