@@ -477,21 +477,16 @@ pub(crate) fn inline_small_functions(
             };
             let callee_name = &caller.params.user_named_funcs()[callee_name];
             let guarded_specialization = self.guarded_imports.contains_key(&callee_name.index)
-                && call_args
-                    .iter()
-                    .filter(|&&arg| {
-                        matches!(
-                            caller.dfg.value_def(arg),
-                            ValueDef::Result(inst, 0)
-                                if matches!(
-                                    caller.dfg.insts[inst],
-                                    InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }
-                                )
-                        )
-                    })
-                    .take(2)
-                    .count()
-                    == 2;
+                && call_args.iter().any(|&arg| {
+                    matches!(
+                        caller.dfg.value_def(arg),
+                        ValueDef::Result(inst, 0)
+                            if matches!(
+                                caller.dfg.insts[inst],
+                                InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }
+                            )
+                    )
+                });
             if callee_name.namespace != 0
                 || caller.name.get_user().is_some_and(|caller_name| {
                     caller_name.namespace == callee_name.namespace

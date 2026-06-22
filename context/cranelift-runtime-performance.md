@@ -34,17 +34,17 @@ were built from fresh target directories.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 32.4 ms | 51.5 ms | 1.59x |
-| `uv lock --check`, offline | 56.9 ms | 79.4 ms | 1.39x |
-| `ruff check` over 1,592 fixtures | 77.5 ms | 137.5 ms | 1.77x |
-| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 100.1 ms | 2.15x |
+| `uv venv --clear` | 31.4 ms | 51.5 ms | 1.64x |
+| `uv lock --check`, offline | 56.4 ms | 79.3 ms | 1.41x |
+| `ruff check` over 1,592 fixtures | 78.3 ms | 137.6 ms | 1.76x |
+| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 97.8 ms | 2.10x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.2x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.1x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -64,9 +64,9 @@ results, and host-environment failures are recorded under
 [Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
 application gate remains the runtime decision boundary because the complete
 suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses. The guarded precondition-import policy still
-needs that complete matched suite rerun before it can be called the final
-policy.
+thousands of short subprocesses. The dynamic-count guarded precondition-import
+policy still needs that complete matched suite rerun before it can be called
+the final policy.
 
 ### Binary size
 
@@ -75,9 +75,9 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 106.5 MB | 2.37x |
+| Ruff | 45.0 MB | 106.6 MB | 2.37x |
 | ty | 47.5 MB | 110.9 MB | 2.33x |
-| uv | 100.0 MB | 179.8 MB | 1.80x |
+| uv | 100.0 MB | 179.9 MB | 1.80x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
@@ -1531,28 +1531,29 @@ leaves in the matched LLVM profile. The earlier guarded prototype had already
 identified the right semantic split, but its imported candidate was rejected
 because dead panic-allocation names survived in the function parameter table.
 
-The retained implementation makes that split first-class. Hinted source roots
-up to ten MIR blocks and 96 operations are translated only as possible guarded
-candidates; roots beyond the ordinary six-block/64-operation limits cannot
-fall into the existing repeated-call policy. A guarded candidate must have at
-most ten CLIF blocks and 64 instructions, return no value, have exactly one
-result-free call in a cold trap block, and contain no load, store, or trap in
-its hot region. Instructions with other side effects are rejected there too.
+The initial retained implementation makes that split first-class. Hinted
+source roots up to ten MIR blocks and 96 operations are translated only as
+possible guarded candidates; roots beyond the ordinary six-block/64-operation
+limits cannot fall into the existing repeated-call policy. A guarded candidate
+must have at most ten CLIF blocks and 64 instructions, return no value, have
+exactly one result-free call in a cold trap block, and contain no load, store,
+or trap in its hot region. Instructions with other side effects are rejected
+there too.
 The cold block is replaced with a call back to the canonical helper using the
 original entry arguments, followed by the original trap. Optimization then
 removes its dead stack slot. The candidate remains eligible only without live
 stack state or a surviving global-value instruction.
 
-At the call site, this guarded body bypasses the repeated-call requirement only
-when at least two arguments are integer constants. This is the
-post-monomorphization count-and-element-size shape that LLVM sees for pointer
-checks. Dynamic-count calls retain the canonical helper. Candidate remapping
-now visits only function names attached to surviving `call`, `try_call`, or
-`func_addr` instructions, so dead panic-message allocation names neither block
-the import nor cause unrelated definitions to be materialized. The stage-2
-bootstrap caught the required `func_addr` case before benchmarking: omitting
-it produced unresolved formatting implementations, while the final mapping
-links and runs the same formatting probe correctly.
+At the call site, this guarded body initially bypassed the repeated-call
+requirement only when at least two arguments were integer constants. This is
+the post-monomorphization count-and-element-size shape that LLVM sees for
+pointer checks. Dynamic-count calls retain the canonical helper. Candidate
+remapping now visits only function names attached to surviving `call`,
+`try_call`, or `func_addr` instructions, so dead panic-message allocation names
+neither block the import nor cause unrelated definitions to be materialized.
+The stage-2 bootstrap caught the required `func_addr` case before benchmarking:
+omitting it produced unresolved formatting implementations, while the final
+mapping links and runs the same formatting probe correctly.
 
 The reduced pointer probe demonstrates both paths. A dynamic count retains its
 direct helper call. Constant count and element size clone the pure arithmetic
@@ -1606,6 +1607,46 @@ or layout in a way that costs more in Ruff than it saves in the pointer guard.
 Results are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/results/guarded-precondition-umulhi-all50.json`
 and `guarded-precondition-umulhi-ruff100.json`.
+
+### Dynamic-count guarded precondition import
+
+A fresh profile of the retained policy left mutable-pointer `add` and `sub`
+precondition helpers at 2,335 active ty samples. The dynamic-count pointer
+probe explained why: the count remained variable, but the element size was
+already an integer constant at the call boundary. Requiring two constant
+arguments therefore kept the whole success-path guard out of line even though
+one argument was enough to specialize it.
+
+The retained extension admits an existing guarded candidate when any call
+argument is an integer constant. No ordinary import policy changes. In the
+dynamic-count pointer probe, the multiply-high overflow check, scaled offset,
+and address check move into the caller; only the cold failure edge calls the
+canonical helper. The valid `add` and `sub` probe still succeeds, while the
+overflow probe reaches the same non-unwinding panic and message. Direct ty
+branches to precondition helpers fall from 4,084 to 2,316 (-43.3%).
+
+The complete 50-run three-lane gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.78% | 31/50 | 0.11892 | 1.64x | +0.061% |
+| `uv lock --check`, offline | +0.63% | 22/50 | 0.47989 | 1.41x | +0.061% |
+| `ruff check` over 1,592 fixtures | +0.52% | 23/50 | 0.67181 | 1.76x | +0.070% |
+| `ty check` over `scripts/ty_benchmark` | -1.97% | 42/50 | 0.00000116 | 2.10x | +0.080% |
+
+A focused 100-run ty replication measured -2.41% with 86/100 wins
+(`p = 8.28e-14`). The other three workloads remain statistically neutral,
+and every LLVM, preceding-Cranelift, and candidate exit code and output digest
+matches. cg_clif check, the complete stage-2 backend, standard-library, and
+proc-macro build, all three fresh application builds, and both pointer probes
+pass. The exact backend is saved as
+`guarded-precondition-one-constant/candidate.dylib` with SHA-256
+`3dd8ab4124b5d2c2ce529b670c4bccc179ce7fa4751c6e301619c93169817a06`.
+The extension is retained: it converts the profile-supported dynamic pointer
+guards into caller-local checks and decisively improves ty for less than 0.1%
+binary growth. Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/guarded-precondition-one-constant-all50.json`
+and `guarded-precondition-one-constant-ty100.json`.
 
 ### Finalization correctness fixes
 
@@ -2353,11 +2394,11 @@ A final CLIF audit of hashbrown's
 `find_or_find_insert_index` did not find that consumer: its inner iteration is
 a nonzero bitmask plus count-trailing-zeros operation, not a repeated scalar
 bound that an isolated CFG range fact can remove. Guarded
-post-monomorphization import now removes the constant-heavy pointer
-precondition boundaries without cloning their panic paths. Remaining dynamic
-count calls need a different interprocedural proof, not another local range
-rule. Do not manufacture a generic CFG-range patch without a newly profiled
-repeated consumer.
+post-monomorphization import now removes pointer-precondition boundaries with
+at least one constant argument without cloning their panic paths. Remaining
+unspecialized calls need a different interprocedural proof, not another local
+range rule. Do not manufacture a generic CFG-range patch without a newly
+profiled repeated consumer.
 
 Automatic loop vectorization is a longer-horizon companion. It is likely
 necessary to close the largest LLVM gap, but its analysis, legality checks,
