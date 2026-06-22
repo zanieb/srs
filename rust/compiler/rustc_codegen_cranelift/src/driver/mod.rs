@@ -33,6 +33,7 @@ fn predefine_mono_items<'tcx>(
                         data.linkage,
                         data.visibility,
                         is_compiler_builtins,
+                        data.inlined,
                     );
                     let is_naked = tcx
                         .codegen_instance_attrs(instance.def)

@@ -27,23 +27,24 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 50 timed trials after five warmups. Lower is better. LLVM, the
-preceding Cranelift policy, and the current Cranelift policy were run in the
-same randomized, block-balanced matrix from freshly built binaries.
+Each row is 50 timed trials after five warmups. Lower is better. The pinned
+matched LLVM control, preceding Cranelift policy, and current Cranelift policy
+were run in the same randomized, block-balanced matrix; both Cranelift lanes
+were built from fresh target directories.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 33.9 ms | 54.9 ms | 1.62x |
-| `uv lock --check`, offline | 60.3 ms | 85.3 ms | 1.41x |
-| `ruff check` over 1,592 fixtures | 81.1 ms | 146.6 ms | 1.81x |
-| `ty check` over `scripts/ty_benchmark` | 48.4 ms | 108.4 ms | 2.24x |
+| `uv venv --clear` | 32.8 ms | 53.1 ms | 1.62x |
+| `uv lock --check`, offline | 60.2 ms | 82.9 ms | 1.38x |
+| `ruff check` over 1,592 fixtures | 79.6 ms | 141.2 ms | 1.77x |
+| `ty check` over `scripts/ty_benchmark` | 48.7 ms | 106.8 ms | 2.19x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
 unresolved imports in every successful compiler lane. These rows measure the
 real resolver and type-checking failure paths, not a no-op command.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.3x faster for
+The conclusion is unambiguous: LLVM is currently about 1.4-2.2x faster for
 these user-visible operations. The implemented changes recover meaningful
 ground for Ruff and ty and a smaller amount for uv lock, but they do not close
 the remaining loop-optimization and code-quality gap.
@@ -63,8 +64,9 @@ results, and host-environment failures are recorded under
 [Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
 application gate remains the runtime decision boundary because the complete
 suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses. The current tiny-import policy still needs
-that complete matched suite rerun before it can be called the final policy.
+thousands of short subprocesses. The current coalesced-local-copy policy still
+needs that complete matched suite rerun before it can be called the final
+policy.
 
 ### Binary size
 
@@ -73,18 +75,19 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 129.2 MB | 2.87x |
-| ty | 47.5 MB | 130.6 MB | 2.75x |
-| uv | 100.0 MB | 272.6 MB | 2.73x |
+| Ruff | 45.0 MB | 107.5 MB | 2.39x |
+| ty | 47.5 MB | 112.9 MB | 2.38x |
+| uv | 100.0 MB | 180.4 MB | 1.80x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
 cg_clif unwinding on Apple silicon initially added 20.9% to Ruff, 20.0% to ty,
 and 23.5% to uv relative to the same policy without exception tables.
 Restricting personality and LSDA metadata to catching functions recovers
-5.7-6.1% of the complete binaries without changing machine text. More
-inlining is not a complete answer: output remains roughly three times LLVM's,
-and uv environment creation is still about 60% slower.
+5.7-6.1% of the complete binaries without changing machine text. Weakly
+coalescing CGU-local copies then recovers another 13.6-33.8% without exporting
+those symbols. More inlining is not a complete answer: output remains 1.8-2.4
+times LLVM's, and uv environment creation is still about 60% slower.
 
 ## Changes Implemented
 
@@ -1629,6 +1632,47 @@ The Cranelift standard example checks every intrinsic against a known result.
 This is primarily a coverage and correctness change, but it is required for
 ty to become a usable performance benchmark.
 
+### Coalesced CGU-local function copies
+
+Rust's partitioner gives every codegen unit a private copy of reachable
+drop glue, external generics, and local `#[inline]` functions. LLVM can inline
+or erase most of those copies before object emission. Cranelift instead kept
+dozens of identical hot bodies under object-local symbols, so the static
+linker had no opportunity to choose one definition for the final executable.
+In the retained ty binary, for example, 31 symbol-table entries matched
+`RawTableInner::find_or_find_insert_index_inner`, and 554 matched pointer
+`precondition_check` helpers.
+
+Cranelift's module linkage model now has a weak linkage whose symbol remains
+hidden to the current static linkage unit. cg_clif selects it only for the
+partitioner's `inlined` function copies with internal Rust linkage and default
+visibility. Object emission maps it to a linkage-scoped weak symbol: ELF,
+Mach-O, and COFF serialization tests verify the representation. The symbol is
+not exported or dynamically preemptible, but another codegen unit's definition
+with the same Rust symbol name may replace it during static linking. The
+retained ty binary has two matching hashbrown probe entries and 25 matching
+precondition helpers after coalescing.
+
+The 50-run matched application gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -3.07% | 38/50 | 0.00031 | +62.3% | -33.85% |
+| `uv lock --check`, offline | -2.38% | 33/50 | 0.03284 | +40.8% | -33.85% |
+| `ruff check` over 1,592 fixtures | -1.24% | 30/50 | 0.20264 | +79.4% | -16.82% |
+| `ty check` over `scripts/ty_benchmark` | -1.79% | 35/50 | 0.00660 | +119.9% | -13.58% |
+
+Every application median improves, the uv and ty changes are statistically
+significant, and every correctness-probe exit code and output digest matches
+both the previous Cranelift policy and LLVM. Ruff's direction is positive but
+not independently significant. The profiling binaries fall from 272.6 to
+180.4 MB for uv, 129.2 to 107.5 MB for Ruff, and 130.6 to 112.9 MB for ty.
+The focused Cranelift module and object suites pass, including emitted weak
+symbol checks for x86-64 ELF, AArch64 Mach-O, and x86-64 COFF. A complete
+stage-2 cg_clif, standard-library, and proc-macro build and all three pinned
+application builds also pass. The evidence is recorded in
+`bench-hidden-weak-all50/results.json` under the benchmark scratch directory.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
@@ -1973,6 +2017,13 @@ profile before the repeated-call import showed
 hashbrown's `find_or_find_insert_index_inner` and cross-CGU
 `FxHasher::write_isize` as prominent Cranelift-only leaves while LLVM had
 absorbed them into callers.
+Weakly coalescing the partitioner's CGU-local copies removes the duplicate
+fallback bodies that remain when Cranelift cannot absorb them: it cuts
+13.6-33.8% from the three binaries and improves all four application medians.
+This does not remove the surviving call boundary, devirtualize the equality
+closure, or reduce the active probe's register pressure. Those remain the
+next runtime arc; the linker result should not be used as a reason to broaden
+inlining without a call-site profitability signal.
 Known-receiver devirtualization removed some copies of the hashbrown loop and
 replaced its indirect equality call in a reduction, but both the direct-only
 and targeted-inlining variants were runtime-neutral in 50-run application
@@ -2023,7 +2074,7 @@ profile redundant cleanup call sites and compact-unwind conversion rather
 than risk removing the frame descriptions needed to unwind through ordinary
 functions.
 
-The remaining 1.5-2.3x LLVM gap shows that local representation fixes alone
+The remaining 1.4-2.2x LLVM gap shows that local representation fixes alone
 will not close the runtime difference.
 
 ### 5. Expand native intrinsic coverage continuously

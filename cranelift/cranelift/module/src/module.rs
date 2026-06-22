@@ -140,6 +140,11 @@ pub enum Linkage {
     Import,
     /// Defined inside the module, but not visible outside it.
     Local,
+    /// Defined inside the module and weakly visible inside the current static linkage unit, but
+    /// not outside it.
+    ///
+    /// Another definition with the same name in the static linkage unit may replace this one.
+    HiddenWeak,
     /// Defined inside the module, visible outside it, and may be preempted.
     Preemptible,
     /// Defined inside the module, visible inside the current static linkage unit, but not outside.
@@ -160,6 +165,12 @@ impl Linkage {
                 Self::Preemptible => Self::Preemptible,
                 _ => Self::Hidden,
             },
+            Self::HiddenWeak => match b {
+                Self::Export => Self::Export,
+                Self::Hidden => Self::Hidden,
+                Self::Preemptible => Self::Preemptible,
+                _ => Self::HiddenWeak,
+            },
             Self::Preemptible => match b {
                 Self::Export => Self::Export,
                 _ => Self::Preemptible,
@@ -167,6 +178,7 @@ impl Linkage {
             Self::Local => match b {
                 Self::Export => Self::Export,
                 Self::Hidden => Self::Hidden,
+                Self::HiddenWeak => Self::HiddenWeak,
                 Self::Preemptible => Self::Preemptible,
                 Self::Local | Self::Import => Self::Local,
             },
@@ -178,7 +190,9 @@ impl Linkage {
     pub fn is_definable(self) -> bool {
         match self {
             Self::Import => false,
-            Self::Local | Self::Preemptible | Self::Hidden | Self::Export => true,
+            Self::Local | Self::HiddenWeak | Self::Preemptible | Self::Hidden | Self::Export => {
+                true
+            }
         }
     }
 
@@ -186,7 +200,7 @@ impl Linkage {
     pub fn requires_definition(self) -> bool {
         match self {
             Self::Import | Self::Preemptible => false,
-            Self::Local | Self::Hidden | Self::Export => true,
+            Self::Local | Self::HiddenWeak | Self::Hidden | Self::Export => true,
         }
     }
 
@@ -194,7 +208,7 @@ impl Linkage {
     pub fn is_final(self) -> bool {
         match self {
             Self::Import | Self::Preemptible => false,
-            Self::Local | Self::Hidden | Self::Export => true,
+            Self::Local | Self::HiddenWeak | Self::Hidden | Self::Export => true,
         }
     }
 }
