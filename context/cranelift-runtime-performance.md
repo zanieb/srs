@@ -1461,9 +1461,46 @@ shared `Type` loads are now correctly `readonly`, but every imported hash
 update is separated from the next by a real branch with a return or trap path.
 Following unconditional jump scaffolding across blocks therefore removes none
 of its 102 stores and was rejected. Collapsing that body toward LLVM's 664-byte
-shape needs store sinking or memory-SSA promotion that carries the hasher
-state through branches and materializes it at observers, not a broader local
-dead-store rule.
+shape needs memory-SSA promotion that carries the hasher state through
+branches and materializes it at observers, not a broader local dead-store
+rule or a terminal-only store sink.
+
+### Rejected terminal-store sinking
+
+The fresh profile after the dead-slot trivial-import change removed
+`BuildHasherDefault<FxHasher>::build_hasher` from the active leaves. It put
+hashbrown's `find_or_find_insert_index_inner` first and `Type::hash` second.
+Four hot copies of `Type::hash` were still 6,100 bytes apiece, with 102 stores
+through the hasher pointer and 31 returns in each copy.
+
+A deliberately narrow prototype grouped identical ordinary `store notrap`
+instructions with the same resolved address, offset, type, and memory flags.
+It shared a store only when every source path had completed all other work and
+reached a void return through `nop`s and argument-free unconditional jumps.
+It would not cross a call, load, trap, other memory operation, potentially
+trapping store, or value-returning path. Focused positive and barrier
+filetests, all 186 `cranelift-codegen` unit tests, and 21 passing doctests
+passed.
+
+The prototype reduced each profiled `Type::hash` copy from 102 stores to 29,
+from 31 returns to 9, and from 6,100 to 5,744 bytes. The complete 50-run
+application gate nevertheless rejected it:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +3.84% | 7/50 | 0.00000021 |
+| `uv lock --check`, offline | +3.09% | 12/50 | 0.00031 |
+| `ruff check` over 1,592 fixtures | +0.20% | 25/50 | 1.00000 |
+| `ty check` over `scripts/ty_benchmark` | +0.56% | 17/50 | 0.03284 |
+
+Every candidate correctness probe retained the preceding Cranelift exit code
+and output digests. Both uv workloads and ty regress decisively while Ruff is
+neutral, so the prototype is not retained. The local code-size win is real,
+but merging cold terminal paths changes layout and adds value-carrying edges
+without eliminating the hot-path hasher traffic. The next memory-state arc
+must promote or forward the hasher value across the active branch region and
+materialize it only at true observers; terminal tail sharing alone optimizes
+the wrong boundary.
 
 The focused barrier filetest, all 1,218 Cranelift filetests, all 186
 `cranelift-codegen` unit tests, 21 passing doctests, a complete cg_clif check,
