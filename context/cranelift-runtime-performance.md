@@ -566,6 +566,31 @@ the code-size win: scalarizing the callee return does not by itself remove the
 profiled boundary or improve application runtime. Results are in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/bench-direct-option-pair-return-all20/results.json`.
 
+Combining the two rejected experiments finally removed the profiled call. A
+narrow `Option<usize>` return path supplied the stack-free pair, indirect
+scalar-pair constants were decomposed to remove the `None` global, and a
+loop-only tier pre-optimized bounded local hinted bodies before applying the
+existing 32-live-instruction safety checks. The helper's runtime MIR has ten
+blocks and 19 operations; optimized CLIF has nine blocks and 29 live
+instructions. The helper symbol and call disappeared from ty, but the caller
+retained its 80-byte frame. uv, Ruff, and ty shrank by 429,488, 1,184,992, and
+2,389,344 bytes. A promising 20-run ty screen (-0.73%, 15/20 wins,
+`p = 0.04139`) did not survive the 50-run four-application gate:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.38% | 28/50 | 0.47989 |
+| `uv lock --check`, offline | -0.37% | 26/50 | 0.88772 |
+| `ruff check` over 1,592 fixtures | +0.01% | 25/50 | 1.0 |
+| `ty check` over `scripts/ty_benchmark` | -0.05% | 27/50 | 0.67181 |
+
+All correctness digests matched and the complete stage-2 backend and
+standard-library build passed. The combined policy is rejected: even removing
+the exact hot loop call is runtime-neutral while its caller frame and stack
+traffic remain. Further work on this body should eliminate that traffic rather
+than broaden inlining. Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/bench-loop-option-usize-all50/results.json`.
+
 An even narrower one-off exception is retained for bodies that become trivial
 forwarders or constructors only after monomorphization. Unhinted source MIR is
 considered only with at most two blocks and four operations. After importing
