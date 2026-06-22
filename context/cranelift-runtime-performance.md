@@ -786,6 +786,25 @@ at least 0.82. Forwarding wider loads from adjacent narrow values removes an
 aggregate round trip; decomposing a wide value into scalar byte operations is
 only a different spelling of work the application already performs.
 
+A loop-header extension tested the next conservative CFG step. It added at
+most four integer block parameters only when a header had exactly two incoming
+`jump` or `brif` edges, exactly one was a backedge, both immediate predecessor
+blocks explicitly stored the same nonescaping stack location, and every
+existing address-escape rule still passed. A focused loop filetest eliminated
+the complete 16-byte stack slot and carried both values through block
+parameters; the existing non-loop diamond remained unchanged.
+
+The full ty build shrank by 17,600 bytes, but the profiled
+`RawTableInner::find_or_find_insert_index_inner` body remained byte-for-byte
+unchanged, including its 80-byte frame and loop index/stride loads and stores.
+That loop's incoming values are defined in the predecessor region rather than
+by stores in both immediate predecessor blocks. A 20-run ty screen was neutral:
+`+0.25%` paired, 9/20 wins, two-sided sign-test `p = 0.82380`. The bounded
+extension is rejected. A future stack-to-SSA attempt needs a real fixed-point
+reaching-value analysis through the loop's predecessor region; adding block
+parameters at progressively broader syntactic joins has no demonstrated hot
+consumer.
+
 ### Boolean-result range folding
 
 The next hot hashbrown reduction exposed an instruction-local range fact that
