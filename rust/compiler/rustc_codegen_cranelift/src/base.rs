@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use cranelift_codegen::CodegenError;
+use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir::UserFuncName;
 use cranelift_codegen::ir::{ExternalName, Opcode, UserExternalName};
@@ -40,6 +41,8 @@ pub(crate) struct CodegenedFunction {
 const MAX_INLINE_INSTRUCTIONS: usize = 32;
 const MAX_INLINE_BLOCKS: usize = 3;
 const MAX_COMPOSED_INLINE_BLOCKS: usize = 2 * MAX_INLINE_BLOCKS;
+const MAX_TRIVIAL_IMPORT_MIR_OPERATIONS: usize = 4;
+const MAX_TRIVIAL_IMPORT_MIR_BLOCKS: usize = 2;
 // Repeated direct call sites provide a static profitability signal and avoid importing tiny
 // bodies across every one-off call boundary in the codegen unit.
 const MIN_REPEATED_IMPORT_CALLS: usize = 4;
@@ -220,8 +223,11 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
             return false;
         }
         let attrs = tcx.codegen_instance_attrs(instance.def);
-        if !matches!(attrs.inline, InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. })
-            || attrs.contains_extern_indicator()
+        let inline_hint = matches!(
+            attrs.inline,
+            InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. }
+        );
+        if attrs.contains_extern_indicator()
             || attrs
                 .flags
                 .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED)
@@ -230,9 +236,15 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
             return false;
         }
         let mir = tcx.instance_mir(instance.def);
-        mir.basic_blocks.len() <= MAX_INLINE_MIR_BLOCKS
-            && mir.basic_blocks.iter().map(|block| block.statements.len() + 1).sum::<usize>()
-                <= MAX_INLINE_MIR_OPERATIONS
+        // Hinted imports retain the wider existing limits. Only translate an unhinted root when
+        // its source MIR is small enough to become a trivial forwarder after composition.
+        let blocks = mir.basic_blocks.len();
+        let operations =
+            mir.basic_blocks.iter().map(|block| block.statements.len() + 1).sum::<usize>();
+        (inline_hint && blocks <= MAX_INLINE_MIR_BLOCKS && operations <= MAX_INLINE_MIR_OPERATIONS)
+            || (!inline_hint
+                && blocks <= MAX_TRIVIAL_IMPORT_MIR_BLOCKS
+                && operations <= MAX_TRIVIAL_IMPORT_MIR_OPERATIONS)
     };
 
     let mut referenced_functions = referenced_functions.into_iter().collect::<Vec<_>>();
@@ -281,8 +293,24 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         }
     }
 
-    // A root can be a tiny forwarder to another tiny hinted body. Import one dependency level and
-    // compose it once, without recursively visiting callees or growing an unbounded catalogue.
+    // A root can be a tiny forwarder to another tiny body. Optimize the isolated catalogue
+    // before composing it so stack forwarding can prove temporary return slots unused. This does
+    // not optimize the ordinary CGU functions an extra time or make bodies with live stack state
+    // eligible for inlining.
+    for function in &mut translated {
+        if function.func.sized_stack_slots.is_empty() {
+            continue;
+        }
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.optimize(catalog_module.isa(), &mut ControlPlane::default())?;
+        if context.func.sized_stack_slots.values().all(|slot| slot.size == 0) {
+            function.func = context.func;
+        }
+    }
+
+    // Import one dependency level and compose it once, without recursively visiting callees or
+    // growing an unbounded catalogue.
     inline_small_functions(catalog_module, &[], &mut translated)?;
 
     let mut candidates = Vec::new();
@@ -290,7 +318,7 @@ pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
         let Some(&func_id) = roots.get(&candidate.func_id.as_u32()) else {
             continue;
         };
-        if !is_composed_inline_candidate(&candidate) {
+        if !is_composed_inline_candidate(&candidate) && !is_trivial_import_candidate(&candidate) {
             continue;
         }
 
@@ -347,9 +375,11 @@ pub(crate) fn inline_small_functions(
         callees.insert(function.func_id.as_u32(), context.func);
     }
     let mut imported_callees = FxHashMap::default();
+    let mut trivial_imports = FxHashMap::default();
     for function in post_monomorphization_candidates {
         let func_id = function.func_id.as_u32();
-        if callees.contains_key(&func_id) || !is_composed_inline_candidate(function) {
+        let trivial = is_trivial_import_candidate(function);
+        if callees.contains_key(&func_id) || (!is_composed_inline_candidate(function) && !trivial) {
             continue;
         }
 
@@ -358,11 +388,15 @@ pub(crate) fn inline_small_functions(
         context.legalize(module.isa())?;
         callees.insert(func_id, context.func);
         imported_callees.insert(func_id, ());
+        if trivial {
+            trivial_imports.insert(func_id, ());
+        }
     }
 
     struct SmallFunctionInliner<'a> {
         callees: &'a FxHashMap<u32, Function>,
         imported_callees: &'a FxHashMap<u32, ()>,
+        trivial_imports: &'a FxHashMap<u32, ()>,
         allowed_imports: &'a FxHashMap<u32, ()>,
     }
 
@@ -385,6 +419,7 @@ pub(crate) fn inline_small_functions(
                         && caller_name.index == callee_name.index
                 })
                 || (self.imported_callees.contains_key(&callee_name.index)
+                    && !self.trivial_imports.contains_key(&callee_name.index)
                     && !self.allowed_imports.contains_key(&callee_name.index))
             {
                 return InlineCommand::KeepCall;
@@ -431,6 +466,7 @@ pub(crate) fn inline_small_functions(
         context.inline(SmallFunctionInliner {
             callees: &callees,
             imported_callees: &imported_callees,
+            trivial_imports: &trivial_imports,
             allowed_imports: &allowed_imports,
         })?;
         function.func = context.func;
@@ -447,12 +483,33 @@ fn is_composed_inline_candidate(function: &CodegenedFunction) -> bool {
     is_inline_candidate_with_block_limit(function, MAX_COMPOSED_INLINE_BLOCKS)
 }
 
+fn is_trivial_import_candidate(function: &CodegenedFunction) -> bool {
+    !function.inline_hint
+        && has_inline_candidate_structure(function, MAX_COMPOSED_INLINE_BLOCKS)
+        && function
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| function.func.layout.block_insts(block))
+            .filter(|&inst| {
+                !matches!(
+                    function.func.dfg.insts[inst].opcode(),
+                    Opcode::Nop | Opcode::Jump | Opcode::Return
+                )
+            })
+            .count()
+            <= 1
+}
+
 fn is_inline_candidate_with_block_limit(function: &CodegenedFunction, max_blocks: usize) -> bool {
-    function.inline_hint
-        && function.inline_asm.is_empty()
+    function.inline_hint && has_inline_candidate_structure(function, max_blocks)
+}
+
+fn has_inline_candidate_structure(function: &CodegenedFunction, max_blocks: usize) -> bool {
+    function.inline_asm.is_empty()
         && function.func.dfg.num_insts() <= MAX_INLINE_INSTRUCTIONS
         && function.func.layout.blocks().count() <= max_blocks
-        && function.func.sized_stack_slots.is_empty()
+        && function.func.sized_stack_slots.values().all(|slot| slot.size == 0)
         && function.func.dynamic_stack_slots.is_empty()
         && function.func.global_values.is_empty()
         && function.func.stack_limit.is_none()

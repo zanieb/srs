@@ -33,10 +33,10 @@ same randomized, block-balanced matrix from freshly built binaries.
 
 | Workload | LLVM | Current Cranelift | LLVM lead |
 | --- | ---: | ---: | ---: |
-| `uv venv --clear` | 34.0 ms | 55.6 ms | 1.64x |
-| `uv lock --check`, offline | 62.2 ms | 88.3 ms | 1.42x |
-| `ruff check` over 1,592 fixtures | 83.7 ms | 144.6 ms | 1.73x |
-| `ty check` over `scripts/ty_benchmark` | 48.4 ms | 109.0 ms | 2.25x |
+| `uv venv --clear` | 33.9 ms | 54.9 ms | 1.62x |
+| `uv lock --check`, offline | 60.3 ms | 85.3 ms | 1.41x |
+| `ruff check` over 1,592 fixtures | 81.1 ms | 146.6 ms | 1.81x |
+| `ty check` over `scripts/ty_benchmark` | 48.4 ms | 108.4 ms | 2.24x |
 
 The uv lock fixture is an intentional offline failure caused by the pinned
 checkout's unavailable resolver data. The ty fixture reports the same four
@@ -63,7 +63,7 @@ results, and host-environment failures are recorded under
 [Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
 application gate remains the runtime decision boundary because the complete
 suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses. The retained readonly/DSE policy still needs
+thousands of short subprocesses. The current tiny-import policy still needs
 that complete matched suite rerun before it can be called the final policy.
 
 ### Binary size
@@ -73,9 +73,9 @@ than distribution sizes.
 
 | Binary | LLVM | Current Cranelift | Cranelift / LLVM |
 | --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 132.4 MB | 2.95x |
-| ty | 47.5 MB | 135.8 MB | 2.86x |
-| uv | 100.0 MB | 275.7 MB | 2.76x |
+| Ruff | 45.0 MB | 129.2 MB | 2.87x |
+| ty | 47.5 MB | 130.6 MB | 2.75x |
+| uv | 100.0 MB | 272.6 MB | 2.73x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
@@ -526,7 +526,8 @@ The 50-run matched gate measured:
 No row is individually decisive, but all four paired medians improve, every
 binary shrinks, and all correctness digests match. The focused backend check
 and complete stage-2 backend and standard-library build pass. The repeated-call
-policy is retained; one-off imports still require a stronger call-site signal.
+policy is retained for nontrivial bodies; the constant-like one-off exception
+below is deliberately smaller than a general call-site signal.
 
 Allowing one-off hinted imports only when the composed body had at most eight
 CLIF instructions tested the smallest plausible exception. It still grew uv,
@@ -536,6 +537,43 @@ uv resolution (+0.05%), Ruff (-0.87%), and ty (-0.04%) were neutral. All
 correctness digests matched. The exception is rejected: even tiny one-off
 imports perturb enough layout to hurt uv, so repeated calls remain the minimum
 static hotness signal.
+
+An even narrower one-off exception is retained for bodies that become trivial
+forwarders or constructors only after monomorphization. Unhinted source MIR is
+considered only with at most two blocks and four operations. After importing
+one dependency level and composing it, the body must satisfy the existing
+call-free, global-free, dynamic-stack-free bounds and contain at most one
+instruction other than `nop`, unconditional jump, or return. These trivial
+imports bypass the four-calls-per-caller requirement; ordinary hinted imports
+still use the repeated-call signal.
+
+The missing legality fact was an already dead return slot. Cranelift forwarded
+the temporary return traffic but left a zero-byte stack-slot record, while
+cg_clif inspected the unoptimized catalogue and rejected any slot metadata.
+cg_clif now pre-optimizes only catalogue bodies that have stack slots and keeps
+the optimized form only when every slot is proven empty. Functions with live
+stack state remain ineligible, and all previously eligible stack-free bodies
+retain their old CLIF. Pre-optimizing the entire catalogue was an important
+negative control: it removed the target calls and shrank ty by 1.31%, but
+regressed the ty workload by 1.37% paired in a 20-run screen.
+
+The bounded combination removes all 54 direct ty calls to the profiled
+`BuildHasherDefault<FxHasher>::build_hasher` forwarder. The complete 50-run
+three-lane gate measured:
+
+| Workload | Candidate vs previous Cranelift | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -0.49% | 31/50 | 0.11892 | +63.8% | -1.107% |
+| `uv lock --check`, offline | -0.49% | 27/50 | 0.67181 | +41.2% | -1.107% |
+| `ruff check` over 1,592 fixtures | -0.84% | 26/50 | 0.88772 | +78.3% | -2.368% |
+| `ty check` over `scripts/ty_benchmark` | -1.41% | 34/50 | 0.01535 | +124.1% | -3.773% |
+
+ty improves decisively, the other three rows are neutral with favorable
+paired medians, every binary shrinks substantially, and all application exit
+codes and output digests match. The complete stage-2 backend, standard-library,
+and proc-macro build and cg_clif check pass. The full matched repository-suite
+rerun remains the finalization gate rather than a prerequisite for retaining
+this independently bounded policy.
 
 A second threshold probe targeted callable `dyn Fn` shims. Raising the hinted
 budget from 800 to 850 retained all 31 hot hashbrown probe copies; 900 and
@@ -1799,7 +1837,8 @@ all of the profiled `FxHasher::write_isize` calls but produced a mixed runtime
 screen and was rejected. Requiring four static call sites per caller retains
 the hot `Type::hash` transformation, improves every application median, and
 leaves one-off boundaries intact. A dynamic profile or stronger call-site cost
-model is the next call arc, not broader body availability by itself.
+model remains the next call arc for nontrivial bodies, not broader body
+availability by itself.
 A narrower follow-up also rejected static body size as a substitute for that
 profitability signal. It allowed one-off imported bodies with at most one live
 non-control Cranelift instruction and composed them through one unhinted MIR
@@ -1810,6 +1849,13 @@ growing Ruff by 14,320 bytes and ty by 11,136 bytes. The experiment therefore
 stopped before a runtime gate: the tiny source dependency did not make the
 root an eligible call-free import, and admitting more unhinted dependencies
 would recreate the rejected broad-availability policy.
+The later dead-slot audit supplied the missing discriminator. Pre-optimizing
+only stack-bearing catalogue bodies, retaining them only when all slots become
+empty, and admitting only a composed unhinted body with one live instruction
+finally removes all 54 direct ty calls to the target forwarder. It improves ty
+by 1.41%, leaves the other application rows neutral, and shrinks all three
+binaries by 1.1-3.8%. This is the bounded one-off exception; larger bodies
+still require repeated calls or a stronger profile-derived cost model.
 Aggregating the repeated-call signal across the whole codegen unit was also
 rejected. Allowing an otherwise eligible imported body after eight direct
 calls across all callers removed another 570 direct calls from ty and shrank
