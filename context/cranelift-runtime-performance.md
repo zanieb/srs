@@ -1778,6 +1778,66 @@ profitability territory. A future attempt should instead expose the final
 optimized body to a later inliner or lower this primitive directly; another
 one-off source-shape exception cannot see the profitable form.
 
+### Rejected direct `read_unaligned` lowering
+
+The phase-correct follow-up recognized Core's `ptr_read_unaligned` diagnostic
+item at cg_clif's call-lowering boundary. With UB checks disabled, the broad
+prototype loaded the source with alignment one and wrote the result directly
+to the MIR destination. Scalar and scalar-pair results were completely loaded
+before any destination store; memory-backed aggregates first passed through a
+private aligned stack slot to preserve overlapping-source-and-destination
+semantics. Builds with UB checks retained Core's original precondition path.
+
+The complete stage-2 backend, standard-library, and proc-macro build passed.
+A focused no-MIR-inlining control covered scalar, scalar-pair, eight-byte SIMD,
+aggregate, zero-sized, and non-`Copy` values. The retained backend emitted six
+Core `read_unaligned` bodies; the direct candidate emitted none, both binaries
+ran successfully, and an explicit UB-checking build retained and passed the
+Core path. The broad candidate backend is preserved as
+`read-unaligned-direct/candidate.dylib` with SHA-256
+`976d5558783db88b0721ca7ee833f6bd203e206fd619bf1a13e2855b22ad8bdb`.
+
+The broad application build likewise removed all surviving Core
+`read_unaligned` bodies: 13 to zero in uv, 10 to zero in Ruff, and 16 to zero
+in ty. Its initial 20-run screen was mixed, however: uv environment creation
+was +5.17% paired, uv resolution -0.30%, Ruff -1.41%, and ty -1.63%, with no
+two-sided sign test below 0.115. A subsequent binary audit found that the
+older saved Ruff and ty controls also differed materially from fresh builds
+of the retained backend under the reconstructed stage-2 compiler, so this
+screen is diagnostic rather than retention-quality evidence. Its full record
+remains in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/read-unaligned-direct-screen20.json`.
+
+The final experiment isolated the measured hashbrown operation: only an
+unchecked `BackendRepr::SimdVector` whose total size is eight bytes was loaded
+directly. The source uses an ordinary unaligned Cranelift vector load followed
+by a by-value destination write, so no aligned-memory fact is attached. A
+focused optimized probe removes the Core wrapper while the UB-checking control
+retains it, and both pass. Fresh application builds against fresh retained
+controls removed exactly the intended wrappers: 13 to 12 in uv, 10 to 9 in
+Ruff, and 16 to 14 in ty. Their Mach-O `__TEXT` segment sizes were unchanged;
+complete file sizes changed by only +8,032, +5,760, and +4,592 bytes. The
+narrow backend is preserved as `read-unaligned-u8x8/candidate.dylib` with
+SHA-256 `04c76520ce03e2b1f5d68bb8208fed70805534b8a1f07d75243f965b0747a0d0`.
+
+The corrected 20-run application gate still showed no benefit:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | +3.97% | 8/20 | 0.50344 |
+| `uv lock --check`, offline | +1.00% | 9/20 | 0.82380 |
+| `ruff check` over 1,592 fixtures | +1.69% | 9/20 | 0.82380 |
+| `ty check` over `scripts/ty_benchmark` | -0.33% | 10/20 | 1.00000 |
+
+Results are in
+`/Users/zanie/code/tmp/cranelift-runtime-performance/results/read-unaligned-u8x8-screen20.json`.
+The narrow rule is rejected without a 50-run gate. Eliminating the wrapper in
+isolation does not keep the group value and surrounding probe state in
+registers, devirtualize the equality closure, or inline the complete loop into
+its caller. The next attempt at this boundary needs a later optimized-body
+inliner or a larger loop transformation rather than another
+primitive-specific call expansion.
+
 ### Finalization correctness fixes
 
 The final whole-suite gate found two backend correctness gaps that the
