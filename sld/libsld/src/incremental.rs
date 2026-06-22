@@ -28141,8 +28141,19 @@ struct MachOOutputTextDefinitionLookup {
     addresses_by_name: HashMap<Vec<u8>, Option<u64>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl MachOOutputTextDefinitionLookup {
     fn new(output_file: &object::File<'_>) -> Option<Self> {
+        #[cfg(test)]
+        MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS.with(|constructions| {
+            constructions.set(constructions.get() + 1);
+        });
+
         let text_sections = output_file
             .sections()
             .filter(|section| {
@@ -29782,10 +29793,7 @@ fn macho_text_relocation_replays_for_input(
     let mut target_input_ranges = Vec::new();
     let mut target_output_symbols = Vec::new();
     let mut retained_output_resolutions = Vec::new();
-    let output_text_definitions = {
-        timing_phase!("Index previous Mach-O output text definitions");
-        MachOOutputTextDefinitionLookup::new(&output_file)
-    };
+    let output_text_definitions = std::cell::OnceCell::new();
     let resolution_lookup = MachOSymbolResolutionLookup::new(resolutions);
     let matched_current_sections = MatchedCurrentSectionLookup::new(matched_sections);
     let relocation_section_index = {
@@ -30111,6 +30119,10 @@ fn macho_text_relocation_replays_for_input(
                     ) else {
                         break;
                     };
+                    let output_text_definitions = output_text_definitions.get_or_init(|| {
+                        timing_phase!("Index previous Mach-O output text definitions");
+                        MachOOutputTextDefinitionLookup::new(&output_file)
+                    });
                     let retained_resolution = output_text_definitions
                         .as_ref()
                         .and_then(|definitions| definitions.resolution(current_name));
@@ -93399,7 +93411,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_relocation_free_macho_archive_member_skips_output_symbol_lookup() {
+    fn changed_relocation_free_macho_archive_member_skips_full_output_symbol_lookups() {
         let previous_identifier = b"crate-hash.cgu.previous.rcgu.o";
         let current_identifier = b"crate-hash.cgu.current.rcgu.o";
         let previous_object = test_macho_object(&[0; 4], &[0; 4], 0);
@@ -93483,6 +93495,7 @@ mod tests {
         };
 
         MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
+        MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
         let replays = macho_text_relocation_replays_for_input(
             &[],
             &HistoricalMachORelocationRecords::new(),
@@ -93508,6 +93521,10 @@ mod tests {
         assert!(replays.replays.is_empty());
         assert_eq!(
             MACHO_LOCAL_OUTPUT_SYMBOL_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
+            0
+        );
+        assert_eq!(
+            MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
             0
         );
     }
@@ -94610,6 +94627,7 @@ mod tests {
             changed_relocation_indices: Vec::new(),
         };
 
+        MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS.with(|count| count.set(0));
         let replays = macho_text_relocation_replays_for_input(
             std::slice::from_ref(&relocation),
             &HistoricalMachORelocationRecords::new(),
@@ -94644,6 +94662,10 @@ mod tests {
         );
         assert!(replays.replays[0].target.is_none());
         assert!(replays.replays[0].relocation_index.is_none());
+        assert_eq!(
+            MACHO_OUTPUT_TEXT_DEFINITION_LOOKUP_CONSTRUCTIONS.with(|count| count.get()),
+            1
+        );
 
         let changed_definition = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
