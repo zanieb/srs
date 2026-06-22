@@ -609,6 +609,19 @@ neutral on all four workloads, with paired median changes of +0.60%, +0.17%,
 -1.57%, and -0.12%, respectively. The profile-supported ceiling therefore
 ends at eight registers; extending it speculatively does not pay for itself.
 
+Constant overlapping copies do not justify applying that retained ceiling to
+`memmove`, either. A fresh fast census measured 2,384,084 copy calls in ty
+versus 267,845 under LLVM. Preserving a constant `copy` intrinsic count and
+expanding it with the existing overlap-safe load-before-store sequence removed
+687,429 calls, mostly reducing the eight-byte bucket from 736,833 to 72,206.
+It nevertheless grew uv, Ruff, and ty by 19,104, 15,744, and 12,272 bytes, and
+the complete 20-run screen moved every workload backward: uv environment
+creation +2.43%, uv resolution +2.43%, Ruff +1.52% (5/20 wins,
+`p = 0.04139`), and ty +0.72%. The experiment is rejected. Residual
+overlapping-copy work needs target-aware lowering or elimination of the copy;
+replacing Darwin's tuned `memmove` with generic scalar loads and stores is not
+a win even for the hot constant sizes.
+
 ### Profiled small constant byte fills
 
 The same libc census found that cg_clif sent constant-size byte repeats and
