@@ -2342,6 +2342,49 @@ not profitable. A future `boxcar` arc should simplify the complete index and
 bucket computation in the caller, not broaden post-monomorphization import
 availability again.
 
+### Rejected readonly-load tail merging
+
+The next retained profile put `NominalInstanceInner::eq` among ty's hottest
+remaining Cranelift-only leaves. LLVM compiled the equivalent nested-enum
+equality wrapper to roughly 200 bytes, while Cranelift repeated the same
+`salsa::Id` payload comparisons across multiple arms in a 628-byte body.
+
+A bounded post-egraph prototype structurally matched only functions with at
+most 128 blocks and blocks with at most eight instructions. It could prove
+equivalence across pure parameter-forwarding trampolines, but redirected only
+duplicate tails containing a nontrapping readonly load. Calls, stores, traps,
+other side effects, differing instruction metadata, and mismatched external
+SSA values or branch arguments remained barriers. The extracted hot CLIF body
+fell from 608 to 344 bytes, and the real ty symbol fell from 628 to 364 bytes
+(-42.0%). uv was byte-identical, Ruff shrank by 16,848 bytes, and ty grew by
+2,656 bytes overall.
+
+The complete stage-2 compiler, backend, standard-library, and proc-macro build
+passed. All 187 `cranelift-codegen` library tests, all 1,218 CLIF filetests,
+and fresh uv, Ruff, and ty builds also passed. The randomized 20-run
+three-lane application screen preserved every exit code and output digest but
+showed no runtime benefit:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +0.21% | 9/20 | 0.82380 | 1.61x |
+| `uv lock --check`, offline | -0.58% | 12/20 | 0.50344 | 1.37x |
+| `ruff check` over 1,592 fixtures | +0.46% | 9/20 | 0.82380 | 1.78x |
+| `ty check` over `scripts/ty_benchmark` | +0.005% | 10/20 | 1.00000 | 2.17x |
+
+The exact backend is saved as
+`readonly-load-tail-merge/stage2-candidate.dylib` with SHA-256
+`d534b6e8312041737a703c6afe3effa5b577be15210f46d21235b82665a20969`;
+the screen is recorded in
+`results/readonly-load-tail-merge-screen20.json` under the benchmark scratch
+directory.
+
+The prototype is rejected and its source changes are reverted. Tail merging
+is a real local code-size win, but this equality body is too small a fraction
+of the user-visible ty operation to justify another global pass. Further work
+on this hotspot needs to eliminate surrounding enum dispatch or combine with a
+broader proven transformation before another application gate.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
