@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -20,9 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ROOT_MARKER = ".srs-cranelift-runtime-benchmark-root"
 WORKLOADS = ("uv-venv", "uv-lock", "ruff-check", "ty-check")
+UV_LOCK_ELAPSED = re.compile(rb"(?<= in )\d+(?:\.\d+)?(?:ms|s)(?=\r?\n|$)")
 
 
 class BenchmarkError(RuntimeError):
@@ -193,7 +195,7 @@ def command_for(
     raise BenchmarkError(f"unknown workload {workload!r}")
 
 
-def run_probe(command: Command) -> dict[str, Any]:
+def run_probe(command: Command, workload: str) -> dict[str, Any]:
     completed = subprocess.run(
         command.argv,
         cwd=command.cwd,
@@ -202,10 +204,16 @@ def run_probe(command: Command) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         timeout=300,
     )
+    stdout = completed.stdout
+    stderr = completed.stderr
+    if workload == "uv-lock":
+        stderr = UV_LOCK_ELAPSED.sub(b"<elapsed>", stderr)
     return {
         "exit_code": completed.returncode,
-        "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
-        "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "raw_stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+        "raw_stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
     }
 
 
@@ -365,14 +373,14 @@ def run(args: argparse.Namespace) -> None:
         # Prime that state outside both the correctness probes and timed region so every lane
         # observes an existing valid environment.
         if workload == "uv-venv":
-            prime = run_probe(commands[args.reference])
+            prime = run_probe(commands[args.reference], workload)
             if prime["exit_code"] != 0:
                 raise BenchmarkError(
                     f"{workload} state priming in {args.reference} exited "
                     f"{prime['exit_code']}"
                 )
         probes[workload] = {
-            lane_name: run_probe(command) for lane_name, command in commands.items()
+            lane_name: run_probe(command, workload) for lane_name, command in commands.items()
         }
         exit_codes = {probe["exit_code"] for probe in probes[workload].values()}
         if len(exit_codes) != 1:
