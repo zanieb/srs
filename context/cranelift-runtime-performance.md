@@ -2526,6 +2526,24 @@ references instead of cloning ordinary glue graphs or globally retaining their
 code. The exact failing Ruff fixture now links from a clean target with a
 private, self-contained glue closure in the fallback CGU.
 
+The first remote Linux stage-2 build exposed the corresponding ordinary-item
+edge. Cranelift linked `zerovec_derive` with a function address for the private
+`Debug::fmt` implementation of its `OwnULETy`, while the only definition
+remained internal to another CGU. Loading the proc-macro therefore failed with
+an undefined Rust symbol before the application suites could start.
+
+cg_clif now computes the set of functions whose complete partition metadata
+contains only non-inlined internal definitions once before parallel codegen.
+Before post-monomorphization processing, a CGU that actually retains a
+reference to one of those functions emits a local definition unless it already
+owns one. This is deliberately narrower than closing over every late ordinary
+reference: transitive private items are discovered by the same partition set,
+while externally available dependencies retain their existing linkage. The
+late drop-glue closure remains the only path that recursively materializes
+definitions absent from partition metadata. A clean Linux stage-2 build and
+the full cross-platform application suites are the acceptance gate for this
+extension.
+
 ### Direct construction into indirect aggregate returns
 
 A fresh amplified ty profile after CGU-local coalescing again put Darwin
