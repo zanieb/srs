@@ -21,7 +21,7 @@ host="fake-host"
 write_fake_clippy_bins() {
     local version="$1"
 
-    for bin in cargo-clippy clippy-driver; do
+    for bin in cargo-clippy clippy-driver rustdoc; do
         cat > "$toolchain_dir/bin/$bin" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

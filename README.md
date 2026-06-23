@@ -15,7 +15,7 @@ the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
 - `sld/`: the downstream `sld` linker source tree.
 - `bootstrap.toml`: Rust bootstrap configuration for the SRS toolchain build.
 - `build.sh`: builds `sld`, then a stage 2 Rust toolchain with LLVM and
-  Cranelift backends, plus Cargo from the Rust tree.
+  Cranelift backends, plus Cargo, Clippy, and rustdoc from the Rust tree.
 - `build-sld.sh`: builds the `sld` binary, using the linked SRS toolchain by
   default when called directly.
 - `scripts/pull-upstream.sh`: refreshes the imported downstream source trees
@@ -100,8 +100,8 @@ A second release on the same UTC date is refused instead of replacing an
 existing tag or release.
 
 `./build.sh` is the slow step. Re-run it after changing Rust, Cargo, Clippy,
-cg_clif, Cranelift, or the linker default. It builds `sld` with `stable` first so the
-installer can attach the built binary. Rust bootstrap stays on the system
+rustdoc, cg_clif, Cranelift, or the linker default. It builds `sld` with
+`stable` first so the installer can attach the built binary. Rust bootstrap stays on the system
 compiler driver while the installed SRS compiler defaults to `sld`; set
 `SRS_SLD_BOOTSTRAP_TOOLCHAIN` to choose another existing rustup toolchain for
 that step. `./install.sh` snapshots the resulting stage 2 sysroot under
