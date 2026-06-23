@@ -420,42 +420,60 @@ fn materialize_referenced_functions<'tcx>(
         .iter()
         .map(|function| (function.func_id, ()))
         .collect::<FxHashMap<_, _>>();
+    // A fallback can reveal drop glue too late for CGU partitioning. Track only glue whose
+    // partition-assigned definitions are object-private, then make that glue and its dependencies
+    // a self-contained local closure. Drop glue with an externally linkable definition does not
+    // need another copy.
+    let mut private_drop_glue_closure = FxHashMap::default();
     loop {
         let mut pending = referenced_functions
             .iter()
             .filter_map(|(&func_id, &instance)| {
-                let can_materialize_post_monomorphization_reference =
-                    materialize_post_monomorphization_references
-                        && matches!(instance.def, InstanceKind::Item(_))
-                        && tcx.is_mir_available(instance.def_id())
-                        && {
-                            let attrs = tcx.codegen_instance_attrs(instance.def);
-                            !attrs.contains_extern_indicator()
-                                && !attrs.flags.contains(CodegenFnAttrFlags::NAKED)
-                        };
+                let materialize_private_drop_glue = private_drop_glue_closure
+                    .contains_key(&func_id)
+                    || matches!(instance.def, InstanceKind::DropGlue(_, Some(_)))
+                        && has_only_object_private_definitions(tcx, instance);
+                let can_materialize_late_reference = (materialize_post_monomorphization_references
+                    || materialize_private_drop_glue)
+                    && match instance.def {
+                        InstanceKind::Item(_) => tcx.is_mir_available(instance.def_id()),
+                        InstanceKind::DropGlue(_, Some(_)) => true,
+                        _ => false,
+                    }
+                    && {
+                        let attrs = tcx.codegen_instance_attrs(instance.def);
+                        !attrs.contains_extern_indicator()
+                            && !attrs.flags.contains(CodegenFnAttrFlags::NAKED)
+                    };
                 (!defined_functions.contains_key(&func_id)
-                    && (can_materialize_post_monomorphization_reference
+                    && (can_materialize_late_reference
                         || matches!(
                             MonoItem::Fn(instance).instantiation_mode(tcx),
                             InstantiationMode::LocalCopy
                                 | InstantiationMode::GloballyShared { may_conflict: true }
                         )))
-                .then_some((func_id, instance))
+                .then_some((
+                    func_id,
+                    instance,
+                    materialize_private_drop_glue,
+                ))
             })
             .collect::<Vec<_>>();
-        pending.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
+        pending.sort_unstable_by_key(|(func_id, _, _)| func_id.as_u32());
         if pending.is_empty() {
             break;
         }
 
-        for (func_id, instance) in pending {
+        for (func_id, instance, materializing_private_drop_glue) in pending {
             defined_functions.insert(func_id, ());
             let name = instance_symbol_name_for_object(tcx, instance);
             let sig = get_function_sig(tcx, module.target_config().default_call_conv, instance);
-            let declared_func_id =
-                module.declare_function(&name, Linkage::HiddenWeak, &sig).unwrap();
+            let linkage =
+                if materializing_private_drop_glue { Linkage::Local } else { Linkage::HiddenWeak };
+            let declared_func_id = module.declare_function(&name, linkage, &sig).unwrap();
             debug_assert_eq!(declared_func_id, func_id);
-            codegened_functions.push(crate::base::codegen_fn(
+            let mut newly_referenced_functions = FxHashMap::default();
+            let function = crate::base::codegen_fn(
                 tcx,
                 cgu_name,
                 debug_context.as_mut(),
@@ -463,10 +481,32 @@ fn materialize_referenced_functions<'tcx>(
                 Function::new(),
                 module,
                 instance,
-                referenced_functions,
-            ));
+                &mut newly_referenced_functions,
+            );
+            for (referenced_func_id, referenced_instance) in newly_referenced_functions {
+                referenced_functions.entry(referenced_func_id).or_insert(referenced_instance);
+                if materializing_private_drop_glue {
+                    private_drop_glue_closure.insert(referenced_func_id, ());
+                }
+            }
+            codegened_functions.push(function);
         }
     }
+}
+
+fn has_only_object_private_definitions<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    let mono_item = MonoItem::Fn(instance);
+    let mut found_definition = false;
+    for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
+        let Some(data) = cgu.items().get(&mono_item) else {
+            continue;
+        };
+        found_definition = true;
+        if data.linkage != RLinkage::Internal || data.inlined {
+            return false;
+        }
+    }
+    found_definition
 }
 
 fn module_codegen(

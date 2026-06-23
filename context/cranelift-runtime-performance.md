@@ -2508,6 +2508,24 @@ the complete stage-2 compiler and cg_clif build now pass. The change is kept as
 a correctness prerequisite and committed independently from the aggregate
 optimization below.
 
+The final Ruff/ty suite exposed a second edge in that same correctness
+boundary. Emitting a hidden-weak fallback for
+`Box::new<ArcInner<snapbox::Assert>>` introduced cleanup drop glue that had not
+been visible to CGU partitioning. The original closure mixed newly discovered
+references back into the ordinary CGU reference map, where the nonempty
+`DropGlue` instance was neither an ordinary MIR item nor a LocalCopy. Another
+CGU contained only a private definition, so the fallback object failed to link.
+
+Fallback materialization now consults the complete partition metadata for
+nonempty drop glue that it discovers. If every partition-assigned definition
+is object-private and the current CGU does not already define it, cg_clif emits
+the glue and its codegenable transitive closure privately in the fallback
+object. Glue with any externally linkable definition keeps the existing path,
+as do unrelated references. This repairs only genuinely unresolved late
+references instead of cloning ordinary glue graphs or globally retaining their
+code. The exact failing Ruff fixture now links from a clean target with a
+private, self-contained glue closure in the fallback CGU.
+
 ### Direct construction into indirect aggregate returns
 
 A fresh amplified ty profile after CGU-local coalescing again put Darwin
