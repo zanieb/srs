@@ -2291,6 +2291,57 @@ turns direct calls into indirect cross-CGU calls and perturbs many unrelated
 wrappers. Further `Type::eq` work should either preserve direct-call locality
 or optimize the inner equality body itself.
 
+### Rejected frequent multi-failure guarded import
+
+The fresh retained profile left `boxcar::Index::location` as another prominent
+Cranelift-only leaf. The retained ty binary had 253 direct calls across ten
+CGU-local copies, while LLVM had absorbed every copy. The earlier
+module-frequency experiments could not reach this helper: its initial CLIF had
+nine blocks, four sized stack slots, and two cold failure calls, so it failed
+the stack-free and single-failure guarded-import boundary.
+
+A phase-correct retry translated an unhinted root only when its source MIR fit
+the existing ten-block, 96-operation guarded ceiling and contained at least
+two calls. It pre-optimized only stack-bearing catalogue bodies, counted live
+rather than removed DFG instructions, and admitted a direct store only when it
+targeted the function's struct-return pointer. Multiple cold failure blocks
+were replaced with calls back to the canonical helper followed by their
+original traps. The optimized `location` candidate had seven blocks, 25 live
+instructions, no live stack slot, and one merged cold exit. To avoid making
+aggregate popularity a general hotness proxy, only candidates with at least
+two cold exits in the original body and eight calls in the codegen unit used
+the module-frequency exception; existing hinted constant specialization
+remained limited to single-failure candidates.
+
+The intended transformation fired. Direct ty calls to `Index::location` fell
+from 253 to 14. The remaining calls preserve canonical cold behavior or occur
+in low-frequency codegen units. uv, Ruff, and ty grew by 12,288, 9,808, and
+26,512 bytes, respectively. A 100-run ty-only screen was directionally
+favorable but not decisive at -0.57% paired with 58/100 wins
+(`p = 0.13321`). The complete 50-run three-lane application gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +1.74% | 16/50 | 0.01535 | +63.5% |
+| `uv lock --check`, offline | -0.53% | 26/50 | 0.88772 | +40.2% |
+| `ruff check` over 1,592 fixtures | -0.78% | 28/50 | 0.47989 | +83.0% |
+| `ty check` over `scripts/ty_benchmark` | +0.82% | 24/50 | 0.88772 | +125.5% |
+
+All application exit codes and output digests matched. The complete stage-2
+compiler, backend, standard-library, and proc-macro build passed. The exact
+backend is saved as
+`multi-failure-guarded-frequency/stage2-candidate.dylib` with SHA-256
+`73a083d9ef61df28725378b2e22f94f124e88710134d5612927458e0349fc5c3`;
+the final trial record is
+`bench-multi-failure-guarded-frequency-all50/results.json`.
+
+The policy is rejected because it decisively regresses uv environment
+creation and does not improve the target ty row. Removing the hot helper call
+without reducing its aggregate-return stores or surrounding caller traffic is
+not profitable. A future `boxcar` arc should simplify the complete index and
+bucket computation in the caller, not broaden post-monomorphization import
+availability again.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
