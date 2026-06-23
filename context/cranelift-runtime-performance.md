@@ -945,6 +945,49 @@ code and output digest matches. All 186 `cranelift-codegen` unit tests, all
 build pass. The complete measurement record is in
 `/Users/zanie/code/tmp/cranelift-runtime-performance/bench-two-way-stack-join-all50/results.json`.
 
+#### Rejected dominating-store join forwarding
+
+A later ty profile exposed the next syntactic gap in the same stack-to-SSA
+pass. `salsa::ActiveQuery::add_read_simple` computes two independent minima as
+a dominating default stack store plus an overwrite in one arm of a diamond.
+LLVM keeps both values in registers and uses conditional selects. Cranelift's
+two-way join rule required both immediate predecessors to contain an explicit
+store, so it retained a branch-and-stack merge for each value.
+
+A bounded prototype carried known nonescaping integer stack values through
+unique, acyclic `jump` or `brif` predecessor chains before applying the
+existing two-edge, four-parameter join rule. It preserved the current overlap,
+escape, exception-edge, and jump-table exclusions. Focused tests covered both
+explicit `stack_store` operations and ordinary stores through an exact
+`stack_addr`. The real `add_read_simple` symbol fell from 140 to 108 bytes, and
+`ActiveQuery::add_read` fell from 292 to 260 bytes. LLVM remains substantially
+tighter at 40 and 176 bytes respectively because it also selects rather than
+branches and avoids the aggregate input copy.
+
+All 186 `cranelift-codegen` library tests, all 1,218 CLIF filetests, the
+focused regression file, `cargo check`, formatting, and the complete stage-2
+compiler, backend, standard-library, and proc-macro build passed. The uv, Ruff,
+and ty binaries nevertheless grew by 163,600 bytes (0.09%), 111,616 bytes
+(0.10%), and 62,512 bytes (0.06%). The randomized 20-run application screen
+preserved every exit code and output digest but did not support retention:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +2.46% | 6/20 | 0.11532 | 1.62x |
+| `uv lock --check`, offline | -0.96% | 12/20 | 0.50344 | 1.43x |
+| `ruff check` over 1,592 fixtures | +1.70% | 7/20 | 0.26318 | 1.81x |
+| `ty check` over `scripts/ty_benchmark` | +0.30% | 10/20 | 1.00000 | 2.18x |
+
+The exact backend is saved as
+`dominating-stack-join/candidate.dylib` with SHA-256
+`3e135dece3c52f1665bead6932225d5627e705df6c69676dac8bc03a3d376f7b`;
+the screen is recorded in
+`results/dominating-stack-join-screen20.json` under the benchmark scratch
+directory. The mixed result is rejected without a 50-run gate, and the source
+changes are reverted. A future stack-to-SSA extension should target a loop or
+larger live region where stack traffic is sampled directly; local min/max
+diamonds are structurally cleaner but too small to move these applications.
+
 ### Boolean-result range folding
 
 The next hot hashbrown reduction exposed an instruction-local range fact that
@@ -2895,7 +2938,10 @@ address-taken group round-trip, cuts the frame from 208 to 96 bytes, and
 improves ty by 1.43% without moving the other workloads. Further stack work in
 this loop should keep a still larger producer-consumer region in registers or
 reduce pressure across the indirect equality call rather than add another
-local transmute or rematerialization policy. A matched
+local transmute or rematerialization policy. Carrying a dominating scalar
+store through small acyclic joins also reduced Salsa's local min/max stack
+traffic, but the four-operation screen rejected it; that syntactic extension
+is not a substitute for removing a sampled loop-carried spill. A matched
 profile before the repeated-call import showed
 hashbrown's `find_or_find_insert_index_inner` and cross-CGU
 `FxHasher::write_isize` as prominent Cranelift-only leaves while LLVM had
