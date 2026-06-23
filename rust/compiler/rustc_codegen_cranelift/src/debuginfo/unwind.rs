@@ -149,11 +149,18 @@ impl UnwindContext {
         let Some(unwind_info) = compiled_code.create_unwind_info(module.isa()).unwrap() else {
             return;
         };
+        // Mach-O's system unwinder requires every FDE to use the same augmented CIE shape. A
+        // function that makes calls also needs LSDA entries for those calls even when it has no
+        // local handler: a null LSDA makes `_Unwind_RaiseException` fail before reaching a
+        // handler in an older frame. Truly call-free functions keep a null LSDA rather than an
+        // empty call-site table.
+        let has_call_sites = compiled_code.buffer.call_sites().next().is_some();
         let needs_lsda = cfg!(feature = "unwinding")
-            && compiled_code
-                .buffer
-                .call_sites()
-                .any(|call_site| !call_site.exception_handlers.is_empty());
+            && ((is_macho && has_call_sites)
+                || compiled_code
+                    .buffer
+                    .call_sites()
+                    .any(|call_site| !call_site.exception_handlers.is_empty()));
 
         match unwind_info {
             UnwindInfo::SystemV(unwind_info) => {
@@ -253,7 +260,16 @@ impl UnwindContext {
                     fde.lsda = Some(address_for_data(lsda));
                 }
 
-                let cie_id = if needs_lsda { self.eh_cie_id } else { self.plain_cie_id };
+                let cie_id = if is_macho && cfg!(feature = "unwinding") {
+                    if !needs_lsda {
+                        fde.lsda = Some(Address::Constant(0));
+                    }
+                    self.eh_cie_id
+                } else if needs_lsda {
+                    self.eh_cie_id
+                } else {
+                    self.plain_cie_id
+                };
                 self.frame_table.add_fde(cie_id.unwrap(), fde);
             }
             UnwindInfo::WindowsX64(_) | UnwindInfo::WindowsArm64(_) => {

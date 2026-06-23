@@ -191,6 +191,9 @@ impl Writer for WriterRelocate {
 
     fn write_eh_pointer(&mut self, address: Address, eh_pe: gimli::DwEhPe, size: u8) -> Result<()> {
         match address {
+            // Encoded pointers reserve an all-zero representation for a null pointer. Applying
+            // a relative base to zero would instead turn it into a non-null section address.
+            Address::Constant(0) => self.write_eh_pointer_data(0, eh_pe.format(), size),
             // Address::Constant arm copied from gimli
             Address::Constant(val) => {
                 // Indirect doesn't matter here.
@@ -238,5 +241,21 @@ impl Writer for WriterRelocate {
                 _ => Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_null_pointer_stays_null() {
+        let mut writer = WriterRelocate::new(RunTimeEndian::Little);
+        let encoding = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
+
+        writer.write_eh_pointer(Address::Constant(0), encoding, 8).unwrap();
+
+        assert_eq!(writer.writer.slice(), &[0, 0, 0, 0]);
+        assert!(writer.relocs.is_empty());
     }
 }
