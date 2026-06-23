@@ -2553,6 +2553,52 @@ compiler, cg_clif, standard-library, and proc-macro builds and all three fresh
 application builds pass. The optimization is retained; the full matched
 repository-suite rerun remains the finalization gate.
 
+#### Rejected transparent aggregate call aliases
+
+The retained ty profile exposed the opposite copy direction in
+`salsa::ActiveQuery::add_read_simple`. Its incoming `DatabaseKeyIndex` is a
+12-byte indirect, readonly argument. MIR wraps it in the one-field
+`QueryEdge` struct and immediately moves that wrapper into
+`IndexMap::insert_full`. LLVM reuses the incoming pointer, combines the two
+preceding min/max diamonds with conditional selects, and tail-calls the map
+operation. cg_clif instead copied the three four-byte fields into a private
+stack slot and passed that slot.
+
+A conservative frontend prototype let a memory-backed one-field aggregate
+temporary alias its source storage only when both layouts had identical size
+and alignment, the field started at offset zero, neither local's address was
+observed, the source had no other use, and the wrapper's sole use moved it
+directly into a call. Scalar and scalar-pair values, multi-field aggregates,
+enums, non-call consumers, copies with later source uses, and ambiguous local
+lifetimes remained unchanged. Focused `Copy` and owning `String` wrapper
+examples both passed; the 12-byte example compiled to only prologue, call, and
+epilogue, confirming that the loads, stores, and local slot disappeared
+without duplicating a drop.
+
+The real `ActiveQuery::add_read_simple` symbol fell from 140 to 108 bytes and
+`ActiveQuery::add_read` from 292 to 252 bytes. The complete stage-2 compiler,
+backend, standard-library, proc-macro, and pinned application builds passed.
+The uv, Ruff, and ty binaries grew slightly, by 5,264, 4,192, and 5,488 bytes
+(all less than 0.005%). The randomized 20-run gate preserved every correctness
+probe but was runtime-neutral:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | +2.34% | 9/20 | 0.82380 | 1.59x |
+| `uv lock --check`, offline | +0.48% | 9/20 | 0.82380 | 1.42x |
+| `ruff check` over 1,592 fixtures | +0.001% | 10/20 | 1.00000 | 1.80x |
+| `ty check` over `scripts/ty_benchmark` | -0.41% | 11/20 | 0.82380 | 2.24x |
+
+The exact backend is saved as
+`transparent-aggregate-alias/candidate.dylib` with SHA-256
+`ca1f8bc109c4caf3c29410291b2f7fab1cc0eb152d2b6d830dfa09640cef9b26`;
+the screen is recorded in
+`results/transparent-aggregate-alias-screen20.json` under the benchmark
+scratch directory. The rule is rejected without a 50-run gate, and its source
+changes are reverted. LLVM's compact wrapper combines input reuse, select
+formation, and a tail call; removing only the three-field copy does not move
+the application boundary.
+
 ### Rejected immutable aggregate vector copies
 
 The profile after direct return construction still sampled
@@ -2965,7 +3011,12 @@ neutral for Ruff. The retained proof is deliberately limited to
 single-definition, single-use memory-backed temporaries whose address is never
 observed. Extending destination reuse to tuples, enum variants, or non-return
 roots requires a separately proven alias and lifetime model rather than
-broadening this rule by shape alone.
+broadening this rule by shape alone. A later exact-storage alias for a
+one-field aggregate moved into an indirect call safely removed Salsa's 12-byte
+input copy but was neutral in all four application rows. That negative result
+narrows the next call-boundary arc to transformations that also remove
+surrounding control flow or the call itself, rather than another isolated
+aggregate copy.
 Read-only provenance alone did not let Cranelift reuse the repeated constant
 loads left in that constructor. Replacing immutable 16-128-byte copies with
 AArch64 vectors made the constructor substantially smaller but trended
