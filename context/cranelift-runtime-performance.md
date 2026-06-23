@@ -2698,6 +2698,38 @@ The main and focused results are recorded in
 `results/unsigned-branch-facts-uv-lock-rep50.json`. The full matched repository
 suites remain the finalization gate rather than a per-arc prerequisite.
 
+#### Rejected zero-comparison equivalence
+
+The remaining `hash_bytes` bounds path branches first on `len != 0` and then,
+in its only successor, on `len >u 0` before loading byte zero. A bounded
+follow-up canonicalized only equality and inequality against a typed zero to
+the equivalent unsigned `<= 0` and `> 0` predicates. Ordinary equality facts
+remained excluded. Focused tests covered both identities, swapped operands,
+and rejection of equality against a nonzero constant.
+
+The complete stage-2 build, Clippy, fresh pinned application builds, and all
+correctness probes passed. The rule fired more broadly and shrank uv, Ruff,
+and ty by another 6,640, 5,232, and 21,216 bytes, respectively. It did not,
+however, shrink the target `hash_bytes` machine body below the retained 936
+bytes. The complete 50-run operation gate against the exact unsigned-fact
+policy measured:
+
+| Workload | Paired change | Wins | Sign p |
+| --- | ---: | ---: | ---: |
+| `uv venv --clear` | -0.96% | 30/50 | 0.20264 |
+| `uv lock --check`, offline | -0.36% | 27/50 | 0.67181 |
+| `ruff check` over 1,592 fixtures | +0.23% | 24/50 | 0.88772 |
+| `ty check` over `scripts/ty_benchmark` | +0.64% | 22/50 | 0.47989 |
+
+No row improves decisively, Ruff and ty move backward, and the original hot
+body is unchanged. The extension is rejected as a size-only win and its source
+and focused tests are reverted. The backend is preserved as
+`zero-comparison-facts/candidate.dylib` with SHA-256
+`9ffc28fbd06e9760224d9ac0a6498569f61938f27512e34db762a712b61fa181`.
+The initial screen and complete gate are recorded in
+`results/zero-comparison-facts-screen20.json` and
+`results/zero-comparison-facts-all50.json`.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
