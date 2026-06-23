@@ -361,6 +361,16 @@ def run(args: argparse.Namespace) -> None:
             )
             for lane_name, lane in lanes.items()
         }
+        # `uv venv --clear` reports different setup details when its target does not exist yet.
+        # Prime that state outside both the correctness probes and timed region so every lane
+        # observes an existing valid environment.
+        if workload == "uv-venv":
+            prime = run_probe(commands[args.reference])
+            if prime["exit_code"] != 0:
+                raise BenchmarkError(
+                    f"{workload} state priming in {args.reference} exited "
+                    f"{prime['exit_code']}"
+                )
         probes[workload] = {
             lane_name: run_probe(command) for lane_name, command in commands.items()
         }
