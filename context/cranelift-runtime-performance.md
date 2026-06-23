@@ -2730,6 +2730,62 @@ The initial screen and complete gate are recorded in
 `results/zero-comparison-facts-screen20.json` and
 `results/zero-comparison-facts-all50.json`.
 
+### MIR-lifetime physical stack-slot reuse
+
+A fresh ty profile after the branch-fact work put
+`TypeRelationChecker::check_type_pair` at 305 active samples in ten seconds.
+The retained Cranelift body was 24,240 bytes with a 6,960-byte local frame;
+its optimized CLIF contained 627 sized stack slots. The matched LLVM body was
+11,852 bytes with a 688-byte local frame. This is a frontend allocation gap as
+well as a register-allocation gap: cg_clif had intentionally ignored MIR
+`StorageLive` and `StorageDead` statements and reserved independent frame
+storage for every memory-backed local.
+
+The first prototype assigned mutually exclusive MIR locals the same Cranelift
+stack-slot identity. It cut the hot frame to 3,968 bytes, but it also collapsed
+alias identities before optimization, grew the body to about 25,420 bytes, and
+regressed the focused ty gate by 2.30% with only 4/20 wins (`p = 0.01182`). That
+form is rejected.
+
+The retained design keeps every logical stack slot distinct through Cranelift
+optimization and records only that a later slot may reuse an earlier slot's
+physical allocation. Machine lowering assigns both slots the same frame offset.
+cg_clif computes conflicts with `MaybeStorageLive`, then first-fit colors only
+nonzero, memory-backed locals with exact size and alignment. SSA locals,
+aggregate destinations, dynamically realigned locals, oversized values, and
+functions above the 4,096-local analysis cap keep one allocation per local.
+The embedder remains responsible for proving disjoint lifetimes; Cranelift's
+verifier additionally rejects invalid, forward, and chained reuse references.
+Inlining remaps the allocation reference with the copied slots.
+
+This preserves alias analysis while reducing `check_type_pair` to a 3,952-byte
+local frame and 23,556 bytes of code, 43.2% and 2.82% below the retained
+Cranelift body. Fresh uv, Ruff, and ty profiling binaries shrink by 181,536,
+13,792, and 14,368 bytes, respectively. The randomized 20-run application gate
+measured:
+
+| Workload | Paired change | Wins | Sign p | Binary change |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -2.17% | 13/20 | 0.26318 | -0.101% |
+| `uv lock --check`, offline | +0.76% | 9/20 | 0.82380 | -0.101% |
+| `ruff check` over 1,592 fixtures | -1.94% | 16/20 | 0.01182 | -0.013% |
+| `ty check` over `scripts/ty_benchmark` | +0.12% | 10/20 | 1.00000 | -0.013% |
+
+Ruff improves decisively, uv environment creation is favorable, and the lock
+and ty rows are neutral. Every correctness-probe exit code and output digest
+matches the retained backend. AArch64 lowering, inlining, parser, and verifier
+filetests cover the physical allocation and structural contract. All 191
+`cranelift-codegen` and 41 `cranelift-reader` library tests, all 1,222 CLIF
+filetests, a no-dependency Clippy run for both Cranelift crates, and the
+complete matching stage-2 backend build pass. The benchmark is recorded in
+`results/mir-physical-stack-slot-reuse-all20.json`; the benchmarked backend had
+SHA-256 `3bcbe8acad763fb8fc63c086d745380016ad349dec3f5a634e4222a88e5b4c44`.
+The final hardened backend, which adds verifier checks and avoids allocating
+the quadratic conflict matrix above the cap without changing the benchmarked
+paths, is saved as `mir-physical-stack-slot-reuse/candidate.dylib` with SHA-256
+`15262c75f834a4637b6d87a4369799da8ce8887b04f3457d7f444eaa48c2a794`.
+The full uv, Ruff, and ty repository suites remain the finalization gate.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
@@ -3103,6 +3159,12 @@ input copy but was neutral in all four application rows. That negative result
 narrows the next call-boundary arc to transformations that also remove
 surrounding control flow or the call itself, rather than another isolated
 aggregate copy.
+Using MIR storage lifetimes for physical stack-slot reuse then addresses the
+broader frame problem without merging Cranelift alias identities. It cuts the
+profiled type-relation frame by 43%, improves Ruff decisively, and leaves both
+uv resolution and ty neutral. Further frame work should preserve that
+post-optimization allocation boundary rather than sharing logical slots in the
+frontend, which was a measured regression.
 Read-only provenance alone did not let Cranelift reuse the repeated constant
 loads left in that constructor. Replacing immutable 16-128-byte copies with
 AArch64 vectors made the constructor substantially smaller but trended

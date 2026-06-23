@@ -425,6 +425,20 @@ impl<'tcx> CPlace<'tcx> {
         CPlace { inner: CPlaceInner::Addr(stack_slot, None), layout }
     }
 
+    pub(crate) fn new_reused_stack_slot(
+        fx: &mut FunctionCx<'_, '_, 'tcx>,
+        layout: TyAndLayout<'tcx>,
+        reuse: StackSlot,
+    ) -> CPlace<'tcx> {
+        assert!(layout.is_sized() && layout.size.bytes() != 0);
+        let stack_slot = fx.create_reused_stack_slot(
+            u32::try_from(layout.size.bytes()).unwrap(),
+            u32::try_from(layout.align.bytes()).unwrap(),
+            reuse,
+        );
+        CPlace { inner: CPlaceInner::Addr(stack_slot, None), layout }
+    }
+
     pub(crate) fn new_var(
         fx: &mut FunctionCx<'_, '_, 'tcx>,
         local: Local,

@@ -80,6 +80,13 @@ pub struct StackSlotData {
     /// entities. This opaque `StackSlotKey` allows the embedder to do
     /// so.
     pub key: Option<StackSlotKey>,
+
+    /// An earlier stack slot whose physical storage can be reused for this slot.
+    ///
+    /// The embedder must guarantee that the two slots' live ranges do not overlap. Keeping the
+    /// slots distinct in IR preserves their independent alias identities during optimization;
+    /// machine lowering assigns them the same frame offset afterwards.
+    pub reuse: Option<StackSlot>,
 }
 
 /// An opaque key uniquely identifying a stack slot.
@@ -110,6 +117,7 @@ impl StackSlotData {
             size,
             align_shift,
             key: None,
+            reuse: None,
         }
     }
 
@@ -126,6 +134,7 @@ impl StackSlotData {
             size,
             align_shift,
             key: Some(key),
+            reuse: None,
         }
     }
 }
@@ -141,8 +150,12 @@ impl fmt::Display for StackSlotData {
             Some(value) => format!(", key = {}", value.bits()),
             None => "".into(),
         };
+        let reuse = match self.reuse {
+            Some(slot) => format!(", reuse = {slot}"),
+            None => "".into(),
+        };
 
-        write!(f, "{} {}{align_shift}{key}", self.kind, self.size)
+        write!(f, "{} {}{align_shift}{key}{reuse}", self.kind, self.size)
     }
 }
 

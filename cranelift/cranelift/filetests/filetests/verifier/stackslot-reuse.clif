@@ -1,0 +1,25 @@
+test verifier
+
+function %invalid_reuse() {
+    ss0 = explicit_slot 8, reuse = ss9 ; error: reused stack slot references invalid stack slot ss9
+
+block0:
+    return
+}
+
+function %forward_reuse() {
+    ss0 = explicit_slot 8, reuse = ss1 ; error: reused stack slot must reference an earlier stack slot, not ss1
+    ss1 = explicit_slot 8
+
+block0:
+    return
+}
+
+function %chained_reuse() {
+    ss0 = explicit_slot 8
+    ss1 = explicit_slot 8, reuse = ss0
+    ss2 = explicit_slot 8, reuse = ss1 ; error: reused stack slot must reference an allocation slot, not ss1
+
+block0:
+    return
+}

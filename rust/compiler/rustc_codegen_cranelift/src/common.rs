@@ -426,6 +426,24 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     }
 
     pub(crate) fn create_stack_slot(&mut self, size: u32, align: u32) -> Pointer {
+        self.create_stack_slot_inner(size, align, None)
+    }
+
+    pub(crate) fn create_reused_stack_slot(
+        &mut self,
+        size: u32,
+        align: u32,
+        reuse: StackSlot,
+    ) -> Pointer {
+        self.create_stack_slot_inner(size, align, Some(reuse))
+    }
+
+    fn create_stack_slot_inner(
+        &mut self,
+        size: u32,
+        align: u32,
+        reuse: Option<StackSlot>,
+    ) -> Pointer {
         assert!(
             size.is_multiple_of(align),
             "size must be a multiple of alignment (size={size}, align={align})"
@@ -442,6 +460,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 // The maximum value of ilog2 is 31 which will always fit in a u8.
                 align_shift: align.ilog2().try_into().unwrap(),
                 key: None,
+                reuse,
             });
             Pointer::stack_slot(stack_slot)
         } else {
@@ -452,6 +471,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 size: size + align,
                 align_shift: abi_align.ilog2().try_into().unwrap(),
                 key: None,
+                reuse,
             });
             let base_ptr = self.bcx.ins().stack_addr(self.pointer_type, stack_slot, 0);
             let misalign_offset = self.bcx.ins().band_imm(base_ptr, i64::from(align - 1));

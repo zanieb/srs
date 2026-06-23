@@ -410,6 +410,33 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
+    fn verify_stack_slots(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        for (stack_slot, data) in &self.func.sized_stack_slots {
+            let Some(reuse) = data.reuse else {
+                continue;
+            };
+
+            if !self.func.sized_stack_slots.is_valid(reuse) {
+                errors.report((
+                    stack_slot,
+                    format!("reused stack slot references invalid stack slot {reuse}"),
+                ));
+            } else if reuse.as_u32() >= stack_slot.as_u32() {
+                errors.report((
+                    stack_slot,
+                    format!("reused stack slot must reference an earlier stack slot, not {reuse}"),
+                ));
+            } else if self.func.sized_stack_slots[reuse].reuse.is_some() {
+                errors.report((
+                    stack_slot,
+                    format!("reused stack slot must reference an allocation slot, not {reuse}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Check that the given block can be encoded as a BB, by checking that only
     /// branching instructions are ending the block.
     fn encodable_as_bb(&self, block: Block, errors: &mut VerifierErrors) -> VerifierStepResult {
@@ -2081,6 +2108,7 @@ impl<'a> Verifier<'a> {
 
     pub fn run(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
         self.verify_global_values(errors)?;
+        self.verify_stack_slots(errors)?;
         self.typecheck_entry_block_params(errors)?;
         self.check_entry_not_cold(errors)?;
         self.typecheck_function_signature(errors)?;

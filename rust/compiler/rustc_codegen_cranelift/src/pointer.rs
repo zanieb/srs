@@ -35,6 +35,13 @@ impl Pointer {
         Pointer { base: PointerBase::Stack(stack_slot), offset: Offset32::new(0), readonly: false }
     }
 
+    pub(crate) fn stack_slot_id(self) -> Option<StackSlot> {
+        match (self.base, self.offset.into()) {
+            (PointerBase::Stack(slot), 0_i64) => Some(slot),
+            _ => None,
+        }
+    }
+
     pub(crate) fn dangling(align: Align) -> Self {
         Pointer { base: PointerBase::Dangling(align), offset: Offset32::new(0), readonly: false }
     }

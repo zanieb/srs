@@ -1,8 +1,13 @@
 //! SSA analysis
 
+use std::borrow::Cow;
+
 use rustc_index::IndexVec;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::StatementKind::*;
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
+use rustc_mir_dataflow::Analysis;
+use rustc_mir_dataflow::impls::{MaybeStorageLive, always_storage_live_locals};
 
 use crate::prelude::*;
 
@@ -139,4 +144,55 @@ pub(crate) fn aggregate_destinations(
     }
 
     destinations
+}
+
+/// Find locals whose MIR storage lifetimes may overlap.
+///
+/// cg_clif allocates all memory-backed locals before lowering the body. Keeping the conflict
+/// relation lets the prelude reuse a stack slot for locals whose `StorageLive` ranges are
+/// disjoint, rather than reserving space for every mutually exclusive match arm at once.
+pub(crate) fn storage_conflicts(
+    fx: &FunctionCx<'_, '_, '_>,
+    eligible: &DenseBitSet<Local>,
+) -> Option<IndexVec<Local, DenseBitSet<Local>>> {
+    const MAX_LOCALS: usize = 4096;
+
+    let local_count = fx.mir.local_decls.len();
+    // Avoid quadratic memory use on unusually large generated MIR bodies. Those bodies keep the
+    // existing one-slot-per-local behavior.
+    if local_count > MAX_LOCALS {
+        return None;
+    }
+
+    let mut conflicts = IndexVec::from_fn_n(|_| DenseBitSet::new_empty(local_count), local_count);
+
+    let always_live = always_storage_live_locals(fx.mir);
+    let mut storage_live = MaybeStorageLive::new(Cow::Owned(always_live))
+        .iterate_to_fixpoint(fx.tcx, fx.mir, None)
+        .into_results_cursor(fx.mir);
+    let mut live_eligible = DenseBitSet::new_empty(local_count);
+
+    let mut record_conflicts =
+        |state: &DenseBitSet<Local>, conflicts: &mut IndexVec<Local, DenseBitSet<Local>>| {
+            live_eligible.clone_from(state);
+            live_eligible.intersect(eligible);
+            for local in live_eligible.iter() {
+                conflicts[local].union(&live_eligible);
+            }
+        };
+
+    for (block, block_data) in mir::traversal::reachable(fx.mir) {
+        storage_live.seek_to_block_start(block);
+        record_conflicts(storage_live.get(), &mut conflicts);
+
+        for (statement_index, statement) in block_data.statements.iter().enumerate() {
+            if !matches!(statement.kind, StorageLive(_) | StorageDead(_)) {
+                continue;
+            }
+            storage_live.seek_after_primary_effect(Location { block, statement_index });
+            record_conflicts(storage_live.get(), &mut conflicts);
+        }
+    }
+
+    Some(conflicts)
 }
