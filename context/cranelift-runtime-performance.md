@@ -2246,6 +2246,51 @@ The focused barrier filetest, all 1,218 Cranelift filetests, all 186
 `cranelift-codegen` unit tests, 21 passing doctests, a complete cg_clif check,
 and the full stage-2 backend, standard-library, and proc-macro build pass.
 
+#### Rejected tail-wrapper import retry with complete materialization
+
+The one-call wrapper policy was retried after post-inlining references became
+materializable. The exact hinted-or-unhinted gate admitted only candidates
+with one direct call and otherwise `nop`, jump, or return instructions under
+the existing six-block and 32-instruction ceilings. Making this policy link
+through the stage-2 bootstrap exposed three distinct availability gaps in the
+prototype: a materialized definition was redeclared with local linkage,
+already-materialized post-inlining roots did not carry their recorded callee
+edges into the stronger closure, and generated MIR shims such as drop glue
+were excluded from that closure. Preserving the hidden-weak declaration,
+seeding only references reachable from newly live roots, and admitting
+MIR-backed non-intrinsic, non-virtual shims made the complete stage-2 compiler,
+standard-library, proc-macro, and backend build pass.
+
+The intended ty transform then occurred. `NominalInstanceType::eq` disappeared
+from the binary and the nominal arm in `Type::eq` called
+`NominalInstanceInner::eq` directly. Because that inner definition crossed a
+CGU boundary, however, the call became an `adrp`/`add`/`blr` sequence to a
+hidden-weak target rather than a direct `bl`. `Type::eq` grew from 1,092 to
+1,116 bytes. The complete binaries nevertheless shrank by 3,095,184 bytes for
+uv, 3,240,128 bytes for Ruff, and 538,416 bytes for ty, showing that the
+runtime result was not a simple static-size effect.
+
+The matched 20-run three-lane gate measured the candidate against the retained
+Cranelift control:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -3.06% | 16/20 | 0.01182 | +64.0% |
+| `uv lock --check`, offline | +0.02% | 10/20 | 1.00000 | +45.2% |
+| `ruff check` over 1,592 fixtures | +4.24% | 5/20 | 0.04139 | +91.2% |
+| `ty check` over `scripts/ty_benchmark` | +7.43% | 2/20 | 0.00040 | +141.4% |
+
+All application exit codes and output digests matched. The exact backend is
+saved as `one-call-wrapper-complete-materialization/candidate.dylib` with
+SHA-256 `a6e2a25cfbc28cce28eb6219ed064b84bea7a4ac715641f2f3370d8aed62814c`;
+the trial record is
+`bench-one-call-wrapper-complete-materialization-all20/results.json`.
+The broad policy is rejected and its source changes are reverted. The retained
+backend was restored. Eliminating a 24-byte wrapper is insufficient when it
+turns direct calls into indirect cross-CGU calls and perturbs many unrelated
+wrappers. Further `Type::eq` work should either preserve direct-call locality
+or optimize the inner equality body itself.
+
 ### AArch64 CRC intrinsics
 
 The initial Cranelift ty binary aborted while reading its vendored typeshed
