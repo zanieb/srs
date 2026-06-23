@@ -2644,6 +2644,60 @@ Rust symbol hashes. Results are in
 `bench-readonly-vector32-exact-all20/results.json` under the benchmark scratch
 directory.
 
+### Exact unsigned branch-fact propagation
+
+The retained ty profile next put `rustc_hash::hash_bytes` at 862 active-stack
+samples. Its 1,064-byte Cranelift body repeated literal unsigned length checks
+after the same condition had already selected the only incoming edge. The
+`len >= 8` path rechecked both `len >= 8` and its complement `len < 8`; the
+four-byte path repeated the same pair. Each redundant branch kept a cold
+bounds-panic block and its call sequence alive. LLVM absorbs this helper
+completely and has no standalone symbol.
+
+Cranelift now propagates one exact unsigned comparison fact through blocks
+with a single predecessor. A fact may pass through an unconditional jump and
+matches an identical, complemented, or operand-swapped comparison. Integer
+constants are compared by typed value rather than SSA identity, so separately
+materialized literals still match. The rule deliberately excludes signed and
+equality comparisons, blocks with multiple incoming edges, transitive
+arithmetic implications, and global replacement of the pure comparison value.
+Only the later `brif` condition becomes constant; other uses retain their
+original semantics.
+
+All four target branches disappear from `hash_bytes`, whose machine body falls
+from 1,064 to 936 bytes. The rule also removes repeated bounds branches more
+broadly: fresh uv, Ruff, and ty binaries shrink by 309,424 bytes (0.172%),
+418,464 bytes (0.390%), and 154,688 bytes (0.137%), respectively.
+
+The complete 50-run matched operation gate measured:
+
+| Workload | Paired change | Wins | Sign p | Candidate vs LLVM | Binary change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `uv venv --clear` | -1.38% | 36/50 | 0.00260 | 1.59x | -0.172% |
+| `uv lock --check`, offline | +1.02% | 21/50 | 0.32224 | 1.39x | -0.172% |
+| `ruff check` over 1,592 fixtures | -0.72% | 29/50 | 0.32224 | 1.78x | -0.390% |
+| `ty check` over `scripts/ty_benchmark` | -0.26% | 27/50 | 0.67181 | 2.15x | -0.137% |
+
+The uv lock row reversed an initially favorable 20-run screen, so it received
+an independent focused 50-run replication. The replication measured -0.54%
+with 32/50 wins and `p = 0.06491`. Thus uv environment creation improves
+decisively, the independent lock result is favorable, Ruff and ty remain
+favorable or neutral, every binary shrinks, and all application exit codes and
+output digests match. The bounded rule is retained.
+
+All 186 `cranelift-codegen` library tests, all 1,219 CLIF filetests, the focused
+true-edge, false-edge, complement, swapped-operand, jump-chain, merge, and
+signed-comparison regressions, including preservation of non-branch comparison
+uses, a no-dependency Clippy run, the complete stage-2
+compiler/backend/standard-library build, and fresh pinned uv/Ruff/ty builds pass.
+The backend is saved as `unsigned-branch-facts/candidate.dylib` with
+SHA-256
+`d447feb632c2025bffd7da3b2de558f9d2ead7639d338424c388a8f49c336ac4`.
+The main and focused results are recorded in
+`results/unsigned-branch-facts-all50.json` and
+`results/unsigned-branch-facts-uv-lock-rep50.json`. The full matched repository
+suites remain the finalization gate rather than a per-arc prerequisite.
+
 ## Full-Suite Backend Validation
 
 ### Selective-LSDA post-change gate
