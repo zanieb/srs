@@ -7,9 +7,8 @@ Cranelift, not Cranelift compile time. LLVM and Cranelift use the same SRS
 rustc, Cargo, sources, profile, target CPU, and linker. Only target codegen
 changes.
 
-The latest comparison was collected on aarch64 macOS from the current SRS
-worktree, based on `131741680` with the subsequent performance commits recorded
-in this document, with:
+The final comparison was collected on dedicated, unsandboxed remote x86_64
+Linux and Apple-silicon macOS hosts from SRS backend source `7497012ee`, with:
 
 - rustc `1.97.0-dev (9e2ac2b97 2026-05-21)`;
 - Cranelift `0.133.0`;
@@ -18,8 +17,9 @@ in this document, with:
 - the repositories' `profiling` profile, with LTO disabled for both backends;
 - `CARGO_INCREMENTAL=0`;
 - the SRS artifact cache and incremental linker disabled;
-- cg_clif's opt-in unwinding support enabled for Apple silicon; and
-- `/usr/bin/clang` as the linker.
+- cg_clif's opt-in unwinding support enabled on both targets;
+- the same linker within each host's LLVM and Cranelift pair; and
+- fresh, backend-specific target directories.
 
 Ruff's production release profile uses fat LTO. Disabling it makes the
 backend comparison possible and controlled, but probably makes the measured
@@ -27,67 +27,85 @@ LLVM lead conservative relative to the shipped Ruff binary.
 
 ## Representative Results
 
-Each row is 50 timed trials after five warmups. Lower is better. The pinned
-matched LLVM control, preceding Cranelift policy, and current Cranelift policy
-were run in the same randomized, block-balanced matrix; both Cranelift lanes
-were built from fresh target directories.
+Each row is 50 timed paired trials after ten warmups. Lower is better. The
+pinned LLVM and Cranelift lanes ran in the same seeded, block-balanced schedule
+on an otherwise idle remote host and were built from fresh target directories.
 
-| Workload | LLVM | Current Cranelift | LLVM lead |
-| --- | ---: | ---: | ---: |
-| `uv venv --clear` | 31.4 ms | 51.5 ms | 1.64x |
-| `uv lock --check`, offline | 56.4 ms | 79.3 ms | 1.41x |
-| `ruff check` over 1,592 fixtures | 78.3 ms | 137.6 ms | 1.76x |
-| `ty check` over `scripts/ty_benchmark` | 46.6 ms | 97.8 ms | 2.10x |
+| Host | Workload | LLVM median | Cranelift median | Median ratio | Paired Cranelift change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux x86_64 | `uv venv --clear` | 31.76 ms | 63.82 ms | 2.01x | +101.03% |
+| Linux x86_64 | `uv lock --check`, offline | 65.96 ms | 113.97 ms | 1.73x | +76.14% |
+| Linux x86_64 | `ruff check` over 1,592 fixtures | 165.83 ms | 419.48 ms | 2.53x | +152.39% |
+| Linux x86_64 | `ty check` over `scripts/ty_benchmark` | 119.57 ms | 364.44 ms | 3.05x | +204.84% |
+| macOS arm64 | `uv venv --clear` | 52.48 ms | 58.27 ms | 1.11x | +25.38% |
+| macOS arm64 | `uv lock --check`, offline | 100.60 ms | 101.87 ms | 1.01x | +3.93% |
+| macOS arm64 | `ruff check` over 1,592 fixtures | 106.50 ms | 175.84 ms | 1.65x | +64.73% |
+| macOS arm64 | `ty check` over `scripts/ty_benchmark` | 51.61 ms | 157.84 ms | 3.06x | +203.07% |
 
-The uv lock fixture is an intentional offline failure caused by the pinned
-checkout's unavailable resolver data. The ty fixture reports the same four
-unresolved imports in every successful compiler lane. These rows measure the
-real resolver and type-checking failure paths, not a no-op command.
+The paired column is the primary statistic because the macOS host showed
+substantial frequency and thermal drift across the absolute samples. Linux is
+stable and severe: Cranelift loses all 50 pairs in every row (`p = 1.78e-15`).
+On macOS it loses all 50 Ruff and ty pairs, 45/50 uv environment pairs, and
+29/50 uv lock pairs. The lock row is neutral (`p = 0.32224`); the other three
+are decisive.
 
-The conclusion is unambiguous: LLVM is currently about 1.4-2.1x faster for
-these user-visible operations. The implemented changes recover meaningful
-ground for Ruff and ty and a smaller amount for uv lock, but they do not close
-the remaining loop-optimization and code-quality gap.
+The uv lock fixture succeeds in both lanes after the stateful probe is primed.
+The ty fixture reports the same four unresolved imports and exit status in
+both lanes. Normalized exit codes and stdout/stderr digests match for every
+probe on both hosts.
 
-Cranelift lost every paired LLVM trial in all four rows (two-sided sign-test
-`p = 1.78e-15`). Exit codes and stdout/stderr digests match between backends
-for every correctness probe.
+The conclusion is unambiguous: the user's understanding is correct. LLVM is
+still substantially faster for the parser- and analysis-heavy Ruff and ty
+operations, with ty just over 3x faster on both architectures. Linux also
+shows 1.7-2.0x LLVM leads for the uv operations. macOS uv lock is the one
+neutral row, while environment creation remains directionally slower under
+Cranelift. The retained changes recover meaningful ground in profiled hot
+paths but do not close the loop, range, call-boundary, and code-layout gap.
+
+The final raw matrices are saved at
+`/Users/zanie/code/tmp/cranelift-remote-final/linux-final-targeted/runtime.json`
+and
+`/Users/zanie/code/tmp/cranelift-remote-final/macos-final-no-weak/runtime.json`.
 
 ### Final acceptance gate
 
 The final gate is the complete repository test suite under matched LLVM and
-Cranelift toolchains, not just the four timing operations. The earlier
-finalization policy ran the matched macOS 3,866-test uv suite, 7,962-test
-Ruff/ty suite, and complete doctest set. The selective-LSDA policy then reran
-the complete Cranelift lane against that pinned LLVM control. The commands,
-results, and host-environment failures are recorded under
-[Full-Suite Backend Validation](#full-suite-backend-validation). The randomized
-application gate remains the runtime decision boundary because the complete
-suites include compilation, network and filesystem work, fixed timeouts, and
-thousands of short subprocesses. The dynamic-count guarded precondition-import
-policy still needs that complete matched suite rerun before it can be called
-the final policy.
+Cranelift toolchains, not just the four timing operations. The final policy ran
+the complete uv, Ruff/ty, and doctest commands on remote x86_64 Linux and
+Apple-silicon macOS hosts. Both macOS lanes are clean. Linux Ruff/ty and
+doctests are clean, and the complete Linux uv lanes have the exact same 34
+host-service and reflink failure names. The commands and results are recorded
+under [Full-Suite Backend Validation](#full-suite-backend-validation).
+
+The balanced application matrix remains the runtime decision boundary because
+the complete suites also include compilation, network and filesystem work,
+fixed timeouts, and thousands of short subprocesses. All retained performance
+and finalization policies are included in this matched final gate.
 
 ### Binary size
 
-The profiling binaries retain full debuginfo, so these are comparative rather
-than distribution sizes.
+The profiling binaries retain full debuginfo, so total file size is not a useful
+cross-platform comparison. These are final machine-text section sizes.
 
-| Binary | LLVM | Current Cranelift | Cranelift / LLVM |
-| --- | ---: | ---: | ---: |
-| Ruff | 45.0 MB | 106.6 MB | 2.37x |
-| ty | 47.5 MB | 110.9 MB | 2.33x |
-| uv | 100.0 MB | 179.9 MB | 1.80x |
+| Host | Binary | LLVM text | Cranelift text | Cranelift / LLVM |
+| --- | --- | ---: | ---: | ---: |
+| Linux x86_64 | uv | 77.76 MB | 147.58 MB | 1.90x |
+| Linux x86_64 | Ruff | 31.97 MB | 75.18 MB | 2.35x |
+| Linux x86_64 | ty | 29.37 MB | 76.16 MB | 2.59x |
+| macOS arm64 | uv | 39.48 MB | 84.00 MB | 2.13x |
+| macOS arm64 | Ruff | 19.30 MB | 43.88 MB | 2.27x |
+| macOS arm64 | ty | 18.56 MB | 39.44 MB | 2.13x |
 
 Cranelift's much larger output is consistent with missed inlining, folding,
 dead-code elimination, and code-layout opportunities. Correctly enabling
 cg_clif unwinding on Apple silicon initially added 20.9% to Ruff, 20.0% to ty,
 and 23.5% to uv relative to the same policy without exception tables.
 Restricting personality and LSDA metadata to catching functions recovers
-5.7-6.1% of the complete binaries without changing machine text. Weakly
-coalescing CGU-local copies then recovers another 13.6-33.8% without exporting
-those symbols. More inlining is not a complete answer: output remains 1.8-2.4
-times LLVM's, and uv environment creation is still about 60% slower.
+5.7-6.1% of the complete ELF binaries without changing machine text. Weakly
+coalescing CGU-local copies then recovers another 13.6-33.8% on ELF without
+exporting those symbols. Mach-O cannot retain that coalescing until its FDE and
+LSDA atoms follow the winning weak text atom. More inlining is not a complete
+answer: final machine text remains 1.9-2.6 times LLVM's.
 
 ## Changes Implemented
 
@@ -1986,18 +2004,53 @@ These are prerequisites, not performance wins. The final runtime and size
 numbers use the corrected unwinding-enabled backend; the earlier Apple-silicon
 Cranelift binaries are not valid correctness controls.
 
-### Selective exception metadata
+The final remote macOS gate exposed two additional parts of the same boundary.
+An unwinder transfers control to a landing pad without recreating transient
+register values from before the throwing call. cg_clif now lowers the
+`catch_unwind` try-call with Cranelift's `PreserveAll` convention. On an
+exceptional edge that convention deliberately treats every allocatable
+register as clobbered, so only values live into the catch block are spilled;
+the ordinary argument ABI is unchanged. A broader experiment made every Apple
+try-call clobber every register. It fixed the focused panic reproduction but
+grew the full Ruff/ty link enough to exceed AArch64's branch range, so it was
+rejected in favor of the intrinsic-specific change.
+
+Mach-O weak coalescing then exposed an object-level metadata bug. The linker
+coalesced hidden-weak CGU copies to one text address but retained multiple FDEs
+at that address. Each FDE pointed at the LSDA generated for its original copy,
+whose post-monomorphization call layout could differ. The system unwinder could
+select a stale record, fail to find the active call site, and return
+`_URC_FATAL_PHASE1_ERROR`. A traced Ruff failure had two FDEs for the same
+`ruff::commands::check::lint_path` address and terminated in exactly that way.
+Until Mach-O can associate each FDE and LSDA atom with its weak function atom,
+cg_clif keeps CGU-local and fallback copies local when Mach-O unwinding is
+enabled. ELF retains hidden-weak coalescing and its size and runtime wins. The
+four affected Ruff packages pass all 626 tests with the target-scoped policy,
+including every expected-panic case that previously aborted.
+
+### Selective exception metadata and Mach-O unwind atoms
 
 The initial unwinding implementation attached a personality-bearing CIE and
 an LSDA to every function whenever cg_clif's `unwinding` feature was enabled.
 Functions without exception handlers still need ordinary frame descriptions
-so a panic can unwind through them, but they do not need a personality or
-language-specific data area. cg_clif now keeps separate plain and augmented
-CIEs and selects the augmented CIE only when a finalized machine call site has
+so a panic can unwind through them, but on ELF they do not need a personality
+or language-specific data area. cg_clif keeps separate plain and augmented CIEs
+there and selects the augmented CIE only when a finalized machine call site has
 an exception handler. LSDA generation follows the same condition.
 
-This changes metadata rather than machine text. The pinned profiling binaries
-shrunk substantially while their `__text` section sizes remained identical:
+Mach-O is the deliberate exception. Its FDEs use one consistent augmented CIE
+shape. Functions with machine call sites receive a real LSDA that includes
+unwind-through entries for ordinary calls; truly call-free functions encode a
+null LSDA. Encoding that null required preserving DWARF's all-zero sentinel
+rather than applying the PC-relative base to zero. This avoids both nounwind
+gaps and empty tables while keeping Apple's linker and system unwinder on one
+CIE shape.
+
+The original selective Mach-O experiment changed metadata rather than machine
+text. Before the final suite exposed the duplicate-FDE boundary, its pinned
+profiling binaries shrank substantially while their `__text` section sizes
+remained identical. These are historical measurements; the final Mach-O policy
+does not claim this file-size saving.
 
 | Binary | Previous Cranelift | Selective LSDA | Change | Candidate / LLVM |
 | --- | ---: | ---: | ---: | ---: |
@@ -2824,6 +2877,37 @@ The full uv, Ruff, and ty repository suites remain the finalization gate.
 
 ## Full-Suite Backend Validation
 
+### Final remote cross-platform gate
+
+The final gate ran on dedicated, unsandboxed remote hosts rather than the local
+development machine: a 16-vCPU, 64-GB x86_64 Linux instance and a native
+12-vCPU, 56-GB Apple-silicon macOS instance. Both hosts used SRS backend source
+`7497012ee`, uv `6c963dd3cb0e`, and Ruff/ty `e0eb28d6345b`. LLVM and Cranelift
+used fresh, backend-specific target directories. The SRS artifact cache,
+incremental compilation, and incremental linker were disabled.
+
+| Host | Suite | LLVM | Cranelift | Interpretation |
+| --- | --- | ---: | ---: | --- |
+| Linux | uv, complete CI feature set | 3,901 passed, 34 failed, 6 skipped | 3,901 passed, 34 failed, 6 skipped | Exact same failure-name set; unavailable Secret Service/native auth plus three host reflink assumptions |
+| Linux | Ruff/ty, all features | 7,962 passed, 44 skipped | 7,962 passed, 44 skipped | Clean |
+| Linux | Ruff/ty doctests | Passed | Passed | Clean |
+| macOS | uv, complete CI feature set | 3,866 passed, 3 skipped | 3,866 passed, 3 skipped | Clean, including keychain and expected-panic coverage |
+| macOS | Ruff/ty, all features | 7,962 passed, 44 skipped | 7,962 passed, 44 skipped | Clean |
+| macOS | Ruff/ty doctests | Passed | Passed | Clean |
+
+The Linux uv command intentionally included the unavailable service tests
+rather than hiding them. The normalized 34-name failure sets have identical
+SHA-256 `dfcbd2d15e2a166e4cd6237556aee52b97061928ac2650e62fd8c07b497fecfd`
+in both lanes. The first Linux Ruff/ty pass also demonstrated an identical
+14-name harness failure set when nested `cargo locate-project` inherited the
+wrong rustup selection; both complete reruns pass with the repository's stable
+nested-Cargo environment. On macOS, seven Ruff server integration tests were
+rerun in both lanes with each lane's freshly built uv executable on `PATH`.
+
+The gate found and fixed the Mach-O duplicate-FDE and catch-state defects
+described above. Earlier suite runs that still contained either defect are
+diagnostic history, not final controls.
+
 ### Selective-LSDA post-change gate
 
 The selective-LSDA backend reran the complete Cranelift application gate from
@@ -3177,6 +3261,11 @@ This does not remove the surviving call boundary, devirtualize the equality
 closure, or reduce the active probe's register pressure. Those remain the
 next runtime arc; the linker result should not be used as a reason to broaden
 inlining without a call-site profitability signal.
+That optimization is now ELF-only while unwinding is enabled. Mach-O coalesces
+the weak text atoms but currently leaves each copy's FDE and LSDA behind, so a
+correct macOS implementation needs the unwind atoms to follow the winning weak
+definition before the size win can be restored there. Merely re-enabling weak
+linkage would reintroduce phase-one panic failures.
 Known-receiver devirtualization removed some copies of the hashbrown loop and
 replaced its indirect equality call in a reduction, but both the direct-only
 and targeted-inlining variants were runtime-neutral in 50-run application
