@@ -1646,8 +1646,13 @@ In the retained ty binary, for example, 31 symbol-table entries matched
 Cranelift's module linkage model now has a weak linkage whose symbol remains
 hidden to the current static linkage unit. cg_clif selects it only for the
 partitioner's `inlined` function copies with internal Rust linkage and default
-visibility. Object emission maps it to a linkage-scoped weak symbol: ELF,
-Mach-O, and COFF serialization tests verify the representation. The symbol is
+visibility in non-proc-macro outputs. A fresh Linux self-host build showed that
+coalescing these copies in a proc-macro dylib can leave the host compiler unable
+to load the crate: `zerovec-derive` compiled successfully, then its consumer
+reported `E0463` for `zerovec_derive`. Proc-macro outputs therefore keep ordinary
+object-local copies; the measured application binaries do not use that output
+mode. Object emission maps retained coalescing to a linkage-scoped weak symbol:
+ELF, Mach-O, and COFF serialization tests verify the representation. The symbol is
 not exported or dynamically preemptible, but another codegen unit's definition
 with the same Rust symbol name may replace it during static linking. The
 retained ty binary has two matching hashbrown probe entries and 25 matching

@@ -7,6 +7,7 @@
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mono::{MonoItem, MonoItemData};
+use rustc_session::config::CrateType;
 
 use crate::prelude::*;
 
@@ -21,6 +22,11 @@ fn predefine_mono_items<'tcx>(
 ) {
     tcx.prof.generic_activity("predefine functions").run(|| {
         let is_compiler_builtins = tcx.is_compiler_builtins(LOCAL_CRATE);
+        // Proc-macro dylibs are loaded by rustc during the same build. Coalescing their CGU-local
+        // copies can produce a dylib that the host compiler rejects as an unavailable proc-macro
+        // crate, even though the crate itself compiled successfully. The measured application
+        // binaries do not use this output mode, so keep its local copies independent.
+        let coalesce_cgu_local_copies = !tcx.crate_types().contains(&CrateType::ProcMacro);
         for &(mono_item, data) in mono_items {
             match mono_item {
                 MonoItem::Fn(instance) => {
@@ -33,7 +39,7 @@ fn predefine_mono_items<'tcx>(
                         data.linkage,
                         data.visibility,
                         is_compiler_builtins,
-                        data.inlined,
+                        data.inlined && coalesce_cgu_local_copies,
                     );
                     let is_naked = tcx
                         .codegen_instance_attrs(instance.def)
