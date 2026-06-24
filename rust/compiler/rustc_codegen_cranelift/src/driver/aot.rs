@@ -484,7 +484,14 @@ fn materialize_referenced_functions<'tcx>(
             defined_functions.insert(func_id, ());
             let name = instance_symbol_name_for_object(tcx, instance);
             let sig = get_function_sig(tcx, module.target_config().default_call_conv, instance);
-            let linkage = if materializing_private_definition || materializing_private_drop_glue {
+            // See `predefine_mono_items`: hidden-weak Mach-O functions can retain stale unwind
+            // metadata after the linker coalesces their text atoms.
+            let macho_unwinding = cfg!(feature = "unwinding")
+                && module.isa().triple().binary_format == target_lexicon::BinaryFormat::Macho;
+            let linkage = if materializing_private_definition
+                || materializing_private_drop_glue
+                || macho_unwinding
+            {
                 Linkage::Local
             } else {
                 Linkage::HiddenWeak

@@ -8,12 +8,12 @@ pub(crate) fn get_clif_linkage(
     linkage: RLinkage,
     visibility: Visibility,
     is_compiler_builtins: bool,
-    is_inlined: bool,
+    coalesce_cgu_local_copy: bool,
 ) -> Linkage {
     match (linkage, visibility) {
         (RLinkage::External, Visibility::Default) if is_compiler_builtins => Linkage::Hidden,
         (RLinkage::External, Visibility::Default) => Linkage::Export,
-        (RLinkage::Internal, Visibility::Default) if is_inlined => Linkage::HiddenWeak,
+        (RLinkage::Internal, Visibility::Default) if coalesce_cgu_local_copy => Linkage::HiddenWeak,
         (RLinkage::Internal, Visibility::Default) => Linkage::Local,
         (RLinkage::External, Visibility::Hidden) => Linkage::Hidden,
         (RLinkage::WeakAny, Visibility::Default) => Linkage::Preemptible,
