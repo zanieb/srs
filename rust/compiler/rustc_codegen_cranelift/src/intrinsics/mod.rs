@@ -1379,15 +1379,14 @@ fn codegen_regular_intrinsic_call<'tcx>(
             let data = data.load_scalar(fx);
             let catch_fn = catch_fn.load_scalar(fx);
 
-            let f_sig = fx.bcx.func.import_signature(Signature {
-                call_conv: fx.target_config.default_call_conv,
-                params: vec![AbiParam::new(pointer_ty(fx.tcx))],
-                returns: vec![],
-            });
-
             if cfg!(not(feature = "unwinding"))
                 || fx.tcx.sess.panic_strategy() == PanicStrategy::Abort
             {
+                let f_sig = fx.bcx.func.import_signature(Signature {
+                    call_conv: fx.target_config.default_call_conv,
+                    params: vec![AbiParam::new(pointer_ty(fx.tcx))],
+                    returns: vec![],
+                });
                 fx.bcx.ins().call_indirect(f_sig, f, &[data]);
 
                 let layout = fx.layout_of(fx.tcx.types.i32);
@@ -1396,6 +1395,16 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
                 fx.bcx.ins().jump(ret_block, &[]);
             } else {
+                // An unwinder transfers control to the exception handler without recreating
+                // transient register values from before the call. PreserveAll try-calls use the
+                // platform's ordinary argument ABI, but deliberately clobber every allocatable
+                // register so values live into the handler are spilled.
+                let f_sig = fx.bcx.func.import_signature(Signature {
+                    call_conv: cranelift_codegen::isa::CallConv::PreserveAll,
+                    params: vec![AbiParam::new(pointer_ty(fx.tcx))],
+                    returns: vec![],
+                });
+
                 let catch_fn_sig = fx.bcx.func.import_signature(Signature {
                     call_conv: fx.target_config.default_call_conv,
                     params: vec![
