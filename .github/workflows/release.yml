@@ -113,10 +113,14 @@ jobs:
             exit 2
           fi
           test -x "$snapshot/bin/cargo-clippy"
+          test -x "$snapshot/bin/cargo-fmt"
           test -x "$snapshot/bin/clippy-driver"
+          test -x "$snapshot/bin/rustfmt"
           test -x "$snapshot/lib/rustlib/$host/bin/sld"
           "$snapshot/bin/cargo-clippy" -V
+          "$snapshot/bin/cargo-fmt" -V
           "$snapshot/bin/clippy-driver" -V
+          "$snapshot/bin/rustfmt" -V
           "$snapshot/lib/rustlib/$host/bin/sld" --version
 
           mkdir -p dist

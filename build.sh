@@ -33,4 +33,5 @@ exec ./x build \
     rustc_codegen_cranelift \
     library/std \
     src/tools/cargo \
-    src/tools/clippy
+    src/tools/clippy \
+    src/tools/rustfmt
