@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use rustc_abi::{Float, Integer, Primitive};
@@ -15,28 +13,6 @@ use rustc_target::spec::{Arch, HasTargetSpec, Target};
 use crate::constant::ConstantCx;
 use crate::debuginfo::FunctionDebugContext;
 use crate::prelude::*;
-
-pub(crate) fn instance_symbol_name_for_object<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-) -> Cow<'tcx, str> {
-    symbol_name_for_object(tcx, tcx.symbol_name(instance).name)
-}
-
-pub(crate) fn symbol_name_for_object<'a>(tcx: TyCtxt<'_>, symbol_name: &'a str) -> Cow<'a, str> {
-    if let Some(exact_name) = symbol_name.strip_prefix('\x01') {
-        // Rustc uses LLVM's \x01 prefix for exact assembly labels. cranelift_object adds the
-        // platform prefix itself, so translate exact labels back to object-level names first.
-        let exact_name = if tcx.sess.target.is_like_darwin {
-            exact_name.strip_prefix('_').unwrap_or(exact_name)
-        } else {
-            exact_name
-        };
-        Cow::Borrowed(exact_name)
-    } else {
-        Cow::Borrowed(symbol_name)
-    }
-}
 
 pub(crate) fn pointer_ty(tcx: TyCtxt<'_>) -> types::Type {
     match tcx.data_layout.pointer_size().bits() {

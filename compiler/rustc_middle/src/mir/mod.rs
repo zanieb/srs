@@ -32,8 +32,8 @@ use crate::mir::interpret::{AllocRange, Scalar};
 use crate::ty::codec::{TyDecoder, TyEncoder};
 use crate::ty::print::{FmtPrinter, Printer, pretty_print_const, with_no_trimmed_paths};
 use crate::ty::{
-    self, GenericArg, GenericArgsRef, Instance, InstanceKind, List, Ty, TyCtxt, TypeVisitableExt,
-    TypingEnv, UserTypeAnnotationIndex,
+    self, GenericArg, GenericArgsRef, Instance, InstanceKind, List, ShimKind, Ty, TyCtxt,
+    TypeVisitableExt, TypingEnv, UserTypeAnnotationIndex,
 };
 
 mod basic_blocks;
@@ -127,8 +127,8 @@ impl<'tcx> MirSource<'tcx> {
         MirSource { instance: InstanceKind::Item(def_id), promoted: None }
     }
 
-    pub fn from_instance(instance: InstanceKind<'tcx>) -> Self {
-        MirSource { instance, promoted: None }
+    pub fn from_shim(shim: ShimKind<'tcx>) -> Self {
+        MirSource { instance: InstanceKind::Shim(shim), promoted: None }
     }
 
     #[inline]
@@ -413,7 +413,7 @@ impl<'tcx> Body<'tcx> {
     }
 
     pub fn typing_env(&self, tcx: TyCtxt<'tcx>) -> TypingEnv<'tcx> {
-        if tcx.use_typing_mode_borrowck() {
+        if tcx.use_typing_mode_post_typeck_until_borrowck() {
             match self.phase {
                 MirPhase::Built if let Some(def_id) = self.source.def_id().as_local() => {
                     TypingEnv::new(
@@ -1730,11 +1730,11 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(BasicBlockData<'_>, 152);
+    static_assert_size!(BasicBlockData<'_>, 160);
     static_assert_size!(LocalDecl<'_>, 40);
     static_assert_size!(SourceScopeData<'_>, 64);
     static_assert_size!(Statement<'_>, 56);
-    static_assert_size!(Terminator<'_>, 96);
+    static_assert_size!(Terminator<'_>, 104);
     static_assert_size!(VarDebugInfo<'_>, 88);
     // tidy-alphabetical-end
 }

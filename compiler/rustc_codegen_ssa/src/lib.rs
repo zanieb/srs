@@ -109,6 +109,7 @@ impl<M> ModuleCodegen<M> {
             name: self.name,
             kind: self.kind,
             object,
+            global_asm_object: None,
             dwarf_object,
             bytecode,
             assembly,
@@ -123,6 +124,7 @@ pub struct CompiledModule {
     pub name: String,
     pub kind: ModuleKind,
     pub object: Option<PathBuf>,
+    pub global_asm_object: Option<PathBuf>,
     pub dwarf_object: Option<PathBuf>,
     pub bytecode: Option<PathBuf>,
     pub assembly: Option<PathBuf>, // --emit=asm
@@ -165,6 +167,10 @@ bitflags::bitflags! {
         const VOLATILE = 1 << 0;
         const NONTEMPORAL = 1 << 1;
         const UNALIGNED = 1 << 2;
+        /// Indicates that writing through the stored pointer is undefined behavior.
+        /// Only valid on stores of pointers, or pairs where the first element is a pointer.
+        /// In the latter case, the flag only applies to the first element of the pair.
+        const CAPTURES_READ_ONLY = 1 << 3;
     }
 }
 
@@ -257,6 +263,7 @@ pub struct CrateInfo {
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
     pub lint_level_specs: CodegenLintLevelSpecs,
     pub metadata_symbol: String,
+    pub symbol_rename_suffix: String,
     pub each_linked_rlib_file_for_lto: Vec<PathBuf>,
     pub exported_symbols_for_lto: Vec<String>,
 }

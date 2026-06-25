@@ -58,7 +58,6 @@ pub(crate) struct DebugReloc {
     pub(crate) name: DebugRelocName,
     pub(crate) addend: i64,
     pub(crate) kind: object::RelocationKind,
-    pub(crate) is_indirect: bool,
 }
 
 #[derive(Clone)]
@@ -151,7 +150,6 @@ impl Writer for WriterRelocate {
                     name: DebugRelocName::Symbol(symbol),
                     addend,
                     kind: object::RelocationKind::Absolute,
-                    is_indirect: false,
                 });
                 self.write_udata(0, size)
             }
@@ -166,7 +164,6 @@ impl Writer for WriterRelocate {
             name: DebugRelocName::Section(section),
             addend: val as i64,
             kind: object::RelocationKind::Absolute,
-            is_indirect: false,
         });
         self.write_udata(0, size)
     }
@@ -184,7 +181,6 @@ impl Writer for WriterRelocate {
             name: DebugRelocName::Section(section),
             addend: val as i64,
             kind: object::RelocationKind::Absolute,
-            is_indirect: false,
         });
         self.write_udata_at(offset, 0, size)
     }
@@ -220,7 +216,6 @@ impl Writer for WriterRelocate {
                         name: DebugRelocName::Symbol(symbol),
                         addend,
                         kind: object::RelocationKind::Relative,
-                        is_indirect: eh_pe.is_indirect(),
                     });
                     self.write_udata(0, size)
                 }
@@ -231,7 +226,6 @@ impl Writer for WriterRelocate {
                         name: DebugRelocName::Symbol(symbol),
                         addend,
                         kind: object::RelocationKind::Absolute,
-                        is_indirect: eh_pe.is_indirect(),
                     });
                     self.write_udata(0, size)
                 }

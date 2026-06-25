@@ -4,6 +4,7 @@ use rustc_abi::{Align, BackendRepr, ExternAbi, HasDataLayout, Reg, Size, Wrappin
 use rustc_ast as ast;
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_data_structures::packed::Pu128;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::lang_items::LangItem;
 use rustc_lint_defs::builtin::TAIL_CALL_TRACK_CALLER;
 use rustc_middle::mir::{self, AssertKind, InlineAsmMacro, SwitchTargets, UnwindTerminateReason};
@@ -17,12 +18,13 @@ use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, FnAbi, PassMode}
 use tracing::{debug, info};
 
 use super::operand::OperandRef;
-use super::operand::OperandValue::{Immediate, Pair, Ref, ZeroSized};
+use super::operand::OperandValue::{self, Immediate, Pair, Ref, ZeroSized};
 use super::place::{PlaceRef, PlaceValue};
 use super::{CachedLlbb, FunctionCx, LocalRef};
 use crate::base::{self, is_call_from_compiler_builtins_to_upstream_monomorphization};
 use crate::common::{self, IntPredicate};
 use crate::errors::CompilerBuiltinsCannotCall;
+use crate::mir::IntrinsicResult;
 use crate::traits::*;
 use crate::{MemFlags, meth};
 
@@ -134,6 +136,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         bx: &mut Bx,
         target: mir::BasicBlock,
         mergeable_succ: bool,
+        attributes: &[AttributeKind],
     ) -> MergingSucc {
         let (needs_landing_pad, is_cleanupret) = self.llbb_characteristics(fx, target);
         if mergeable_succ && !needs_landing_pad && !is_cleanupret {
@@ -149,7 +152,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                 // to a trampoline.
                 bx.cleanup_ret(self.funclet(fx).unwrap(), Some(lltarget));
             } else {
-                bx.br(lltarget);
+                bx.br_with_attrs(lltarget, attributes);
             }
             MergingSucc::False
         }
@@ -263,6 +266,12 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                     bx.lifetime_end(tmp, size);
                 }
                 fx.store_return(bx, ret_dest, &fn_abi.ret, invokeret);
+
+                // If the return value was retagged as it was stored,
+                // then we might be in a different basic block now.
+                // Update the cached block for `target` to point to this new
+                // block, where codegen will continue.
+                fx.cached_llbbs[target] = CachedLlbb::Some(bx.llbb());
             }
             MergingSucc::False
         } else {
@@ -284,7 +293,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                     bx.lifetime_end(tmp, size);
                 }
                 fx.store_return(bx, ret_dest, &fn_abi.ret, llret);
-                self.funclet_br(fx, bx, target, mergeable_succ)
+                self.funclet_br(fx, bx, target, mergeable_succ, &[])
             } else {
                 bx.unreachable();
                 MergingSucc::False
@@ -352,7 +361,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
             bx.codegen_inline_asm(template, operands, options, line_spans, instance, None, None);
 
             if let Some(target) = destination {
-                self.funclet_br(fx, bx, target, mergeable_succ)
+                self.funclet_br(fx, bx, target, mergeable_succ, &[])
             } else {
                 bx.unreachable();
                 MergingSucc::False
@@ -518,13 +527,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     }
 
     fn codegen_return_terminator(&mut self, bx: &mut Bx) {
-        // Call `va_end` if this is the definition of a C-variadic function.
+        // Explicitly end the lifetime of the VaList if this function is c-variadic. We explicitly
+        // start the lifetime when desugaring `...`. Ending the lifetime meaningfully improves
+        // codegen.
         if self.fn_abi.c_variadic {
             // The `VaList` "spoofed" argument is just after all the real arguments.
             let va_list_arg_idx = self.fn_abi.args.len();
             match self.locals[mir::Local::arg(va_list_arg_idx)] {
                 LocalRef::Place(va_list) => {
-                    bx.va_end(va_list.val.llval);
+                    // NOTE: we don't actually call LLVM's va_end here. We know it's a no-op for
+                    // all current targets and hence don't bother
+                    // (as permitted by https://llvm.org/docs/LangRef.html#llvm-va-end-intrinsic).
 
                     // Explicitly end the lifetime of the `va_list`, improves LLVM codegen.
                     bx.lifetime_end(va_list.val.llval, va_list.layout.size);
@@ -605,9 +618,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let ty = self.monomorphize(ty);
         let drop_fn = Instance::resolve_drop_glue(bx.tcx(), ty);
 
-        if let ty::InstanceKind::DropGlue(_, None) = drop_fn.def {
+        if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)) = drop_fn.def {
             // we don't actually need to drop anything.
-            return helper.funclet_br(self, bx, target, mergeable_succ);
+            return helper.funclet_br(self, bx, target, mergeable_succ, &[]);
         }
 
         let place = self.codegen_place(bx, location.as_ref());
@@ -716,7 +729,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         // Don't codegen the panic block if success if known.
         if const_cond == Some(expected) {
-            return helper.funclet_br(self, bx, target, mergeable_succ);
+            return helper.funclet_br(self, bx, target, mergeable_succ, &[]);
         }
 
         // Because we're branching to a panic block (either a `#[cold]` one
@@ -850,7 +863,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         if is_valid {
             // a NOP
             let target = target.unwrap();
-            return Some(helper.funclet_br(self, bx, target, mergeable_succ));
+            return Some(helper.funclet_br(self, bx, target, mergeable_succ, &[]));
         }
 
         let layout = bx.layout_of(ty);
@@ -921,10 +934,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 match instance.def {
                     // We don't need AsyncDropGlueCtorShim here because it is not `noop func`,
                     // it is `func returning noop future`
-                    ty::InstanceKind::DropGlue(_, None) => {
+                    ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)) => {
                         // Empty drop glue; a no-op.
                         let target = target.unwrap();
-                        return helper.funclet_br(self, bx, target, mergeable_succ);
+                        return helper.funclet_br(self, bx, target, mergeable_succ, &[]);
                     }
                     ty::InstanceKind::Intrinsic(def_id) => {
                         let intrinsic = bx.tcx().intrinsic(def_id).unwrap();
@@ -944,32 +957,31 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let result_layout =
                             self.cx.layout_of(self.monomorphized_place_ty(destination.as_ref()));
 
-                        let (result, store_in_local) = if result_layout.is_zst() {
-                            (
-                                PlaceRef::new_sized(bx.const_undef(bx.type_ptr()), result_layout),
-                                None,
-                            )
-                        } else if let Some(local) = destination.as_local() {
-                            match self.locals[local] {
-                                LocalRef::Place(dest) => (dest, None),
-                                LocalRef::UnsizedPlace(_) => bug!("return type must be sized"),
-                                LocalRef::PendingOperand => {
-                                    // Currently, intrinsics always need a location to store
-                                    // the result, so we create a temporary `alloca` for the
-                                    // result.
-                                    let tmp = PlaceRef::alloca(bx, result_layout);
-                                    tmp.storage_live(bx);
-                                    (tmp, Some(local))
+                        let (result_place, store_in_local) =
+                            if let Some(local) = destination.as_local() {
+                                match self.locals[local] {
+                                    LocalRef::Place(dest) => (Some(dest.val), None),
+                                    LocalRef::UnsizedPlace(_) => bug!("return type must be sized"),
+                                    LocalRef::PendingOperand => (None, Some(local)),
+                                    LocalRef::Operand(_) => {
+                                        if result_layout.is_zst() {
+                                            let place = PlaceRef::new_sized(
+                                                bx.const_undef(bx.type_ptr()),
+                                                result_layout,
+                                            );
+                                            (Some(place.val), None)
+                                        } else {
+                                            bug!("place local already assigned to");
+                                        }
+                                    }
                                 }
-                                LocalRef::Operand(_) => {
-                                    bug!("place local already assigned to");
-                                }
-                            }
-                        } else {
-                            (self.codegen_place(bx, destination.as_ref()), None)
-                        };
+                            } else {
+                                (Some(self.codegen_place(bx, destination.as_ref()).val), None)
+                            };
 
-                        if result.val.align < result.layout.align.abi {
+                        if let Some(place) = result_place
+                            && place.align < result_layout.align.abi
+                        {
                             // Currently, MIR code generation does not create calls
                             // that store directly to fields of packed structs (in
                             // fact, the calls it creates write only to temps).
@@ -982,24 +994,61 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let args: Vec<_> =
                             args.iter().map(|arg| self.codegen_operand(bx, &arg.node)).collect();
 
-                        match self.codegen_intrinsic_call(bx, instance, &args, result, source_info)
-                        {
-                            Ok(()) => {
-                                if let Some(local) = store_in_local {
-                                    let op = bx.load_operand(result);
-                                    result.storage_dead(bx);
+                        let intrinsic_result = self.codegen_intrinsic_call(
+                            bx,
+                            instance,
+                            &args,
+                            result_layout,
+                            result_place,
+                            source_info,
+                        );
+
+                        if let IntrinsicResult::Operand(op_val) = intrinsic_result {
+                            match (result_place, store_in_local) {
+                                (None, Some(local)) => {
+                                    let op = OperandRef {
+                                        val: op_val,
+                                        layout: result_layout,
+                                        move_annotation: None,
+                                    };
                                     self.overwrite_local(local, LocalRef::Operand(op));
                                     self.debug_introduce_local(bx, local);
                                 }
+                                (Some(place_val), None) => {
+                                    let dest = PlaceRef { val: place_val, layout: result_layout };
+                                    op_val.store(bx, dest);
+                                }
+                                _ => bug!(),
+                            }
+                        }
 
+                        match intrinsic_result {
+                            IntrinsicResult::Operand(_) | IntrinsicResult::WroteIntoPlace => {
                                 return if let Some(target) = target {
-                                    helper.funclet_br(self, bx, target, mergeable_succ)
+                                    helper.funclet_br(self, bx, target, mergeable_succ, &[])
                                 } else {
                                     bx.unreachable();
                                     MergingSucc::False
                                 };
                             }
-                            Err(instance) => {
+                            IntrinsicResult::Err(_) => {
+                                // Even though we're definitely going to error, we need it initialize
+                                // the local or `maybe_codegen_consume_direct` might ICE later
+                                // when it goes to use the result from this intrinsic.
+                                if let Some(local) = store_in_local {
+                                    let op = OperandRef {
+                                        val: OperandValue::poison(bx, result_layout),
+                                        layout: result_layout,
+                                        move_annotation: None,
+                                    };
+                                    self.overwrite_local(local, LocalRef::Operand(op));
+                                }
+                                // Also we need to terminate the block to avoid an LLVM assertion,
+                                // even though we're not going to actually use the IR.
+                                bx.abort();
+                                return MergingSucc::False;
+                            }
+                            IntrinsicResult::Fallback(instance) => {
                                 if intrinsic.must_be_overridden {
                                     span_bug!(
                                         fn_span,
@@ -1086,7 +1135,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     &ArgAbi { layout: result_layout, mode: PassMode::Direct(ArgAttributes::new()) },
                     llret,
                 );
-                return helper.funclet_br(self, bx, target, mergeable_succ);
+                return helper.funclet_br(self, bx, target, mergeable_succ, &[]);
             } else {
                 bx.unreachable();
                 return MergingSucc::False;
@@ -1268,7 +1317,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     }
                     LocalRef::Operand(arg) => {
                         let Ref(place_value) = arg.val else {
-                            bug!("only `Ref` should use `PassMode::Indirect`");
+                            bug!(
+                                "only `Ref` should use `PassMode::Indirect`, but got {:?}",
+                                arg.val
+                            );
                         };
                         bx.typed_place_copy(place_value, tmp.val, fn_abi.args[i].layout);
                         op.val = arg.val;
@@ -1530,7 +1582,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
 
             mir::TerminatorKind::Goto { target } => {
-                helper.funclet_br(self, bx, target, mergeable_succ())
+                helper.funclet_br(self, bx, target, mergeable_succ(), &terminator.attributes)
             }
 
             mir::TerminatorKind::SwitchInt { ref discr, ref targets } => {
@@ -1548,9 +1600,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 MergingSucc::False
             }
 
-            mir::TerminatorKind::Drop { place, target, unwind, replace: _, drop, async_fut } => {
+            mir::TerminatorKind::Drop { place, target, unwind, replace: _, drop } => {
                 assert!(
-                    async_fut.is_none() && drop.is_none(),
+                    drop.is_none(),
                     "Async Drop must be expanded or reset to sync before codegen"
                 );
                 self.codegen_drop_terminator(
@@ -1700,7 +1752,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     op.store_with_annotation(bx, scratch);
                     (scratch.val.llval, scratch.val.align, true)
                 }
-                _ => (op.immediate_or_packed_pair(bx), arg.layout.align.abi, false),
+                PassMode::Direct(_) => (op.immediate(), arg.layout.align.abi, false),
+                PassMode::Ignore | PassMode::Pair(..) => unreachable!("handled above"),
             },
             Ref(op_place_val) => match arg.mode {
                 PassMode::Indirect { attrs, on_stack, .. } => {
@@ -2148,19 +2201,27 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         llval: Bx::Value,
     ) {
         use self::ReturnDest::*;
-
+        let retags_enabled = bx.tcx().sess.opts.unstable_opts.codegen_emit_retag.is_some();
         match dest {
             Nothing => (),
-            Store(dst) => bx.store_arg(ret_abi, llval, dst),
+            Store(dst) => {
+                bx.store_arg(ret_abi, llval, dst);
+                if retags_enabled {
+                    self.codegen_retag_place(bx, dst, false);
+                }
+            }
             IndirectOperand(tmp, index) => {
-                let op = bx.load_operand(tmp);
+                let mut op = bx.load_operand(tmp);
                 tmp.storage_dead(bx);
+                if retags_enabled {
+                    op = self.codegen_retag_operand(bx, op, false);
+                }
                 self.overwrite_local(index, LocalRef::Operand(op));
                 self.debug_introduce_local(bx, index);
             }
             DirectOperand(index) => {
                 // If there is a cast, we have to store and reload.
-                let op = if let PassMode::Cast { .. } = ret_abi.mode {
+                let mut op = if let PassMode::Cast { .. } = ret_abi.mode {
                     let tmp = PlaceRef::alloca(bx, ret_abi.layout);
                     tmp.storage_live(bx);
                     bx.store_arg(ret_abi, llval, tmp);
@@ -2170,6 +2231,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 } else {
                     OperandRef::from_immediate_or_packed_pair(bx, llval, ret_abi.layout)
                 };
+                if retags_enabled {
+                    op = self.codegen_retag_operand(bx, op, false);
+                }
                 self.overwrite_local(index, LocalRef::Operand(op));
                 self.debug_introduce_local(bx, index);
             }
@@ -2196,9 +2260,9 @@ fn load_cast<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 ) -> Bx::Value {
     let cast_ty = bx.cast_backend_type(cast);
     if let Some(offset_from_start) = cast.rest_offset {
-        assert!(cast.prefix[1..].iter().all(|p| p.is_none()));
+        assert_eq!(cast.prefix.len(), 1);
         assert_eq!(cast.rest.unit.size, cast.rest.total);
-        let first_ty = bx.reg_backend_type(&cast.prefix[0].unwrap());
+        let first_ty = bx.reg_backend_type(&cast.prefix[0]);
         let second_ty = bx.reg_backend_type(&cast.rest.unit);
         let first = bx.load(first_ty, ptr, align);
         let second_ptr = bx.inbounds_ptradd(ptr, bx.const_usize(offset_from_start.bytes()));
@@ -2219,9 +2283,8 @@ pub fn store_cast<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     align: Align,
 ) {
     if let Some(offset_from_start) = cast.rest_offset {
-        assert!(cast.prefix[1..].iter().all(|p| p.is_none()));
+        assert_eq!(cast.prefix.len(), 1);
         assert_eq!(cast.rest.unit.size, cast.rest.total);
-        assert!(cast.prefix[0].is_some());
         let first = bx.extract_value(value, 0);
         let second = bx.extract_value(value, 1);
         bx.store(first, ptr, align);
