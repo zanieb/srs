@@ -1,11 +1,11 @@
 use crate::common::{HttpHooks, Profile, RunCommon, RunTarget};
 use bytes::Bytes;
 use clap::Parser;
-use futures::future::FutureExt;
-use http::{Response, StatusCode};
-use http_body_util::BodyExt as _;
+use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::{Body, Frame, SizeHint};
+use http_body_util::{BodyExt as _, Full};
+use hyper::server::conn::http1;
+use pin_project_lite::pin_project;
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -15,24 +15,26 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{self, AsyncWrite};
-use tokio::sync::Notify;
-use wasmtime::component::{Component, Linker};
+use tokio::sync::{Notify, Semaphore};
+use wasmtime::component::{Component, GuestTaskId, Linker};
+use wasmtime::error::Context as _;
 use wasmtime::{
-    Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail, error::Context as _,
+    AsContextMut as _, Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail,
 };
 use wasmtime_cli_flags::opt::WasmtimeOptionValue;
 use wasmtime_wasi::p2::{StreamError, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-#[cfg(feature = "component-model-async")]
-use wasmtime_wasi_http::handler::p2::bindings as p2;
-use wasmtime_wasi_http::handler::{HandlerState, Proxy, ProxyHandler, ProxyPre, StoreBundle};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::handler::{
+    self, HandlerState, Instance, Prepared, Proxy, ProxyHandler, ProxyPre, ShouldAccept, ViewFn,
+    WorkerExpiration, WorkerState, WorkerStatus,
+};
 use wasmtime_wasi_http::io::TokioIo;
-use wasmtime_wasi_http::{WasiHttpCtx, p2::WasiHttpView};
 
 #[cfg(feature = "debug")]
 use crate::commands::run::RunCommand;
@@ -67,6 +69,8 @@ struct Host {
 
     #[cfg(feature = "profiling")]
     guest_profiler: Option<Arc<wasmtime::GuestProfiler>>,
+
+    write_profile: Option<WriteProfile>,
 }
 
 impl WasiView for Host {
@@ -158,6 +162,23 @@ pub struct ServeCommand {
     /// (microseconds), and `ns` (nanoseconds).
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     idle_instance_timeout: Duration,
+
+    /// Replace or add a request header before forwarding it to the component.
+    ///
+    /// The argument must have the form `name: value`. May be specified more
+    /// than once. An argument beginning with `@` is treated as a file containing
+    /// one header per line.
+    #[arg(short = 'H', long = "header", value_name = "HEADER")]
+    headers: Vec<String>,
+
+    /// Maximum number of concurrent requests that can be processed at any one
+    /// point in time.
+    #[arg(long)]
+    max_concurrent_requests: Option<usize>,
+    /// Maximum number of concurrent connections that can be held at any one
+    /// point in time.
+    #[arg(long)]
+    max_concurrent_connections: Option<usize>,
 }
 
 impl ServeCommand {
@@ -300,20 +321,16 @@ impl ServeCommand {
     /// sequentially, so the debugger can pause and inspect state.
     #[cfg(feature = "debug")]
     async fn serve_under_debugger(
-        &self,
+        self,
         mut debug_run: RunCommand,
-        engine: &Engine,
-        linker: &Linker<Host>,
-        component: &Component,
+        linker: Linker<Host>,
+        component: Component,
     ) -> Result<()> {
-        let instance_pre = linker.instantiate_pre(component)?;
-        let proxy_pre = wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre)?;
-
-        let mut debuggee_store = self.new_store(engine, None)?;
+        let mut debuggee_store = self.new_store(linker.engine(), None)?;
 
         // Pre-register component modules so the debugger can see
         // them and set breakpoints at the initial stop.
-        debuggee_store.debug_register_component(component)?;
+        debuggee_store.debug_register_component(&component)?;
 
         let debug_engine = debug_run.new_engine()?;
         let debug_main = debug_run.run.load_module(
@@ -335,32 +352,31 @@ impl ServeCommand {
         };
         debug_run.add_debugger_api(&mut debug_linker)?;
 
-        let addr = self.addr;
         debug_run
             .invoke_debugger(
                 &mut debug_store,
                 &debug_component,
                 &mut debug_linker,
                 debuggee_store,
-                move |store| Box::pin(debug_serve_body(store, proxy_pre, addr)),
+                move |store| Box::pin(self.serve_maybe_debug(linker, component, Some(store))),
             )
             .await
     }
 
-    fn new_store(&self, engine: &Engine, req_id: Option<u64>) -> Result<Store<Host>> {
+    fn new_store(&self, engine: &Engine, instance_id: Option<u64>) -> Result<Store<Host>> {
         let mut builder = WasiCtxBuilder::new();
         self.run.configure_wasip2(&mut builder)?;
 
-        if let Some(req_id) = req_id {
-            builder.env("REQUEST_ID", req_id.to_string());
+        if let Some(instance_id) = instance_id {
+            builder.env("INSTANCE_ID", instance_id.to_string());
         }
 
         let stdout_prefix: String;
         let stderr_prefix: String;
-        match req_id {
-            Some(req_id) if !self.no_logging_prefix => {
-                stdout_prefix = format!("stdout [{req_id}] :: ");
-                stderr_prefix = format!("stderr [{req_id}] :: ");
+        match instance_id {
+            Some(instance_id) if !self.no_logging_prefix => {
+                stdout_prefix = format!("stdout [{instance_id}] :: ");
+                stderr_prefix = format!("stderr [{instance_id}] :: ");
             }
             _ => {
                 stdout_prefix = "".to_string();
@@ -390,6 +406,7 @@ impl ServeCommand {
             wasi_keyvalue: None,
             #[cfg(feature = "profiling")]
             guest_profiler: None,
+            write_profile: None,
         };
 
         if self.run.common.wasi.nn == Some(true) {
@@ -540,8 +557,6 @@ impl ServeCommand {
     }
 
     async fn serve(mut self) -> Result<()> {
-        use hyper::server::conn::http1;
-
         #[cfg(feature = "debug")]
         let debug_run = self.debugger_setup()?;
 
@@ -578,18 +593,29 @@ impl ServeCommand {
         #[cfg(feature = "debug")]
         if let Some(debug_run) = debug_run {
             return self
-                .serve_under_debugger(debug_run, &engine, &linker, &component)
+                .serve_under_debugger(debug_run, linker, component)
                 .await;
         }
 
+        self.serve_maybe_debug(linker, component, None).await
+    }
+
+    async fn serve_maybe_debug(
+        self,
+        linker: Linker<Host>,
+        component: Component,
+        mut debuggee_store: Option<&mut Store<Host>>,
+    ) -> Result<()> {
+        let engine = linker.engine();
+        let request_headers = RequestHeaders::parse(&self.headers)?;
         let instance = linker.instantiate_pre(&component)?;
         #[cfg(feature = "component-model-async")]
         let instance = match wasmtime_wasi_http::p3::bindings::ServicePre::new(instance.clone()) {
             Ok(pre) => ProxyPre::P3(pre),
-            Err(_) => ProxyPre::P2(p2::ProxyPre::new(instance)?),
+            Err(_) => ProxyPre::P2(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance)?),
         };
         #[cfg(not(feature = "component-model-async"))]
-        let instance = ProxyPre::P2(p2::ProxyPre::new(instance)?);
+        let instance = ProxyPre::P2(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance)?);
 
         // Spawn background task(s) waiting for graceful shutdown signals. This
         // always listens for ctrl-c but additionally can listen for a TCP
@@ -639,6 +665,8 @@ impl ServeCommand {
             Some(interval)
         } else if let Some(t) = self.run.common.wasm.timeout {
             Some(EPOCH_INTERRUPT_PERIOD.min(t))
+        } else if debuggee_store.is_some() {
+            Some(Duration::from_millis(1))
         } else {
             None
         };
@@ -659,27 +687,47 @@ impl ServeCommand {
             1
         };
 
-        let handler = ProxyHandler::new(
-            HostHandlerState {
-                cmd: self,
-                engine,
-                component,
-                max_instance_reuse_count,
-                max_instance_concurrent_reuse_count,
-                // Give one shutdown guard to this handler which will track the
-                // full lifetime of any instances spawned.
-                _shutdown_guard: Box::new(shutdown.clone().increment()),
-            },
+        let max_concurrent_connections = self
+            .max_concurrent_connections
+            .unwrap_or(if debuggee_store.is_some() { 1 } else { 1000 });
+        let max_concurrent_requests = self
+            .max_concurrent_requests
+            .unwrap_or(if debuggee_store.is_some() { 1 } else { 1000 });
+        if debuggee_store.is_some() && max_concurrent_connections != 1 {
+            bail!("cannot have more than 1 max concurrent connections with a debugger");
+        }
+        if debuggee_store.is_some() && max_concurrent_requests != 1 {
+            bail!("cannot have more than 1 max concurrent requests with a debugger");
+        }
+
+        let sem_connections = Arc::new(Semaphore::new(max_concurrent_connections));
+
+        let handler = ProxyHandler::new(HostHandlerState {
+            sem_requests: Semaphore::new(max_concurrent_requests),
+            cmd: self,
+            component,
+            request_headers,
+            max_instance_reuse_count,
+            max_instance_concurrent_reuse_count,
             instance,
-        );
+            next_instance_id: AtomicU64::default(),
+            next_request_id: AtomicU64::default(),
+            // Give one shutdown guard to this handler which will track the
+            // full lifetime of any instances spawned.
+            _shutdown_guard: Box::new(shutdown.clone().increment()),
+        });
 
         loop {
             // Wait for a socket, but also "race" against shutdown to break out
             // of this loop. Once the graceful shutdown signal is received then
             // this loop exits immediately.
-            let (stream, _) = tokio::select! {
+            let (connection_permit, stream) = tokio::select! {
                 _ = shutdown.requested.notified() => break,
-                v = listener.accept() => v?,
+                v = async {
+                    let permit = sem_connections.clone().acquire_owned().await?;
+                    let (stream, _) = listener.accept().await?;
+                    wasmtime::error::Ok((permit, stream))
+                } => v?,
             };
 
             // The Nagle algorithm can impose a significant latency penalty
@@ -689,61 +737,31 @@ impl ServeCommand {
             // TCP fragmentation.
             stream.set_nodelay(true)?;
 
-            let stream = TokioIo::new(stream);
-            let h = handler.clone();
-
             // In addition to the shutdown guard given to the handler above,
             // also give one to the tokio tasks doing HTTP I/O as well to ensure
             // it keeps them alive too.
             let shutdown_guard = shutdown.clone().increment();
-            tokio::task::spawn(async move {
-                if let Err(e) = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(
-                        stream,
-                        hyper::service::service_fn(move |req| {
-                            let h = h.clone();
-                            async move {
-                                use http_body_util::{BodyExt, Full};
-                                match handle_request(h, req).await {
-                                    Ok(r) => Ok::<_, Infallible>(r),
-                                    Err(e) => {
-                                        eprintln!("error: {e:?}");
-                                        let error_html = "\
-<!doctype html>
-<html>
-<head>
-    <title>500 Internal Server Error</title>
-</head>
-<body>
-    <center>
-        <h1>500 Internal Server Error</h1>
-        <hr>
-        wasmtime
-    </center>
-</body>
-</html>";
-                                        Ok(Response::builder()
-                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                            .header("Content-Type", "text/html; charset=UTF-8")
-                                            .body(
-                                                Full::new(bytes::Bytes::from(error_html))
-                                                    .map_err(|_| unreachable!())
-                                                    .boxed_unsync(),
-                                            )
-                                            .unwrap())
-                                    }
-                                }
-                            }
-                        }),
-                    )
-                    .await
-                {
-                    eprintln!("error: {e:?}");
+
+            // When debugging, handle the client synchronously since
+            // concurrent requests can't be served. Otherwise though spawn a
+            // task to handle this client.
+            match &mut debuggee_store {
+                Some(store) => {
+                    handle_client(stream, &handler, Some(store)).await;
                 }
-                drop(shutdown_guard);
-            });
+                None => {
+                    let handler = handler.clone();
+                    tokio::task::spawn(async move {
+                        handle_client(stream, &handler, None).await;
+                        drop(shutdown_guard);
+                        drop(connection_permit);
+                    });
+                }
+            }
         }
+
+        // Don't allow any further requests to get picked up.
+        handler.state().sem_requests.close();
 
         drop(handler);
 
@@ -765,46 +783,150 @@ impl ServeCommand {
     }
 }
 
-struct HostHandlerState {
-    cmd: ServeCommand,
-    engine: Engine,
-    component: Component,
+pin_project! {
+    struct HostWorkerExpiration {
+        idle_timeout: Duration,
+        request_timeout: Duration,
+        #[pin]
+        sleep: tokio::time::Sleep,
+    }
+}
+
+impl WorkerExpiration for HostWorkerExpiration {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        status: WorkerStatus,
+        start: Instant,
+    ) -> Poll<()> {
+        let mut me = self.project();
+
+        let timeout = match status {
+            WorkerStatus::Idle => *me.idle_timeout,
+            // TODO: add a dedicated `post_return_timeout` config setting
+            // instead of reusing `request_timeout` for
+            // `WorkerStatus::PostReturn` here
+            WorkerStatus::Requests | WorkerStatus::PostReturn => *me.request_timeout,
+        };
+
+        if let Some(deadline) = start.checked_add(timeout) {
+            let deadline = deadline.into();
+            if deadline != me.sleep.deadline() {
+                me.sleep.as_mut().reset(deadline);
+            }
+            me.sleep.poll(cx)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct HostWorkerState {
+    instance_id: u64,
     max_instance_reuse_count: usize,
     max_instance_concurrent_reuse_count: usize,
+    request_timeout: Duration,
+}
+
+impl WorkerState for HostWorkerState {
+    type StoreData = Host;
+    type RequestId = u64;
+
+    fn should_accept_request(&self, concurrent_count: usize, total_count: usize) -> ShouldAccept {
+        if total_count >= self.max_instance_reuse_count {
+            ShouldAccept::Never
+        } else if concurrent_count >= self.max_instance_concurrent_reuse_count {
+            ShouldAccept::No
+        } else {
+            ShouldAccept::Yes
+        }
+    }
+
+    fn on_request_start(
+        &self,
+        _store: StoreContextMut<Host>,
+        request_id: u64,
+        _task_id: GuestTaskId,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
+        log::info!(
+            "Instance {} handling request {request_id}",
+            self.instance_id,
+        );
+
+        Box::pin(tokio::time::sleep(self.request_timeout))
+    }
+
+    fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+        if let Err(error) = result {
+            eprintln!("worker failed: {error:?}");
+        }
+
+        if let Some(write_profile) = store.data_mut().write_profile.take() {
+            write_profile(store.as_context_mut());
+        }
+
+        drop(store);
+    }
+}
+
+struct HostHandlerState {
+    cmd: ServeCommand,
+    component: Component,
+    request_headers: RequestHeaders,
+    max_instance_reuse_count: usize,
+    max_instance_concurrent_reuse_count: usize,
+    instance: ProxyPre<Host>,
+    next_instance_id: AtomicU64,
+    next_request_id: AtomicU64,
+    sem_requests: Semaphore,
     _shutdown_guard: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl HostHandlerState {
+    async fn instantiate_into(&self, store: &mut Store<Host>) -> Result<Proxy> {
+        let write_profile = setup_epoch_handler(&self.cmd, &mut *store, self.component.clone())?;
+        store.data_mut().write_profile = Some(write_profile);
+        self.instance.instantiate_async(&mut *store).await
+    }
+
+    fn view(&self) -> ViewFn<Host> {
+        match &self.instance {
+            ProxyPre::P2(_) => ViewFn::P2(wasmtime_wasi_http::p2::WasiHttpView::http),
+            ProxyPre::P3(_) => ViewFn::P3(wasmtime_wasi_http::p3::WasiHttpView::http),
+        }
+    }
 }
 
 impl HandlerState for HostHandlerState {
     type StoreData = Host;
+    type WorkerExpiration = HostWorkerExpiration;
+    type WorkerState = HostWorkerState;
 
-    fn new_store(&self, req_id: Option<u64>) -> Result<StoreBundle<Host>> {
-        let mut store = self.cmd.new_store(&self.engine, req_id)?;
-        let write_profile = setup_epoch_handler(&self.cmd, &mut store, self.component.clone())?;
+    async fn instantiate(
+        &self,
+    ) -> Result<Instance<Self::StoreData, Self::WorkerExpiration, Self::WorkerState>> {
+        let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
+        let mut store = self
+            .cmd
+            .new_store(self.component.engine(), Some(instance_id))?;
+        let proxy = self.instantiate_into(&mut store).await?;
 
-        Ok(StoreBundle {
+        Ok(Instance {
             store,
-            write_profile,
+            proxy,
+            view: self.view(),
+            expiration: HostWorkerExpiration {
+                idle_timeout: self.cmd.idle_instance_timeout,
+                request_timeout: self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX),
+                sleep: tokio::time::sleep(Duration::MAX),
+            },
+            state: HostWorkerState {
+                max_instance_reuse_count: self.max_instance_reuse_count,
+                max_instance_concurrent_reuse_count: self.max_instance_concurrent_reuse_count,
+                instance_id,
+                request_timeout: self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX),
+            },
         })
-    }
-
-    fn request_timeout(&self) -> Duration {
-        self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX)
-    }
-
-    fn idle_instance_timeout(&self) -> Duration {
-        self.cmd.idle_instance_timeout
-    }
-
-    fn max_instance_reuse_count(&self) -> usize {
-        self.max_instance_reuse_count
-    }
-
-    fn max_instance_concurrent_reuse_count(&self) -> usize {
-        self.max_instance_concurrent_reuse_count
-    }
-
-    fn handle_worker_error(&self, error: wasmtime::Error) {
-        eprintln!("worker error: {error}");
     }
 }
 
@@ -914,7 +1036,7 @@ fn setup_epoch_handler(
     }
 
     // Profiling disabled but there's a global request timeout
-    if cmd.run.common.wasm.timeout.is_some() {
+    if cmd.run.common.wasm.timeout.is_some() || cmd.run.common.debug.debugger.is_some() {
         store.epoch_deadline_async_yield_and_update(1);
     }
 
@@ -986,310 +1108,164 @@ fn setup_guest_profiler(
     Ok(write_profile)
 }
 
-/// Build a minimal error response with an empty body.
-fn error_response(status: StatusCode) -> hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>> {
-    Response::builder()
-        .status(status)
-        .body(
-            http_body_util::Empty::new()
-                .map_err(|_| unreachable!())
-                .boxed_unsync(),
-        )
-        .unwrap()
-}
+type Request = hyper::Request<hyper::body::Incoming>;
 
-/// Debuggee body for `wasmtime serve -g`: instantiate the HTTP component
-/// once, then handle requests sequentially on a single store.
-#[cfg(feature = "debug")]
-async fn debug_serve_body(
-    store: &mut Store<Host>,
-    proxy_pre: wasmtime_wasi_http::p2::bindings::ProxyPre<Host>,
-    addr: SocketAddr,
-) -> Result<()> {
-    use hyper::server::conn::http1;
-    use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
-    use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+async fn handle_client(
+    client: tokio::net::TcpStream,
+    handler: &ProxyHandler<HostHandlerState>,
+    debuggee_store: Option<&mut Store<Host>>,
+) {
+    // Hyper's `service_fn` takes an `Fn` closure, so to bridge the need to
+    // transfer a mutable store to each request for debugging a tokio mutex is
+    // used. The tokio mutex is required as the returned future must also be
+    // `Send`.
+    let lock = &debuggee_store.map(tokio::sync::Mutex::new);
 
-    type P2Response = std::result::Result<
-        hyper::Response<HyperOutgoingBody>,
-        wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
-    >;
-
-    let engine_clone = store.engine().clone();
-    let _epoch_thread = std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(1));
-            engine_clone.increment_epoch();
-        }
-    });
-
-    store.epoch_deadline_async_yield_and_update(1);
-
-    // Instantiate the HTTP component once.
-    let proxy = proxy_pre.instantiate_async(&mut *store).await?;
-
-    // Bind the TCP listener.
-    let socket = match addr {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(!cfg!(windows))?;
-    socket.bind(addr)?;
-    let listener = socket.listen(100)?;
-    eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
-
-    // Accept loop: handle one connection at a time, requests sequentially.
-    loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let stream = TokioIo::new(stream);
-
-        // Channel to bridge hyper's service_fn with our sequential
-        // request processing on the single store.
-        type RespBody = hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>;
-        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<(
-            hyper::Request<hyper::body::Incoming>,
-            tokio::sync::oneshot::Sender<std::result::Result<RespBody, Infallible>>,
-        )>(1);
-
-        let serve_conn = http1::Builder::new().keep_alive(true).serve_connection(
-            stream,
-            hyper::service::service_fn(move |req| {
-                let req_tx = req_tx.clone();
-                async move {
-                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                    if req_tx.send((req, resp_tx)).await.is_err() {
-                        return Ok::<_, Infallible>(error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        ));
+    if let Err(e) = http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(
+            TokioIo::new(client),
+            hyper::service::service_fn(move |req| async move {
+                let mut debuggee_store = match &lock {
+                    Some(store) => Some(store.lock().await),
+                    None => None,
+                };
+                let debuggee_store = debuggee_store.as_mut().map(|s| &mut ***s);
+                match handle_request(handler, debuggee_store, req).await {
+                    Ok(r) => Ok::<_, Infallible>(r),
+                    Err(e) => {
+                        eprintln!("error: {e:?}");
+                        let error_html = "\
+<!doctype html>
+<html>
+<head>
+    <title>500 Internal Server Error</title>
+</head>
+<body>
+    <center>
+        <h1>500 Internal Server Error</h1>
+        <hr>
+        wasmtime
+    </center>
+</body>
+</html>";
+                        Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("Content-Type", "text/html; charset=UTF-8")
+                            .body(
+                                Full::new(bytes::Bytes::from(error_html))
+                                    .map_err(|_| unreachable!())
+                                    .boxed_unsync(),
+                            )
+                            .unwrap())
                     }
-                    resp_rx
-                        .await
-                        .unwrap_or(Ok(error_response(StatusCode::SERVICE_UNAVAILABLE)))
                 }
             }),
-        );
-
-        tokio::pin!(serve_conn);
-
-        loop {
-            tokio::select! {
-                result = &mut serve_conn => {
-                    if let Err(e) = result {
-                        eprintln!("connection error: {e:?}");
-                    }
-                    break;
-                }
-                msg = req_rx.recv() => {
-                    let Some((req, resp_tx)) = msg else { break };
-
-                    let (p2_tx, p2_rx) = tokio::sync::oneshot::channel::<P2Response>();
-                    let wasi_req = store
-                        .data_mut()
-                        .http()
-                        .new_incoming_request(Scheme::Http, req);
-                    let wasi_out = wasi_req.and_then(|_req| {
-                        let out = store.data_mut().http().new_response_outparam(p2_tx);
-                        out.map(|out| (_req, out))
-                    });
-                    let (wasi_req, wasi_out) = match wasi_out {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!("error creating WASI request: {e:?}");
-                            let _ = resp_tx.send(Ok(error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )));
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = proxy
-                        .wasi_http_incoming_handler()
-                        .call_handle(&mut *store, wasi_req, wasi_out)
-                        .await
-                    {
-                        eprintln!("handler error: {e:?}");
-                    }
-
-                    let resp = match p2_rx.await {
-                        Ok(Ok(resp)) => resp.map(|body| {
-                            body.map_err(|e| e.into()).boxed_unsync()
-                        }),
-                        Ok(Err(e)) => {
-                            eprintln!("component error: {e:?}");
-                            error_response(StatusCode::INTERNAL_SERVER_ERROR)
-                        }
-                        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR),
-                    };
-                    let _ = resp_tx.send(Ok(resp));
-                }
-            }
-        }
+        )
+        .await
+    {
+        eprintln!("error: {e:?}");
     }
 }
 
-type Request = hyper::Request<hyper::body::Incoming>;
-
 async fn handle_request(
-    handler: ProxyHandler<HostHandlerState>,
-    req: Request,
+    handler: &ProxyHandler<HostHandlerState>,
+    debuggee_store: Option<&mut Store<Host>>,
+    mut req: Request,
 ) -> Result<hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>> {
-    use tokio::sync::oneshot;
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
 
-    let req_id = handler.next_req_id();
+    // This is used to throttle the maximum number of concurrent requests that
+    // can be processed at any one point in time before delegating to
+    // `handler.handle(...)` below.
+    let _request_permit = handler.state().sem_requests.acquire().await?;
 
+    handler.state().request_headers.apply(req.headers_mut());
+
+    let request_id = handler
+        .state()
+        .next_request_id
+        .fetch_add(1, Ordering::Relaxed);
     log::info!(
-        "Request {req_id} handling {} to {}",
+        "Received request {request_id}: {} {}",
         req.method(),
         req.uri()
     );
 
-    // Here we must declare different channel types for p2 and p3 since p2's
-    // `WasiHttpView::new_response_outparam` expects a specific kind of sender
-    // that uses `p2::http::types::ErrorCode`, and we don't want to have to
-    // convert from the p3 `ErrorCode` to the p2 one, only to convert again to
-    // `wasmtime::Error`.
-
-    type P2Response = Result<
-        hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        p2::http::types::ErrorCode,
-    >;
-    type P3Response = hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>;
-
-    enum Sender {
-        P2(oneshot::Sender<P2Response>),
-        P3(oneshot::Sender<P3Response>),
-    }
-
-    enum Receiver {
-        P2(oneshot::Receiver<P2Response>),
-        P3(oneshot::Receiver<P3Response>),
-    }
-
-    let (tx, rx) = match handler.instance_pre() {
-        ProxyPre::P2(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P2(tx), Receiver::P2(rx))
-        }
-        ProxyPre::P3(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P3(tx), Receiver::P3(rx))
-        }
-    };
-
-    handler.spawn(
-        if handler.state().max_instance_reuse_count() == 1 {
-            Some(req_id)
-        } else {
-            None
-        },
-        Box::new(move |store, proxy| {
-            Box::pin(
-                async move {
-                    match proxy {
-                        Proxy::P2(proxy) => {
-                            let Sender::P2(tx) = tx else { unreachable!() };
-                            let (req, out) = store.with(move |mut store| {
-                                let req = store
-                                    .data_mut()
-                                    .http()
-                                    .new_incoming_request(p2::http::types::Scheme::Http, req)?;
-                                let out = store.data_mut().http().new_response_outparam(tx)?;
-                                wasmtime::error::Ok((req, out))
-                            })?;
-
-                            proxy
-                                .wasi_http_incoming_handler()
-                                .call_handle(store, req, out)
-                                .await
-                        }
-                        Proxy::P3(proxy) => {
-                            use wasmtime_wasi_http::p3::bindings::http::types::{
-                                ErrorCode, Request,
-                            };
-
-                            let Sender::P3(tx) = tx else { unreachable!() };
-                            let (req, body) = req.into_parts();
-                            let body = body.map_err(ErrorCode::from_hyper_request_error);
-                            let req = http::Request::from_parts(req, body);
-                            let (request, request_io_result) = Request::from_http(req);
-                            let res = proxy.handle(store, request).await??;
-                            let res = store
-                                .with(|mut store| res.into_http(&mut store, request_io_result))?;
-
-                            // With the guest response now transformed into a
-                            // host-compatible response layer one more wrapper
-                            // around the body. This layer is solely responsible
-                            // for dropping a channel half on destruction, and
-                            // this enables waiting here until the body is
-                            // consumed by waiting for this destruction to
-                            // happen.
-                            let (resp_body_tx, resp_body_rx) = oneshot::channel();
-                            let res = res.map(|body| {
-                                let body = body.map_err(|e| e.into());
-                                P3BodyWrapper {
-                                    _tx: resp_body_tx,
-                                    body,
-                                }
-                                .boxed_unsync()
-                            });
-
-                            // If `wasmtime serve` is waiting on this response
-                            // and actually got it then wait for the body to
-                            // finish, otherwise it's thrown away so skip that
-                            // step.
-                            if tx.send(res).is_ok() {
-                                _ = resp_body_rx.await;
-                            }
-
-                            Ok(())
-                        }
-                    }
-                }
-                .map(move |result| {
-                    if let Err(error) = result {
-                        eprintln!("[{req_id}] :: {error:?}");
-                    }
-                }),
-            )
-        }),
-    );
-
-    return Ok(match rx {
-        Receiver::P2(rx) => rx
-            .await
-            .context("guest never invoked `response-outparam::set` method")?
-            .map_err(|e| wasmtime::Error::from(e))?
-            .map(|body| body.map_err(|e| e.into()).boxed_unsync()),
-        Receiver::P3(rx) => rx.await?,
+    let req = req.map(|body| {
+        body.map_err(ErrorCode::from_hyper_request_error)
+            .map_err(handler::ErrorCode::from)
+            .boxed_unsync()
     });
 
-    // Forwarding implementation of `Body` to an inner `B` with the sole purpose
-    // of carrying `_tx` to its destruction.
-    struct P3BodyWrapper<B> {
-        body: B,
-        _tx: oneshot::Sender<()>,
+    match debuggee_store {
+        // For debugging go ahead and synchronously execute the instance here
+        // in a single instance. This is debugging-specific to use the store
+        // passed in.
+        Some(store) => {
+            let instance = handler.state().instantiate_into(store).await?;
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let prepared = Prepared::new(
+                store.as_context_mut(),
+                &instance,
+                req,
+                handler.state().view(),
+                tx,
+            )?;
+            store
+                .run_concurrent(async |store| prepared.run(store, std::future::pending()).await)
+                .await??;
+            rx.await?
+        }
+
+        // For when debugging is disabled delegate to the default handling path.
+        None => handler.handle(request_id, req).await,
+    }
+}
+
+#[derive(Clone, Default)]
+struct RequestHeaders {
+    entries: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl RequestHeaders {
+    fn parse(headers: &[String]) -> Result<Self> {
+        let mut entries = Vec::new();
+        for header in headers {
+            if let Some(path) = header.strip_prefix('@') {
+                let contents = std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read header file `{path}`"))?;
+                for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                    entries.push(parse_header(line)?);
+                }
+            } else {
+                entries.push(parse_header(header)?);
+            }
+        }
+        Ok(Self { entries })
     }
 
-    impl<B: Body + Unpin> Body for P3BodyWrapper<B> {
-        type Data = B::Data;
-        type Error = B::Error;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            Pin::new(&mut self.body).poll_frame(cx)
+    fn apply(&self, headers: &mut HeaderMap) {
+        // Remove all request-provided values before appending CLI-provided
+        // values so repeated CLI headers with the same name are preserved.
+        for name in self.entries.iter().map(|(name, _)| name) {
+            headers.remove(name);
         }
-
-        fn is_end_stream(&self) -> bool {
-            self.body.is_end_stream()
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            self.body.size_hint()
+        for (name, value) in &self.entries {
+            headers.append(name, value.clone());
         }
     }
+}
+
+fn parse_header(header: &str) -> Result<(HeaderName, HeaderValue)> {
+    let (name, value) = header
+        .split_once(':')
+        .with_context(|| format!("header `{header}` is missing `:`"))?;
+    let name = HeaderName::from_bytes(name.trim().as_bytes())
+        .with_context(|| format!("invalid header name in header `{header}`"))?;
+    let value = HeaderValue::from_str(value.trim_start())
+        .with_context(|| format!("invalid header value in header `{header}`"))?;
+    Ok((name, value))
 }
 
 #[derive(Clone)]

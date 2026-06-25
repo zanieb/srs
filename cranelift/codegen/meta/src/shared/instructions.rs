@@ -772,7 +772,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -792,7 +792,7 @@ pub(crate) fn define(
             &formats.store,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", Mem).with_doc("Value to be stored"),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
@@ -817,7 +817,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -836,7 +836,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -855,7 +855,7 @@ pub(crate) fn define(
             &formats.store,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", iExt8),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
@@ -880,7 +880,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -899,7 +899,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -918,7 +918,7 @@ pub(crate) fn define(
             &formats.store,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", iExt16),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
@@ -943,7 +943,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -962,7 +962,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -981,7 +981,7 @@ pub(crate) fn define(
             &formats.store,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", iExt32),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
@@ -1069,7 +1069,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -1087,7 +1087,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -1115,7 +1115,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -1133,7 +1133,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -1161,7 +1161,7 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
@@ -1179,58 +1179,12 @@ pub(crate) fn define(
             &formats.load,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
         ])
         .operands_out(vec![Operand::new("a", I64x2).with_doc("Value loaded")])
         .can_load(),
-    );
-
-    ig.push(
-        Inst::new(
-            "stack_load",
-            r#"
-        Load a value from a stack slot at the constant offset.
-
-        This is a polymorphic instruction that can load any value type which
-        has a memory representation.
-
-        The offset is an immediate constant, not an SSA value. The memory
-        access cannot go out of bounds, i.e.
-        `sizeof(a) + Offset <= sizeof(SS)`.
-        "#,
-            &formats.stack_load,
-        )
-        .operands_in(vec![
-            Operand::new("SS", &entities.stack_slot),
-            Operand::new("Offset", &imm.offset32).with_doc("In-bounds offset into stack slot"),
-        ])
-        .operands_out(vec![Operand::new("a", Mem).with_doc("Value loaded")])
-        .can_load(),
-    );
-
-    ig.push(
-        Inst::new(
-            "stack_store",
-            r#"
-        Store a value to a stack slot at a constant offset.
-
-        This is a polymorphic instruction that can store any value type with a
-        memory representation.
-
-        The offset is an immediate constant, not an SSA value. The memory
-        access cannot go out of bounds, i.e.
-        `sizeof(a) + Offset <= sizeof(SS)`.
-        "#,
-            &formats.stack_store,
-        )
-        .operands_in(vec![
-            Operand::new("x", Mem).with_doc("Value to be stored"),
-            Operand::new("SS", &entities.stack_slot),
-            Operand::new("Offset", &imm.offset32).with_doc("In-bounds offset into stack slot"),
-        ])
-        .can_store(),
     );
 
     ig.push(
@@ -1243,7 +1197,7 @@ pub(crate) fn define(
         refer to a byte inside the stack slot:
         `0 <= Offset < sizeof(SS)`.
         "#,
-            &formats.stack_load,
+            &formats.stack_addr,
         )
         .operands_in(vec![
             Operand::new("SS", &entities.stack_slot),
@@ -1254,62 +1208,16 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
-            "dynamic_stack_load",
-            r#"
-        Load a value from a dynamic stack slot.
-
-        This is a polymorphic instruction that can load any value type which
-        has a memory representation.
-        "#,
-            &formats.dynamic_stack_load,
-        )
-        .operands_in(vec![Operand::new("DSS", &entities.dynamic_stack_slot)])
-        .operands_out(vec![Operand::new("a", Mem).with_doc("Value loaded")])
-        .can_load(),
-    );
-
-    ig.push(
-        Inst::new(
-            "dynamic_stack_store",
-            r#"
-        Store a value to a dynamic stack slot.
-
-        This is a polymorphic instruction that can store any dynamic value type with a
-        memory representation.
-        "#,
-            &formats.dynamic_stack_store,
-        )
-        .operands_in(vec![
-            Operand::new("x", Mem).with_doc("Value to be stored"),
-            Operand::new("DSS", &entities.dynamic_stack_slot),
-        ])
-        .can_store(),
-    );
-
-    ig.push(
-        Inst::new(
             "dynamic_stack_addr",
             r#"
         Get the address of a dynamic stack slot.
 
         Compute the absolute address of the first byte of a dynamic stack slot.
         "#,
-            &formats.dynamic_stack_load,
+            &formats.dynamic_stack_addr,
         )
         .operands_in(vec![Operand::new("DSS", &entities.dynamic_stack_slot)])
         .operands_out(vec![Operand::new("addr", iAddr)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "global_value",
-            r#"
-        Compute the value of global GV.
-        "#,
-            &formats.unary_global_value,
-        )
-        .operands_in(vec![Operand::new("GV", &entities.global_value)])
-        .operands_out(vec![Operand::new("a", Mem).with_doc("Value loaded")]),
     );
 
     ig.push(
@@ -1766,29 +1674,8 @@ pub(crate) fn define(
             Operand::new("x", Int),
             Operand::new("y", Int),
         ])
-        .operands_out(vec![Operand::new("a", &Int.as_truthy())]),
-    );
-
-    ig.push(
-        Inst::new(
-            "icmp_imm",
-            r#"
-        Compare scalar integer to a constant.
-
-        This is the same as the `icmp` instruction, except one operand is
-        a sign extended 64 bit immediate constant.
-
-        This instruction can only compare scalars. Use `icmp` for
-        lane-wise vector comparisons.
-        "#,
-            &formats.int_compare_imm,
-        )
-        .operands_in(vec![
-            Operand::new("Cond", &imm.intcc),
-            Operand::new("x", iB),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", i8)]),
+        .operands_out(vec![Operand::new("a", &Int.as_truthy())])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1803,7 +1690,8 @@ pub(crate) fn define(
             &formats.binary,
         )
         .operands_in(vec![Operand::new("x", Int), Operand::new("y", Int)])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1859,7 +1747,8 @@ pub(crate) fn define(
             &formats.binary,
         )
         .operands_in(vec![Operand::new("x", Int), Operand::new("y", Int)])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1946,7 +1835,8 @@ pub(crate) fn define(
         .operands_in(vec![Operand::new("x", iB), Operand::new("y", iB)])
         .operands_out(vec![Operand::new("a", iB)])
         .can_trap()
-        .side_effects_idempotent(),
+        .side_effects_idempotent()
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1965,7 +1855,8 @@ pub(crate) fn define(
         .operands_in(vec![Operand::new("x", iB), Operand::new("y", iB)])
         .operands_out(vec![Operand::new("a", iB)])
         .can_trap()
-        .side_effects_idempotent(),
+        .side_effects_idempotent()
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1981,7 +1872,8 @@ pub(crate) fn define(
         .operands_in(vec![Operand::new("x", iB), Operand::new("y", iB)])
         .operands_out(vec![Operand::new("a", iB)])
         .can_trap()
-        .side_effects_idempotent(),
+        .side_effects_idempotent()
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -1997,128 +1889,8 @@ pub(crate) fn define(
         .operands_in(vec![Operand::new("x", iB), Operand::new("y", iB)])
         .operands_out(vec![Operand::new("a", iB)])
         .can_trap()
-        .side_effects_idempotent(),
-    );
-
-    ig.push(
-        Inst::new(
-            "iadd_imm",
-            r#"
-        Add immediate integer.
-
-        Same as `iadd`, but one operand is a sign extended 64 bit immediate constant.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "imul_imm",
-            r#"
-        Integer multiplication by immediate constant.
-
-        Same as `imul`, but one operand is a sign extended 64 bit immediate constant.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "udiv_imm",
-            r#"
-        Unsigned integer division by an immediate constant.
-
-        Same as `udiv`, but one operand is a zero extended 64 bit immediate constant.
-
-        This operation traps if the divisor is zero.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "sdiv_imm",
-            r#"
-        Signed integer division by an immediate constant.
-
-        Same as `sdiv`, but one operand is a sign extended 64 bit immediate constant.
-
-        This operation traps if the divisor is zero, or if the result is not
-        representable in `B` bits two's complement. This only happens
-        when `x = -2^{B-1}, Y = -1`.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "urem_imm",
-            r#"
-        Unsigned integer remainder with immediate divisor.
-
-        Same as `urem`, but one operand is a zero extended 64 bit immediate constant.
-
-        This operation traps if the divisor is zero.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "srem_imm",
-            r#"
-        Signed integer remainder with immediate divisor.
-
-        Same as `srem`, but one operand is a sign extended 64 bit immediate constant.
-
-        This operation traps if the divisor is zero.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "irsub_imm",
-            r#"
-        Immediate reverse wrapping subtraction: `a := Y - x \pmod{2^B}`.
-
-        The immediate operand is a sign extended 64 bit constant.
-
-        Also works as integer negation when `Y = 0`. Use `iadd_imm`
-        with a negative immediate operand for the reverse immediate
-        subtraction.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
+        .side_effects_idempotent()
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2376,7 +2148,8 @@ pub(crate) fn define(
             &formats.binary,
         )
         .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
+        .operands_out(vec![Operand::new("a", bits)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2388,7 +2161,8 @@ pub(crate) fn define(
             &formats.binary,
         )
         .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
+        .operands_out(vec![Operand::new("a", bits)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2400,7 +2174,8 @@ pub(crate) fn define(
             &formats.binary,
         )
         .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
+        .operands_out(vec![Operand::new("a", bits)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2417,99 +2192,6 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
-            "band_not",
-            r#"
-        Bitwise and not.
-
-        Computes `x & ~y`.
-        "#,
-            &formats.binary,
-        )
-        .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "bor_not",
-            r#"
-        Bitwise or not.
-
-        Computes `x | ~y`.
-        "#,
-            &formats.binary,
-        )
-        .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "bxor_not",
-            r#"
-        Bitwise xor not.
-
-        Computes `x ^ ~y`.
-        "#,
-            &formats.binary,
-        )
-        .operands_in(vec![Operand::new("x", bits), Operand::new("y", bits)])
-        .operands_out(vec![Operand::new("a", bits)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "band_imm",
-            r#"
-        Bitwise and with immediate.
-
-        Same as `band`, but one operand is a zero extended 64 bit immediate constant.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "bor_imm",
-            r#"
-        Bitwise or with immediate.
-
-        Same as `bor`, but one operand is a zero extended 64 bit immediate constant.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "bxor_imm",
-            r#"
-        Bitwise xor with immediate.
-
-        Same as `bxor`, but one operand is a zero extended 64 bit immediate constant.
-
-        Polymorphic over all scalar integer types, but does not support vector
-        types.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![Operand::new("x", iB), Operand::new("Y", &imm.imm64)])
-        .operands_out(vec![Operand::new("a", iB)]),
-    );
-
-    ig.push(
-        Inst::new(
             "rotl",
             r#"
         Rotate left.
@@ -2522,7 +2204,8 @@ pub(crate) fn define(
             Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
             Operand::new("y", iB).with_doc("Number of bits to shift"),
         ])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2539,41 +2222,8 @@ pub(crate) fn define(
             Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
             Operand::new("y", iB).with_doc("Number of bits to shift"),
         ])
-        .operands_out(vec![Operand::new("a", Int)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "rotl_imm",
-            r#"
-        Rotate left by immediate.
-
-        Same as `rotl`, but one operand is a zero extended 64 bit immediate constant.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![
-            Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", Int)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "rotr_imm",
-            r#"
-        Rotate right by immediate.
-
-        Same as `rotr`, but one operand is a zero extended 64 bit immediate constant.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![
-            Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2598,7 +2248,8 @@ pub(crate) fn define(
             Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
             Operand::new("y", iB).with_doc("Number of bits to shift"),
         ])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2624,7 +2275,8 @@ pub(crate) fn define(
             Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
             Operand::new("y", iB).with_doc("Number of bits to shift"),
         ])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -2643,58 +2295,8 @@ pub(crate) fn define(
             Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
             Operand::new("y", iB).with_doc("Number of bits to shift"),
         ])
-        .operands_out(vec![Operand::new("a", Int)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "ishl_imm",
-            r#"
-        Integer shift left by immediate.
-
-        The shift amount is masked to the size of ``x``.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![
-            Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", Int)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "ushr_imm",
-            r#"
-        Unsigned shift right by immediate.
-
-        The shift amount is masked to the size of ``x``.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![
-            Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", Int)]),
-    );
-
-    ig.push(
-        Inst::new(
-            "sshr_imm",
-            r#"
-        Signed shift right by immediate.
-
-        The shift amount is masked to the size of ``x``.
-        "#,
-            &formats.binary_imm64,
-        )
-        .operands_in(vec![
-            Operand::new("x", Int).with_doc("Scalar or vector value to shift"),
-            Operand::new("Y", &imm.imm64),
-        ])
-        .operands_out(vec![Operand::new("a", Int)]),
+        .operands_out(vec![Operand::new("a", Int)])
+        .inst_builder_imm_method(true),
     );
 
     ig.push(
@@ -3132,9 +2734,9 @@ pub(crate) fn define(
 
         The input and output types must be storable to memory and of the same
         size. A bitcast is equivalent to storing one type and loading the other
-        type from the same address, both using the specified MemFlagsData.
+        type from the same address, both using the specified MemFlags.
 
-        Note that this operation only supports the `big` or `little` MemFlagsData.
+        Note that this operation only supports the `big` or `little` MemFlags.
         The specified byte order only affects the result in the case where
         input and output types differ in lane count/size.  In this case, the
         operation is only valid if a byte order specifier is provided.
@@ -3142,7 +2744,7 @@ pub(crate) fn define(
             &formats.load_no_offset,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", Mem),
         ])
         .operands_out(vec![
@@ -3773,7 +3375,7 @@ pub(crate) fn define(
             &formats.atomic_rmw,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("AtomicRmwOp", &imm.atomic_rmw_op),
             Operand::new("p", iAddr),
             Operand::new("x", AtomicMem).with_doc("Value to be atomically stored"),
@@ -3802,7 +3404,7 @@ pub(crate) fn define(
             &formats.atomic_cas,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
             Operand::new("e", AtomicMem).with_doc("Expected value in CAS"),
             Operand::new("x", AtomicMem).with_doc("Value to be atomically stored"),
@@ -3830,7 +3432,7 @@ pub(crate) fn define(
             &formats.load_no_offset,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("p", iAddr),
         ])
         .operands_out(vec![
@@ -3855,7 +3457,7 @@ pub(crate) fn define(
             &formats.store_no_offset,
         )
         .operands_in(vec![
-            Operand::new("MemFlagsData", &imm.memflags),
+            Operand::new("MemFlags", &imm.memflags),
             Operand::new("x", AtomicMem).with_doc("Value to be atomically stored"),
             Operand::new("p", iAddr),
         ])

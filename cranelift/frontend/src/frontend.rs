@@ -31,8 +31,6 @@ pub struct FunctionBuilderContext {
     ssa: SSABuilder,
     status: SecondaryMap<Block, BlockStatus>,
     variables: PrimaryMap<Variable, Type>,
-    stack_map_vars: EntitySet<Variable>,
-    stack_map_values: EntitySet<Value>,
     safepoints: safepoints::SafepointSpiller,
 }
 
@@ -72,15 +70,11 @@ impl FunctionBuilderContext {
             ssa,
             status,
             variables,
-            stack_map_vars,
-            stack_map_values,
             safepoints,
         } = self;
         ssa.clear();
         status.clear();
         variables.clear();
-        stack_map_values.clear();
-        stack_map_vars.clear();
         safepoints.clear();
     }
 
@@ -218,6 +212,13 @@ impl<'short, 'long> InstBuilderBase<'short> for FuncInstBuilder<'short, 'long> {
             self.builder.fill_current_block()
         }
         (inst, &mut self.builder.func.dfg)
+    }
+
+    fn build_aux_inst(&mut self, data: InstructionData, ctrl_typevar: Type) -> Inst {
+        // Reborrow the underlying `FunctionBuilder` to append the auxiliary
+        // instruction to the current block, leaving `self` intact so the
+        // caller can still build its final instruction.
+        self.builder.ins().build(data, ctrl_typevar).0
     }
 }
 
@@ -430,18 +431,19 @@ impl<'a> FunctionBuilder<'a> {
     /// the stack and it being reloading again, the stack can be updated to
     /// facilitate moving GCs.
     ///
-    /// This does not affect any pre-existing uses of the variable.
+    /// This must be called before any definition of the variable.
     ///
     /// # Panics
     ///
     /// Panics if the variable's type is larger than 16 bytes or if this
-    /// variable has not been declared yet.
+    /// variable has not been declared yet. In debug builds, also panics if
+    /// the variable has already been defined.
     pub fn declare_var_needs_stack_map(&mut self, var: Variable) {
         log::trace!("declare_var_needs_stack_map({var:?})");
         let ty = self.func_ctx.variables[var];
         assert!(ty != types::INVALID);
         assert!(ty.bytes() <= 16);
-        self.func_ctx.stack_map_vars.insert(var);
+        self.func_ctx.ssa.mark_var_needs_stack_map(var);
     }
 
     /// Returns the Cranelift IR necessary to use a previously defined user
@@ -559,7 +561,7 @@ impl<'a> FunctionBuilder<'a> {
         assert!(size <= 16);
         assert!(size.is_power_of_two());
 
-        self.func_ctx.stack_map_values.insert(val);
+        self.func_ctx.ssa.stack_map_values_mut().insert(val);
     }
 
     /// Creates a jump table in the function, to be used by [`br_table`](InstBuilder::br_table) instructions.
@@ -679,7 +681,7 @@ impl<'a> FunctionBuilder<'a> {
     ///
     /// This resets the state of the [`FunctionBuilderContext`] in preparation to
     /// be used for another function.
-    pub fn finalize(mut self) {
+    pub fn finalize(mut self, frontend_config: TargetFrontendConfig) {
         // Check that all the `Block`s are filled and sealed.
         #[cfg(debug_assertions)]
         {
@@ -709,23 +711,15 @@ impl<'a> FunctionBuilder<'a> {
             }
         }
 
-        // Propagate the needs-stack-map bit from variables to each of their
-        // associated values.
-        for var in self.func_ctx.stack_map_vars.iter() {
-            for val in self.func_ctx.ssa.values_for_var(var) {
-                log::trace!("propagating needs-stack-map from {var:?} to {val:?}");
-                debug_assert_eq!(self.func.dfg.value_type(val), self.func_ctx.variables[var]);
-                self.func_ctx.stack_map_values.insert(val);
-            }
-        }
-
         // If we have any values that need inclusion in stack maps, then we need
         // to run our pass to spill those values to the stack at safepoints and
         // generate stack maps.
-        if !self.func_ctx.stack_map_values.is_empty() {
-            self.func_ctx
-                .safepoints
-                .run(&mut self.func, &self.func_ctx.stack_map_values);
+        if !self.func_ctx.ssa.stack_map_values().is_empty() {
+            self.func_ctx.safepoints.run(
+                &mut self.func,
+                self.func_ctx.ssa.stack_map_values(),
+                frontend_config.pointer_type(),
+            );
         }
 
         // Clear the state (but preserve the allocated buffers) in preparation
@@ -1164,7 +1158,7 @@ impl<'a> FunctionBuilder<'a> {
         let pointer_type = config.pointer_type();
         let size = self.ins().iconst(pointer_type, size as i64);
         let cmp = self.call_memcmp(config, left, right, size);
-        self.ins().icmp_imm(zero_cc, cmp, 0)
+        self.ins().icmp_imm_s(zero_cc, cmp, 0)
     }
 }
 
@@ -1303,7 +1297,7 @@ mod tests {
                 builder.seal_all_blocks();
             }
 
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         let flags = settings::Flags::new(settings::builder());
@@ -1369,7 +1363,7 @@ mod tests {
             builder.ins().return_(&[size]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1424,7 +1418,7 @@ block0:
             builder.ins().return_(&[dest]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1476,7 +1470,7 @@ block0:
             builder.ins().return_(&[dest]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1520,7 +1514,7 @@ block0:
             builder.ins().return_(&[dest]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1559,7 +1553,7 @@ block0:
             builder.ins().return_(&[dest]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1620,7 +1614,7 @@ block0:
             builder.ins().return_(&[cmp]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1766,14 +1760,15 @@ block0:
     fn0 = %Memcmp sig0
 
 block0:
+    v7 = iconst.i64 0
+    v1 -> v7
     v6 = iconst.i64 0
-    v1 -> v6
-    v5 = iconst.i64 0
-    v0 -> v5
+    v0 -> v6
     v2 = iconst.i64 3
     v3 = call fn0(v0, v1, v2)  ; v0 = 0, v1 = 0, v2 = 3
-    v4 = icmp_imm sge v3, 0
-    return v4",
+    v4 = iconst.i32 0
+    v5 = icmp sge v3, v4  ; v4 = 0
+    return v5",
             |builder, target, x, y| {
                 builder.emit_small_memory_compare(
                     target.frontend_config(),
@@ -1828,7 +1823,7 @@ block0:
             builder.ins().return_(&[ret]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1861,7 +1856,7 @@ block0:
             builder.ins().return_(&[a, b, c]);
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(systemv_frontend_config());
         }
 
         check(
@@ -1934,7 +1929,7 @@ block0:
         builder.ins().return_(&[]);
 
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(systemv_frontend_config());
 
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         let ctx = cranelift_codegen::Context::for_function(func);
@@ -2009,7 +2004,7 @@ block0:
         builder.ins().return_(&[ret_val]);
 
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(systemv_frontend_config());
 
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         let ctx = cranelift_codegen::Context::for_function(func);

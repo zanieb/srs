@@ -5,7 +5,6 @@ use std::mem;
 use std::sync::Mutex;
 use wasmparser::FuncValidatorAllocations;
 use wasmtime_cranelift::CompiledFunction;
-#[cfg(feature = "component-model")]
 use wasmtime_environ::component::ComponentTranslation;
 use wasmtime_environ::error::Result;
 use wasmtime_environ::{
@@ -167,25 +166,15 @@ impl wasmtime_environ::Compiler for Compiler {
         })
     }
 
-    fn compile_array_to_wasm_trampoline(
+    fn compile_trampoline(
         &self,
-        translation: &ModuleTranslation<'_>,
+        translation: Option<&ModuleTranslation<'_>>,
+        key: FuncKey,
         types: &ModuleTypesBuilder,
-        key: FuncKey,
         symbol: &str,
     ) -> Result<CompiledFunctionBody, CompileError> {
         self.trampolines
-            .compile_array_to_wasm_trampoline(translation, types, key, symbol)
-    }
-
-    fn compile_wasm_to_array_trampoline(
-        &self,
-        wasm_func_ty: &wasmtime_environ::WasmFuncType,
-        key: FuncKey,
-        symbol: &str,
-    ) -> Result<CompiledFunctionBody, CompileError> {
-        self.trampolines
-            .compile_wasm_to_array_trampoline(wasm_func_ty, key, symbol)
+            .compile_trampoline(translation, key, types, symbol)
     }
 
     fn append_code(
@@ -193,7 +182,7 @@ impl wasmtime_environ::Compiler for Compiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, wasmtime_environ::FuncKey) -> usize,
-    ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
+    ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         self.trampolines.append_code(obj, funcs, resolve_reloc)
     }
 
@@ -213,7 +202,6 @@ impl wasmtime_environ::Compiler for Compiler {
         self.isa.is_branch_protection_enabled()
     }
 
-    #[cfg(feature = "component-model")]
     fn component_compiler(&self) -> &dyn wasmtime_environ::component::ComponentCompiler {
         self.trampolines.component_compiler()
     }
@@ -225,7 +213,7 @@ impl wasmtime_environ::Compiler for Compiler {
         _get_func: &'a dyn Fn(
             StaticModuleIndex,
             DefinedFuncIndex,
-        ) -> (SymbolId, &'a (dyn Any + Send + Sync)),
+        ) -> (Option<SymbolId>, &'a (dyn Any + Send + Sync)),
         _dwarf_package_bytes: Option<&'a [u8]>,
         _tunables: &'a Tunables,
     ) -> Result<()> {
@@ -234,14 +222,6 @@ impl wasmtime_environ::Compiler for Compiler {
 
     fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
         self.isa.create_systemv_cie()
-    }
-
-    fn compile_wasm_to_builtin(
-        &self,
-        key: FuncKey,
-        symbol: &str,
-    ) -> Result<CompiledFunctionBody, CompileError> {
-        self.trampolines.compile_wasm_to_builtin(key, symbol)
     }
 
     fn compiled_function_relocation_targets<'a>(
@@ -280,45 +260,14 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         Ok(body)
     }
 
-    fn compile_array_to_wasm_trampoline(
+    fn compile_trampoline(
         &self,
-        translation: &ModuleTranslation<'_>,
+        translation: Option<&ModuleTranslation<'_>>,
+        key: FuncKey,
         types: &ModuleTypesBuilder,
-        key: FuncKey,
         symbol: &str,
     ) -> Result<CompiledFunctionBody, CompileError> {
-        let mut body = self
-            .0
-            .compile_array_to_wasm_trampoline(translation, types, key, symbol)?;
-        if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, None, symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
-        }
-        Ok(body)
-    }
-
-    fn compile_wasm_to_array_trampoline(
-        &self,
-        wasm_func_ty: &wasmtime_environ::WasmFuncType,
-        key: FuncKey,
-        symbol: &str,
-    ) -> Result<CompiledFunctionBody, CompileError> {
-        let mut body = self
-            .0
-            .compile_wasm_to_array_trampoline(wasm_func_ty, key, symbol)?;
-        if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, None, symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
-        }
-        Ok(body)
-    }
-
-    fn compile_wasm_to_builtin(
-        &self,
-        key: FuncKey,
-        symbol: &str,
-    ) -> Result<CompiledFunctionBody, CompileError> {
-        let mut body = self.0.compile_wasm_to_builtin(key, symbol)?;
+        let mut body = self.0.compile_trampoline(translation, key, types, symbol)?;
         if let Some(c) = self.0.inlining_compiler() {
             c.finish_compiling(&mut body, None, symbol)
                 .map_err(|e| CompileError::Codegen(e.to_string()))?;
@@ -338,7 +287,7 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
-    ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
+    ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         self.0.append_code(obj, funcs, resolve_reloc)
     }
 
@@ -358,7 +307,6 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         self.0.is_branch_protection_enabled()
     }
 
-    #[cfg(feature = "component-model")]
     fn component_compiler(&self) -> &dyn wasmtime_environ::component::ComponentCompiler {
         self
     }
@@ -370,7 +318,7 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         get_func: &'a dyn Fn(
             StaticModuleIndex,
             DefinedFuncIndex,
-        ) -> (SymbolId, &'a (dyn Any + Send + Sync)),
+        ) -> (Option<SymbolId>, &'a (dyn Any + Send + Sync)),
         dwarf_package_bytes: Option<&'a [u8]>,
         tunables: &'a Tunables,
     ) -> Result<()> {
@@ -379,9 +327,8 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
     }
 }
 
-#[cfg(feature = "component-model")]
 impl wasmtime_environ::component::ComponentCompiler for NoInlineCompiler {
-    fn compile_trampoline(
+    fn compile_component_trampoline(
         &self,
         component: &wasmtime_environ::component::ComponentTranslation,
         types: &wasmtime_environ::component::ComponentTypesBuilder,
@@ -393,7 +340,7 @@ impl wasmtime_environ::component::ComponentCompiler for NoInlineCompiler {
         let mut body = self
             .0
             .component_compiler()
-            .compile_trampoline(component, types, key, abi, tunables, symbol)?;
+            .compile_component_trampoline(component, types, key, abi, tunables, symbol)?;
         if let Some(c) = self.0.inlining_compiler() {
             c.finish_compiling(&mut body, None, symbol)
                 .map_err(|e| CompileError::Codegen(e.to_string()))?;

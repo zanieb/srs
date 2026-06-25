@@ -5,7 +5,6 @@ use crate::sockets::util::{
     set_unicast_hop_limit, udp_bind, udp_connect, udp_disconnect, udp_socket,
 };
 use crate::sockets::{SocketAddrCheck, SocketAddressFamily, WasiSocketsCtx};
-use cap_net_ext::AddressFamily;
 use io_lifetimes::AsSocketlike as _;
 use io_lifetimes::raw::{FromRawSocketlike as _, IntoRawSocketlike as _};
 use rustix::io::Errno;
@@ -57,23 +56,14 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     /// Create a new socket in the given family.
-    pub(crate) fn new(cx: &WasiSocketsCtx, family: AddressFamily) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(cx: &WasiSocketsCtx, family: SocketAddressFamily) -> Result<Self, ErrorCode> {
         cx.allowed_network_uses.check_allowed_udp()?;
-
-        // Delegate socket creation to cap_net_ext. They handle a couple of things for us:
-        // - On Windows: call WSAStartup if not done before.
-        // - Set the NONBLOCK and CLOEXEC flags. Either immediately during socket creation,
-        //   or afterwards using ioctl or fcntl. Exact method depends on the platform.
 
         let fd = udp_socket(family)?;
 
-        let socket_address_family = match family {
-            AddressFamily::Ipv4 => SocketAddressFamily::Ipv4,
-            AddressFamily::Ipv6 => {
-                rustix::net::sockopt::set_ipv6_v6only(&fd, true)?;
-                SocketAddressFamily::Ipv6
-            }
-        };
+        if family == SocketAddressFamily::Ipv6 {
+            rustix::net::sockopt::set_ipv6_v6only(&fd, true)?;
+        }
 
         let socket = with_ambient_tokio_runtime(|| {
             tokio::net::UdpSocket::try_from(unsafe {
@@ -84,7 +74,7 @@ impl UdpSocket {
         Ok(Self {
             socket: Arc::new(socket),
             udp_state: UdpState::Default,
-            family: socket_address_family,
+            family,
             socket_addr_check: None,
         })
     }
@@ -187,11 +177,18 @@ impl UdpSocket {
             Send(Arc<tokio::net::UdpSocket>),
             SendTo(Arc<tokio::net::UdpSocket>, SocketAddr),
         }
-        let mut socket = match (&self.udp_state, addr) {
-            (UdpState::BindStarted, _) => Err(ErrorCode::InvalidState),
-            (UdpState::Default | UdpState::Bound, None) => Err(ErrorCode::InvalidArgument),
-            (UdpState::Default | UdpState::Bound, Some(addr)) => {
-                Ok(Mode::SendTo(Arc::clone(&self.socket), addr))
+        let socket = match (&self.udp_state, addr) {
+            (UdpState::BindStarted, _) | (UdpState::Default, Some(_)) => {
+                Err(ErrorCode::InvalidState)
+            }
+            (UdpState::Bound | UdpState::Default, None) => Err(ErrorCode::InvalidArgument),
+            (UdpState::Bound, Some(addr)) => {
+                if is_valid_remote_address(addr) && is_valid_address_family(addr.ip(), self.family)
+                {
+                    Ok(Mode::SendTo(Arc::clone(&self.socket), addr))
+                } else {
+                    Err(ErrorCode::InvalidArgument)
+                }
             }
             (UdpState::Connected(..), None) => Ok(Mode::Send(Arc::clone(&self.socket))),
             (UdpState::Connected(caddr), Some(addr)) => {
@@ -202,28 +199,6 @@ impl UdpSocket {
                 }
             }
         };
-
-        // Send may be called without a prior bind or connect. In that case, the
-        // first send will automatically assign a free local port. This is
-        // normally performed by the OS itself. However, if the `send` syscall
-        // failed, we can't reliably know which state the socket is in at the
-        // kernel level and our own `udp_state` bookkeeping may have become
-        // out-of-sync.
-        // To avoid that, we perform the implicit bind ourselves here. This way,
-        // we always leave the socket in a consistent state: Bound.
-        if socket.is_ok()
-            && let UdpState::Default = self.udp_state
-        {
-            let implicit_addr = crate::sockets::util::implicit_bind_addr(self.family);
-            match udp_bind(&self.socket, implicit_addr) {
-                Ok(()) => {
-                    self.udp_state = UdpState::Bound;
-                }
-                Err(e) => {
-                    socket = Err(e);
-                }
-            }
-        }
 
         async move {
             match socket? {

@@ -43,12 +43,14 @@
   (export "memory" (memory 0)))
 
 ;; function u0:0(i64 vmctx, i64, i32) tail {
+;;     region0 = 8 "VMContext+0x8"
+;;     region1 = 268435480 "VMStoreContext+0x18"
+;;     region2 = 2415919104 "VMMemoryDefinition+0x0"
+;;     region3 = 2415919112 "VMMemoryDefinition+0x8"
+;;     region4 = 536870912 "PublicMemory"
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned readonly can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
@@ -59,13 +61,13 @@
 ;; @0049                               brif.i32 v2, block4, block6
 ;;
 ;;                                 block4:
-;; @004b                               v7 = uextend.i64 v3  ; v3 = 35
-;; @004b                               v8 = load.i64 notrap aligned readonly can_move v0+56
-;; @004b                               v9 = iadd v8, v7
-;; @004b                               v10 = sload16.i64 little heap v9
+;; @004b                               v6 = uextend.i64 v3  ; v3 = 35
+;; @004b                               v7 = load.i64 notrap aligned readonly can_move region2 v0+56
+;; @004b                               v8 = iadd v7, v6
+;; @004b                               v9 = sload16.i64 little region4 v8
 ;; @004e                               trap user12
 ;;
 ;;                                 block6:
-;; @005d                               v11 = popcnt.i32 v3  ; v3 = 35
+;; @005d                               v10 = popcnt.i32 v3  ; v3 = 35
 ;; @0060                               return
 ;; }

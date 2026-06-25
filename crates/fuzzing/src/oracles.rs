@@ -21,6 +21,10 @@ mod gc_access;
 pub mod memory;
 mod stacks;
 
+/// Oracle for sequences of Wasmtime API calls.
+pub mod api;
+pub use api::make_api_calls;
+
 use self::diff_wasmtime::WasmtimeInstance;
 use self::engine::{DiffEngine, DiffInstance};
 use crate::generators::ExceptionOps;
@@ -604,101 +608,6 @@ impl<T, U> DiffEqResult<T, U> {
     }
 }
 
-/// Invoke the given API calls.
-pub fn make_api_calls(api: generators::api::ApiCalls) {
-    use crate::generators::api::ApiCall;
-    use std::collections::HashMap;
-
-    let mut store: Option<Store<StoreLimits>> = None;
-    let mut modules: HashMap<usize, Module> = Default::default();
-    let mut instances: HashMap<usize, Instance> = Default::default();
-
-    for call in api.calls {
-        match call {
-            ApiCall::StoreNew(config) => {
-                log::trace!("creating store");
-                assert!(store.is_none());
-                store = Some(config.to_store());
-            }
-
-            ApiCall::ModuleNew { id, wasm } => {
-                log::debug!("creating module: {id}");
-                log_wasm(&wasm);
-                let module = match Module::new(store.as_ref().unwrap().engine(), &wasm) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let old = modules.insert(id, module);
-                assert!(old.is_none());
-            }
-
-            ApiCall::ModuleDrop { id } => {
-                log::trace!("dropping module: {id}");
-                drop(modules.remove(&id));
-            }
-
-            ApiCall::InstanceNew { id, module } => {
-                log::trace!("instantiating module {module} as {id}");
-                let module = match modules.get(&module) {
-                    Some(m) => m,
-                    None => continue,
-                };
-
-                let store = store.as_mut().unwrap();
-                if let Some(instance) = instantiate_with_dummy(store, module) {
-                    instances.insert(id, instance);
-                }
-            }
-
-            ApiCall::InstanceDrop { id } => {
-                log::trace!("dropping instance {id}");
-                instances.remove(&id);
-            }
-
-            ApiCall::CallExportedFunc { instance, nth } => {
-                log::trace!("calling instance export {instance} / {nth}");
-                let instance = match instances.get(&instance) {
-                    Some(i) => i,
-                    None => {
-                        // Note that we aren't guaranteed to instantiate valid
-                        // modules, see comments in `InstanceNew` for details on
-                        // that. But the API call generator can't know if
-                        // instantiation failed, so we might not actually have
-                        // this instance. When that's the case, just skip the
-                        // API call and keep going.
-                        continue;
-                    }
-                };
-                let store = store.as_mut().unwrap();
-
-                let funcs = instance
-                    .exports(&mut *store)
-                    .filter_map(|e| match e.into_extern() {
-                        Extern::Func(f) => Some(f),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                if funcs.is_empty() {
-                    continue;
-                }
-
-                let nth = nth % funcs.len();
-                let f = &funcs[nth];
-                let ty = f.ty(&store);
-                if let Some(params) = ty
-                    .params()
-                    .map(|p| p.default_value())
-                    .collect::<Option<Vec<_>>>()
-                {
-                    let mut results = vec![Val::I32(0); ty.results().len()];
-                    let _ = f.call(store, &params, &mut results);
-                }
-            }
-        }
-    }
-}
-
 /// Executes the wast `test` with the `config` specified.
 ///
 /// Ensures that wast tests pass regardless of the `Config`.
@@ -937,6 +846,49 @@ pub fn gc_ops(mut fuzz_config: generators::Config, mut ops: GcOps) -> Result<usi
         });
 
         linker.define(&store, "", "take_struct", func).unwrap();
+
+        let func_ty = FuncType::new(
+            store.engine(),
+            vec![ValType::Ref(RefType::new(true, HeapType::Eq))],
+            vec![],
+        );
+
+        let func = Func::new(&mut store, func_ty, {
+            move |_caller: Caller<'_, StoreLimits>, _params, _results| {
+                log::info!("gc_ops: take_eq(<ref null eq>)");
+                Ok(())
+            }
+        });
+
+        linker.define(&store, "", "take_eq", func).unwrap();
+
+        // `take_i31` receives an `i31ref` along with the guest's inline
+        // `i31.get_s` and `i31.get_u` results, and asserts that the host's own
+        // view of the i31 matches the values the Wasm instructions produced.
+        linker
+            .func_wrap("", "take_i31", {
+                move |_caller: Caller<'_, StoreLimits>,
+                      r: Option<I31>,
+                      wasm_get_s: i32,
+                      wasm_get_u: i32|
+                      -> Result<()> {
+                    log::info!("gc_ops: take_i31({r:?}, get_s={wasm_get_s}, get_u={wasm_get_u})");
+                    if let Some(i31) = r {
+                        assert_eq!(
+                            i31.get_i32(),
+                            wasm_get_s,
+                            "host `i31.get_s` must match inline Wasm `i31.get_s`"
+                        );
+                        assert_eq!(
+                            i31.get_u32() as i32,
+                            wasm_get_u,
+                            "host `i31.get_u` must match inline Wasm `i31.get_u`"
+                        );
+                    }
+                    Ok(())
+                }
+            })
+            .unwrap();
 
         for imp in module.imports() {
             if imp.module() == "" {

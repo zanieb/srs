@@ -298,6 +298,7 @@ impl Metadata<'_> {
             memory_guard_size,
             debug_native,
             debug_guest,
+            debug_symbols,
             parse_wasm_debuginfo,
             consume_fuel,
             ref operator_cost,
@@ -342,6 +343,10 @@ impl Metadata<'_> {
             // way.
             metadata_for_internal_asserts: _,
             metadata_for_gc_heap_corruption: _,
+
+            // Only affects cold-block layout; a compiled artifact loads into an
+            // engine configured either way.
+            branch_hinting: _,
         } = self.tunables;
 
         Self::check_collector(collector, other.collector)?;
@@ -361,6 +366,7 @@ impl Metadata<'_> {
             "native debug information support",
         )?;
         Self::check_bool(debug_guest, other.debug_guest, "guest debug")?;
+        Self::check_bool(debug_symbols, other.debug_symbols, "debug symbols")?;
         Self::check_bool(
             parse_wasm_debuginfo,
             other.parse_wasm_debuginfo,
@@ -606,7 +612,7 @@ mod test {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(any(miri, not(has_native_signals)), ignore)]
     #[cfg(target_pointer_width = "64")] // different defaults on 32-bit platforms
     fn test_tunables_int_mismatch() -> Result<()> {
         let engine = Engine::default();

@@ -267,8 +267,10 @@ async fn test_round_trip_recurse(component: &str, same_instance: bool) -> Result
         type Data<'a> = &'a mut Self;
     }
 
-    impl component_async_tests::round_trip::bindings::local::local::baz::HostWithStore for MyCtx {
-        async fn foo<T: Send>(accessor: &Accessor<T, Self>, s: String) -> wasmtime::Result<String> {
+    impl<T: Send> component_async_tests::round_trip::bindings::local::local::baz::HostWithStore<T>
+        for MyCtx
+    {
+        async fn foo(accessor: &Accessor<T, Self>, s: String) -> wasmtime::Result<String> {
             if let Some(instance) = accessor.with(|mut access| access.get().instance.take()) {
                 run(accessor, &instance).await?;
                 accessor.with(|mut access| access.get().instance = Some(instance));
@@ -474,13 +476,18 @@ pub async fn test_round_trip(
                 )?;
 
             for (input, expected) in inputs_and_outputs {
-                assert_eq!(
-                    *expected,
-                    &round_trip
-                        .local_local_baz()
-                        .call_foo(&mut store, input)
-                        .await?
-                );
+                store
+                    .run_concurrent(async |store| -> wasmtime::Result<_> {
+                        assert_eq!(
+                            *expected,
+                            &round_trip
+                                .local_local_baz()
+                                .call_foo(store, input.to_string())
+                                .await?
+                        );
+                        Ok(())
+                    })
+                    .await??;
             }
 
             store.assert_concurrent_state_empty();

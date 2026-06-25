@@ -1,6 +1,11 @@
 //! WebAssembly trap handling, which is built on top of the lower-level
 //! signalhandling mechanisms.
 
+#![cfg_attr(
+    all(not(has_native_signals), not(feature = "pulley")),
+    expect(unused, reason = "easier to not #[cfg] methods and all related types")
+)]
+
 mod backtrace;
 
 #[cfg(feature = "coredump")]
@@ -51,8 +56,7 @@ pub(crate) enum TrapTest {
     /// Not a wasm trap, need to delegate to whatever process handler is next.
     NotWasm,
     /// This trap was handled by the embedder via custom embedding APIs.
-    #[cfg(has_host_compiler_backend)]
-    #[cfg_attr(miri, expect(dead_code, reason = "using #[cfg] too unergonomic"))]
+    #[cfg(all(has_native_signals, not(miri)))]
     HandledByEmbedder,
     /// This is a wasm trap, it needs to be handled.
     Trap(Handler),
@@ -199,6 +203,7 @@ host_result_no_catch! {
     u64,
     f32,
     f64,
+    usize,
     i8x16,
     f32x4,
     f64x2,
@@ -244,7 +249,11 @@ where
         // generate the return value of this function. This is the
         // conditionally, below, passed to `catch_unwind`.
         let f = move || match f(store) {
-            Ok(ret) => (ret.into_abi(), None),
+            Ok(ret) => {
+                let abi = ret.into_abi();
+                debug_assert!(abi != T::SENTINEL);
+                (abi, None)
+            }
             Err(reason) => (T::SENTINEL, Some(UnwindReason::from(reason))),
         };
 
@@ -280,7 +289,7 @@ where
 /// `into_abi` function.
 pub unsafe trait HostResultHasUnwindSentinel {
     /// The Cranelift-understood ABI of this value (should not be `Self`).
-    type Abi: Copy;
+    type Abi: Copy + PartialEq;
 
     /// A value that indicates that an unwind should happen and is tested for in
     /// Cranelift-generated code.
@@ -337,6 +346,14 @@ unsafe impl HostResultHasUnwindSentinel for bool {
     const SENTINEL: Self::Abi = u32::MAX;
     fn into_abi(self) -> Self::Abi {
         u32::from(self)
+    }
+}
+
+unsafe impl HostResultHasUnwindSentinel for *mut u8 {
+    type Abi = *mut u8;
+    const SENTINEL: Self::Abi = ptr::without_provenance_mut(usize::MAX);
+    fn into_abi(self) -> Self::Abi {
+        self
     }
 }
 
@@ -820,8 +837,8 @@ impl CallThreadState {
                     // required by its stack-walking logic.
                     #[cfg(feature = "gc")]
                     if err.is::<ThrownException>()
-                        && store.has_pending_exception()
-                        && let Some(catch) = unsafe { compute_handler(store) }
+                        && let Some((instance, tag)) = store.pending_exception_tag_and_instance()
+                        && let Some(catch) = unsafe { compute_handler(store, instance, tag) }
                     {
                         handler = catch;
                         // Take the pending exception at this time and use it as
@@ -1071,6 +1088,11 @@ fn entry_trap_handler(vm_store_context: &VMStoreContext) -> Handler {
 /// thread's current list pointed to by TLS is youngest-to-oldest links, while a
 /// suspended fiber stores oldest-to-youngest links.
 pub(crate) mod tls {
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    use crate::module::ModuleRegistry;
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    use crate::store::StoreOpaque;
+
     use super::CallThreadState;
 
     pub use raw::Ptr;
@@ -1147,6 +1169,8 @@ pub(crate) mod tls {
     }
 
     pub use raw::initialize as tls_eager_initialize;
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    use wasmtime_unwinder::Unwind;
 
     /// Opaque state used to persist the state of the `CallThreadState`
     /// activations associated with a fiber stack that's used as part of an
@@ -1251,6 +1275,32 @@ pub(crate) mod tls {
         pub fn assert_current_state_not_in_range(range: core::ops::Range<usize>) {
             let p = raw::get() as usize;
             assert!(!range.contains(&p));
+        }
+
+        #[cfg(all(feature = "component-model-async", feature = "gc"))]
+        pub(crate) fn trace_gc_roots(
+            &mut self,
+            modules: &ModuleRegistry,
+            unwind: &dyn Unwind,
+            gc_roots_list: &mut crate::vm::GcRootsList,
+        ) {
+            let mut ptr = self.state;
+            unsafe {
+                while let Some(state) = ptr.as_ref() {
+                    let _ = wasmtime_unwinder::visit_frames::<()>(
+                        unwind,
+                        state.old_last_wasm_exit_pc(),
+                        state.old_last_wasm_exit_fp(),
+                        state.old_last_wasm_entry_fp(),
+                        |frame| {
+                            StoreOpaque::trace_wasm_stack_frame(modules, gc_roots_list, frame);
+                            core::ops::ControlFlow::Continue(())
+                        },
+                    );
+
+                    ptr = state.prev.get();
+                }
+            }
         }
     }
 

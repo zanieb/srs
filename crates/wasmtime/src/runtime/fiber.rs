@@ -9,6 +9,13 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::task::{Context, Poll};
 use wasmtime_fiber::{Fiber, FiberStack, Suspend};
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use wasmtime_unwinder::Unwind;
+
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use super::module::ModuleRegistry;
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use super::vm::GcRootsList;
 
 type WasmtimeResume = Result<NonNull<Context<'static>>>;
 type WasmtimeYield = StoreFiberYield;
@@ -453,6 +460,21 @@ impl<'a> StoreFiber<'a> {
             }
         }
     }
+
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    pub(crate) fn trace_gc_roots(
+        &mut self,
+        modules: &ModuleRegistry,
+        unwind: &dyn Unwind,
+        gc_roots_list: &mut GcRootsList,
+    ) {
+        if let Some(state) = &mut self.state {
+            state
+                .get_mut()
+                .tls
+                .trace_gc_roots(modules, unwind, gc_roots_list);
+        }
+    }
 }
 
 // Note that this implementation will panic if the fiber is in-progress, which
@@ -836,7 +858,16 @@ where
         let reset = ResetCurrentPointersToNull(store_ref);
 
         fun(reset.0)
-    })?;
+    });
+    let fiber = match fiber {
+        Ok(fiber) => fiber,
+        Err((e, stack)) => {
+            unsafe {
+                engine.allocator().deallocate_fiber_stack(stack);
+            }
+            return Err(e);
+        }
+    };
     Ok(StoreFiber {
         state: Some(
             FiberResumeState {
