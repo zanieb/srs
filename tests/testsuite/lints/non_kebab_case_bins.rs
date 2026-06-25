@@ -19,13 +19,14 @@ name = "foo_bar"
 path = "src/main.rs"
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_bins = "warn"
 "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] binaries should have a kebab-case name
@@ -41,8 +42,6 @@ non_kebab_case_bins = "warn"
 9 + name = "foo-bar"
   |
 [WARNING] `foo` (manifest) generated 1 warning
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -61,13 +60,14 @@ edition = "2015"
 authors = []
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_bins = "warn"
 "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] binaries should have a kebab-case name
@@ -83,16 +83,14 @@ non_kebab_case_bins = "warn"
  3 + name = "foo-bar"
    |
 [HELP] to change the binary name to kebab case, specify `bin.name`
-  --> Cargo.toml:9:30
+  --> Cargo.toml:10:30
    |
- 9 ~ non_kebab_case_bins = "warn"
-10 + [[bin]]
-11 + name = "foo-bar"
-12 + path = "src/main.rs"
+10 ~ non_kebab_case_bins = "warn"
+11 + [[bin]]
+12 + name = "foo-bar"
+13 + path = "src/main.rs"
    |
 [WARNING] `foo_bar` (manifest) generated 1 warning
-[CHECKING] foo_bar v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -111,13 +109,14 @@ edition = "2015"
 authors = []
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_bins = "warn"
 "#,
         )
         .file("src/bin/foo_bar.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] binaries should have a kebab-case name
@@ -132,8 +131,6 @@ non_kebab_case_bins = "warn"
 1 + src/bin/foo-bar.rs
   |
 [WARNING] `foo` (manifest) generated 1 warning
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -147,13 +144,14 @@ fn bin_name_from_script_name() {
             r#"
 ---
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_bins = "warn"
 ---
 fn main() {}"#,
         )
         .build();
 
-    p.cargo("check -Zcargo-lints -Zscript --manifest-path foo_bar")
+    p.cargo("fetch -Zcargo-lints -Zscript --manifest-path foo_bar")
         .masquerade_as_nightly_cargo(&["cargo-lints", "script"])
         .with_stderr_data(str![[r#"
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
@@ -170,8 +168,6 @@ fn main() {}"#,
 1 + foo-bar
   |
 [WARNING] `foo_bar` (manifest) generated 1 warning
-[CHECKING] foo_bar v0.0.0 ([ROOT]/foo/foo_bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();

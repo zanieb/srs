@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -211,9 +210,8 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
         // upload.
         let mut ready = plan.take_ready();
 
-        if ready.is_empty() {
-            // Circular dependencies are caught above, so this indicates a failure
-            // to progress, potentially due to a timeout while waiting for confirmations.
+        if ready.is_empty() && to_confirm.is_empty() {
+            // Cycles are caught above; reaching here means an unexpected stall.
             return Err(crate::util::internal(format!(
                 "no packages ready to publish but {} packages remain in plan with {} awaiting confirmation: {}",
                 plan.len(),
@@ -390,7 +388,7 @@ fn wait_for_any_publish_confirmation(
     pkgs: &BTreeSet<PackageId>,
     timeout: Duration,
 ) -> CargoResult<BTreeSet<PackageId>> {
-    let mut source = SourceConfigMap::empty(gctx)?.load(registry_src, &HashSet::new())?;
+    let mut source = SourceConfigMap::empty(gctx)?.load(registry_src)?;
     // Disable the source's built-in progress bars. Repeatedly showing a bunch
     // of independent progress bars can be a little confusing. There is an
     // overall progress bar managed here.

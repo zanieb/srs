@@ -442,12 +442,6 @@ impl<'gctx> Source for GitSource<'gctx> {
         format!("Git repository {}", self.source_id.borrow())
     }
 
-    fn add_to_yanked_whitelist(&self, _pkgs: &[PackageId]) {}
-
-    async fn is_yanked(&self, _pkg: PackageId) -> CargoResult<bool> {
-        Ok(false)
-    }
-
     fn invalidate_cache(&self) {}
 
     fn set_quiet(&mut self, quiet: bool) {
@@ -499,6 +493,13 @@ mod test {
         let ident1 = ident(&src("https://github.com/PistonDevelopers/piston"));
         let ident2 = ident(&src("git://github.com/PistonDevelopers/piston"));
         assert_eq!(ident1, ident2);
+    }
+
+    #[test]
+    fn test_canonicalize_idents_does_not_strip_dot_git_for_sparse() {
+        let ident1 = ident(&src("sparse+https://crates.io/fake-registry"));
+        let ident2 = ident(&src("sparse+https://crates.io/fake-registry.git"));
+        assert_ne!(ident1, ident2);
     }
 
     fn src(s: &str) -> SourceId {

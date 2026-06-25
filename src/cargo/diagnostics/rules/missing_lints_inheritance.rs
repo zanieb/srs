@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use cargo_util_schemas::manifest::TomlToolLints;
 use cargo_util_terminal::report::Group;
 use cargo_util_terminal::report::Level;
 use cargo_util_terminal::report::Origin;
@@ -13,10 +12,10 @@ use crate::CargoResult;
 use crate::GlobalContext;
 use crate::core::Package;
 use crate::core::Workspace;
-use crate::diagnostics::DiagnosticStats;
 use crate::diagnostics::Lint;
-use crate::diagnostics::LintLevel;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::LintLevelProduct;
+use crate::diagnostics::ScopedDiagnosticStats;
+use crate::diagnostics::workspace_rel_path;
 
 pub static LINT: &Lint = &Lint {
     name: "missing_lints_inheritance",
@@ -55,23 +54,18 @@ workspace = true
 };
 
 #[instrument(skip_all)]
-pub fn missing_lints_inheritance(
+pub(crate) fn lint_package(
     ws: &Workspace<'_>,
     pkg: &Package,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = LINT.level(
-        cargo_lints,
-        pkg.rust_version(),
-        pkg.manifest().unstable_features(),
-    );
-
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
     let root = ws.root_maybe();
     // `normalized_toml` normally isn't guaranteed to include inheritance information except
@@ -93,7 +87,7 @@ pub fn missing_lints_inheritance(
     let contents = manifest.contents();
     let level = lint_level.to_diagnostic_level();
     let emitted_source = LINT.emitted_source(lint_level, source);
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+    let manifest_path = workspace_rel_path(ws, manifest_path);
 
     let mut primary = Group::with_title(level.primary_title(LINT.desc));
     primary = primary.element(Origin::path(&manifest_path));
@@ -120,7 +114,7 @@ pub fn missing_lints_inheritance(
         report.push(help);
     }
 
-    stats.record_lint(lint_level);
+    pkg_stats.record_lint(lint_level);
     gctx.shell().print_report(&report, lint_level.force())?;
 
     Ok(())

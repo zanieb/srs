@@ -51,7 +51,7 @@ pub mod timings;
 mod unit;
 pub mod unit_dependencies;
 pub mod unit_graph;
-mod unused_deps;
+pub mod unused_deps;
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -815,6 +815,9 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
     if build_runner.bcx.gctx.cli_unstable().checksum_freshness {
         base.arg("-Z").arg("checksum-hash-algorithm=blake3");
     }
+    if gctx.shell().verbosity() == Verbosity::Verbose && unit.is_local() {
+        base.arg("--verbose");
+    }
 
     if is_primary {
         base.env("CARGO_PRIMARY_PACKAGE", "1");
@@ -903,16 +906,14 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
         if build_runner.bcx.gctx.cli_unstable().checksum_freshness {
             rustdoc.arg("-Z").arg("checksum-hash-algorithm=blake3");
         }
-
-        rustdoc.arg("-Zunstable-options");
     } else if build_runner.bcx.gctx.cli_unstable().rustdoc_mergeable_info {
         // toolchain resources are written at the end, at the same time as merging
         rustdoc.arg("--emit=html-non-static-files");
-        rustdoc.arg("-Zunstable-options");
     }
 
     if build_runner.bcx.gctx.cli_unstable().rustdoc_mergeable_info {
         // write out mergeable data to be imported
+        rustdoc.arg("-Zunstable-options");
         rustdoc.arg("--merge=none");
         let mut arg = OsString::from("--parts-out-dir=");
         // `-Zrustdoc-mergeable-info` always uses the new layout.
@@ -1510,11 +1511,11 @@ fn trim_paths_args_rustdoc(
     // feature gate was checked during manifest/config parsing.
     cmd.arg("-Zunstable-options");
 
-    // Order of `--remap-path-prefix` flags is important for `-Zbuild-std`.
-    // We want to show `/rustc/<hash>/library/std` instead of `std-0.0.0`.
-    cmd.arg(package_remap(build_runner, unit));
-    cmd.arg(build_dir_remap(build_runner));
-    cmd.arg(sysroot_remap(build_runner, unit));
+    for pair in trim_paths_remap(build_runner, unit) {
+        let mut arg = OsString::from("--remap-path-prefix=");
+        arg.push(pair);
+        cmd.arg(arg);
+    }
 
     Ok(())
 }
@@ -1537,13 +1538,27 @@ fn trim_paths_args(
     // feature gate was checked during manifest/config parsing.
     cmd.arg(format!("--remap-path-scope={trim_paths}"));
 
-    // Order of `--remap-path-prefix` flags is important for `-Zbuild-std`.
-    // We want to show `/rustc/<hash>/library/std` instead of `std-0.0.0`.
-    cmd.arg(package_remap(build_runner, unit));
-    cmd.arg(build_dir_remap(build_runner));
-    cmd.arg(sysroot_remap(build_runner, unit));
+    for pair in trim_paths_remap(build_runner, unit) {
+        let mut arg = OsString::from("--remap-path-prefix=");
+        arg.push(pair);
+        cmd.arg(arg);
+    }
 
     Ok(())
+}
+
+/// Computes the `<from>=<to>` path remap pairs for [RFC 3127] trim-paths.
+///
+/// Order of `--remap-path-prefix` flags is important for `-Zbuild-std`.
+/// We want to show `/rustc/<hash>/library/std` instead of `std-0.0.0`.
+///
+/// [RFC 3127]: https://rust-lang.github.io/rfcs/3127-trim-paths.html
+pub(crate) fn trim_paths_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> [OsString; 3] {
+    [
+        package_remap(build_runner, unit),
+        build_dir_remap(build_runner),
+        sysroot_remap(build_runner, unit),
+    ]
 }
 
 /// Path prefix remap rules for sysroot.
@@ -1551,7 +1566,7 @@ fn trim_paths_args(
 /// This remap logic aligns with rustc:
 /// <https://github.com/rust-lang/rust/blob/c2ef3516/src/bootstrap/src/lib.rs#L1113-L1116>
 fn sysroot_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OsString {
-    let mut remap = OsString::from("--remap-path-prefix=");
+    let mut remap = OsString::new();
     remap.push({
         // See also `detect_sysroot_src_path()`.
         let mut sysroot = build_runner.bcx.target_data.info(unit.kind).sysroot.clone();
@@ -1581,7 +1596,7 @@ fn sysroot_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OsString {
 fn package_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OsString {
     let pkg_root = unit.pkg.root();
     let ws_root = build_runner.bcx.ws.root();
-    let mut remap = OsString::from("--remap-path-prefix=");
+    let mut remap = OsString::new();
     let source_id = unit.pkg.package_id().source_id();
     if source_id.is_git() {
         remap.push(
@@ -1628,7 +1643,7 @@ fn package_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> OsString {
 ///   files (dwp and dwo).
 fn build_dir_remap(build_runner: &BuildRunner<'_, '_>) -> OsString {
     let build_dir = build_runner.bcx.ws.build_dir();
-    let mut remap = OsString::from("--remap-path-prefix=");
+    let mut remap = OsString::new();
     remap.push(build_dir.as_path_unlocked());
     remap.push("=/cargo/build-dir");
     remap

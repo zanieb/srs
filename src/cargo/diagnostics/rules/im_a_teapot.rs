@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use cargo_util_schemas::manifest::TomlToolLints;
 use cargo_util_terminal::report::AnnotationKind;
 use cargo_util_terminal::report::Group;
 use cargo_util_terminal::report::Level;
@@ -13,11 +12,12 @@ use crate::CargoResult;
 use crate::GlobalContext;
 use crate::core::Feature;
 use crate::core::Package;
-use crate::diagnostics::DiagnosticStats;
+use crate::core::Workspace;
 use crate::diagnostics::Lint;
-use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelProduct;
+use crate::diagnostics::ScopedDiagnosticStats;
 use crate::diagnostics::get_key_value_span;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::workspace_rel_path;
 
 /// This lint is only to be used for testing purposes
 pub static LINT: &Lint = &Lint {
@@ -30,20 +30,19 @@ pub static LINT: &Lint = &Lint {
 };
 
 #[instrument(skip_all)]
-pub fn check_im_a_teapot(
+pub(crate) fn lint_package(
+    ws: &Workspace<'_>,
     pkg: &Package,
     path: &Path,
-    pkg_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
     let manifest = pkg.manifest();
-    let (lint_level, source) =
-        LINT.level(pkg_lints, pkg.rust_version(), manifest.unstable_features());
-
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
     if manifest
         .normalized_toml()
@@ -51,7 +50,7 @@ pub fn check_im_a_teapot(
         .is_some_and(|p| p.im_a_teapot.is_some())
     {
         let level = lint_level.to_diagnostic_level();
-        let manifest_path = rel_cwd_manifest_path(path, gctx);
+        let manifest_path = workspace_rel_path(ws, path);
         let emitted_source = LINT.emitted_source(lint_level, source);
 
         let mut desc = Group::with_title(level.primary_title(LINT.desc));
@@ -72,7 +71,7 @@ pub fn check_im_a_teapot(
 
         let report = &[desc.element(Level::NOTE.message(&emitted_source))];
 
-        stats.record_lint(lint_level);
+        pkg_stats.record_lint(lint_level);
         gctx.shell().print_report(report, lint_level.force())?;
     }
     Ok(())

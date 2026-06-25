@@ -19,6 +19,7 @@ fn bidi_comments_warn() {
 {BIDI_MANIFEST}
 
 [lints.cargo]
+default = {{ level = \"allow\", priority = -1 }}
 text_direction_codepoint_in_comment = \"warn\"
 text_direction_codepoint_in_literal = \"allow\"
 "
@@ -29,7 +30,7 @@ text_direction_codepoint_in_literal = \"allow\"
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] unicode codepoint changing visible direction of text present in comment
@@ -62,8 +63,6 @@ text_direction_codepoint_in_literal = \"allow\"
   |                                           |           "/u{202b}"
   |                                           this comment contains an invisible unicode text flow control codepoint
 [WARNING] `foo` (manifest) generated 3 warnings
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -76,6 +75,7 @@ fn bidi_literals_warn() {
 {BIDI_MANIFEST}
 
 [lints.cargo]
+default = {{ level = \"allow\", priority = -1 }}
 text_direction_codepoint_in_comment = \"allow\"
 text_direction_codepoint_in_literal = \"warn\"
 "
@@ -86,7 +86,7 @@ text_direction_codepoint_in_literal = \"warn\"
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] unicode codepoint changing visible direction of text present in literal
@@ -136,8 +136,6 @@ text_direction_codepoint_in_literal = \"warn\"
 9 + repository = "a /u{202E}repository/u{202A} everywhere"  # this is a �tricky� comment
   |
 [WARNING] `foo` (manifest) generated 3 warnings
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -153,6 +151,7 @@ members = [\"bar\"]
 {BIDI_MANIFEST}
 
 [lints.cargo]
+default = {{ level = \"allow\", priority = -1 }}
 text_direction_codepoint_in_comment = \"warn\"
 text_direction_codepoint_in_literal = \"warn\"
 "
@@ -174,7 +173,7 @@ edition = \"2015\"
         .file("bar/src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] unicode codepoint changing visible direction of text present in comment
@@ -253,8 +252,6 @@ edition = \"2015\"
 12 + repository = "a /u{202E}repository/u{202A} everywhere"  # this is a �tricky� comment
    |
 [WARNING] `foo` (manifest) generated 6 warnings
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -273,6 +270,7 @@ homepage = \"a \u{202e}homepage\u{202a} there\"  # this is a \u{202b}tricky\u{20
 repository = \"a \u{202e}repository\u{202a} everywhere\"  # this is a \u{202b}tricky\u{202c} comment
 
 [workspace.lints.cargo]
+default = {{ level = \"allow\", priority = -1 }}
 text_direction_codepoint_in_comment = \"warn\"
 text_direction_codepoint_in_literal = \"warn\"
 "
@@ -300,7 +298,7 @@ workspace = true
         .file("bar/src/lib.rs", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] unicode codepoint changing visible direction of text present in comment
@@ -379,8 +377,6 @@ workspace = true
 8 + repository = "a /u{202E}repository/u{202A} everywhere"  # this is a �tricky� comment
   |
 [WARNING] workspace (manifest) generated 6 warnings
-[CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();

@@ -201,12 +201,6 @@ impl<'gctx> Source for PathSource<'gctx> {
         }
     }
 
-    fn add_to_yanked_whitelist(&self, _pkgs: &[PackageId]) {}
-
-    async fn is_yanked(&self, _pkg: PackageId) -> CargoResult<bool> {
-        Ok(false)
-    }
-
     fn invalidate_cache(&self) {
         // Path source has no local cache.
     }
@@ -400,12 +394,6 @@ impl<'gctx> Source for RecursivePathSource<'gctx> {
             Ok(path) => path.display().to_string(),
             Err(_) => self.source_id.to_string(),
         }
-    }
-
-    fn add_to_yanked_whitelist(&self, _pkgs: &[PackageId]) {}
-
-    async fn is_yanked(&self, _pkg: PackageId) -> CargoResult<bool> {
-        Ok(false)
     }
 
     fn invalidate_cache(&self) {

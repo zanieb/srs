@@ -1,4 +1,59 @@
-use anyhow::bail;
+//! Hard-coded and user-controlled diagnostics
+//!
+//! Diagnostics are user messages, like warnings and errors.
+//! When they are named for setting a user-overridable level,
+//! they are called lints.
+//!
+//! # When should a diagnostic be a lint
+//!
+//! Lints are generally preferred because of the level of control for users.
+//!
+//! Use a hard-coded diagnostic when:
+//! - Critical errors
+//! - There is no associated package or workspace. The diagnostic must still be suppressible
+//!   somehow (e.g. a user explicitly opting in to a config field's default value)
+//! - The warning message is too important to allow a user to hide (rare)
+//!
+//! # Adding a diagnostic
+//!
+//! The mechanics of adding a diagnostic is dependent on the requirements:
+//! - TOML syntax or manifest schema: [`passes::emit_parse_diagnostics`], [`rules::PARSE_PASS_RULES`]
+//! - Lockfile
+//!   - May be overly broad for what dependencies are checked
+//! - Pre-build unit graph
+//!   - Tailored to a specific configuration (features, targets) but requires users to enumerate every configuration
+//! - Post-build unit graph: [`rules::unused_dependencies::lint_build_results`]
+//!   - Slow feedback cycle since a build needs to happen
+//! - Does not fit into any idea of a pass: directly call [`cargo_util_terminal::Shell::warn`] or [`crate::CargoResult::Err`]
+//!
+//! When evaluating a diagnostic:
+//! - Only evaluate and emit for local packages unless it is for a [future-incompat lint]
+//!
+//! When generating a diagnostic [report][cargo_util_terminal::report::Report]:
+//! - Try to keep the report succinct while ensuring a beginner can understand what is wrong and how to fix.
+//!   It is a difficult balance to hit; err on the side of providing extra information.
+//! - Messages should generally be a phrase, starting with a lowercase letter.
+//!   If multiple sentences are needed, consider if a [message][cargo_util_terminal::report::Message] or sub-diagnostic would be more
+//!   appropriate.
+//! - Only the first lint for a package should emit the [`lint::Lint::emitted_source`]
+//!
+//! See also [rustc's Errors and Lints](https://rustc-dev-guide.rust-lang.org/diagnostics.html)
+//!
+//! # Adding a pass
+//!
+//! When a diagnostic requires adding a new pass, keep in mind:
+//! - Cap lints (skip everything for non-local)
+//! - Support for `build.warnings`
+//! - When errors should block further evaluation within the pass
+//! - Providing a summary at the end, like what is provided by [`ScopedDiagnosticStats::report_summary`]
+//! - Prefer data driven passes to simplify adding rules
+//!   - Ensure the pass' lints are in [`rules::LINTS`], e.g. `ensure_parse_passed_in_lints`
+//!   - Prefer evaluating the lint level within the pass
+//!
+//! See [`passes::emit_parse_diagnostics`] as an example.
+//!
+//! [future-incompat lint]: https://rustc-dev-guide.rust-lang.org/diagnostics.html#future-incompatible-lints
+
 use cargo_util_schemas::manifest::RustVersion;
 use cargo_util_schemas::manifest::TomlToolLints;
 
@@ -10,23 +65,72 @@ use crate::util::GlobalContext;
 mod lint;
 mod report;
 
+pub mod passes;
 pub mod rules;
 
-pub use lint::{Lint, LintGroup, LintLevel, LintLevelSource};
-pub use report::{AsIndex, get_key_value, get_key_value_span, rel_cwd_manifest_path};
+pub use lint::{Lint, LintGroup, LintLevel, LintLevelProduct, LintLevelSource};
+pub use report::{AsIndex, cwd_rel_path, get_key_value, get_key_value_span, workspace_rel_path};
 pub use rules::{LINT_GROUPS, LINTS};
 
-pub struct DiagnosticStats {
-    warning_count: usize,
-    error_count: usize,
+pub struct PassOutput {
+    pub lint_warning_count: usize,
 }
 
-impl DiagnosticStats {
+pub struct GlobalDiagnosticStats {
+    error_count: usize,
+    lint_warning_count: usize,
+}
+
+impl GlobalDiagnosticStats {
     pub fn new() -> Self {
         Self {
+            error_count: 0,
+            lint_warning_count: 0,
+        }
+    }
+
+    pub fn scope(&mut self) -> ScopedDiagnosticStats<'_> {
+        ScopedDiagnosticStats {
             warning_count: 0,
             error_count: 0,
+            global: self,
         }
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    pub fn lint_warning_count(&self) -> usize {
+        self.lint_warning_count
+    }
+
+    pub fn ok(&self) -> CargoResult<PassOutput> {
+        if 0 < self.error_count {
+            Err(crate::Error::new(crate::AlreadyPrintedError::new(
+                anyhow::format_err!("see above"),
+            )))
+        } else {
+            Ok(PassOutput {
+                lint_warning_count: self.lint_warning_count,
+            })
+        }
+    }
+}
+
+pub struct ScopedDiagnosticStats<'g> {
+    warning_count: usize,
+    error_count: usize,
+    global: &'g mut GlobalDiagnosticStats,
+}
+
+impl ScopedDiagnosticStats<'_> {
+    pub fn warning_count(&self) -> usize {
+        self.warning_count
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count
     }
 
     pub fn record_warning(&mut self) {
@@ -35,6 +139,7 @@ impl DiagnosticStats {
 
     pub fn record_error(&mut self) {
         self.error_count += 1;
+        self.global.error_count += 1;
     }
 
     pub fn record_lint(&mut self, lint: LintLevel) {
@@ -43,12 +148,16 @@ impl DiagnosticStats {
                 self.record_error();
             }
             LintLevel::Warn => {
+                self.global.lint_warning_count += 1;
                 self.record_warning();
             }
             LintLevel::Allow => {}
         }
     }
 
+    /// Print a summary to the user
+    ///
+    /// **Note:** be sure to call `GlobalDiagnosticStats::ok` or equivalent to fail the operation
     pub fn report_summary(
         &self,
         action: &str,
@@ -71,10 +180,10 @@ impl DiagnosticStats {
             let name = name
                 .map(|n| format!("`{n}`"))
                 .unwrap_or_else(|| "workspace".to_owned());
-            bail!(
+            gctx.shell().error(format!(
                 "could not {action} {name} (manifest) due to {} previous error{plural}",
                 self.error_count
-            )
+            ))?;
         }
 
         Ok(())
@@ -93,8 +202,18 @@ pub enum ManifestFor<'a> {
 }
 
 impl ManifestFor<'_> {
-    fn lint_level(&self, pkg_lints: &TomlToolLints, lint: &Lint) -> (LintLevel, LintLevelSource) {
-        lint.level(pkg_lints, self.rust_version(), self.unstable_features())
+    fn lint_level(
+        &self,
+        pkg_lints: &TomlToolLints,
+        lint: &Lint,
+        gctx: &GlobalContext,
+    ) -> LintLevelProduct {
+        lint.level(
+            pkg_lints,
+            self.rust_version(),
+            self.unstable_features(),
+            gctx,
+        )
     }
 
     pub fn rust_version(&self) -> Option<&RustVersion> {

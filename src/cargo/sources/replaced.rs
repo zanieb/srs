@@ -155,16 +155,4 @@ impl<'gctx> Source for ReplacedSource<'gctx> {
     fn is_replaced(&self) -> bool {
         !self.is_builtin_replacement()
     }
-
-    fn add_to_yanked_whitelist(&self, pkgs: &[PackageId]) {
-        let pkgs = pkgs
-            .iter()
-            .map(|id| id.with_source_id(self.replace_with))
-            .collect::<Vec<_>>();
-        self.inner.add_to_yanked_whitelist(&pkgs);
-    }
-
-    async fn is_yanked(&self, pkg: PackageId) -> CargoResult<bool> {
-        self.inner.is_yanked(pkg).await
-    }
 }

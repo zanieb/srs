@@ -19,6 +19,7 @@ use crate::core::resolver::{
 use crate::core::{
     Dependency, FeatureValue, PackageId, PackageIdSpec, PackageIdSpecQuery, Registry, Summary,
 };
+use crate::sources::IndexSummary;
 use crate::sources::source::QueryKind;
 use crate::util::LocalPollAdapter;
 use crate::util::closest_msg;
@@ -68,8 +69,33 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
         let (dep, first_version) = key;
         let mut summaries = Vec::new();
         self.registry
-            .query(dep, QueryKind::Exact, &mut |s| {
-                summaries.push(s.into_summary());
+            .query(dep, QueryKind::Exact, &mut |s| match s {
+                IndexSummary::Candidate(summary) => {
+                    // Filter out versions that are too new,
+                    // unless pinned by a lock file or a `[patch]` entry.
+                    //
+                    // Unlike yanked, `cargo update --precise` does not opt in here
+                    // unless `resolver.incompatible-publish-age = "allow"` is set.
+                    let too_new = self.version_prefs.too_new(&summary).is_some();
+                    if !too_new || self.version_prefs.should_prefer(&summary.package_id()) {
+                        summaries.push(summary);
+                    }
+                }
+                // Prefer yanked only when
+                //
+                // * it is recorded in lock file or a `[patch]` entry
+                // * it is specified in `cargo update --precise`
+                IndexSummary::Yanked(summary) => {
+                    let pkg_id = summary.package_id();
+                    let allow_precise = pkg_id
+                        .source_id()
+                        .precise_registry_version(pkg_id.name().as_str())
+                        .is_some_and(|(_, to)| to == pkg_id.version());
+                    if allow_precise || self.version_prefs.should_prefer(&pkg_id) {
+                        summaries.push(summary);
+                    }
+                }
+                _ => {}
             })
             .await?;
 
@@ -92,20 +118,21 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
                 .registry
                 .query_vec(dep, QueryKind::Exact)
                 .await?
-                .into_iter();
-            let s = summaries
-                .next()
-                .ok_or_else(|| {
-                    anyhow::format_err!(
-                        "no matching package for override `{}` found\n\
+                .into_iter()
+                .filter_map(|s| match s {
+                    IndexSummary::Candidate(s) => Some(s),
+                    _ => None,
+                });
+            let s = summaries.next().ok_or_else(|| {
+                anyhow::format_err!(
+                    "no matching package for override `{}` found\n\
                      location searched: {}\n\
                      version required: {}",
-                        spec,
-                        dep.source_id(),
-                        dep.version_req()
-                    )
-                })?
-                .into_summary();
+                    spec,
+                    dep.source_id(),
+                    dep.version_req()
+                )
+            })?;
             let summaries = summaries.collect::<Vec<_>>();
             if !summaries.is_empty() {
                 let bullets = summaries
@@ -213,6 +240,10 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
 
     pub fn registry(&self) -> &T {
         self.inner.registry
+    }
+
+    pub fn version_prefs(&self) -> &VersionPreferences {
+        self.inner.version_prefs
     }
 
     pub fn query(
