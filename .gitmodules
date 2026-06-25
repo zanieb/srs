@@ -46,11 +46,8 @@
 [submodule "cranelift/tests/spec_testsuite"]
 	path = cranelift/tests/spec_testsuite
 	url = https://github.com/WebAssembly/testsuite
-[submodule "cranelift/tests/wasi_testsuite/wasi-threads"]
-	path = cranelift/tests/wasi_testsuite/wasi-threads
-	url = https://github.com/WebAssembly/wasi-threads
-[submodule "cranelift/tests/wasi_testsuite/wasi-common"]
-	path = cranelift/tests/wasi_testsuite/wasi-common
+[submodule "cranelift/tests/wasi-testsuite"]
+	path = cranelift/tests/wasi-testsuite
 	url = https://github.com/WebAssembly/wasi-testsuite.git
 	branch = prod/testsuite-base
 [submodule "cranelift/tests/component-model"]
