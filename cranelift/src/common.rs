@@ -14,10 +14,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime::component::Component;
 
 /// Whether or not WASIp3 is enabled by default.
-///
-/// Currently this is disabled (the `&& false`), but that'll get removed in the
-/// future.
-pub const P3_DEFAULT: bool = cfg!(feature = "component-model-async") && false;
+pub const P3_DEFAULT: bool = cfg!(feature = "component-model-async");
 
 #[derive(Clone)]
 pub enum RunTarget {
@@ -354,6 +351,9 @@ impl RunCommon {
                 wasmtime_wasi::FilePerms::all(),
             )?;
         }
+        if let Some(cwd) = &self.common.wasi.cwd {
+            builder.initial_cwd(cwd);
+        }
 
         if self.common.wasi.listenfd == Some(true) {
             bail!("components do not support --listenfd");
@@ -461,14 +461,15 @@ impl RunCommon {
         T: wasmtime_wasi::WasiView,
     {
         let mut p2_options = wasmtime_wasi::p2::bindings::LinkOptions::default();
-        p2_options.cli_exit_with_code(self.common.wasi.cli_exit_with_code.unwrap_or(false));
+        if self.common.wasi.cli_exit_with_code == Some(false) {
+            eprintln!("warning: cannot disable `-Scli-exit-with-code` any more");
+        }
         p2_options.network_error_code(self.common.wasi.network_error_code.unwrap_or(false));
         wasmtime_wasi::p2::add_to_linker_with_options_async(linker, &p2_options)?;
 
         #[cfg(feature = "component-model-async")]
         if self.common.wasi.p3.unwrap_or(P3_DEFAULT) {
-            let mut p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
-            p3_options.cli_exit_with_code(self.common.wasi.cli_exit_with_code.unwrap_or(false));
+            let p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
             wasmtime_wasi::p3::add_to_linker_with_options(linker, &p3_options)
                 .context("failed to link `wasi:cli@0.3.x`")?;
         }

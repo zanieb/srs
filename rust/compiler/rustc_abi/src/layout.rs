@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Write};
 use std::ops::Deref;
+use std::range::RangeInclusive;
 use std::{cmp, iter};
 
 use rustc_hashes::Hash64;
@@ -631,11 +632,13 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             let all_indices = variants.indices();
             let needs_disc =
                 |index: VariantIdx| index != largest_variant_index && !absent(&variants[index]);
-            let niche_variants = all_indices.clone().find(|v| needs_disc(*v)).unwrap()
-                ..=all_indices.rev().find(|v| needs_disc(*v)).unwrap();
+            let niche_variants = RangeInclusive {
+                start: all_indices.clone().find(|v| needs_disc(*v)).unwrap(),
+                last: all_indices.rev().find(|v| needs_disc(*v)).unwrap(),
+            };
 
             let count =
-                (niche_variants.end().index() as u128 - niche_variants.start().index() as u128) + 1;
+                (niche_variants.last.index() as u128 - niche_variants.start.index() as u128) + 1;
 
             // Use the largest niche in the largest variant.
             let niche = variant_layouts[largest_variant_index].largest_niche?;
@@ -1495,19 +1498,21 @@ where
     // Compute the size and alignment of the vector
     let size =
         elt.size.checked_mul(count, dl).ok_or_else(|| LayoutCalculatorError::SizeOverflow)?;
-    let (repr, align) = match kind {
+    let (repr, size, align) = match kind {
         SimdVectorKind::Scalable(number_of_vectors) => (
             BackendRepr::SimdScalableVector { element, count, number_of_vectors },
+            size.checked_mul(number_of_vectors.0 as u64, dl)
+                .ok_or_else(|| LayoutCalculatorError::SizeOverflow)?,
             dl.llvmlike_vector_align(size),
         ),
         // Non-power-of-two vectors have padding up to the next power-of-two.
         // If we're a packed repr, remove the padding while keeping the alignment as close
         // to a vector as possible.
         SimdVectorKind::PackedFixed if !count.is_power_of_two() => {
-            (BackendRepr::Memory { sized: true }, Align::max_aligned_factor(size))
+            (BackendRepr::Memory { sized: true }, size, Align::max_aligned_factor(size))
         }
         SimdVectorKind::PackedFixed | SimdVectorKind::Fixed => {
-            (BackendRepr::SimdVector { element, count }, dl.llvmlike_vector_align(size))
+            (BackendRepr::SimdVector { element, count }, size, dl.llvmlike_vector_align(size))
         }
     };
     let size = size.align_to(align);

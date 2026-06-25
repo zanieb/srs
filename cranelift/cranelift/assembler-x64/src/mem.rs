@@ -102,7 +102,7 @@ impl From<i32> for AmodeOffset {
 }
 
 impl core::fmt::LowerHex for AmodeOffset {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // This rather complex implementation is necessary to match how
         // `capstone` pretty-prints memory immediates.
         if self.0 == 0 {
@@ -157,7 +157,7 @@ impl AmodeOffsetPlusKnownOffset {
 }
 
 impl core::fmt::LowerHex for AmodeOffsetPlusKnownOffset {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(offset) = self.offset {
             write!(f, "<offset:{offset}>+")?;
         }

@@ -40,6 +40,7 @@ pub fn find_tests(root: &Path) -> Result<Vec<WastTest>> {
         &spec_tests,
         &FindConfig::Infer(spec_test_config),
     )
+    .context("Do you need to `git submodule update --init`?")
     .with_context(|| format!("failed to add tests from `{}`", spec_tests.display()))?;
 
     let misc_tests = root.join("tests/misc_testsuite");
@@ -52,6 +53,7 @@ pub fn find_tests(root: &Path) -> Result<Vec<WastTest>> {
         &cm_tests,
         &FindConfig::Infer(component_test_config),
     )
+    .context("Do you need to `git submodule update --init`?")
     .with_context(|| format!("failed to add tests from `{}`", cm_tests.display()))?;
 
     // Temporarily work around upstream tests that fail in unexpected ways (e.g.
@@ -190,6 +192,7 @@ fn component_test_config(test: &Path) -> TestConfig {
     ret.spec_test = Some(true);
     ret.reference_types = Some(true);
     ret.multi_memory = Some(true);
+    ret.component_model_implements = Some(true);
 
     if let Some(parent) = test.parent() {
         if parent.ends_with("async")
@@ -273,6 +276,7 @@ macro_rules! foreach_config_option {
             tail_call
             extended_const
             wide_arithmetic
+            branch_hinting
             hogs_memory
             nan_canonicalization
             component_model_async
@@ -468,16 +472,9 @@ impl WastTest {
         }
 
         let unsupported = [
-            // These tests in the `component-model` submodule have not yet been
-            // updated to account for the recent threading-related intrinsic
-            // changes.
-            "test/async/trap-if-block-and-sync.wast",
             // Wasmtime doesn't expose the component-model `cm64` feature toggle
             // yet, so this parser-only test can't be enabled here.
             "test/wasm-tools/memory64.wast",
-            // Cancellable `thread.yield` semantics still diverge from the
-            // latest submodule expectation.
-            "test/async/cancellable.wast",
         ];
         if unsupported.iter().any(|part| self.path.ends_with(part)) {
             return true;
@@ -658,6 +655,7 @@ impl WastTest {
                         "misc_testsuite/winch/issue-10331.wast",
                         "misc_testsuite/winch/replace_lane.wast",
                         "misc_testsuite/simd/riscv64-replicated-imm5-works.wast",
+                        "misc_testsuite/simd/v128-equal.wast",
                         "spec_testsuite/simd_align.wast",
                         "spec_testsuite/simd_boolean.wast",
                         "spec_testsuite/simd_conversions.wast",

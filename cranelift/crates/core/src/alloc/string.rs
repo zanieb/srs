@@ -106,7 +106,7 @@ impl<'de> serde::de::Deserialize<'de> for TryString {
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = TryString;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a `wasmtime_core::alloc::String` str")
             }
 

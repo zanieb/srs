@@ -48,7 +48,7 @@ pub(crate) enum UnwindCode {
 }
 
 impl UnwindCode {
-    fn emit(&self, writer: &mut Writer) {
+    fn emit(&self, writer: &mut Writer<'_>) {
         enum UnwindOperation {
             PushNonvolatileRegister = 0,
             LargeStackAlloc = 1,

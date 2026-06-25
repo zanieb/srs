@@ -3,6 +3,8 @@ set unwind_info=false
 target aarch64 use_bti
 
 function %f1(i32) -> i32 {
+    region0 = 0 "table"
+
 block0(v0: i32):
     br_table v0, block4, [block1, block2, block3]
 
@@ -54,7 +56,7 @@ block5(v5: i32):
 ;
 ; Disassembled:
 ; block0: ; offset 0x0
-;   hint #0x22
+;   bti c
 ; block1: ; offset 0x4
 ;   cmp w0, #3
 ;   b.hs #0x50
@@ -63,19 +65,19 @@ block5(v5: i32):
 ;   ldrsw x11, [x10, w11, uxtw #2]
 ;   add x10, x10, x11
 ;   br x10
-;   .byte 0x24, 0x00, 0x00, 0x00
-;   .byte 0x18, 0x00, 0x00, 0x00
-;   .byte 0x0c, 0x00, 0x00, 0x00
+;   udf #0x24
+;   udf #0x18
+;   udf #0xc
 ; block2: ; offset 0x2c
-;   hint #0x24
+;   bti j
 ;   mov w5, #3
 ;   b #0x54
 ; block3: ; offset 0x38
-;   hint #0x24
+;   bti j
 ;   mov w5, #2
 ;   b #0x54
 ; block4: ; offset 0x44
-;   hint #0x24
+;   bti j
 ;   mov w5, #1
 ;   b #0x54
 ; block5: ; offset 0x50
@@ -85,9 +87,11 @@ block5(v5: i32):
 ;   ret
 
 function %f2(i64) -> i64 {
+    region0 = 0 "table"
+
 block0(v0: i64):
     v1 = ireduce.i32 v0
-    v2 = load.i64 notrap aligned table v0
+    v2 = load.i64 notrap aligned region0 v0
     br_table v1, block1, [block2]
 
 block1:
@@ -118,7 +122,7 @@ block2:
 ;
 ; Disassembled:
 ; block0: ; offset 0x0
-;   hint #0x22
+;   bti c
 ; block1: ; offset 0x4
 ;   ldr x5, [x0]
 ;   mov x8, x5
@@ -129,9 +133,9 @@ block2:
 ;   ldrsw x7, [x6, w7, uxtw #2]
 ;   add x6, x6, x7
 ;   br x6
-;   .byte 0x04, 0x00, 0x00, 0x00
+;   udf #4
 ; block2: ; offset 0x2c
-;   hint #0x24
+;   bti j
 ;   mov x0, x8
 ;   add x0, x0, #0x2a
 ;   ret
@@ -141,6 +145,8 @@ block2:
 
 function %f3(i64) -> i64 {
     fn0 = %g(i64) -> i64
+
+    region0 = 0 "table"
 
 block0(v0: i64):
     v1 = call fn0(v0)
@@ -159,14 +165,14 @@ block0(v0: i64):
 ;
 ; Disassembled:
 ; block0: ; offset 0x0
-;   hint #0x22
+;   bti c
 ;   stp x29, x30, [sp, #-0x10]!
 ;   mov x29, sp
 ; block1: ; offset 0xc
 ;   ldr x3, #0x14
 ;   b #0x1c
-;   .byte 0x00, 0x00, 0x00, 0x00 ; reloc_external Abs8 %g 0
-;   .byte 0x00, 0x00, 0x00, 0x00
+;   udf #0 ; reloc_external Abs8 %g 0
+;   udf #0
 ;   blr x3
 ;   ldp x29, x30, [sp], #0x10
 ;   ret

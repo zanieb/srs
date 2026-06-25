@@ -127,7 +127,7 @@ impl Value {
 }
 
 impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(enum_variant) = self.as_enum() {
             write!(f, "{}={}", self.name, enum_variant)
         } else if let Some(num) = self.as_num() {
@@ -293,7 +293,7 @@ pub enum SetError {
 impl core::error::Error for SetError {}
 
 impl fmt::Display for SetError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SetError::BadName(name) => write!(f, "No existing setting named '{name}'"),
             SetError::BadType => {
@@ -349,7 +349,7 @@ pub mod detail {
             &self,
             detail: Detail,
             byte: u8,
-            f: &mut fmt::Formatter,
+            f: &mut fmt::Formatter<'_>,
         ) -> fmt::Result {
             match detail {
                 Detail::Bool { bit } => write!(f, "{}", (byte & (1 << bit)) != 0),
@@ -513,6 +513,7 @@ enable_probestack = false
 enable_heap_access_spectre_mitigation = true
 enable_table_access_spectre_mitigation = true
 enable_incremental_compilation_cache_checks = false
+enable_compact_unwind_abi = false
 "#;
         if actual != expected {
             panic!(

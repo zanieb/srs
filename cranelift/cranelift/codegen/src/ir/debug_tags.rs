@@ -132,7 +132,7 @@ impl DebugTags {
 }
 
 impl core::fmt::Display for DebugTag {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DebugTag::User(value) => write!(f, "{value}"),
             DebugTag::StackSlot(slot) => write!(f, "{slot}"),

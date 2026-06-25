@@ -7,13 +7,13 @@ pub static LOG_FILENAME_PREFIX: &str = "cranelift.dbg.";
 /// Helper for printing lists.
 pub struct DisplayList<'a, T>(pub &'a [T])
 where
-    T: 'a + fmt::Display;
+    T: fmt::Display;
 
 impl<'a, T> fmt::Display for DisplayList<'a, T>
 where
     T: 'a + fmt::Display,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0.split_first() {
             None => write!(f, "[]"),
             Some((first, rest)) => {

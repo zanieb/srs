@@ -116,7 +116,7 @@ impl Inst {
 }
 
 impl core::fmt::Display for Inst {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Inst {
             mnemonic: name,
             format,
@@ -161,7 +161,7 @@ pub struct Alternate {
 }
 
 impl core::fmt::Display for Alternate {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{} => {}", self.feature, self.name)
     }
 }

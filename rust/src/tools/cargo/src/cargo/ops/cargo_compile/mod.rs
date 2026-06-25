@@ -143,9 +143,13 @@ pub fn compile_with_exec<'a>(
     options: &CompileOptions,
     exec: &Arc<dyn Executor>,
 ) -> CargoResult<Compilation<'a>> {
-    ws.emit_warnings()?;
+    let parse_pass_output = crate::diagnostics::passes::emit_parse_diagnostics(
+        ws,
+        crate::diagnostics::rules::PARSE_PASS_RULES,
+    )?;
     let compilation = compile_ws(ws, options, exec)?;
-    if ws.gctx().warning_handling()? == WarningHandling::Deny && compilation.lint_warning_count > 0
+    if ws.gctx().warning_handling()? == WarningHandling::Deny
+        && (compilation.lint_warning_count + parse_pass_output.lint_warning_count) > 0
     {
         anyhow::bail!("warnings are denied by `build.warnings` configuration")
     }
@@ -154,7 +158,7 @@ pub fn compile_with_exec<'a>(
 
 /// Like [`compile_with_exec`] but without warnings from manifest parsing.
 #[tracing::instrument(skip_all)]
-pub fn compile_ws<'a>(
+fn compile_ws<'a>(
     ws: &Workspace<'a>,
     options: &CompileOptions,
     exec: &Arc<dyn Executor>,
@@ -309,7 +313,7 @@ pub fn create_bcx<'a, 'gctx>(
     let dry_run = false;
 
     if let Some(logger) = logger {
-        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
+        let elapsed = ws.gctx().invocation_instant().elapsed().as_secs_f64();
         logger.log(LogMessage::ResolutionStarted { elapsed });
     }
 
@@ -331,7 +335,7 @@ pub fn create_bcx<'a, 'gctx>(
     } = resolve;
 
     if let Some(logger) = logger {
-        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
+        let elapsed = ws.gctx().invocation_instant().elapsed().as_secs_f64();
         logger.log(LogMessage::ResolutionFinished { elapsed });
     }
 
@@ -419,7 +423,7 @@ pub fn create_bcx<'a, 'gctx>(
     let mut scrape_units = Vec::new();
 
     if let Some(logger) = logger {
-        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
+        let elapsed = ws.gctx().invocation_instant().elapsed().as_secs_f64();
         logger.log(LogMessage::UnitGraphStarted { elapsed });
     }
 
@@ -568,7 +572,7 @@ pub fn create_bcx<'a, 'gctx>(
                 dependencies,
             });
         }
-        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
+        let elapsed = ws.gctx().invocation_instant().elapsed().as_secs_f64();
         logger.log(LogMessage::UnitGraphFinished { elapsed });
     }
 

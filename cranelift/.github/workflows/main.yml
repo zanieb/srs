@@ -423,6 +423,8 @@ jobs:
               -p wasmtime-wasi-http --no-default-features
               -p wasmtime-wasi-http --no-default-features --features p2
               -p wasmtime-wasi-http --no-default-features --features p3
+              -p wasmtime-wasi-http --no-default-features --features p2,component-model-async
+              -p wasmtime-wasi-http --no-default-features --features p3,component-model-async
               -p wasmtime-wasi-http --no-default-features --features p3 --all-targets
 
           - name: wasmtime-wasi
@@ -450,6 +452,14 @@ jobs:
               -p wasmtime-wizer --no-default-features --features component-model
               -p wasmtime-wizer --no-default-features --features rayon
               -p wasmtime-wizer --no-default-features --all-features
+
+          - name: wasmtime-cli-flags
+            checks: |
+              -p wasmtime-cli-flags --no-default-features
+              -p wasmtime-cli-flags --no-default-features --features serde
+              -p wasmtime-cli-flags --no-default-features --features clap
+              -p wasmtime-cli-flags --no-default-features --features toml
+              -p wasmtime-cli-flags --no-default-features --all-features
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
@@ -521,7 +531,7 @@ jobs:
           --exclude wasmtime-wasi-tls \
           --exclude wasmtime-fuzzing \
           --exclude wasm-spec-interpreter \
-          --exclude veri_engine \
+          --exclude cranelift-isle-veri \
           --exclude calculator \
           --exclude wasi-preview1-component-adapter
 
@@ -602,10 +612,10 @@ jobs:
           os: ubuntu-latest
           test: >
             cargo check -p wasmtime --no-default-features --features runtime,component-model &&
-            cargo check -p wasmtime --no-default-features --features runtime,gc,component-model,pulley,async,debug,debug-builtins,demangle,anyhow &&
+            cargo check -p wasmtime --no-default-features --features runtime,gc,component-model-async,pulley,debug,debug-builtins,demangle,anyhow &&
             cargo check -p cranelift-control --no-default-features &&
             cargo check -p cranelift-assembler-x64 --lib &&
-            cargo check -p cranelift-codegen --no-default-features --features x86,arm64 &&
+            cargo check -p cranelift-codegen --no-default-features --features x86,arm64,riscv64 &&
             cargo check -p cranelift-frontend --no-default-features &&
             cargo check -p pulley-interpreter --features encode,decode,disas,interp &&
             cargo check -p wasmtime-wasi-io --no-default-features
@@ -638,6 +648,13 @@ jobs:
         - target: riscv32imac-unknown-none-elf
           os: ubuntu-latest
           test: cargo check -p wasmtime --no-default-features --features runtime,gc,component-model,async
+        - target: loongarch64-unknown-linux-gnu
+          os: ubuntu-latest
+          test: cargo build
+          apt_packages: gcc-14-loongarch64-linux-gnu
+          env:
+            CC_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-gcc-14
+            CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER: loongarch64-linux-gnu-gcc-14
     env: ${{ matrix.env || fromJSON('{}') }}
     steps:
     - uses: actions/checkout@v6
@@ -708,8 +725,6 @@ jobs:
     - uses: ./.github/actions/apt-get-install
       with:
         packages: ocaml-nox ocamlbuild ocaml-findlib libzarith-ocaml-dev
-    - run: cargo fetch
-      working-directory: ./fuzz
     - run: cargo fuzz check --dev
     - run: cargo fuzz check --dev --fuzz-dir ./cranelift/isle/fuzz
     - run: cargo fuzz check --dev --fuzz-dir ./crates/environ/fuzz --features component-model
@@ -840,8 +855,6 @@ jobs:
     - shell: pwsh
       run: echo "C:\msys64\mingw64\bin" >> $Env:GITHUB_PATH
       if: matrix.target == 'x86_64-pc-windows-gnu'
-
-    - run: cargo fetch --locked
 
     - uses: ./.github/actions/apt-get-install
       name: Install cross-compilation tools
@@ -1287,7 +1300,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - crate: "wasmtime --features component-model-async-bytes"
+          - crate: "wasmtime --features component-model-bytes,component-model-async"
           - crate: "wasmtime-cli"
           - crate: "wasmtime-environ --all-features"
           - crate: "pulley-interpreter --all-features"
@@ -1295,6 +1308,9 @@ jobs:
           - crate: "wasmtime-internal-core --all-features"
           - script: ./ci/miri-provenance-test.sh
           - script: ./ci/miri-wast.sh ./tests/spec_testsuite/table.wast
+          - script: "./ci/miri-wast.sh ./tests/spec_testsuite/struct.wast -Ccollector=null"
+          - script: "./ci/miri-wast.sh ./tests/spec_testsuite/struct.wast -Ccollector=copying"
+          - script: "./ci/miri-wast.sh ./tests/spec_testsuite/struct.wast -Ccollector=drc"
     needs: determine
     if: needs.determine.outputs.test-miri && github.repository == 'bytecodealliance/wasmtime'
     name: Miri

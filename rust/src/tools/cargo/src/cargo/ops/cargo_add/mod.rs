@@ -30,7 +30,9 @@ use crate::core::Summary;
 use crate::core::Workspace;
 use crate::core::dependency::DepKind;
 use crate::core::registry::PackageRegistry;
+use crate::core::resolver::PublishAgePolicy;
 use crate::ops::resolve_ws;
+use crate::sources::IndexSummary;
 use crate::sources::source::QueryKind;
 use crate::util::OptVersionReq;
 use crate::util::cache_lock::CacheLockMode;
@@ -277,6 +279,8 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
             table.sort_values();
         }
     }
+
+    manifest.ensure_edition();
 
     if let Some(locked_flag) = options.gctx.locked_flag() {
         let new_raw_manifest = manifest.to_string();
@@ -836,8 +840,42 @@ fn get_latest_dependency(
 
             let mut possibilities: Vec<_> = possibilities
                 .into_iter()
-                .map(|s| s.into_summary())
+                .filter_map(|s| match s {
+                    IndexSummary::Candidate(s) => Some(s),
+                    _ => None,
+                })
                 .collect();
+            let has_candidates = !possibilities.is_empty();
+
+            // `cargo add` selects a version outside the resolver,
+            // so the `min-publish-age` policy must be applied here too.
+            let publish_age = PublishAgePolicy::new(gctx)?;
+            if let Some(publish_age) = &publish_age {
+                let mut too_new = Vec::new();
+                possibilities.retain(|s| match publish_age.too_new(s) {
+                    Some(violation) => {
+                        too_new.push((s.version().clone(), violation));
+                        false
+                    }
+                    None => true,
+                });
+                if possibilities.is_empty() && has_candidates {
+                    too_new.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    let mut msg = format!(
+                        "all versions of crate `{dependency}` are too new per `min-publish-age`"
+                    );
+                    for (version, violation) in &too_new {
+                        let note = violation.note();
+                        let _ = write!(&mut msg, "\n  version {version} is too new ({note})",);
+                    }
+                    let _ = write!(
+                        &mut msg,
+                        "\nhelp: to add the latest version anyways, \
+                         re-run with `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow`"
+                    );
+                    anyhow::bail!(msg);
+                }
+            }
 
             possibilities.sort_by_key(|s| {
                 // Fallback to a pre-release if no official release is available by sorting them as
@@ -962,7 +1000,10 @@ fn select_package(
 
             let possibilities: Vec<_> = possibilities
                 .into_iter()
-                .map(|s| s.into_summary())
+                .filter_map(|s| match s {
+                    IndexSummary::Candidate(s) => Some(s),
+                    _ => None,
+                })
                 .collect();
 
             match possibilities.len() {
@@ -1189,7 +1230,10 @@ fn populate_available_features(
     // in the lock file for a given version requirement.
     let lowest_common_denominator = possibilities
         .iter()
-        .map(|s| s.as_summary())
+        .filter_map(|s| match s {
+            IndexSummary::Candidate(s) => Some(s),
+            _ => None,
+        })
         .min_by_key(|s| {
             // Fallback to a pre-release if no official release is available by sorting them as
             // more.

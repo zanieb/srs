@@ -45,7 +45,7 @@ fn codegen_field<'tcx>(
             // Bump the unaligned offset up to the appropriate alignment
             let one = fx.bcx.ins().iconst(fx.pointer_type, 1);
             let align_sub_1 = fx.bcx.ins().isub(unsized_align, one);
-            let and_lhs = fx.bcx.ins().iadd_imm(align_sub_1, unaligned_offset as i64);
+            let and_lhs = fx.bcx.ins().iadd_imm_s(align_sub_1, unaligned_offset as i64);
             let zero = fx.bcx.ins().iconst(fx.pointer_type, 0);
             let and_rhs = fx.bcx.ins().isub(zero, unsized_align);
             let offset = fx.bcx.ins().band(and_lhs, and_rhs);
@@ -275,7 +275,8 @@ impl<'tcx> CValue<'tcx> {
             CValueInner::ByVal(_) | CValueInner::ByValPair(_, _) => unreachable!(),
             CValueInner::ByRef(ptr, None) => {
                 let lane_idx = clif_intcast(fx, lane_idx, fx.pointer_type, false);
-                let field_offset = fx.bcx.ins().imul_imm(lane_idx, lane_layout.size.bytes() as i64);
+                let field_offset =
+                    fx.bcx.ins().imul_imm_s(lane_idx, lane_layout.size.bytes() as i64);
                 let field_ptr = ptr.offset_value(fx, field_offset);
                 CValue::by_ref(field_ptr, lane_layout)
             }
@@ -686,17 +687,14 @@ impl<'tcx> CPlace<'tcx> {
     ) -> CPlace<'tcx> {
         let layout = self.layout();
 
-        match self.inner {
-            CPlaceInner::VarPair(local, var1, var2) => {
-                let layout = layout.field(&*fx, field.index());
+        if let CPlaceInner::VarPair(local, var1, var2) = self.inner {
+            let layout = layout.field(&*fx, field.index());
 
-                match field.as_u32() {
-                    0 => return CPlace { inner: CPlaceInner::Var(local, var1), layout },
-                    1 => return CPlace { inner: CPlaceInner::Var(local, var2), layout },
-                    _ => unreachable!("field should be 0 or 1"),
-                }
+            match field.as_u32() {
+                0 => return CPlace { inner: CPlaceInner::Var(local, var1), layout },
+                1 => return CPlace { inner: CPlaceInner::Var(local, var2), layout },
+                _ => unreachable!("field should be 0 or 1"),
             }
-            _ => {}
         }
 
         let (base, extra) = match self.inner {
@@ -788,7 +786,7 @@ impl<'tcx> CPlace<'tcx> {
                 let field_offset = fx
                     .bcx
                     .ins()
-                    .imul_imm(lane_idx, i64::try_from(lane_layout.size.bytes()).unwrap());
+                    .imul_imm_s(lane_idx, i64::try_from(lane_layout.size.bytes()).unwrap());
                 let field_ptr = ptr.offset_value(fx, field_offset);
                 CPlace::for_ptr(field_ptr, lane_layout).write_cvalue(fx, value);
             }
@@ -815,7 +813,7 @@ impl<'tcx> CPlace<'tcx> {
             _ => bug!("place_index({:?})", self.layout().ty),
         };
 
-        let offset = fx.bcx.ins().imul_imm(index, elem_layout.size.bytes() as i64);
+        let offset = fx.bcx.ins().imul_imm_s(index, elem_layout.size.bytes() as i64);
 
         CPlace::for_ptr(ptr.offset_value(fx, offset), elem_layout)
     }

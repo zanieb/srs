@@ -19,13 +19,14 @@ authors = []
 foo_bar = []
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_features = "warn"
             "#,
         )
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("check -Zcargo-lints")
+    foo.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
         .with_stderr_data(str![[r#"
 [WARNING] features should have a kebab-case name
@@ -41,8 +42,6 @@ non_kebab_case_features = "warn"
 9 + foo-bar = []
   |
 [WARNING] `foo` (manifest) generated 1 warning
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -66,13 +65,14 @@ authors = []
 foo_bar = { version = "0.0.1", optional = true }
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 non_kebab_case_features = "warn"
             "#,
         )
         .file("src/lib.rs", "")
         .build();
 
-    foo.cargo("check -Zcargo-lints")
+    foo.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints", "test-dummy-unstable"])
         .with_stderr_data(str![[r#"
 [WARNING] features should have a kebab-case name
@@ -86,8 +86,8 @@ non_kebab_case_features = "warn"
 [WARNING] `foo` (manifest) generated 1 warning
 [UPDATING] `dummy-registry` index
 [LOCKING] 1 package to latest compatible version
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[DOWNLOADING] crates ...
+...
 
 "#]])
         .run();

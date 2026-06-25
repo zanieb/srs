@@ -1122,9 +1122,9 @@ fn custom_build_script_rustc_flags() {
 [COMPILING] foo v0.5.0 ([ROOT]/foo/foo)
 [RUNNING] `rustc --crate-name build_script_build --edition=2015 foo/build.rs [..]`
 [RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
-[RUNNING] `rustc --crate-name foo --edition=2015 foo/src/lib.rs [..]-L dependency=[ROOT]/foo/target/debug/deps -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2 -l nonexistinglib`
+[RUNNING] `rustc --crate-name foo --edition=2015 foo/src/lib.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --verbose -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2 -l nonexistinglib`
 [COMPILING] bar v0.5.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name bar --edition=2015 src/main.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --extern foo=[ROOT]/foo/target/debug/deps/libfoo-[HASH].rlib -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2`
+[RUNNING] `rustc --crate-name bar --edition=2015 src/main.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --extern foo=[ROOT]/foo/target/debug/deps/libfoo-[HASH].rlib --verbose -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]]).run();
@@ -1181,9 +1181,9 @@ fn custom_build_script_rustc_flags_no_space() {
 [COMPILING] foo v0.5.0 ([ROOT]/foo/foo)
 [RUNNING] `rustc --crate-name build_script_build --edition=2015 foo/build.rs [..]`
 [RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
-[RUNNING] `rustc --crate-name foo --edition=2015 foo/src/lib.rs [..]-L dependency=[ROOT]/foo/target/debug/deps -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2 -l nonexistinglib`
+[RUNNING] `rustc --crate-name foo --edition=2015 foo/src/lib.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --verbose -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2 -l nonexistinglib`
 [COMPILING] bar v0.5.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name bar --edition=2015 src/main.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --extern foo=[ROOT]/foo/target/debug/deps/libfoo-[HASH].rlib -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2`
+[RUNNING] `rustc --crate-name bar --edition=2015 src/main.rs [..]-L dependency=[ROOT]/foo/target/debug/deps --extern foo=[ROOT]/foo/target/debug/deps/libfoo-[HASH].rlib --verbose -L [ROOT]/foo/dummy-path1 -L [ROOT]/foo/dummy-path2`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]]).run();
@@ -2374,7 +2374,7 @@ fn build_deps_simple() {
 [COMPILING] a v0.5.0 ([ROOT]/foo/a)
 [RUNNING] `rustc --crate-name a [..]`
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name build_script_build [..] build.rs [..] --extern a=[ROOT]/foo/target/debug/deps/liba-[HASH].rlib`
+[RUNNING] `rustc --crate-name build_script_build [..] build.rs [..] --extern a=[ROOT]/foo/target/debug/deps/liba-[HASH].rlib[..]`
 [RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
 [RUNNING] `rustc --crate-name foo [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -2487,13 +2487,13 @@ fn build_cmd_with_a_build_cmd() {
 [COMPILING] b v0.5.0 ([ROOT]/foo/b)
 [RUNNING] `rustc --crate-name b [..]`
 [COMPILING] a v0.5.0 ([ROOT]/foo/a)
-[RUNNING] `rustc --crate-name build_script_build [..] a/build.rs [..] --extern b=[ROOT]/foo/target/debug/deps/libb-[HASH].rlib`
+[RUNNING] `rustc --crate-name build_script_build [..] a/build.rs [..] --extern b=[ROOT]/foo/target/debug/deps/libb-[HASH].rlib[..]`
 [RUNNING] `[ROOT]/foo/target/debug/build/a-[HASH]/build-script-build`
-[RUNNING] `rustc --crate-name a [..]a/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps`
+[RUNNING] `rustc --crate-name a [..]a/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps[..]`
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name build_script_build --edition=2015 build.rs [..]--crate-type bin --emit=[..]link[..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/build/foo-[HASH] -L dependency=[ROOT]/foo/target/debug/deps --extern a=[ROOT]/foo/target/debug/deps/liba-[HASH].rlib`
+[RUNNING] `rustc --crate-name build_script_build --edition=2015 build.rs [..]--crate-type bin --emit=[..]link[..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/build/foo-[HASH] -L dependency=[ROOT]/foo/target/debug/deps --extern a=[ROOT]/foo/target/debug/deps/liba-[HASH].rlib[..]`
 [RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
-[RUNNING] `rustc --crate-name foo [..]src/lib.rs [..]--crate-type lib --emit=[..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps`
+[RUNNING] `rustc --crate-name foo [..]src/lib.rs [..]--crate-type lib --emit=[..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]]).run();
@@ -6811,4 +6811,62 @@ fn linker_search_path_preference() {
 [RUNNING] `rustc --crate-name foo [..] -L [ROOT]/foo/target/debug/build/foo-[HASH]/out/libs2 -L [ROOT]/foo/target/debug/build/foo-[HASH]/out/libs1 -L [ROOT]/foo/target/debug/build/a-[HASH]/out/libsA.2 -L [ROOT]/foo/target/debug/build/a-[HASH]/out/libsA.1 -L [ROOT]/foo/target/debug/build/b-[HASH]/out/libsB.1 -L [ROOT]/foo/target/debug/build/b-[HASH]/out/libsB.2 -L /usr/lib -L /lib -L /usr/lib3 -L /lib3 -L /usr/lib2 -L /lib2`
 ...
 "#]]).run();
+}
+
+#[cargo_test]
+fn target_runner_does_not_apply_to_build_script_with_host_config() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [target.'cfg(r#true)']
+                runner = "nonexistent-target-runner"
+                "#,
+            ),
+        )
+        .file("build.rs", "fn main() {}")
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("build -Z target-applies-to-host --verbose -Z host-config")
+        .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name build_script_build [..]`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [..]
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn target_linker_does_not_apply_to_build_script_with_host_config() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [target.'cfg(r#true)']
+                linker = "nonexistent-host-linker"
+                "#,
+            ),
+        )
+        .file("build.rs", "fn main() {}")
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("build -Z target-applies-to-host --verbose -Z host-config")
+        .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name build_script_build [..]`
+[RUNNING] `[ROOT]/foo/target/debug/build/foo-[HASH]/build-script-build`
+[RUNNING] `rustc --crate-name foo [..]`
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [..]
+
+"#]])
+        .run();
 }

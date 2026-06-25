@@ -3,7 +3,6 @@ use std::path::Path;
 
 use cargo_platform::Platform;
 use cargo_util_schemas::manifest::TomlDependency;
-use cargo_util_schemas::manifest::TomlToolLints;
 use cargo_util_terminal::report::AnnotationKind;
 use cargo_util_terminal::report::Group;
 use cargo_util_terminal::report::Level;
@@ -20,12 +19,13 @@ use crate::core::Manifest;
 use crate::core::MaybePackage;
 use crate::core::Package;
 use crate::core::Workspace;
-use crate::diagnostics::DiagnosticStats;
 use crate::diagnostics::Lint;
 use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelProduct;
 use crate::diagnostics::LintLevelSource;
+use crate::diagnostics::ScopedDiagnosticStats;
 use crate::diagnostics::get_key_value;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::workspace_rel_path;
 use crate::util::OptVersionReq;
 
 pub static LINT: &Lint = &Lint {
@@ -85,24 +85,20 @@ serde = "1.0.219"
 };
 
 #[instrument(skip_all)]
-pub fn implicit_minimum_version_req_pkg(
+pub(crate) fn lint_package(
+    ws: &Workspace<'_>,
     pkg: &Package,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = LINT.level(
-        cargo_lints,
-        pkg.rust_version(),
-        pkg.manifest().unstable_features(),
-    );
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
-
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+    let manifest_path = workspace_rel_path(ws, manifest_path);
 
     let manifest = pkg.manifest();
 
@@ -142,7 +138,7 @@ pub fn implicit_minimum_version_req_pkg(
             emit_source = false;
         }
 
-        stats.record_lint(lint_level);
+        pkg_stats.record_lint(lint_level);
         gctx.shell().print_report(&report, lint_level.force())?;
     }
 
@@ -150,25 +146,20 @@ pub fn implicit_minimum_version_req_pkg(
 }
 
 #[instrument(skip_all)]
-pub fn implicit_minimum_version_req_ws(
+pub(crate) fn lint_workspace(
     ws: &Workspace<'_>,
     maybe_pkg: &MaybePackage,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = LINT.level(
-        cargo_lints,
-        ws.lowest_rust_version(),
-        maybe_pkg.unstable_features(),
-    );
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
-
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+    let manifest_path = workspace_rel_path(ws, manifest_path);
 
     let document = maybe_pkg.document();
     let contents = maybe_pkg.contents();
@@ -224,14 +215,14 @@ pub fn implicit_minimum_version_req_ws(
             emit_source = false;
         }
 
-        stats.record_lint(lint_level);
+        pkg_stats.record_lint(lint_level);
         gctx.shell().print_report(&report, lint_level.force())?;
     }
 
     Ok(())
 }
 
-pub fn span_of_version_req<'doc>(
+pub(crate) fn span_of_version_req<'doc>(
     document: &'doc toml::Spanned<toml::de::DeTable<'static>>,
     path: &[&str],
 ) -> Option<std::ops::Range<usize>> {

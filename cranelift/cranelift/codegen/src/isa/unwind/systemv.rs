@@ -26,7 +26,7 @@ pub enum RegisterMappingError {
 impl core::error::Error for RegisterMappingError {}
 
 impl core::fmt::Display for RegisterMappingError {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RegisterMappingError::MissingBank => write!(f, "unable to find bank for register info"),
             RegisterMappingError::UnsupportedArchitecture => write!(

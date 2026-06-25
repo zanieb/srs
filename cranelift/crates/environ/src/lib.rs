@@ -11,7 +11,7 @@
 #![warn(clippy::cast_sign_loss)]
 #![no_std]
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 #[macro_use]
 extern crate std;
 extern crate alloc;
@@ -24,6 +24,7 @@ mod address_map;
 mod frame_table;
 #[macro_use]
 mod builtin;
+pub mod bytes;
 mod demangling;
 mod ext;
 mod gc;

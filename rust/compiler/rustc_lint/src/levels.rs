@@ -31,7 +31,7 @@ use tracing::{debug, instrument};
 
 use crate::builtin::MISSING_DOCS;
 use crate::context::{CheckLintNameResult, LintStore};
-use crate::errors::{
+use crate::diagnostics::{
     CheckNameUnknownTool, MalformedAttribute, MalformedAttributeSub, OverruledAttribute,
     OverruledAttributeSub, RequestedLevel, UnknownToolInScopedLint, UnsupportedGroup,
 };
@@ -114,11 +114,11 @@ impl LintLevelSets {
     }
 }
 
-fn lints_that_dont_need_to_run(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
+fn skippable_lints(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
     let store = unerased_lint_store(&tcx.sess);
     let root_map = tcx.shallow_lint_levels_on(hir::CRATE_OWNER_ID);
 
-    let mut dont_need_to_run: FxHashSet<LintId> = store
+    let mut skippable: FxHashSet<LintId> = store
         .get_lints()
         .into_iter()
         .filter(|lint| {
@@ -145,13 +145,13 @@ fn lints_that_dont_need_to_run(tcx: TyCtxt<'_>, (): ()) -> UnordSet<LintId> {
         for (_, specs) in map.specs.iter() {
             for (lint, level_spec) in specs.iter() {
                 if !level_spec.is_allow() {
-                    dont_need_to_run.remove(lint);
+                    skippable.remove(lint);
                 }
             }
         }
     }
 
-    dont_need_to_run.into()
+    skippable.into()
 }
 
 #[instrument(level = "trace", skip(tcx), ret)]
@@ -233,7 +233,7 @@ pub trait LintLevelsProvider {
         &self,
         attr_id: AttrId,
         attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId;
 }
 
@@ -258,7 +258,7 @@ impl LintLevelsProvider for TopDown {
         &self,
         attr_id: AttrId,
         _attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId {
         UnstableLintExpectationId { attr_id, lint_index }
     }
@@ -296,7 +296,7 @@ impl LintLevelsProvider for LintLevelQueryMap<'_> {
         &self,
         _attr_id: AttrId,
         attr_index: usize,
-        lint_index: Option<u16>,
+        lint_index: u16,
     ) -> Self::LintExpectationId {
         let attr_index = attr_index.try_into().unwrap();
         StableLintExpectationId { hir_id: self.cur, attr_index, lint_index }
@@ -740,11 +740,7 @@ where
                 // `Expect` is the only lint level with a `LintExpectationId` that can be created
                 // from an attribute.
                 let lint_id = (level == Level::Expect).then(|| {
-                    self.provider.mk_lint_expectation_id(
-                        attr.id(),
-                        attr_index,
-                        Some(lint_index as u16),
-                    )
+                    self.provider.mk_lint_expectation_id(attr.id(), attr_index, lint_index as u16)
                 });
 
                 let sp = li.span();
@@ -1039,7 +1035,7 @@ where
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { shallow_lint_levels_on, lints_that_dont_need_to_run, ..*providers };
+    *providers = Providers { shallow_lint_levels_on, skippable_lints, ..*providers };
 }
 
 pub(crate) fn parse_lint_and_tool_name(lint_name: &str) -> (Option<Symbol>, &str) {

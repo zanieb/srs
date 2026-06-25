@@ -42,7 +42,7 @@ impl Default for SourceLoc {
 }
 
 impl fmt::Display for SourceLoc {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_default() {
             write!(f, "@-")
         } else {
@@ -93,7 +93,7 @@ impl Default for RelSourceLoc {
 }
 
 impl fmt::Display for RelSourceLoc {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_default() {
             write!(f, "@-")
         } else {

@@ -97,9 +97,9 @@ impl CallConv {
         match self {
             CallConv::Tail
             | CallConv::SystemV
-            | CallConv::AppleAarch64
             | CallConv::Winch
-            | CallConv::PreserveAll => true,
+            | CallConv::PreserveAll
+            | CallConv::AppleAarch64 => true,
             _ => false,
         }
     }
@@ -117,7 +117,7 @@ impl CallConv {
     /// destinations as this return value.
     pub fn exception_payload_types(&self, pointer_ty: Type) -> &[Type] {
         match self {
-            CallConv::Tail | CallConv::SystemV | CallConv::AppleAarch64 | CallConv::PreserveAll => {
+            CallConv::Tail | CallConv::SystemV | CallConv::PreserveAll | CallConv::AppleAarch64 => {
                 match pointer_ty {
                     types::I32 => &[types::I32, types::I32],
                     types::I64 => &[types::I64, types::I64],
@@ -130,7 +130,7 @@ impl CallConv {
 }
 
 impl fmt::Display for CallConv {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match *self {
             Self::Fast => "fast",
             Self::Tail => "tail",

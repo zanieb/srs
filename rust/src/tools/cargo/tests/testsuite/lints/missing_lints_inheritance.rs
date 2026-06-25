@@ -25,13 +25,9 @@ edition = "2015"
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }
 
@@ -45,6 +41,7 @@ fn ws_lints() {
 members = ["bar"]
 
 [workspace.lints.cargo]
+default = { level = "allow", priority = -1 }
 missing_lints_inheritance = "warn"
 "#,
         )
@@ -61,7 +58,7 @@ edition = "2015"
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] missing `[lints]` to inherit `[workspace.lints]`
@@ -79,8 +76,6 @@ edition = "2015"
 6 + [lints]
   |
 [WARNING] `bar` (manifest) generated 1 warning
-[CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -96,6 +91,7 @@ fn empty_pkg_lints() {
 members = ["bar"]
 
 [workspace.lints.cargo]
+default = { level = "allow", priority = -1 }
 missing_lints_inheritance = "warn"
 "#,
         )
@@ -114,13 +110,9 @@ edition = "2015"
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }
 
@@ -134,6 +126,7 @@ fn inherit_lints() {
 members = ["bar"]
 
 [workspace.lints.cargo]
+default = { level = "allow", priority = -1 }
 missing_lints_inheritance = "warn"
 "#,
         )
@@ -153,12 +146,8 @@ workspace = true
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] bar v0.0.1 ([ROOT]/foo/bar)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }

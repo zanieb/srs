@@ -119,7 +119,7 @@ pub(crate) fn codegen_fn<'tcx>(
 
     tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));
     fx.bcx.seal_all_blocks();
-    fx.bcx.finalize();
+    fx.bcx.finalize(fx.target_config);
 
     // Recover all necessary data from fx, before accessing func will prevent future access to it.
     let symbol_name = fx.symbol_name;
@@ -147,7 +147,7 @@ pub(crate) fn codegen_fn<'tcx>(
 }
 
 pub(crate) fn compile_fn(
-    profiler: &SelfProfilerRef,
+    prof: &SelfProfilerRef,
     output_filenames: &OutputFilenames,
     should_write_ir: bool,
     cached_context: &mut Context,
@@ -156,8 +156,7 @@ pub(crate) fn compile_fn(
     global_asm: &mut String,
     codegened_func: CodegenedFunction,
 ) {
-    let _timer =
-        profiler.generic_activity_with_arg("compile function", &*codegened_func.symbol_name);
+    let _timer = prof.generic_activity_with_arg("compile function", &*codegened_func.symbol_name);
 
     let clif_comments = codegened_func.clif_comments;
     global_asm.push_str(&codegened_func.inline_asm);
@@ -196,7 +195,7 @@ pub(crate) fn compile_fn(
     };
 
     // Define function
-    profiler.generic_activity("define function").run(|| {
+    prof.generic_activity("define function").run(|| {
         context.want_disasm = should_write_ir;
         match module.define_function(codegened_func.func_id, context) {
             Ok(()) => {}
@@ -248,7 +247,7 @@ pub(crate) fn compile_fn(
     }
 
     // Define debuginfo for function
-    profiler.generic_activity("generate debug info").run(|| {
+    prof.generic_activity("generate debug info").run(|| {
         if let Some(debug_context) = debug_context {
             codegened_func.func_debug_cx.unwrap().finalize(
                 debug_context,
@@ -582,9 +581,9 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
             | TerminatorKind::CoroutineDrop => {
                 bug!("shouldn't exist at codegen {:?}", bb_data.terminator());
             }
-            TerminatorKind::Drop { place, target, unwind, replace: _, drop, async_fut } => {
+            TerminatorKind::Drop { place, target, unwind, replace: _, drop } => {
                 assert!(
-                    async_fut.is_none() && drop.is_none(),
+                    drop.is_none(),
                     "Async Drop must be expanded or reset to sync before codegen"
                 );
                 let drop_place = codegen_place(fx, *place);
@@ -657,7 +656,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                             let val = operand.load_scalar(fx);
                             match layout.ty.kind() {
                                 ty::Bool => {
-                                    let res = fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0);
+                                    let res = fx.bcx.ins().icmp_imm_s(IntCC::Equal, val, 0);
                                     CValue::by_val(res, layout)
                                 }
                                 ty::Uint(_) | ty::Int(_) => {
@@ -845,13 +844,13 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                         fx.bcx.ins().jump(loop_block, &[zero.into()]);
 
                         fx.bcx.switch_to_block(loop_block);
-                        let done = fx.bcx.ins().icmp_imm(IntCC::Equal, index, times as i64);
+                        let done = fx.bcx.ins().icmp_imm_s(IntCC::Equal, index, times as i64);
                         fx.bcx.ins().brif(done, done_block, &[], loop_block2, &[]);
 
                         fx.bcx.switch_to_block(loop_block2);
                         let to = lval.place_index(fx, index);
                         to.write_cvalue(fx, operand);
-                        let index = fx.bcx.ins().iadd_imm(index, 1);
+                        let index = fx.bcx.ins().iadd_imm_s(index, 1);
                         fx.bcx.ins().jump(loop_block, &[index.into()]);
 
                         fx.bcx.switch_to_block(done_block);
@@ -943,7 +942,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                 let count = codegen_operand(fx, count).load_scalar(fx);
 
                 let bytes = if elem_size != 1 {
-                    fx.bcx.ins().imul_imm(count, elem_size as i64)
+                    fx.bcx.ins().imul_imm_s(count, elem_size as i64)
                 } else {
                     count
                 };
@@ -996,7 +995,7 @@ pub(crate) fn codegen_place<'tcx>(
                     fx.bcx.ins().iconst(fx.pointer_type, offset as i64)
                 } else {
                     let len = codegen_array_len(fx, cplace);
-                    fx.bcx.ins().iadd_imm(len, -(offset as i64))
+                    fx.bcx.ins().iadd_imm_s(len, -(offset as i64))
                 };
                 cplace = cplace.place_index(fx, index);
             }
@@ -1023,7 +1022,7 @@ pub(crate) fn codegen_place<'tcx>(
                         let (ptr, len) = cplace.to_ptr_unsized();
                         cplace = CPlace::for_ptr_with_extra(
                             ptr.offset_i64(fx, elem_layout.size.bytes() as i64 * (from as i64)),
-                            fx.bcx.ins().iadd_imm(len, -(from as i64 + to as i64)),
+                            fx.bcx.ins().iadd_imm_s(len, -(from as i64 + to as i64)),
                             cplace.layout(),
                         );
                     }
@@ -1052,7 +1051,7 @@ pub(crate) fn codegen_operand<'tcx>(
         Operand::RuntimeChecks(checks) => {
             let val = checks.value(fx.tcx.sess);
             let layout = fx.layout_of(fx.tcx.types.bool);
-            return CValue::const_val(fx, layout, val.into());
+            CValue::const_val(fx, layout, val.into())
         }
     }
 }

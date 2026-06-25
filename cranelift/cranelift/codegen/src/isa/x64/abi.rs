@@ -1,7 +1,8 @@
 //! Implementation of the standard x64 ABI.
 
 use crate::CodegenResult;
-use crate::ir::{self, LibCall, MemFlagsData, Signature, TrapCode, types};
+use crate::ir::MemFlagsData;
+use crate::ir::{self, LibCall, Signature, TrapCode, types};
 use crate::ir::{ExternalName, types::*};
 use crate::isa;
 use crate::isa::winch;
@@ -96,7 +97,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator,
+        mut args: ArgsAccumulator<'_>,
     ) -> CodegenResult<(u32, Option<usize>)> {
         let is_fastcall = call_conv == CallConv::WindowsFastcall;
         let is_tail = call_conv == CallConv::Tail;

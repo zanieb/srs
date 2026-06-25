@@ -229,8 +229,8 @@ fn write_atomic_impl(path: &Path, contents: &[u8], follow_destination_symlink: b
     .map(|meta| {
         use std::os::unix::fs::PermissionsExt;
 
-        // these constants are u16 on macOS
-        let mask = u32::from(libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO);
+        // these constants are u16 on macOS and i32 on Redox
+        let mask = (libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
         let mode = meta.permissions().mode() & mask;
 
         std::fs::Permissions::from_mode(mode)
@@ -966,9 +966,9 @@ mod tests {
     fn write_atomic_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let original_perms = std::fs::Permissions::from_mode(u32::from(
-            libc::S_IRWXU | libc::S_IRGRP | libc::S_IWGRP | libc::S_IROTH,
-        ));
+        let original_perms = std::fs::Permissions::from_mode(
+            (libc::S_IRWXU | libc::S_IRGRP | libc::S_IWGRP | libc::S_IROTH) as u32,
+        );
 
         let tmp = tempfile::Builder::new().tempfile().unwrap();
 
@@ -983,7 +983,7 @@ mod tests {
 
         let new_perms = std::fs::metadata(tmp.path()).unwrap().permissions();
 
-        let mask = u32::from(libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO);
+        let mask = (libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
         assert_eq!(original_perms.mode(), new_perms.mode() & mask);
     }
 

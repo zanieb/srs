@@ -4,6 +4,7 @@ use std::ops::{Range, RangeFrom};
 use std::{debug_assert_matches, iter};
 
 use rustc_abi::{ExternAbi, FieldIdx};
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir::attrs::{InlineAttr, OptimizeAttr};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
@@ -14,7 +15,7 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{
-    self, Instance, InstanceKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized,
+    self, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized,
 };
 use rustc_session::config::{DebugInfo, OptLevel};
 use rustc_span::Spanned;
@@ -253,7 +254,7 @@ impl<'tcx> Inliner<'tcx> for ForceInliner<'tcx> {
 
         let call_span = callsite.source_info.span;
         let callee = tcx.def_path_str(callsite.callee.def_id());
-        tcx.dcx().emit_err(crate::errors::ForceInlineFailure {
+        tcx.dcx().emit_err(crate::diagnostics::ForceInlineFailure {
             call_span,
             attr_span,
             caller_span: tcx.def_span(self.def_id),
@@ -262,7 +263,7 @@ impl<'tcx> Inliner<'tcx> for ForceInliner<'tcx> {
             callee: callee.clone(),
             reason,
             justification: justification
-                .map(|sym| crate::errors::ForceInlineJustification { sym, callee }),
+                .map(|sym| crate::diagnostics::ForceInlineJustification { sym, callee }),
         });
     }
 }
@@ -413,14 +414,8 @@ impl<'tcx> Inliner<'tcx> for NormalInliner<'tcx> {
 
             let term = blk.terminator();
             let caller_attrs = tcx.codegen_fn_attrs(self.caller_def_id());
-            if let TerminatorKind::Drop {
-                ref place,
-                target,
-                unwind,
-                replace: _,
-                drop: _,
-                async_fut: _,
-            } = term.kind
+            if let TerminatorKind::Drop { ref place, target, unwind, replace: _, drop: _ } =
+                term.kind
             {
                 work_list.push(target);
 
@@ -565,11 +560,23 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
             let args = tcx
                 .try_normalize_erasing_regions(inliner.typing_env(), Unnormalized::new_wip(args))
                 .ok()?;
-            let callee =
+            let mut callee =
                 Instance::try_resolve(tcx, inliner.typing_env(), def_id, args).ok().flatten()?;
 
-            if let InstanceKind::Virtual(..) | InstanceKind::Intrinsic(_) = callee.def {
+            if let InstanceKind::Virtual(..) = callee.def {
                 return None;
+            }
+            if let InstanceKind::Intrinsic(..) = callee.def {
+                let intrinsic = tcx.intrinsic(def_id).unwrap();
+                if intrinsic.must_be_overridden {
+                    return None; // intrinsic without fallback body
+                }
+                if !tcx.sess.fallback_intrinsics.contains(&intrinsic.name) {
+                    return None; // intrinsic that the backend may want to overwrite
+                }
+                // The callee is the fallback body.
+                debug!("callsite is fallback body: {def_id:?}");
+                callee = ty::Instance { def: ty::InstanceKind::Item(def_id), args: callee.args };
             }
 
             if inliner.history().contains(&callee.def_id()) {
@@ -732,18 +739,21 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         // the correct param-env for types being dropped. Stall resolving
         // the MIR for this instance until all of its const params are
         // substituted.
-        InstanceKind::DropGlue(_, Some(ty)) if ty.has_type_flags(TypeFlags::HAS_CT_PARAM) => {
+        InstanceKind::Shim(ShimKind::DropGlue(_, Some(ty)))
+            if ty.has_type_flags(TypeFlags::HAS_CT_PARAM) =>
+        {
             debug!("still needs substitution");
             return Err("implementation limitation -- HACK for dropping polymorphic type");
         }
-        InstanceKind::AsyncDropGlue(_, ty) | InstanceKind::AsyncDropGlueCtorShim(_, ty) => {
+        InstanceKind::Shim(ShimKind::AsyncDropGlue(_, ty))
+        | InstanceKind::Shim(ShimKind::AsyncDropGlueCtor(_, ty)) => {
             return if ty.still_further_specializable() {
                 Err("still needs substitution")
             } else {
                 Ok(())
             };
         }
-        InstanceKind::FutureDropPollShim(_, ty, ty2) => {
+        InstanceKind::Shim(ShimKind::FutureDropPoll(_, ty, ty2)) => {
             return if ty.still_further_specializable() || ty2.still_further_specializable() {
                 Err("still needs substitution")
             } else {
@@ -755,15 +765,15 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         // not get any optimizations run on it. Any subsequent inlining may cause cycles, but we
         // do not need to catch this here, we can wait until the inliner decides to continue
         // inlining a second time.
-        InstanceKind::VTableShim(_)
-        | InstanceKind::ReifyShim(..)
-        | InstanceKind::FnPtrShim(..)
-        | InstanceKind::ClosureOnceShim { .. }
-        | InstanceKind::ConstructCoroutineInClosureShim { .. }
-        | InstanceKind::DropGlue(..)
-        | InstanceKind::CloneShim(..)
-        | InstanceKind::ThreadLocalShim(..)
-        | InstanceKind::FnPtrAddrShim(..) => return Ok(()),
+        InstanceKind::Shim(ShimKind::VTable(_))
+        | InstanceKind::Shim(ShimKind::Reify(..))
+        | InstanceKind::Shim(ShimKind::FnPtr(..))
+        | InstanceKind::Shim(ShimKind::ClosureOnce { .. })
+        | InstanceKind::Shim(ShimKind::ConstructCoroutineInClosure { .. })
+        | InstanceKind::Shim(ShimKind::DropGlue(..))
+        | InstanceKind::Shim(ShimKind::Clone(..))
+        | InstanceKind::Shim(ShimKind::ThreadLocal(..))
+        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Ok(()),
     }
 
     if inliner.tcx().is_constructor(callee_def_id) {
@@ -872,6 +882,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
             Some(Terminator {
                 source_info: terminator.source_info,
                 kind: TerminatorKind::Goto { target: block },
+                attributes: ThinVec::new(),
             }),
             caller_body[block].is_cleanup,
         );
@@ -1010,6 +1021,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     caller_body[callsite.block].terminator = Some(Terminator {
         source_info: callsite.source_info,
         kind: TerminatorKind::Goto { target: integrator.map_block(START_BLOCK) },
+        attributes: ThinVec::new(),
     });
 
     // Copy required constants from the callee_body into the caller_body. Although we are only
@@ -1361,8 +1373,8 @@ fn try_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: InstanceKind<'tcx>,
 ) -> Result<&'tcx Body<'tcx>, &'static str> {
-    if let ty::InstanceKind::DropGlue(_, Some(ty)) | ty::InstanceKind::AsyncDropGlueCtorShim(_, ty) =
-        instance
+    if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, Some(ty)))
+    | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(_, ty)) = instance
         && let ty::Adt(def, args) = ty.kind()
     {
         let fields = def.all_fields();

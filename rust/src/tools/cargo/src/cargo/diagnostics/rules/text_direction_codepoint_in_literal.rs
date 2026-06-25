@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use cargo_util_schemas::manifest::TomlToolLints;
 use cargo_util_terminal::report::AnnotationKind;
 use cargo_util_terminal::report::Group;
 use cargo_util_terminal::report::Level;
@@ -18,11 +17,12 @@ use super::CORRECTNESS;
 use crate::CargoResult;
 use crate::GlobalContext;
 use crate::core::MaybePackage;
-use crate::diagnostics::DiagnosticStats;
+use crate::core::Workspace;
 use crate::diagnostics::Lint;
-use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelProduct;
 use crate::diagnostics::ManifestFor;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::ScopedDiagnosticStats;
+use crate::diagnostics::workspace_rel_path;
 
 pub static LINT: &Lint = &Lint {
     name: "text_direction_codepoint_in_literal",
@@ -49,17 +49,18 @@ by default we deny their use.
 };
 
 #[instrument(skip_all)]
-pub fn text_direction_codepoint_in_literal(
+pub(crate) fn lint_manifest(
+    ws: &Workspace<'_>,
     manifest: ManifestFor<'_>,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = manifest.lint_level(cargo_lints, LINT);
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
     if matches!(
         &manifest,
@@ -91,7 +92,7 @@ pub fn text_direction_codepoint_in_literal(
 
     let toml_source = Source::new(contents);
     let events = bidi_events(&toml_source, &bidi_spans);
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+    let manifest_path = workspace_rel_path(ws, manifest_path);
     let mut emitted_source = None;
     for event in events {
         let token_span = event.token.span();
@@ -157,7 +158,7 @@ pub fn text_direction_codepoint_in_literal(
 
         let report = [primary, help];
 
-        stats.record_lint(lint_level);
+        pkg_stats.record_lint(lint_level);
         gctx.shell().print_report(&report, lint_level.force())?;
     }
 

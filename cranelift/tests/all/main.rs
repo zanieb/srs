@@ -54,7 +54,6 @@ mod stack_overflow;
 mod store;
 mod structs;
 mod table;
-#[cfg(all(feature = "stack-switching", unix, target_arch = "x86_64"))]
 mod tags;
 mod threads;
 mod traps;
@@ -96,6 +95,11 @@ pub(crate) fn skip_pooling_allocator_tests() -> bool {
     // There are a couple of issues when running the pooling allocator tests under QEMU:
     // - high memory usage that may exceed the limits imposed by the environment (e.g. CI)
     // - https://github.com/bytecodealliance/wasmtime/pull/2518#issuecomment-747280133
+    no_hog_memory()
+}
+
+/// Whether tests that hog memory should be skipped.
+pub(crate) fn no_hog_memory() -> bool {
     std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok()
 }
 

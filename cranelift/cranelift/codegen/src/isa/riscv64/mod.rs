@@ -6,9 +6,11 @@ use crate::isa::riscv64::settings as riscv_settings;
 use crate::isa::{
     Builder as IsaBuilder, FunctionAlignment, IsaFlagsHashKey, OwnedTargetIsa, TargetIsa,
 };
+#[cfg(feature = "unwind")]
+use crate::machinst::CompiledCode;
 use crate::machinst::{
-    CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
-    TextSectionBuilder, VCode, compile,
+    CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet, TextSectionBuilder, VCode,
+    compile,
 };
 use crate::result::CodegenResult;
 use crate::settings::{self as shared_settings, Flags};
@@ -236,7 +238,7 @@ impl TargetIsa for Riscv64Backend {
 }
 
 impl fmt::Display for Riscv64Backend {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MachBackend")
             .field("name", &self.name())
             .field("triple", &self.triple())

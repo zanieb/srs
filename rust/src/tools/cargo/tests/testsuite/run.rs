@@ -608,7 +608,7 @@ fn run_example_autodiscover_2015() {
     p.cargo("run --example a")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[WARNING] An explicit [[example]] section is specified in Cargo.toml which currently
+[WARNING] Cargo.toml: An explicit [[example]] section is specified in Cargo.toml which currently
 disables Cargo from automatically inferring other example targets.
 This inference behavior will change in the Rust 2018 edition and the following
 files will be included as a example target:
@@ -623,6 +623,7 @@ automatically infer them to be a target, such as in subfolders.
 
 For more information on this warning you can consult
 https://github.com/rust-lang/cargo/issues/5330
+[WARNING] `foo` (manifest) generated 1 warning
 [ERROR] no example target named `a` in default-run packages
 [HELP] available example targets:
     do_magic
@@ -1104,9 +1105,9 @@ fn example_with_release_flag() {
         .with_stderr_data(str![[r#"
 [LOCKING] 1 package to latest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/deps -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps`
+[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/deps -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps[..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/examples -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps --extern bar=[ROOT]/foo/target/release/deps/libbar-[HASH].rlib`
+[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/examples -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps --extern bar=[ROOT]/foo/target/release/deps/libbar-[HASH].rlib[..]`
 [FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
 [RUNNING] `target/release/examples/a[EXE]`
 
@@ -1121,9 +1122,9 @@ fast2
     p.cargo("run -v --example a")
         .with_stderr_data(str![[r#"
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps`
+[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps[..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/examples -L dependency=[ROOT]/foo/target/debug/deps --extern bar=[ROOT]/foo/target/debug/deps/libbar-[HASH].rlib`
+[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/examples -L dependency=[ROOT]/foo/target/debug/deps --extern bar=[ROOT]/foo/target/debug/deps/libbar-[HASH].rlib[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `target/debug/examples/a[EXE]`
 

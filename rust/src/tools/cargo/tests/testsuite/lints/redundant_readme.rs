@@ -16,6 +16,7 @@ authors = []
 readme = "README.md"
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 redundant_readme = "warn"
 "#,
         )
@@ -23,7 +24,7 @@ redundant_readme = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] explicit `package.readme` can be inferred
@@ -38,8 +39,6 @@ redundant_readme = "warn"
 7 - readme = "README.md"
   |
 [WARNING] `foo` (manifest) generated 1 warning
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
@@ -58,6 +57,7 @@ edition = "2015"
 authors = []
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 redundant_readme = "warn"
 "#,
         )
@@ -65,13 +65,9 @@ redundant_readme = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }
 
@@ -89,6 +85,7 @@ authors = []
 readme = "FOO.md"
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 redundant_readme = "warn"
 "#,
         )
@@ -96,13 +93,9 @@ redundant_readme = "warn"
         .file("FOO.md", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }
 
@@ -120,6 +113,7 @@ authors = []
 readme = "src/README.md"
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 redundant_readme = "warn"
 "#,
         )
@@ -127,13 +121,9 @@ redundant_readme = "warn"
         .file("src/README.md", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }
 
@@ -154,6 +144,7 @@ authors = []
 readme.workspace = true
 
 [lints.cargo]
+default = { level = "allow", priority = -1 }
 redundant_readme = "warn"
 "#,
         )
@@ -161,12 +152,8 @@ redundant_readme = "warn"
         .file("README.md", "")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
-        .with_stderr_data(str![[r#"
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-
-"#]])
+        .with_stderr_data(str![""])
         .run();
 }

@@ -40,6 +40,14 @@ where
 }
 
 impl<T: ReservedValue> PackedOption<T> {
+    /// Const constructor wrapping a raw `T`.
+    ///
+    /// To create `None`, pass `T::reserved_value()`. To create `Some(val)`,
+    /// pass a non-reserved `val`.
+    pub const fn new(val: T) -> Self {
+        Self(val)
+    }
+
     /// Returns `true` if the packed option is a `None` value.
     pub fn is_none(&self) -> bool {
         self.0.is_reserved_value()
@@ -119,7 +127,7 @@ impl<T> fmt::Debug for PackedOption<T>
 where
     T: ReservedValue + fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_none() {
             write!(f, "None")
         } else {

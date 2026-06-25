@@ -149,7 +149,7 @@ pub enum LookupError {
 impl core::error::Error for LookupError {}
 
 impl fmt::Display for LookupError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             LookupError::SupportDisabled => write!(f, "Support for this target is disabled"),
             LookupError::Unsupported => {

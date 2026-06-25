@@ -40,7 +40,7 @@ type VecArgPair = Vec<ArgPair>;
 
 /// The main entry point for lowering with ISLE.
 pub(crate) fn lower(
-    lower_ctx: &mut Lower<MInst>,
+    lower_ctx: &mut Lower<'_, MInst>,
     backend: &S390xBackend,
     inst: Inst,
 ) -> Option<InstOutput> {
@@ -52,7 +52,7 @@ pub(crate) fn lower(
 
 /// The main entry point for branch lowering with ISLE.
 pub(crate) fn lower_branch(
-    lower_ctx: &mut Lower<MInst>,
+    lower_ctx: &mut Lower<'_, MInst>,
     backend: &S390xBackend,
     branch: Inst,
     targets: &[MachLabel],
@@ -688,7 +688,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
             base: x,
             index: y,
             disp: UImm12::maybe_from_u64(bias as u64).unwrap(),
-            flags,
+            flags: flags.into(),
         }
     }
 
@@ -705,14 +705,14 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
                 base: x,
                 index: y,
                 disp: imm,
-                flags,
+                flags: flags.into(),
             }
         } else {
             MemArg::BXD20 {
                 base: x,
                 index: y,
                 disp: *offset,
-                flags,
+                flags: flags.into(),
             }
         }
     }
@@ -727,7 +727,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
         MemArg::Symbol {
             name: Box::new(name),
             offset,
-            flags,
+            flags: flags.into(),
         }
     }
 
@@ -736,7 +736,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
         MemArg::Symbol {
             name: Box::new(ExternalName::KnownSymbol(KnownSymbol::ElfGlobalOffsetTable)),
             offset: 0,
-            flags: MemFlagsData::trusted(),
+            flags: MemFlagsData::trusted().into(),
         }
     }
 

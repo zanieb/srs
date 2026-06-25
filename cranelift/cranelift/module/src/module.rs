@@ -327,7 +327,7 @@ impl std::error::Error for ModuleError {
 }
 
 impl std::fmt::Display for ModuleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Undeclared(name) => {
                 write!(f, "Undeclared identifier: {name}")
@@ -540,7 +540,7 @@ mod serialize {
     impl<'de> serde::de::Visitor<'de> for ModuleDeclarationsFieldVisitor {
         type Value = ModuleDeclarationsField;
 
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("field identifier")
         }
 
@@ -584,7 +584,7 @@ mod serialize {
     impl<'de> Visitor<'de> for ModuleDeclarationsVisitor {
         type Value = ModuleDeclarations;
 
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("struct ModuleDeclarations")
         }
 

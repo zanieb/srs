@@ -7,10 +7,7 @@ use core::marker::PhantomData;
 use core::slice;
 
 /// Iterate over all keys in order.
-pub struct Iter<'a, K: EntityRef, V>
-where
-    V: 'a,
-{
+pub struct Iter<'a, K: EntityRef, V> {
     enumerate: Enumerate<slice::Iter<'a, V>>,
     unused: PhantomData<K>,
 }
@@ -47,10 +44,7 @@ impl<'a, K: EntityRef, V> DoubleEndedIterator for Iter<'a, K, V> {
 impl<'a, K: EntityRef, V> ExactSizeIterator for Iter<'a, K, V> {}
 
 /// Iterate over all keys in order.
-pub struct IterMut<'a, K: EntityRef, V>
-where
-    V: 'a,
-{
+pub struct IterMut<'a, K: EntityRef, V> {
     enumerate: Enumerate<slice::IterMut<'a, V>>,
     unused: PhantomData<K>,
 }
