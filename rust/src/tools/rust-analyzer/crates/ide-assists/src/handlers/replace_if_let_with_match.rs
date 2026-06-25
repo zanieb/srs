@@ -17,7 +17,7 @@ use crate::{
     AssistContext, AssistId, Assists,
     utils::{
         does_pat_match_variant, does_pat_variant_nested_or_literal, unwrap_trivial_block,
-        wrap_paren,
+        wrap_paren_in_guard_chain,
     },
 };
 
@@ -171,7 +171,7 @@ fn make_else_arm(
     let (pattern, expr) = if let Some(else_expr) = else_expr {
         let pattern = match conditionals {
             [(None, Some(_), _)] => make.literal_pat("false").into(),
-            [(Some(pat), _, _)] => match ctx
+            [(Some(pat), None, _)] => match ctx
                 .sema
                 .type_of_pat(pat)
                 .and_then(|ty| TryEnum::from_ty(&ctx.sema, &ty.adjusted()))
@@ -303,7 +303,7 @@ pub(crate) fn replace_match_with_if_let(
                 _ => make.expr_let(if_let_pat, scrutinee).into(),
             };
             let condition = if let Some(guard) = guard {
-                let guard = wrap_paren(guard, make, ast::prec::ExprPrecedence::LAnd);
+                let guard = wrap_paren_in_guard_chain(guard, make);
                 make.expr_bin(condition, ast::BinaryOp::LogicOp(ast::LogicOp::And), guard).into()
             } else {
                 condition
@@ -712,13 +712,11 @@ impl VariantData {
         check_assist(
             replace_if_let_with_match,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     if $0let true = true && let Some(1) = None {} else { other() }
 }
 "#,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     match true {
         true if let Some(1) = None => {}
@@ -731,7 +729,6 @@ fn main() {
         check_assist(
             replace_if_let_with_match,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     if true {
         $0if let ParenExpr(expr) = cond
@@ -758,7 +755,6 @@ fn main() {
 }
 "#,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     if true {
         match cond {
@@ -816,13 +812,11 @@ fn main() {
         check_assist(
             replace_if_let_with_match,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     if $0let true = true && let Some(1) = None {}
 }
 "#,
             r#"
-#![feature(if_let_guard)]
 fn main() {
     match true {
         true if let Some(1) = None => {}
@@ -956,6 +950,31 @@ fn foo(x: Option<i32>) {
     }
 
     #[test]
+    fn special_case_option_with_guard() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: option
+fn foo(x: Option<i32>) {
+    $0if let Some(x) = x && x != 4 {
+        println!("{}", x)
+    } else {
+        println!("none")
+    }
+}
+"#,
+            r#"
+fn foo(x: Option<i32>) {
+    match x {
+        Some(x) if x != 4 => println!("{}", x),
+        _ => println!("none"),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn special_case_option_ref() {
         check_assist(
             replace_if_let_with_match,
@@ -999,6 +1018,31 @@ fn foo(x: Option<i32>) {
     match x {
         None => println!("none"),
         Some(_) => println!("some"),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn special_case_inverted_option_with_guard() {
+        check_assist(
+            replace_if_let_with_match,
+            r#"
+//- minicore: option
+fn foo(x: Option<i32>) {
+    $0if let None = x && other_cond {
+        println!("none")
+    } else {
+        println!("some")
+    }
+}
+"#,
+            r#"
+fn foo(x: Option<i32>) {
+    match x {
+        None if other_cond => println!("none"),
+        _ => println!("some"),
     }
 }
 "#,
@@ -2410,7 +2454,7 @@ fn main() {
     }
 
     #[test]
-    fn test_replace_match_with_if_let_chain() {
+    fn test_replace_match_with_if_let_with_simple_guard() {
         check_assist(
             replace_match_with_if_let,
             r#"
@@ -2451,6 +2495,73 @@ fn main() {
     }
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn test_replace_match_with_if_let_with_if_let_guard() {
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 Some(0) {
+        Some(n) if let Some(m) = n.checked_add(1) => (),
+        _ => code(),
+    }
+}
+"#,
+            r#"
+fn main() {
+    if let Some(n) = Some(0) && let Some(m) = n.checked_add(1) {
+        ()
+    } else {
+        code()
+    }
+}
+"#,
+        );
+
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 Some(0) {
+        Some(n) if let Some(m) = n.checked_add(1) && m > 5 => (),
+        _ => code(),
+    }
+}
+        "#,
+            r#"
+fn main() {
+    if let Some(n) = Some(0) && let Some(m) = n.checked_add(1) && m > 5 {
+        ()
+    } else {
+        code()
+    }
+}
+        "#,
+        );
+
+        // what if the `let` expr is not the first one in the guard?
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 Some(0) {
+        Some(n) if n > 5 && let Some(m) = n.checked_add(1) => (),
+        _ => code(),
+    }
+}
+        "#,
+            r#"
+fn main() {
+    if let Some(n) = Some(0) && n > 5 && let Some(m) = n.checked_add(1) {
+        ()
+    } else {
+        code()
+    }
+}
+        "#,
         );
     }
 

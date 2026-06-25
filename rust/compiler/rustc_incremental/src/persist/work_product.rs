@@ -12,7 +12,7 @@ use rustc_session::Session;
 use rustc_span::{SourceFileHash, SourceFileHashAlgorithm};
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::persist::fs::*;
 
 const SLD_RUSTC_WORK_PRODUCT_PROVENANCE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE";
@@ -20,15 +20,17 @@ const SLD_CGU_OBJECT_DIGEST_FILE_ID: &str = "sld-blake3-o";
 
 /// Copies a CGU work product to the incremental compilation directory, so next compilation can
 /// find and reuse it.
+///
+/// Panics when incr comp is disabled.
 pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
     sess: &Session,
     cgu_name: &str,
     files: &[(&'static str, &Path)],
     known_links: &[PathBuf],
     known_object_digest: Option<&str>,
-) -> Option<(WorkProductId, WorkProduct, Option<String>)> {
+) -> (WorkProductId, WorkProduct, Option<String>) {
     debug!(?cgu_name, ?files);
-    sess.opts.incremental.as_ref()?;
+    assert!(sess.opts.incremental.is_some());
 
     let mut saved_files = UnordMap::default();
     let mut object_digest = None;
@@ -37,7 +39,7 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
         let path_in_incr_dir = in_incr_comp_dir_sess(sess, &file_name);
         let reused = known_links.contains(&path_in_incr_dir);
         if !reused && let Err(err) = link_or_copy(path, &path_in_incr_dir) {
-            sess.dcx().emit_warn(errors::CopyWorkProductToCache {
+            sess.dcx().emit_warn(diagnostics::CopyWorkProductToCache {
                 from: path,
                 to: &path_in_incr_dir,
                 err,
@@ -59,7 +61,7 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
     let work_product = WorkProduct { cgu_name: cgu_name.to_string(), saved_files };
     debug!(?work_product);
     let work_product_id = WorkProductId::from_cgu_name(cgu_name);
-    Some((work_product_id, work_product, object_digest))
+    (work_product_id, work_product, object_digest)
 }
 
 fn track_sld_cgu_object_digest(
@@ -154,7 +156,7 @@ pub(crate) fn delete_workproduct_files(sess: &Session, work_product: &WorkProduc
     for (_, path) in work_product.saved_files.items().into_sorted_stable_ord() {
         let path = in_incr_comp_dir_sess(sess, path);
         if let Err(err) = std_fs::remove_file(&path) {
-            sess.dcx().emit_warn(errors::DeleteWorkProduct { path: &path, err });
+            sess.dcx().emit_warn(diagnostics::DeleteWorkProduct { path: &path, err });
         }
     }
 }

@@ -662,6 +662,12 @@ config_data! {
         /// For traits the type "methods" can be used to only exclude the methods but not the trait
         /// itself.
         ///
+        /// For modules the type "sub_items" can be used to only exclude the all items in it but not the module
+        /// itself. This does not include items defined in nested modules.
+        ///
+        /// For enums the type "variants" can be used to only exclude the all variants in it but not the enum
+        /// itself.
+        ///
         /// This setting also inherits `#rust-analyzer.completion.excludeTraits#`.
         completion_autoimport_exclude: Vec<AutoImportExclusion> = vec![
             AutoImportExclusion::Verbose { path: "core::borrow::Borrow".to_owned(), r#type: AutoImportExclusionType::Methods },
@@ -1938,6 +1944,12 @@ impl Config {
                             AutoImportExclusionType::Methods => {
                                 ide_completion::AutoImportExclusionType::Methods
                             }
+                            AutoImportExclusionType::SubItems => {
+                                ide_completion::AutoImportExclusionType::SubItems
+                            }
+                            AutoImportExclusionType::Variants => {
+                                ide_completion::AutoImportExclusionType::Variants
+                            }
                         },
                     ),
                 })
@@ -2997,6 +3009,8 @@ pub enum AutoImportExclusion {
 pub enum AutoImportExclusionType {
     Always,
     Methods,
+    SubItems,
+    Variants,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -4128,10 +4142,11 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                             },
                             "type": {
                                 "type": "string",
-                                "enum": ["always", "methods"],
+                                "enum": ["always", "methods", "sub_items", "variants"],
                                 "enumDescriptions": [
                                     "Do not show this item or its methods (if it is a trait) in auto-import completions.",
-                                    "Do not show this traits methods in auto-import completions."
+                                    "Do not show this trait's methods in auto-import completions.",
+                                    "Do not show this module's all items in it in auto-import completions."
                                 ],
                             },
                         }

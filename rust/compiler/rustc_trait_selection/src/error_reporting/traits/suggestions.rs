@@ -48,8 +48,8 @@ use super::{
     DefIdOrName, FindExprBySpan, ImplCandidate, Obligation, ObligationCause, ObligationCauseCode,
     PredicateObligation,
 };
+use crate::diagnostics;
 use crate::error_reporting::TypeErrCtxt;
-use crate::errors;
 use crate::infer::InferCtxtExt as _;
 use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 use crate::traits::{ImplDerivedCause, NormalizeExt, ObligationCtxt, SelectionContext};
@@ -128,7 +128,7 @@ pub fn suggest_restriction<'tcx, G: EmissionGuarantee>(
     msg: &str,
     err: &mut Diag<'_, G>,
     fn_sig: Option<&hir::FnSig<'_>>,
-    projection: Option<ty::AliasTy<'_>>,
+    projection: Option<ty::ProjectionAliasTy<'_>>,
     trait_pred: ty::PolyTraitPredicate<'tcx>,
     // When we are dealing with a trait, `super_traits` will be `Some`:
     // Given `trait T: A + B + C {}`
@@ -140,11 +140,8 @@ pub fn suggest_restriction<'tcx, G: EmissionGuarantee>(
     if hir_generics.where_clause_span.from_expansion()
         || hir_generics.where_clause_span.desugaring_kind().is_some()
         || projection.is_some_and(|projection| {
-            (tcx.is_impl_trait_in_trait(projection.kind.def_id())
-                && !tcx.features().return_type_notation())
-                || tcx
-                    .lookup_stability(projection.kind.def_id())
-                    .is_some_and(|stab| stab.is_unstable())
+            (tcx.is_impl_trait_in_trait(projection.kind) && !tcx.features().return_type_notation())
+                || tcx.lookup_stability(projection.kind).is_some_and(|stab| stab.is_unstable())
         })
     {
         return;
@@ -152,7 +149,7 @@ pub fn suggest_restriction<'tcx, G: EmissionGuarantee>(
     let generics = tcx.generics_of(item_id);
     // Given `fn foo(t: impl Trait)` where `Trait` requires assoc type `A`...
     if let Some((param, bound_str, fn_sig)) =
-        fn_sig.zip(projection).and_then(|(sig, p)| match *p.self_ty().kind() {
+        fn_sig.zip(projection).and_then(|(sig, p)| match *p.projection_self_ty().kind() {
             // Shenanigans to get the `Trait` from the `impl Trait`.
             ty::Param(param) => {
                 let param_def = generics.type_param(param, tcx);
@@ -479,8 +476,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let self_ty = trait_pred.skip_binder().self_ty();
         let (param_ty, projection) = match *self_ty.kind() {
             ty::Param(_) => (true, None),
-            ty::Alias(projection @ ty::AliasTy { kind: ty::Projection { .. }, .. }) => {
-                (false, Some(projection))
+            ty::Alias(alias) => {
+                if let Some(projection) = alias.try_to_projection() {
+                    (false, Some(projection))
+                } else {
+                    (false, None)
+                }
             }
             _ => (false, None),
         };
@@ -1493,7 +1494,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             if let ty::ClauseKind::Projection(proj) = pred.kind().skip_binder()
                             && self
                                 .tcx
-                                .is_lang_item(proj.projection_term.def_id(), LangItem::FnOnceOutput)
+                                .is_lang_item(proj.def_id(), LangItem::FnOnceOutput)
                             // args tuple will always be args[1]
                             && let ty::Tuple(args) = proj.projection_term.args.type_at(1).kind()
                             {
@@ -1537,7 +1538,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         if let ty::ClauseKind::Projection(proj) = pred.kind().skip_binder()
                             && self
                                 .tcx
-                                .is_lang_item(proj.projection_term.def_id(), LangItem::FnOnceOutput)
+                                .is_lang_item(proj.def_id(), LangItem::FnOnceOutput)
                             && proj.projection_term.self_ty() == found
                             // args tuple will always be args[1]
                             && let ty::Tuple(args) = proj.projection_term.args.type_at(1).kind()
@@ -2648,7 +2649,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         ) -> Ty<'tcx> {
             let inputs = trait_ref.args.type_at(1);
             let sig = match inputs.kind() {
-                ty::Tuple(inputs) if infcx.tcx.is_fn_trait(trait_ref.def_id) => {
+                ty::Tuple(inputs) if infcx.tcx.is_callable_trait(trait_ref.def_id) => {
                     infcx.tcx.mk_fn_sig_safe_rust_abi(*inputs, infcx.next_ty_var(DUMMY_SP))
                 }
                 _ => infcx.tcx.mk_fn_sig_safe_rust_abi([inputs], infcx.next_ty_var(DUMMY_SP)),
@@ -4876,7 +4877,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         expected: where_pred
                             .skip_binder()
                             .projection_term
-                            .expect_ty(self.tcx)
+                            .expect_ty()
                             .to_ty(self.tcx),
                         found,
                     })];
@@ -6119,11 +6120,11 @@ fn hint_missing_borrow<'tcx>(
     }
 
     if !to_borrow.is_empty() {
-        err.subdiagnostic(errors::AdjustSignatureBorrow::Borrow { to_borrow });
+        err.subdiagnostic(diagnostics::AdjustSignatureBorrow::Borrow { to_borrow });
     }
 
     if !remove_borrow.is_empty() {
-        err.subdiagnostic(errors::AdjustSignatureBorrow::RemoveBorrow { remove_borrow });
+        err.subdiagnostic(diagnostics::AdjustSignatureBorrow::RemoveBorrow { remove_borrow });
     }
 }
 
@@ -6425,12 +6426,12 @@ fn point_at_assoc_type_restriction<G: EmissionGuarantee>(
         return;
     };
     let Some(name) = tcx
-        .opt_rpitit_info(proj.projection_term.def_id())
+        .opt_rpitit_info(proj.def_id())
         .and_then(|data| match data {
             ty::ImplTraitInTraitData::Trait { fn_def_id, .. } => Some(tcx.item_name(fn_def_id)),
             ty::ImplTraitInTraitData::Impl { .. } => None,
         })
-        .or_else(|| tcx.opt_item_name(proj.projection_term.def_id()))
+        .or_else(|| tcx.opt_item_name(proj.def_id()))
     else {
         return;
     };

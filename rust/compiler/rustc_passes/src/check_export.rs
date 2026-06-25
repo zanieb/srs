@@ -17,7 +17,7 @@ use rustc_middle::ty::{
 use rustc_session::config::CrateType;
 use rustc_span::Span;
 
-use crate::errors::UnexportableItem;
+use crate::diagnostics::UnexportableItem;
 
 struct ExportableItemCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -147,7 +147,9 @@ impl<'tcx> Visitor<'tcx> for ExportableItemCollector<'tcx> {
             hir::ItemKind::Impl(impl_) if impl_.of_trait.is_none() => {
                 unreachable!();
             }
-            _ => self.report_wrong_site(def_id),
+            _ => {
+                self.tcx.dcx().delayed_bug("Target is checked by attribute parser");
+            }
         }
     }
 
