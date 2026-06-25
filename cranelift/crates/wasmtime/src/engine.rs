@@ -1,5 +1,3 @@
-use crate::Config;
-use crate::RRConfig;
 use crate::prelude::*;
 #[cfg(feature = "runtime")]
 pub use crate::runtime::code_memory::CustomCodeMemory;
@@ -7,6 +5,7 @@ pub use crate::runtime::code_memory::CustomCodeMemory;
 use crate::runtime::type_registry::TypeRegistry;
 #[cfg(feature = "runtime")]
 use crate::runtime::vm::{GcRuntime, ModuleRuntimeInfo};
+use crate::{Config, RRConfig};
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 #[cfg(target_has_atomic = "64")]
@@ -499,6 +498,7 @@ information about this check\
             | "is_pic"
             | "bb_padding_log2_minus_one"
             | "log2_min_function_alignment"
+            | "enable_compact_unwind_abi"
             | "machine_code_cfg_info"
             | "tls_model" // wasmtime doesn't use tls right now
             | "opt_level" // opt level doesn't change semantics
@@ -570,6 +570,7 @@ information about this check\
             "has_lse" => "lse",
             "has_pauth" => "paca",
             "has_fp16" => "fp16",
+            "has_dotprod" => "dotprod",
 
             // aarch64 features which don't need detection
             // No effect on its own.

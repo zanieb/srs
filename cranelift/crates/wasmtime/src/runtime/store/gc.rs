@@ -1,5 +1,7 @@
 //! GC-related methods for stores.
 
+use crate::error::Context;
+use crate::module::ModuleRegistry;
 use crate::store::{
     Asyncness, AutoAssertNoGc, InstanceId, StoreOpaque, StoreResourceLimiter, yield_now,
 };
@@ -7,8 +9,8 @@ use crate::type_registry::RegisteredType;
 use crate::vm::{self, Backtrace, Frame, GcRootsList, GcStore, SendSyncPtr, VMGcRef};
 use crate::{
     ExnRef, GcHeapOutOfMemory, Result, Rooted, Store, StoreContextMut, ThrownException, bail,
-    format_err,
 };
+use core::fmt;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
 use core::ops::{Deref, DerefMut};
@@ -110,7 +112,7 @@ impl<'a, T> StoreContextMut<'a, T> {
             None,
             why.map(|e| e.bytes_needed()),
             Asyncness::No,
-        ));
+        ))?;
         Ok(())
     }
 
@@ -133,6 +135,17 @@ impl<'a, T> StoreContextMut<'a, T> {
     }
 }
 
+#[derive(Debug)]
+struct GcHeapGrowthFailed;
+
+impl fmt::Display for GcHeapGrowthFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GC heap growth failed")
+    }
+}
+
+impl core::error::Error for GcHeapGrowthFailed {}
+
 impl StoreOpaque {
     /// Perform any growth or GC needed to allocate `bytes_needed` bytes.
     ///
@@ -150,7 +163,7 @@ impl StoreOpaque {
         root: Option<VMGcRef>,
         bytes_needed: Option<u64>,
         asyncness: Asyncness,
-    ) -> Option<VMGcRef> {
+    ) -> Result<Option<VMGcRef>> {
         let mut scope = crate::OpaqueRootScope::new(self);
         scope.trim_gc_liveness_flags(true);
         let store_id = scope.id();
@@ -158,15 +171,15 @@ impl StoreOpaque {
 
         scope
             .collect_and_maybe_grow_gc_heap(limiter, bytes_needed, asyncness)
-            .await;
+            .await?;
 
-        root.map(|r| {
+        Ok(root.map(|r| {
             let r = r
                 .get_gc_ref(&scope)
                 .expect("still in scope")
                 .unchecked_copy();
             scope.clone_gc_ref(&r)
-        })
+        }))
     }
 
     // This lives on the Store because it must simultaneously borrow
@@ -186,18 +199,25 @@ impl StoreOpaque {
         limiter: Option<&mut StoreResourceLimiter<'_>>,
         bytes_needed: Option<u64>,
         asyncness: Asyncness,
-    ) {
+    ) -> Result<()> {
         log::trace!("collect_and_maybe_grow_gc_heap(bytes_needed = {bytes_needed:#x?})");
-        self.do_gc(asyncness).await;
+        self.do_gc(asyncness).await?;
         if let Some(n) = bytes_needed
-            && n > u64::try_from(self.gc_heap_capacity())
-                .unwrap()
-                .saturating_sub(self.gc_store.as_ref().map_or(0, |gc| {
+            && n > u64::try_from(self.gc_heap_capacity())?.saturating_sub(
+                self.gc_store.as_ref().map_or(0, |gc| {
                     u64::try_from(gc.last_post_gc_allocated_bytes.unwrap_or(0)).unwrap()
-                }))
+                }),
+            )
         {
-            let _ = self.grow_gc_heap(limiter, n, asyncness).await;
+            if let Err(e) = self.grow_gc_heap(limiter, n, asyncness).await {
+                if e.is::<GcHeapGrowthFailed>() {
+                    log::trace!("ignoring GC heap growth failure: {e}");
+                } else {
+                    return Err(e);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Attempt to grow the GC heap by `bytes_needed` bytes.
@@ -222,7 +242,7 @@ impl StoreOpaque {
             .as_ref()
             .map_or(false, |gc| gc.gc_heap.needs_gc_before_next_growth())
         {
-            self.do_gc(asyncness).await;
+            self.do_gc(asyncness).await?;
             debug_assert!(
                 !self
                     .gc_store
@@ -238,7 +258,7 @@ impl StoreOpaque {
         // grow it, then replace it.
         let mut heap = TakenGcHeap::new(self);
 
-        let current_size_in_bytes = u64::try_from(heap.memory.byte_size()).unwrap();
+        let current_size_in_bytes = u64::try_from(heap.memory.byte_size())?;
         let current_size_in_pages = current_size_in_bytes / page_size;
 
         // Aim to double the heap size, amortizing the cost of growth.
@@ -273,12 +293,13 @@ impl StoreOpaque {
         unsafe {
             heap.memory
                 .grow(delta_pages_for_alloc, limiter)
-                .await?
-                .ok_or_else(|| format_err!("failed to grow GC heap"))?;
+                .await
+                .context(GcHeapGrowthFailed)?
+                .ok_or(GcHeapGrowthFailed)?;
         }
-        heap.store.vm_store_context.gc_heap = heap.memory.vmmemory();
+        *heap.store.vm_store_context.gc_heap.get_mut() = heap.memory.vmmemory();
 
-        let new_size_in_bytes = u64::try_from(heap.memory.byte_size()).unwrap();
+        let new_size_in_bytes = u64::try_from(heap.memory.byte_size())?;
         assert!(new_size_in_bytes > current_size_in_bytes);
         heap.delta_bytes_grown = new_size_in_bytes - current_size_in_bytes;
         let delta_bytes_for_alloc = delta_pages_for_alloc.checked_mul(page_size).unwrap();
@@ -383,7 +404,7 @@ impl StoreOpaque {
                         );
                         store
                             .gc(limiter.as_deref_mut(), None, None, asyncness)
-                            .await;
+                            .await?;
 
                         match alloc_func(&mut store, value) {
                             Ok(x) => Ok(x),
@@ -413,7 +434,7 @@ impl StoreOpaque {
                             .await
                         {
                             log::trace!("growing GC heap failed: {e}");
-                            store.gc(limiter, None, None, asyncness).await;
+                            store.gc(limiter, None, None, asyncness).await?;
                         }
 
                         alloc_func(&mut store, value)
@@ -431,11 +452,13 @@ impl StoreOpaque {
     /// the TLS call state; that must be done separately.
     ///
     /// GC barriers are not required by the caller of this function.
-    pub(crate) fn set_pending_exception(&mut self, exnref: &VMGcRef) -> ThrownException {
+    pub(crate) fn set_pending_exception(&mut self, exnref: &VMGcRef) -> crate::Error {
         debug_assert!(exnref.is_exnref(&*self.unwrap_gc_store_mut().gc_heap));
         let gc_store = self.gc_store.as_mut().unwrap();
-        gc_store.write_gc_ref(&mut self.pending_exception, Some(exnref));
-        ThrownException
+        match gc_store.write_gc_ref(&mut self.pending_exception, Some(exnref)) {
+            Ok(()) => ThrownException.into(),
+            Err(e) => e,
+        }
     }
 
     /// Takes the pending exception from this store, if any, and exposes it to
@@ -444,7 +467,7 @@ impl StoreOpaque {
         let exnref = self.pending_exception.take()?;
         let gc_store = self.unwrap_gc_store_mut();
         debug_assert!(exnref.is_exnref(&*gc_store.gc_heap));
-        Some(gc_store.expose_gc_ref_to_wasm(exnref))
+        Some(gc_store.expose_gc_ref_to_wasm(exnref).unwrap())
     }
 
     /// Takes the pending exception of the store, yielding ownership of its
@@ -464,12 +487,14 @@ impl StoreOpaque {
         let pending_exnref = self.pending_exception.as_ref()?.unchecked_copy();
         debug_assert!(pending_exnref.is_exnref(&*self.unwrap_gc_store_mut().gc_heap));
         let mut store = AutoAssertNoGc::new(self);
-        Some(
-            pending_exnref
-                .into_exnref_unchecked()
-                .tag(&mut store)
-                .expect("cannot read tag"),
-        )
+
+        // Note that if the GC heap is corrupt this will return an error, and in
+        // such as situation we return `None` here pretending that there's no
+        // pending exception. This defers the GC heap corruption to get detected
+        // later. This method is primarily called right now to determine if
+        // there's a handler for an exception, and by returning `None` here this
+        // turns into just any old embedder error.
+        pending_exnref.into_exnref_unchecked().tag(&mut store).ok()
     }
 
     /// Get an owned rooted reference to the pending exception,
@@ -493,7 +518,7 @@ impl StoreOpaque {
     /// exception pointer.
     fn throw_impl<R>(&mut self, exception: Rooted<ExnRef>) -> Result<R> {
         let exception = exception.try_gc_ref(self)?.unchecked_copy();
-        Err(self.set_pending_exception(&exception).into())
+        Err(self.set_pending_exception(&exception))
     }
 
     /// Helper method to require that a `GcStore` was previously allocated for
@@ -535,10 +560,10 @@ impl StoreOpaque {
         }
     }
 
-    async fn do_gc(&mut self, asyncness: Asyncness) {
+    async fn do_gc(&mut self, asyncness: Asyncness) -> Result<()> {
         // If the GC heap hasn't been initialized, there is nothing to collect.
         if self.gc_store.is_none() {
-            return;
+            return Ok(());
         }
 
         log::trace!("============ Begin GC ===========");
@@ -558,13 +583,14 @@ impl StoreOpaque {
                 // fall back to the runtime-agnostic code.
                 yield_now,
             )
-            .await;
+            .await?;
 
         // Restore the GC roots for the next GC.
         roots.clear();
         self.gc_roots_list = roots;
 
         log::trace!("============ End GC ===========");
+        Ok(())
     }
 
     async fn trace_roots(&mut self, gc_roots_list: &mut GcRootsList, asyncness: Asyncness) {
@@ -606,7 +632,11 @@ impl StoreOpaque {
         log::trace!("End trace GC roots")
     }
 
-    fn trace_wasm_stack_frame(&self, gc_roots_list: &mut GcRootsList, frame: Frame) {
+    pub(crate) fn trace_wasm_stack_frame(
+        modules: &ModuleRegistry,
+        gc_roots_list: &mut GcRootsList,
+        frame: Frame,
+    ) {
         let pc = frame.pc();
         debug_assert!(pc != 0, "we should always get a valid PC for Wasm frames");
 
@@ -616,12 +646,15 @@ impl StoreOpaque {
             "we should always get a valid frame pointer for Wasm frames"
         );
 
-        let (module_with_code, _offset) = self
-            .modules()
-            .module_and_code_by_pc(pc)
-            .expect("should have module info for Wasm frame");
+        let (store_code, offset) = modules
+            .store_code_by_pc(pc)
+            .expect("should have store code for Wasm frame");
+        let offset = u32::try_from(offset).unwrap();
 
-        if let Some(stack_map) = module_with_code.lookup_stack_map(pc) {
+        let stack_map =
+            wasmtime_environ::StackMap::lookup(offset, store_code.code_memory().stack_map_data());
+
+        if let Some(stack_map) = stack_map {
             log::trace!(
                 "We have a stack map that maps {} bytes in this Wasm frame",
                 stack_map.frame_size()
@@ -630,25 +663,22 @@ impl StoreOpaque {
             let sp = unsafe { stack_map.sp(fp) };
             for stack_slot in unsafe { stack_map.live_gc_refs(sp) } {
                 unsafe {
-                    self.trace_wasm_stack_slot(gc_roots_list, stack_slot);
+                    Self::trace_wasm_stack_slot(gc_roots_list, stack_slot);
                 }
             }
         }
 
         #[cfg(feature = "debug")]
-        if let Some(frame_table) = module_with_code.module().frame_table() {
-            let relpc = module_with_code
-                .text_offset(pc)
-                .expect("PC should be within module");
-            for stack_slot in crate::debug::gc_refs_in_frame(frame_table, relpc, fp) {
+        if let Some(frame_table) = store_code.code_memory().frame_table() {
+            for stack_slot in crate::debug::gc_refs_in_frame(frame_table, offset, fp) {
                 unsafe {
-                    self.trace_wasm_stack_slot(gc_roots_list, stack_slot);
+                    Self::trace_wasm_stack_slot(gc_roots_list, stack_slot);
                 }
             }
         }
     }
 
-    unsafe fn trace_wasm_stack_slot(&self, gc_roots_list: &mut GcRootsList, stack_slot: *mut u32) {
+    unsafe fn trace_wasm_stack_slot(gc_roots_list: &mut GcRootsList, stack_slot: *mut u32) {
         let raw: u32 = unsafe { core::ptr::read(stack_slot) };
         log::trace!("Stack slot @ {stack_slot:p} = {raw:#x}");
 
@@ -665,9 +695,24 @@ impl StoreOpaque {
         log::trace!("Begin trace GC roots :: Wasm stack");
 
         Backtrace::trace(self, |frame| {
-            self.trace_wasm_stack_frame(gc_roots_list, frame);
+            Self::trace_wasm_stack_frame(self.modules(), gc_roots_list, frame);
             core::ops::ControlFlow::Continue(())
         });
+
+        #[cfg(feature = "component-model-async")]
+        if self.concurrency_support() {
+            let unwind = self.unwinder();
+            let StoreOpaque {
+                modules,
+                store_data,
+                ..
+            } = self;
+            store_data
+                .components
+                .task_state_mut()
+                .concurrent_state_mut()
+                .trace_fiber_roots(modules, unwind, gc_roots_list);
+        }
 
         log::trace!("End trace GC roots :: Wasm stack");
     }
@@ -691,7 +736,7 @@ impl StoreOpaque {
             match state {
                 VMStackState::Suspended => {
                     Backtrace::trace_suspended_continuation(self, continuation.deref(), |frame| {
-                        self.trace_wasm_stack_frame(gc_roots_list, frame);
+                        Self::trace_wasm_stack_frame(self.modules(), gc_roots_list, frame);
                         core::ops::ControlFlow::Continue(())
                     });
                 }

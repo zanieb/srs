@@ -190,7 +190,9 @@ fn macho_build_version(triple: &Triple) -> Option<object::write::MachOBuildVersi
             // TODO(madsmtm): Properly support simulator after
             // https://github.com/bytecodealliance/target-lexicon/pull/130
             let platform = match (triple.operating_system, triple.environment) {
-                (Darwin(_), _) => 0, // PLATFORM_UNKNOWN
+                // Sometimes the target is macOS but the environment is Darwin,
+                // and sometimes it's the other way around. Support both.
+                (Darwin(_), _) => PLATFORM_MACOS,
                 (MacOSX(_), _) => PLATFORM_MACOS,
                 (_, Macabi) => PLATFORM_MACCATALYST,
                 (IOS(_), Sim) => PLATFORM_IOSSIMULATOR,
@@ -247,7 +249,6 @@ pub struct ObjectModule {
     libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
     known_symbols: HashMap<ir::KnownSymbol, SymbolId>,
     known_labels: HashMap<(FuncId, CodeOffset), SymbolId>,
-    custom_sections: HashMap<(Vec<u8>, Vec<u8>, SectionKind, u32), SectionId>,
     per_function_section: bool,
     per_data_object_section: bool,
     #[cfg(feature = "unwind")]
@@ -283,7 +284,6 @@ impl ObjectModule {
             libcall_names: builder.libcall_names,
             known_symbols: HashMap::new(),
             known_labels: HashMap::new(),
-            custom_sections: HashMap::new(),
             per_function_section: builder.per_function_section,
             per_data_object_section: builder.per_data_object_section,
             #[cfg(feature = "unwind")]
@@ -561,55 +561,39 @@ impl Module for ObjectModule {
                 )));
             }
             let (seg, sec, macho_flags) = &custom_segment_section.as_ref().unwrap();
-            let section_kind = if decl.writable {
-                SectionKind::Data
-            } else if relocs.is_empty() {
-                SectionKind::ReadOnlyData
-            } else {
-                SectionKind::ReadOnlyDataWithRel
-            };
-            let key = (
+            let section = self.object.add_section(
                 seg.clone().into_bytes(),
                 sec.clone().into_bytes(),
-                section_kind,
-                *macho_flags,
+                if decl.writable {
+                    SectionKind::Data
+                } else if relocs.is_empty() {
+                    SectionKind::ReadOnlyData
+                } else {
+                    SectionKind::ReadOnlyDataWithRel
+                },
             );
-            match self.custom_sections.entry(key) {
-                Entry::Occupied(o) => *o.get(),
-                Entry::Vacant(v) => {
-                    let section = self.object.add_section(
-                        seg.clone().into_bytes(),
-                        sec.clone().into_bytes(),
-                        section_kind,
-                    );
 
-                    match self.object.section_flags_mut(section) {
-                        SectionFlags::MachO { flags } => {
-                            // There are no default flags for the `SectionKind`s
-                            // that we've specified above, so it's fine to
-                            // override.
-                            //
-                            // (If we don't want to override, we'll have to be
-                            // careful with how we set these, to ensure we set
-                            // the section type properly).
-                            assert_eq!(*flags, 0);
-                            *flags = *macho_flags;
-                        }
-                        _ => {
-                            if *macho_flags != 0 {
-                                return Err(cranelift_module::ModuleError::Backend(
-                                    anyhow::anyhow!(
-                                        "unsupported Mach-O flags for this platform: {macho_flags:?}"
-                                    ),
-                                ));
-                            }
-                        }
+            match self.object.section_flags_mut(section) {
+                SectionFlags::MachO { flags } => {
+                    // There are no default flags for the `SectionKind`s that
+                    // we've specified above, so it's fine to override.
+                    //
+                    // (If we don't want to override, we'll have to be careful
+                    // with how we set these, to ensure we set the section
+                    // type properly).
+                    assert_eq!(*flags, 0);
+                    *flags = *macho_flags;
+                }
+                _ => {
+                    if *macho_flags != 0 {
+                        return Err(cranelift_module::ModuleError::Backend(anyhow::anyhow!(
+                            "unsupported Mach-O flags for this platform: {macho_flags:?}"
+                        )));
                     }
-
-                    v.insert(section);
-                    section
                 }
             }
+
+            section
         };
 
         if used {

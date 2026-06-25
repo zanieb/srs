@@ -64,6 +64,12 @@ audit-as-crates-io = true
 [policy.cranelift-isle]
 audit-as-crates-io = true
 
+[policy.cranelift-isle-veri]
+criteria = []
+
+[policy.cranelift-isle-veri-aslp]
+criteria = []
+
 [policy.cranelift-jit]
 audit-as-crates-io = true
 
@@ -99,9 +105,6 @@ audit-as-crates-io = true
 
 [policy.uap-bench]
 criteria = []
-
-[policy.wasi-common]
-audit-as-crates-io = true
 
 [policy.wasmtime]
 audit-as-crates-io = true
@@ -194,9 +197,6 @@ audit-as-crates-io = true
 audit-as-crates-io = true
 
 [policy.wasmtime-wasi-nn]
-audit-as-crates-io = true
-
-[policy.wasmtime-wasi-threads]
 audit-as-crates-io = true
 
 [policy.wasmtime-wasi-tls]

@@ -5,22 +5,23 @@ macro_rules! foreach_builtin_function {
         $mac! {
             // Returns an index for wasm's `memory.grow` builtin function.
             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
-            // Returns an index for wasm's `table.init`.
-            table_init(vmctx: vmctx, table: u32, elem: u32, dst: u64, src: u64, len: u64) -> bool;
-            // Returns an index for wasm's `elem.drop`.
-            elem_drop(vmctx: vmctx, elem: u32) -> bool;
             // Returns an index for wasm's `memory.copy`
             memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
             // Returns an index for wasm's `memory.fill` instruction.
             memory_fill(vmctx: vmctx, dst: pointer, val: u32, len: size);
+            // Returns the current size of the passive `elem` segment.
+            passive_elem_segment_len(vmctx: vmctx, elem: u32) -> size;
+            // Returns the base address of the passive `elem` segment.
+            passive_elem_segment_base(vmctx: vmctx, elem: u32) -> pointer;
+            // Guts of `elem.drop` for passive data segments.
+            passive_elem_segment_drop(vmctx: vmctx, elem: u32) -> bool;
             // Returns a value for wasm's `ref.func` instruction.
             ref_func(vmctx: vmctx, func: u32) -> pointer;
             // Returns a table entry after lazily initializing it.
             table_get_lazy_init_func_ref(vmctx: vmctx, table: u32, index: u64) -> pointer;
-            // Returns an index for Wasm's `table.grow` instruction for `funcref`s.
-            table_grow_func_ref(vmctx: vmctx, table: u32, delta: u64, init: pointer) -> pointer;
-            // Returns an index for Wasm's `table.fill` instruction for `funcref`s.
-            table_fill_func_ref(vmctx: vmctx, table: u32, dst: u64, val: pointer, len: u64) -> bool;
+            // Grows `table` by `delta` elements, returning the destination
+            // address that new elements should be written at.
+            table_grow(vmctx: vmctx, table: u32, delta: u64) -> pointer;
             // Returns an index for wasm's `memory.atomic.notify` instruction.
             #[cfg(feature = "threads")]
             memory_atomic_notify(vmctx: vmctx, memory: u32, addr: u64, count: u32) -> u64;
@@ -118,28 +119,6 @@ macro_rules! foreach_builtin_function {
                 module_interned_type_index: u32
             ) -> pointer;
 
-            // Builtin implementation of the `array.new_elem` instruction.
-            #[cfg(feature = "gc")]
-            array_new_elem(
-                vmctx: vmctx,
-                array_interned_type_index: u32,
-                elem_index: u32,
-                elem_offset: u32,
-                len: u32
-            ) -> u32;
-
-            // Builtin implementation of the `array.init_elem` instruction.
-            #[cfg(feature = "gc")]
-            array_init_elem(
-                vmctx: vmctx,
-                array_interned_type_index: u32,
-                array: u32,
-                dst: u32,
-                elem_index: u32,
-                src: u32,
-                len: u32
-            ) -> bool;
-
             // Returns whether `actual_engine_type` is a subtype of
             // `expected_engine_type`.
             #[cfg(feature = "gc")]
@@ -148,14 +127,6 @@ macro_rules! foreach_builtin_function {
                 actual_engine_type: u32,
                 expected_engine_type: u32
             ) -> u32;
-
-            // Returns an index for Wasm's `table.grow` instruction for GC references.
-            #[cfg(feature = "gc")]
-            table_grow_gc_ref(vmctx: vmctx, table: u32, delta: u64, init: u32) -> pointer;
-
-            // Returns an index for Wasm's `table.fill` instruction for GC references.
-            #[cfg(feature = "gc")]
-            table_fill_gc_ref(vmctx: vmctx, table: u32, dst: u64, val: u32, len: u64) -> bool;
 
             // Wasm floating-point routines for when the CPU instructions aren't available.
             ceil_f32(vmctx: vmctx, x: f32) -> f32;
@@ -185,21 +156,6 @@ macro_rules! foreach_builtin_function {
             #[cfg(feature = "stack-switching")]
             cont_new(vmctx: vmctx, r: pointer, param_count: u32, result_count: u32) -> pointer;
 
-            // Returns an index for Wasm's `table.grow` instruction
-            // for `contobj`s.  Note that the initial
-            // Option<VMContObj> (i.e., the value to fill the new
-            // slots with) is split into two arguments: The underlying
-            // continuation reference and the revision count.  To
-            // denote the continuation being `None`, `init_contref`
-            // may be 0.
-            #[cfg(feature = "stack-switching")]
-            table_grow_cont_obj(vmctx: vmctx, table: u32, delta: u64, init_contref: pointer, init_revision: size) -> pointer;
-
-            // `value_contref` and `value_revision` together encode
-            // the Option<VMContObj>, as in previous libcall.
-            #[cfg(feature = "stack-switching")]
-            table_fill_cont_obj(vmctx: vmctx, table: u32, dst: u64, value_contref: pointer, value_revision: size, len: u64) -> bool;
-
             // Return the instance ID for a given vmctx.
             #[cfg(feature = "gc")]
             get_instance_id(vmctx: vmctx) -> u32;
@@ -207,6 +163,10 @@ macro_rules! foreach_builtin_function {
             // Throw an exception.
             #[cfg(feature = "gc")]
             throw_ref(vmctx: vmctx, exnref: u32) -> bool;
+
+            // Force a GC cycle for the DRC collector.
+            #[cfg(feature = "gc-drc")]
+            force_gc(vmctx: vmctx) -> bool;
 
             // Process a debug breakpoint.
             breakpoint(vmctx: vmctx) -> bool;
@@ -395,9 +355,7 @@ impl BuiltinFunctionIndex {
 
             // Growth-related functions return -2 as a sentinel.
             (@get memory_grow pointer) => (TrapSentinel::NegativeTwo);
-            (@get table_grow_func_ref pointer) => (TrapSentinel::NegativeTwo);
-            (@get table_grow_gc_ref pointer) => (TrapSentinel::NegativeTwo);
-            (@get table_grow_cont_obj pointer) => (TrapSentinel::NegativeTwo);
+            (@get table_grow pointer) => (TrapSentinel::NegativeTwo);
 
             // Atomics-related functions return a negative value to indicate a trap.
             (@get memory_atomic_notify u64) => (TrapSentinel::Negative);
@@ -413,10 +371,12 @@ impl BuiltinFunctionIndex {
             // The final epoch represents a trap
             (@get new_epoch u64) => (TrapSentinel::NegativeOne);
 
+            // Failure here indicates GC heap corruption.
+            (@get get_interned_func_ref pointer) => (TrapSentinel::NegativeOne);
+
             // These libcalls can't trap
             (@get ref_func pointer) => (return None);
             (@get table_get_lazy_init_func_ref pointer) => (return None);
-            (@get get_interned_func_ref pointer) => (return None);
             (@get intern_func_ref_for_gc_heap u64) => (return None);
             (@get is_subtype u32) => (return None);
             (@get ceil_f32 f32) => (return None);
@@ -432,6 +392,8 @@ impl BuiltinFunctionIndex {
             (@get fma_f32x4 f32x4) => (return None);
             (@get fma_f64x2 f64x2) => (return None);
             (@get passive_data_segment_base pointer) => (return None);
+            (@get passive_elem_segment_len size) => (return None);
+            (@get passive_elem_segment_base pointer) => (return None);
 
             (@get cont_new pointer) => (TrapSentinel::Negative);
 

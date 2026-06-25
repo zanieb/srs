@@ -1,13 +1,19 @@
 //! Compilation support for the component model.
 
+use std::marker::PhantomData;
+
+use crate::alias_region::AliasRegions;
 use crate::func_environ::BuiltinFunctions;
 use crate::trap::TranslateTrap;
-use crate::{TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, compiler::Compiler};
+use crate::{
+    TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, TRAP_UNCAUGHT_EXCEPTION, compiler::Compiler,
+};
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlagsData, Value};
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::FunctionBuilder;
+use wasmtime_environ::GetPtrSize;
 use wasmtime_environ::error::{Result, bail};
 use wasmtime_environ::{
     Abi, BuiltinFunctionIndex, CompiledFunctionBody, EntityRef, FuncKey, HostCall, PanicOnOom as _,
@@ -25,6 +31,7 @@ struct TrampolineCompiler<'a> {
     block0: ir::Block,
     signature: &'a WasmFuncType,
     builtins: BuiltinFunctions,
+    alias_regions: AliasRegions<VMComponentOffsets<u8>>,
 }
 
 /// What host functions can be called, used in `translate_hostcall` below.
@@ -108,16 +115,18 @@ impl<'a> TrampolineCompiler<'a> {
             crate::wasm_call_signature(isa, signature, &compiler.tunables),
         );
         let (builder, block0) = func_compiler.builder(func);
+        let offsets = VMComponentOffsets::new(isa.pointer_bytes(), component);
         TrampolineCompiler {
             compiler,
             isa,
             builder,
             component,
             types,
-            offsets: VMComponentOffsets::new(isa.pointer_bytes(), component),
+            offsets,
             block0,
             signature,
             builtins: BuiltinFunctions::new(compiler),
+            alias_regions: AliasRegions::new(offsets),
         }
     }
 
@@ -139,7 +148,6 @@ impl<'a> TrampolineCompiler<'a> {
                 options,
                 lower_ty,
             } => {
-                let pointer_type = self.isa.pointer_type();
                 self.translate_hostcall(
                     HostCallee::Lowering(*index),
                     HostResult::MultiValue {
@@ -149,13 +157,13 @@ impl<'a> TrampolineCompiler<'a> {
                     WasmArgs::ValRawList,
                     |me, params| {
                         let vmctx = params[0];
+                        let lowering_data = me.alias_regions.vmcomponent_lowering_data(
+                            &mut me.builder.cursor(),
+                            vmctx,
+                            *index,
+                        );
                         params.extend([
-                            me.builder.ins().load(
-                                pointer_type,
-                                MemFlagsData::trusted(),
-                                vmctx,
-                                i32::try_from(me.offsets.lowering_data(*index)).unwrap(),
-                            ),
+                            lowering_data,
                             me.index_value(*lower_ty),
                             me.index_value(*options),
                         ]);
@@ -966,11 +974,10 @@ impl<'a> TrampolineCompiler<'a> {
             HostCallee::Lowering(index) => {
                 // Load host function pointer from the vmcontext and then call that
                 // indirect function pointer with the list of arguments.
-                let host_fn = self.builder.ins().load(
-                    pointer_type,
-                    MemFlagsData::trusted(),
+                let host_fn = self.alias_regions.vmcomponent_lowering_callee(
+                    &mut self.builder.cursor(),
                     vmctx,
-                    i32::try_from(self.offsets.lowering_callee(index)).unwrap(),
+                    index,
                 );
                 let host_sig = {
                     let mut sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
@@ -1106,9 +1113,8 @@ impl<'a> TrampolineCompiler<'a> {
         //    run_destructor_block:
         //      ;; test may_leave, but only if the component instances
         //      ;; differ
-        //      flags = load.i32 vmctx+$instance_flags_offset
-        //      masked = band flags, $FLAG_MAY_LEAVE
-        //      trapz masked, $TRAP_CANNOT_LEAVE_COMPONENT
+        //      may_leave = load.i32 vmctx+$instance_flags_offset
+        //      trapz may_leave, $TRAP_CANNOT_LEAVE_COMPONENT
         //
         //      ;; set may_block to false, saving the old value to restore
         //      ;; later, but only if the component instances differ and
@@ -1182,18 +1188,14 @@ impl<'a> TrampolineCompiler<'a> {
 
                 if self.compiler.tunables.concurrency_support {
                     // Stash the old value of `may_block` and then set it to false.
-                    let old_may_block = self.builder.ins().load(
-                        ir::types::I32,
-                        trusted,
-                        vmctx,
-                        i32::try_from(self.offsets.task_may_block()).unwrap(),
-                    );
+                    let old_may_block = self
+                        .alias_regions
+                        .vmcomponent_task_may_block(&mut self.builder.cursor(), vmctx);
                     let zero = self.builder.ins().iconst(ir::types::I32, i64::from(0));
-                    self.builder.ins().store(
-                        ir::MemFlagsData::trusted(),
-                        zero,
+                    self.alias_regions.store_vmcomponent_task_may_block(
+                        &mut self.builder.cursor(),
                         vmctx,
-                        i32::try_from(self.offsets.task_may_block()).unwrap(),
+                        zero,
                     );
 
                     // Call `enter_sync_call`
@@ -1227,17 +1229,16 @@ impl<'a> TrampolineCompiler<'a> {
         // Conditionally emit destructor-execution code based on whether we
         // statically know that a destructor exists or not.
         if has_destructor {
-            let rep = self.builder.ins().ushr_imm(should_run_destructor, 1);
+            let rep = self.builder.ins().ushr_imm_u(should_run_destructor, 1);
             let rep = self.builder.ins().ireduce(ir::types::I32, rep);
             let index = self.types[resource].unwrap_concrete_ty();
             // NB: despite the vmcontext storing nullable funcrefs for function
             // pointers we know this is statically never null due to the
             // `has_destructor` check above.
-            let dtor_func_ref = self.builder.ins().load(
-                pointer_type,
-                trusted,
+            let dtor_func_ref = self.alias_regions.vmcomponent_resource_destructor(
+                &mut self.builder.cursor(),
                 vmctx,
-                i32::try_from(self.offsets.resource_destructor(index)).unwrap(),
+                index,
             );
             if self.compiler.emit_debug_checks {
                 self.builder
@@ -1265,11 +1266,38 @@ impl<'a> TrampolineCompiler<'a> {
             // takes ourselves out of the chain here but that's ok since the
             // caller is only used for store/limits and that same info is
             // stored, but elsewhere, in the component context.
-            self.builder.ins().call_indirect(
+            //
+            // The destructor is another component's code and this
+            // intrinsic is the boundary between the two components,
+            // so per the component model's canonical ABI an exception
+            // thrown by the destructor and not caught within its
+            // component must become a trap rather than unwinding into
+            // the calling component. That's implemented here with a
+            // catch-all exception handler.
+            let continuation = self.builder.create_block();
+            let uncaught_exception = self.builder.create_block();
+            self.builder.set_cold_block(uncaught_exception);
+            let dfg = &mut self.builder.func.dfg;
+            let exception_table = dfg.exception_tables.push(ir::ExceptionTableData::new(
                 sig_ref,
+                ir::BlockCall::new(continuation, None, &mut dfg.value_lists),
+                [ir::ExceptionTableItem::Default(ir::BlockCall::new(
+                    uncaught_exception,
+                    None,
+                    &mut dfg.value_lists,
+                ))],
+            ));
+            self.builder.ins().try_call_indirect(
                 func_addr,
                 &[callee_vmctx, caller_vmctx, rep],
+                exception_table,
             );
+            self.builder.switch_to_block(uncaught_exception);
+            self.builder.seal_block(uncaught_exception);
+            let (mut traps, builder) = self.traps();
+            traps.trap(builder, TRAP_UNCAUGHT_EXCEPTION);
+            self.builder.switch_to_block(continuation);
+            self.builder.seal_block(continuation);
         }
 
         if let Some(old_may_block) = old_may_block {
@@ -1281,11 +1309,10 @@ impl<'a> TrampolineCompiler<'a> {
             self.raise_if_host_trapped(result.unwrap());
 
             // Restore the old value of `may_block`
-            self.builder.ins().store(
-                ir::MemFlagsData::trusted(),
-                old_may_block,
+            self.alias_regions.store_vmcomponent_task_may_block(
+                &mut self.builder.cursor(),
                 vmctx,
-                i32::try_from(self.offsets.task_may_block()).unwrap(),
+                old_may_block,
             );
         }
 
@@ -1309,12 +1336,8 @@ impl<'a> TrampolineCompiler<'a> {
     }
 
     fn load_memory(&mut self, vmctx: ir::Value, memory: RuntimeMemoryIndex) -> ir::Value {
-        self.builder.ins().load(
-            self.isa.pointer_type(),
-            MemFlagsData::trusted(),
-            vmctx,
-            i32::try_from(self.offsets.runtime_memory(memory)).unwrap(),
-        )
+        self.alias_regions
+            .vmcomponent_runtime_memory(&mut self.builder.cursor(), vmctx, memory)
     }
 
     fn load_callback(
@@ -1324,11 +1347,10 @@ impl<'a> TrampolineCompiler<'a> {
     ) -> ir::Value {
         let pointer_type = self.isa.pointer_type();
         match callback {
-            Some(idx) => self.builder.ins().load(
-                pointer_type,
-                MemFlagsData::trusted(),
+            Some(idx) => self.alias_regions.vmcomponent_runtime_callback(
+                &mut self.builder.cursor(),
                 vmctx,
-                i32::try_from(self.offsets.runtime_callback(idx)).unwrap(),
+                idx,
             ),
             None => self.builder.ins().iconst(pointer_type, 0),
         }
@@ -1341,11 +1363,10 @@ impl<'a> TrampolineCompiler<'a> {
     ) -> ir::Value {
         let pointer_type = self.isa.pointer_type();
         match post_return {
-            Some(idx) => self.builder.ins().load(
-                pointer_type,
-                MemFlagsData::trusted(),
+            Some(idx) => self.alias_regions.vmcomponent_runtime_post_return(
+                &mut self.builder.cursor(),
                 vmctx,
-                i32::try_from(self.offsets.runtime_post_return(idx)).unwrap(),
+                idx,
             ),
             None => self.builder.ins().iconst(pointer_type, 0),
         }
@@ -1363,12 +1384,9 @@ impl<'a> TrampolineCompiler<'a> {
         let pointer_type = self.isa.pointer_type();
         // First load the pointer to the builtins structure which is static
         // per-process.
-        let builtins_array = self.builder.ins().load(
-            pointer_type,
-            MemFlagsData::trusted().with_readonly(),
-            vmctx,
-            i32::try_from(self.offsets.builtins()).unwrap(),
-        );
+        let builtins_array = self
+            .alias_regions
+            .vmcomponent_builtins(&mut self.builder.cursor(), vmctx);
         // Next load the function pointer at `offset` and return that.
         self.builder.ins().load(
             pointer_type,
@@ -1397,8 +1415,12 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn raise_if_host_trapped(&mut self, succeeded: ir::Value) {
         let caller_vmctx = self.caller_vmctx();
-        self.compiler
-            .raise_if_host_trapped(&mut self.builder, caller_vmctx, succeeded);
+        self.compiler.raise_if_host_trapped(
+            &mut self.builder,
+            &mut self.alias_regions,
+            caller_vmctx,
+            succeeded,
+        );
     }
 
     fn raise_if_transcode_trapped(&mut self, amount_copied: ir::Value) {
@@ -1504,26 +1526,27 @@ impl<'a> TrampolineCompiler<'a> {
     fn check_may_leave_instance(&mut self, instance: RuntimeComponentInstanceIndex) {
         let vmctx = self.builder.func.dfg.block_params(self.block0)[0];
 
-        let flags = self.builder.ins().load(
-            ir::types::I32,
-            ir::MemFlagsData::trusted(),
+        let may_leave = self.alias_regions.vmcomponent_instance_may_leave(
+            &mut self.builder.cursor(),
             vmctx,
-            i32::try_from(self.offsets.instance_flags(instance)).unwrap(),
+            instance,
         );
-        let may_leave_bit = self
-            .builder
-            .ins()
-            .band_imm(flags, i64::from(FLAG_MAY_LEAVE));
         let (mut traps, builder) = self.traps();
-        traps.trapz(builder, may_leave_bit, TRAP_CANNOT_LEAVE_COMPONENT);
+        traps.trapz(builder, may_leave, TRAP_CANNOT_LEAVE_COMPONENT);
     }
 
-    fn traps(&mut self) -> (TrapTranslator<'_>, &mut FunctionBuilder<'a>) {
+    fn traps(
+        &mut self,
+    ) -> (
+        TrapTranslator<'_, VMComponentOffsets<u8>>,
+        &mut FunctionBuilder<'a>,
+    ) {
         (
             TrapTranslator {
                 compiler: self.compiler,
                 vmctx: self.caller_vmctx(),
                 builtins: &mut self.builtins,
+                alias_regions: &mut self.alias_regions,
             },
             &mut self.builder,
         )
@@ -1540,35 +1563,34 @@ impl<'a> TrampolineCompiler<'a> {
     /// `VMComponentContext` if it's otherwise unused.
     fn load_vm_store_context(&mut self) -> ir::Value {
         let caller_vmctx = self.abi_load_params()[1];
-        self.builder.ins().load(
-            self.isa.pointer_type(),
-            ir::MemFlagsData::trusted()
-                .with_readonly()
-                .with_alias_region(Some(ir::AliasRegion::Vmctx))
-                .with_can_move(),
-            caller_vmctx,
-            i32::from(self.offsets.ptr.vmctx_store_context()),
-        )
+        self.alias_regions
+            .vmctx_store_context(&mut self.builder.cursor(), caller_vmctx)
     }
 }
 
-// Helper structure to implement `TranslateTrap`. This isn't possible to do
-// natively for `TrampolineCompiler` because it stores `FunctionBuilder`
-// internally. This differs from `FuncEnvironment` for core wasm which stores it
-// externally, hence the slightly different idioms to bridge here.
-struct TrapTranslator<'a> {
+// XXX: we can't implement this for `TrampolineCompiler` directly because it
+// stores `FunctionBuilder` internally, but this needs to take the builder as an
+// argument.
+struct TrapTranslator<'a, O: GetPtrSize> {
     compiler: &'a Compiler,
     vmctx: ir::Value,
+    alias_regions: &'a mut AliasRegions<O>,
     builtins: &'a mut BuiltinFunctions,
 }
 
-impl TranslateTrap for TrapTranslator<'_> {
+impl<O: GetPtrSize> TranslateTrap<O> for TrapTranslator<'_, O> {
     fn compiler(&self) -> &Compiler {
         self.compiler
     }
+
     fn vmctx_val(&mut self, _: &mut FuncCursor<'_>) -> ir::Value {
         self.vmctx
     }
+
+    fn alias_regions(&mut self) -> &mut AliasRegions<O> {
+        self.alias_regions
+    }
+
     fn builtin_funcref(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1578,8 +1600,60 @@ impl TranslateTrap for TrapTranslator<'_> {
     }
 }
 
+fn checked_native_addr<T: TranslateTrap<O>, O: GetPtrSize>(
+    traps: &mut T,
+    builder: &mut FunctionBuilder<'_>,
+    isa: &(dyn TargetIsa + 'static),
+    base_address: ir::Value,
+    offset: ir::Value,
+    length: ir::Value,
+    size: u32,
+) -> Result<ir::Value> {
+    debug_assert_eq!(builder.func.dfg.value_type(base_address), ir::types::I64);
+    debug_assert_eq!(builder.func.dfg.value_type(offset), ir::types::I64);
+    debug_assert_eq!(builder.func.dfg.value_type(length), ir::types::I64);
+
+    // Compute `offset + size`, trapping if it either overflows or is greater
+    // than `length`.
+    let size = builder.ins().iconst(ir::types::I64, i64::from(size));
+    let (end, overflow) = builder.ins().uadd_overflow(offset, size);
+    let too_big = builder.ins().icmp(IntCC::UnsignedGreaterThan, end, length);
+    let oob = builder.ins().bor(overflow, too_big);
+
+    // Compute the native address `base_address + offset`, truncating to the
+    // target's pointer width on 32-bit architectures.
+    let addr = builder.ins().iadd(base_address, offset);
+    let addr = match isa.pointer_bits() {
+        32 => builder.ins().ireduce(ir::types::I32, addr),
+        64 => addr,
+        p => bail!("unsupported architecture: no support for {p}-bit pointers"),
+    };
+
+    let addr =
+        // When Spectre mitigations are enabled, replace the address with NULL
+        // on the out-of-bounds path. The subsequent access only happens on the
+        // in-bounds path (we will have trapped otherwise), but this guards
+        // against the bounds-check branch being mispredicted and the access
+        // being performed speculatively against an out-of-bounds address.
+        if isa.flags().enable_heap_access_spectre_mitigation() {
+            let pointer_type = isa.pointer_type();
+            let null = builder.ins().iconst(pointer_type, 0);
+            let addr = builder.ins().select_spectre_guard(oob, null, addr);
+            traps.trapz(builder, addr, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+            addr
+        }
+        // Otherwise, when Spectre mitigations are disabled, just conditionally
+        // trap on the out-of-bounds condition directly.
+        else {
+            traps.trapnz(builder, oob, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+            addr
+        };
+
+    Ok(addr)
+}
+
 impl ComponentCompiler for Compiler {
-    fn compile_trampoline(
+    fn compile_component_trampoline(
         &self,
         component: &ComponentTranslation,
         types: &ComponentTypesBuilder,
@@ -1606,8 +1680,17 @@ impl ComponentCompiler for Compiler {
                     FuncKey::ComponentTrampoline(Abi::Wasm, trampoline_index),
                     sig,
                     symbol,
-                    offsets.vm_store_context(),
                     wasmtime_environ::component::VMCOMPONENT_MAGIC,
+                    |_alias_regions, pointer_type, cursor, vmctx| {
+                        // TODO: `VMComponentContext` doesn't have its own alias
+                        // region or helpers yet.
+                        cursor.ins().load(
+                            pointer_type,
+                            ir::MemFlagsData::trusted().with_readonly().with_can_move(),
+                            vmctx,
+                            i32::try_from(offsets.vm_store_context()).unwrap(),
+                        )
+                    },
                 )?);
             }
 
@@ -1628,6 +1711,7 @@ impl ComponentCompiler for Compiler {
         let pointer_type = self.isa.pointer_type();
         self.debug_assert_vmctx_kind(
             &mut c.builder,
+            &mut c.alias_regions,
             vmctx,
             wasmtime_environ::component::VMCOMPONENT_MAGIC,
         );
@@ -1635,12 +1719,12 @@ impl ComponentCompiler for Compiler {
         super::save_last_wasm_exit_fp_and_pc(
             &mut c.builder,
             pointer_type,
-            &c.offsets.ptr,
+            &mut c.alias_regions,
             vm_store_context,
         );
 
         c.translate(&component.trampolines[trampoline_index]);
-        c.builder.finalize();
+        c.builder.finalize(c.isa.frontend_config());
         compiler.cx.abi = Some(abi);
 
         Ok(CompiledFunctionBody {
@@ -1678,8 +1762,17 @@ impl ComponentCompiler for Compiler {
                     FuncKey::UnsafeIntrinsic(Abi::Wasm, intrinsic),
                     &wasm_func_ty,
                     symbol,
-                    offsets.vm_store_context(),
                     wasmtime_environ::component::VMCOMPONENT_MAGIC,
+                    |_alias_regions, pointer_type, cursor, vmctx| {
+                        // TODO: `VMComponentContext` doesn't have its own alias
+                        // region or helpers yet.
+                        cursor.ins().load(
+                            pointer_type,
+                            ir::MemFlagsData::trusted().with_readonly().with_can_move(),
+                            vmctx,
+                            i32::try_from(offsets.vm_store_context()).unwrap(),
+                        )
+                    },
                 )?);
             }
 
@@ -1698,16 +1791,28 @@ impl ComponentCompiler for Compiler {
             &types,
             &wasm_func_ty,
         );
-        let params = c.abi_load_params();
-        let result = UnsafeIntrinsicCompiler {
-            isa: c.isa,
-            ptr: &c.offsets.ptr,
-            cursor: c.builder.cursor(),
-        }
-        .translate(intrinsic, &params)?;
-        c.abi_store_results(result.as_slice());
 
-        c.builder.finalize();
+        // Translate the intrinsic by reusing the very same
+        // `UnsafeIntrinsicCompiler` that is used when intrinsics are inlined
+        // directly into their callers. The only difference is that here we drive
+        // it over this standalone trampoline's body: we load the trampoline's
+        // parameters, hand them to the intrinsic compiler, and return whatever
+        // value (if any) it produces.
+        let params = c.abi_load_params();
+        let isa = c.isa;
+        let (mut traps, builder) = c.traps();
+        let mut intrinsic_compiler = UnsafeIntrinsicCompiler {
+            isa,
+            builder,
+            traps: &mut traps,
+            phantom: PhantomData,
+        };
+        match intrinsic_compiler.translate(intrinsic, &params)? {
+            Some(value) => c.abi_store_results(&[value]),
+            None => c.abi_store_results(&[]),
+        }
+
+        c.builder.finalize(c.isa.frontend_config());
         compiler.cx.abi = Some(abi);
 
         Ok(CompiledFunctionBody {
@@ -1924,14 +2029,9 @@ impl TrampolineCompiler<'_> {
     }
 
     fn load_runtime_memory_base(&mut self, vmctx: ir::Value, mem: RuntimeMemoryIndex) -> ir::Value {
-        let pointer_type = self.isa.pointer_type();
         let from_vmmemory_definition = self.load_memory(vmctx, mem);
-        self.builder.ins().load(
-            pointer_type,
-            MemFlagsData::trusted(),
-            from_vmmemory_definition,
-            i32::from(self.offsets.ptr.vmmemory_definition_base()),
-        )
+        self.alias_regions
+            .vmmemory_definition_base(&mut self.builder.cursor(), from_vmmemory_definition)
     }
 }
 
@@ -1944,13 +2044,22 @@ impl TrampolineCompiler<'_> {
 /// This type itself is more of a context type of sorts where it maintains
 /// little-to-no state and instead just weaves together all that's necessary for
 /// translating an intrinsic.
-pub struct UnsafeIntrinsicCompiler<'a> {
+pub struct UnsafeIntrinsicCompiler<'a, 'b, T, O>
+where
+    T: TranslateTrap<O>,
+    O: GetPtrSize,
+{
     pub isa: &'a (dyn TargetIsa + 'static),
-    pub cursor: FuncCursor<'a>,
-    pub ptr: &'a (dyn PtrSize + 'static),
+    pub builder: &'a mut FunctionBuilder<'b>,
+    pub traps: &'a mut T,
+    pub phantom: PhantomData<O>,
 }
 
-impl<'a> UnsafeIntrinsicCompiler<'a> {
+impl<T, O> UnsafeIntrinsicCompiler<'_, '_, T, O>
+where
+    T: TranslateTrap<O>,
+    O: GetPtrSize,
+{
     /// Translates the `intrinsic` provided which is provided `params` as
     /// arguments.
     ///
@@ -1980,6 +2089,22 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
                 self.translate_store_intrinsic(intrinsic, params)?;
                 None
             }
+
+            UnsafeIntrinsic::U8CheckedNativeLoad
+            | UnsafeIntrinsic::U16CheckedNativeLoad
+            | UnsafeIntrinsic::U32CheckedNativeLoad
+            | UnsafeIntrinsic::U64CheckedNativeLoad => {
+                Some(self.translate_checked_load_intrinsic(intrinsic, params)?)
+            }
+
+            UnsafeIntrinsic::U8CheckedNativeStore
+            | UnsafeIntrinsic::U16CheckedNativeStore
+            | UnsafeIntrinsic::U32CheckedNativeStore
+            | UnsafeIntrinsic::U64CheckedNativeStore => {
+                self.translate_checked_store_intrinsic(intrinsic, params)?;
+                None
+            }
+
             UnsafeIntrinsic::StoreDataAddress => {
                 let pointer_type = self.isa.pointer_type();
 
@@ -1987,19 +2112,14 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
                 let store_ctx = self.load_vm_store_context(params);
 
                 // Load the `*mut T` out of the `VMStoreContext`.
-                let data_address = self.cursor.ins().load(
-                    pointer_type,
-                    ir::MemFlagsData::trusted()
-                        .with_readonly()
-                        .with_alias_region(Some(ir::AliasRegion::Vmctx))
-                        .with_can_move(),
-                    store_ctx,
-                    i32::from(self.ptr.vmstore_context_store_data()),
-                );
+                let data_address = self
+                    .traps
+                    .alias_regions()
+                    .vmstore_context_store_data(&mut self.builder.cursor(), store_ctx);
 
                 // Zero-extend the address if we are on a 32-bit architecture.
                 let data_address = match pointer_type.bits() {
-                    32 => self.cursor.ins().uextend(ir::types::I64, data_address),
+                    32 => self.builder.ins().uextend(ir::types::I64, data_address),
                     64 => data_address,
                     p => bail!("unsupported architecture: no support for {p}-bit pointers"),
                 };
@@ -2033,16 +2153,16 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
         };
 
         // Truncate the pointer, if necessary.
-        debug_assert_eq!(self.cursor.func.dfg.value_type(pointer), ir::types::I64);
+        debug_assert_eq!(self.builder.func.dfg.value_type(pointer), ir::types::I64);
         let pointer = match self.isa.pointer_bits() {
-            32 => self.cursor.ins().ireduce(ir::types::I32, pointer),
+            32 => self.builder.ins().ireduce(ir::types::I32, pointer),
             64 => pointer,
             p => bail!("unsupported architecture: no support for {p}-bit pointers"),
         };
 
         // Do the load!
         let mut value = self
-            .cursor
+            .builder
             .ins()
             .load(clif_ty, ir::MemFlagsData::trusted(), pointer, 0);
 
@@ -2055,7 +2175,7 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
             assert!(clif_ty.bytes() < wasm_clif_ty.bytes());
             // NB: all of our unsafe intrinsics for native loads are
             // unsigned, so we always zero-extend.
-            value = self.cursor.ins().uextend(wasm_clif_ty, value);
+            value = self.builder.ins().uextend(wasm_clif_ty, value);
         }
 
         Ok(value)
@@ -2077,9 +2197,9 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
         };
 
         // Truncate the pointer, if necessary.
-        debug_assert_eq!(self.cursor.func.dfg.value_type(pointer), ir::types::I64);
+        debug_assert_eq!(self.builder.func.dfg.value_type(pointer), ir::types::I64);
         let pointer = match self.isa.pointer_bits() {
-            32 => self.cursor.ins().ireduce(ir::types::I32, pointer),
+            32 => self.builder.ins().ireduce(ir::types::I32, pointer),
             64 => pointer,
             p => bail!("unsupported architecture: no support for {p}-bit pointers"),
         };
@@ -2091,13 +2211,117 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
         let wasm_ty = crate::value_type(self.isa, wasm_ty);
         if clif_ty != wasm_ty {
             assert!(clif_ty.bytes() < wasm_ty.bytes());
-            value = self.cursor.ins().ireduce(clif_ty, value);
+            value = self.builder.ins().ireduce(clif_ty, value);
         }
 
         // Do the store!
-        self.cursor
+        self.builder
             .ins()
             .store(ir::MemFlagsData::trusted(), value, pointer, 0);
+
+        Ok(())
+    }
+
+    fn translate_checked_load_intrinsic(
+        &mut self,
+        intrinsic: UnsafeIntrinsic,
+        params: &[ir::Value],
+    ) -> Result<ir::Value> {
+        debug_assert_eq!(
+            intrinsic.core_params(),
+            &[WasmValType::I64, WasmValType::I64, WasmValType::I64]
+        );
+        debug_assert_eq!(intrinsic.core_results().len(), 1);
+
+        let wasm_ty = intrinsic.core_results()[0];
+        let clif_ty = unsafe_intrinsic_clif_results(intrinsic)[0];
+
+        let [_callee_vmctx, _caller_vmctx, base_address, offset, length] = *params else {
+            unreachable!()
+        };
+
+        // Bounds-check the access and compute its native address, trapping if
+        // it is out of bounds.
+        let addr = checked_native_addr(
+            self.traps,
+            self.builder,
+            self.isa,
+            base_address,
+            offset,
+            length,
+            clif_ty.bytes(),
+        )?;
+
+        // Do the load!
+        let mut value = self
+            .builder
+            .ins()
+            .load(clif_ty, ir::MemFlagsData::trusted(), addr, 0);
+
+        // Zero-extend the loaded value to the Wasm result type, if necessary.
+        let wasm_clif_ty = crate::value_type(self.isa, wasm_ty);
+        if clif_ty != wasm_clif_ty {
+            assert!(clif_ty.bytes() < wasm_clif_ty.bytes());
+            value = self.builder.ins().uextend(wasm_clif_ty, value);
+        }
+
+        Ok(value)
+    }
+
+    fn translate_checked_store_intrinsic(
+        &mut self,
+        intrinsic: UnsafeIntrinsic,
+        params: &[ir::Value],
+    ) -> Result<()> {
+        debug_assert!(intrinsic.core_results().is_empty());
+        debug_assert!(matches!(
+            intrinsic.core_params(),
+            [
+                WasmValType::I64,
+                WasmValType::I64,
+                WasmValType::I64,
+                _value_ty
+            ]
+        ));
+
+        let wasm_ty = intrinsic.core_params()[3];
+        let clif_ty = unsafe_intrinsic_clif_params(intrinsic)[3];
+
+        let [
+            _callee_vmctx,
+            _caller_vmctx,
+            base_address,
+            offset,
+            length,
+            mut value,
+        ] = *params
+        else {
+            unreachable!()
+        };
+
+        // Bounds-check the access and compute its native address, trapping if
+        // it is out of bounds.
+        let addr = checked_native_addr(
+            self.traps,
+            self.builder,
+            self.isa,
+            base_address,
+            offset,
+            length,
+            clif_ty.bytes(),
+        )?;
+
+        // Truncate the value to the access type, if necessary.
+        let wasm_ty = crate::value_type(self.isa, wasm_ty);
+        if clif_ty != wasm_ty {
+            assert!(clif_ty.bytes() < wasm_ty.bytes());
+            value = self.builder.ins().ireduce(clif_ty, value);
+        }
+
+        // Do the store!
+        self.builder
+            .ins()
+            .store(ir::MemFlagsData::trusted(), value, addr, 0);
 
         Ok(())
     }
@@ -2122,26 +2346,30 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
             UnsafeIntrinsic::ContextGetI32_1 | UnsafeIntrinsic::ContextSetI32_1 => 1,
             _ => unreachable!(),
         };
-        let offset = self.ptr.vmstore_context_component_context_slot(slot);
         let vmstore_context = self.load_vm_store_context(params);
         match intrinsic {
             UnsafeIntrinsic::ContextGetI32_0 | UnsafeIntrinsic::ContextGetI32_1 => {
-                let context = self.cursor.ins().load(
-                    ty,
-                    MemFlagsData::trusted(),
-                    vmstore_context,
-                    i32::from(offset),
-                );
+                let context = self
+                    .traps
+                    .alias_regions()
+                    .vmstore_context_component_context_slot(
+                        &mut self.builder.cursor(),
+                        ty,
+                        vmstore_context,
+                        slot,
+                    );
                 Some(context)
             }
             UnsafeIntrinsic::ContextSetI32_0 | UnsafeIntrinsic::ContextSetI32_1 => {
                 let new_context = params[2];
-                self.cursor.ins().store(
-                    MemFlagsData::trusted(),
-                    new_context,
-                    vmstore_context,
-                    i32::from(offset),
-                );
+                self.traps
+                    .alias_regions()
+                    .store_vmstore_context_component_context_slot(
+                        &mut self.builder.cursor(),
+                        vmstore_context,
+                        slot,
+                        new_context,
+                    );
                 None
             }
             _ => unreachable!(),
@@ -2159,15 +2387,9 @@ impl<'a> UnsafeIntrinsicCompiler<'a> {
     /// `VMComponentContext` if it's otherwise unused.
     fn load_vm_store_context(&mut self, params: &[ir::Value]) -> ir::Value {
         let caller_vmctx = params[1];
-        self.cursor.ins().load(
-            self.isa.pointer_type(),
-            ir::MemFlagsData::trusted()
-                .with_readonly()
-                .with_alias_region(Some(ir::AliasRegion::Vmctx))
-                .with_can_move(),
-            caller_vmctx,
-            i32::from(self.ptr.vmctx_store_context()),
-        )
+        self.traps
+            .alias_regions()
+            .vmctx_store_context(&mut self.builder.cursor(), caller_vmctx)
     }
 }
 
