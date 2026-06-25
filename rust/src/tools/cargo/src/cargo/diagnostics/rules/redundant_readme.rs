@@ -2,7 +2,6 @@ use std::path::Path;
 
 use cargo_util_schemas::manifest::InheritableField;
 use cargo_util_schemas::manifest::StringOrBool;
-use cargo_util_schemas::manifest::TomlToolLints;
 use cargo_util_terminal::report::AnnotationKind;
 use cargo_util_terminal::report::Group;
 use cargo_util_terminal::report::Level;
@@ -15,12 +14,14 @@ use super::STYLE;
 use crate::CargoResult;
 use crate::GlobalContext;
 use crate::core::Package;
-use crate::diagnostics::DiagnosticStats;
+use crate::core::Workspace;
 use crate::diagnostics::Lint;
 use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelProduct;
 use crate::diagnostics::LintLevelSource;
+use crate::diagnostics::ScopedDiagnosticStats;
 use crate::diagnostics::get_key_value_span;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::workspace_rel_path;
 use crate::util::toml::DEFAULT_README_FILES;
 
 pub static LINT: &Lint = &Lint {
@@ -64,34 +65,30 @@ name = "foo"
 };
 
 #[instrument(skip_all)]
-pub fn redundant_readme(
+pub(crate) fn lint_package(
+    ws: &Workspace<'_>,
     pkg: &Package,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = LINT.level(
-        cargo_lints,
-        pkg.rust_version(),
-        pkg.manifest().unstable_features(),
-    );
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
 
-    if lint_level == LintLevel::Allow {
-        return Ok(());
-    }
+    let manifest_path = workspace_rel_path(ws, manifest_path);
 
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
-
-    lint_package(pkg, &manifest_path, lint_level, source, stats, gctx)
+    lint_package_inner(pkg, &manifest_path, lint_level, source, pkg_stats, gctx)
 }
 
-fn lint_package(
+fn lint_package_inner(
     pkg: &Package,
     manifest_path: &str,
     lint_level: LintLevel,
     source: LintLevelSource,
-    stats: &mut DiagnosticStats,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
     let manifest = pkg.manifest();
@@ -159,7 +156,7 @@ fn lint_package(
         report.push(help);
     }
 
-    stats.record_lint(lint_level);
+    pkg_stats.record_lint(lint_level);
     gctx.shell().print_report(&report, lint_level.force())?;
 
     Ok(())

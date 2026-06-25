@@ -18,6 +18,7 @@ rust-version = "1.0"
 unknown = "foo"
 
 [workspace.lints.cargo]
+default = { level = "allow", priority = -1 }
 unused_workspace_package_fields = "warn"
 
 [package]
@@ -47,7 +48,7 @@ workspace = true
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("fetch -Zcargo-lints")
         .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [WARNING] unused field in `workspace.package`
@@ -72,9 +73,8 @@ workspace = true
 9 - unknown = "foo"
   |
 [WARNING] workspace (manifest) generated 2 warnings
-[WARNING] [ROOT]/foo/Cargo.toml: unused manifest key: workspace.package.unknown
-[CHECKING] foo v0.0.1 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[WARNING] Cargo.toml: unused manifest key: workspace.package.unknown
+[WARNING] `foo` (manifest) generated 1 warning
 
 "#]])
         .run();

@@ -485,9 +485,10 @@ fn cargo_compile_duplicate_build_targets() {
 
     p.cargo("build")
         .with_stderr_data(str![[r#"
-[WARNING] file `[ROOT]/foo/src/main.rs` found to be present in multiple build targets:
+[WARNING] Cargo.toml: file `[ROOT]/foo/src/main.rs` found to be present in multiple build targets:
   * `lib` target `main`
   * `bin` target `foo`
+[WARNING] `foo` (manifest) generated 1 warning
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -636,10 +637,8 @@ fn cargo_compile_with_bin_and_crate_type() {
     p.cargo("build")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
-
-Caused by:
-  the target `the_foo_bin` is a binary and can't have any crate-types set (currently "cdylib, rlib")
+[ERROR] Cargo.toml: the target `the_foo_bin` is a binary and can't have any crate-types set (currently "cdylib, rlib")
+[ERROR] could not parse `foo` (manifest) due to 1 previous error
 
 "#]])
         .run();
@@ -724,10 +723,8 @@ fn cargo_compile_with_bin_and_proc() {
     p.cargo("build")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
-
-Caused by:
-  the target `the_foo_bin` is a binary and can't have `proc-macro` set `true`
+[ERROR] Cargo.toml: the target `the_foo_bin` is a binary and can't have `proc-macro` set `true`
+[ERROR] could not parse `foo` (manifest) due to 1 previous error
 
 "#]])
         .run();
@@ -1576,7 +1573,7 @@ fn cargo_default_env_metadata_env_var() {
         .with_stderr_data(format!(
             "\
 ...
-[RUNNING] `rustc --crate-name foo [..]--extern bar=[ROOT]/foo/target/debug/deps/{dll_prefix}bar{dll_suffix}`
+[RUNNING] `rustc --crate-name foo [..]--extern bar=[ROOT]/foo/target/debug/deps/{dll_prefix}bar{dll_suffix}[..]`
 ...
 "))
         .run();
@@ -1589,7 +1586,7 @@ fn cargo_default_env_metadata_env_var() {
         .with_stderr_data(format!(
             "\
 ...
-[RUNNING] `rustc --crate-name foo [..]--extern bar=[ROOT]/foo/target/debug/deps/{dll_prefix}bar-[..]{dll_suffix}`
+[RUNNING] `rustc --crate-name foo [..]--extern bar=[ROOT]/foo/target/debug/deps/{dll_prefix}bar-[..]{dll_suffix}[..]`
 ...
 "))
         .run();
@@ -2006,8 +2003,9 @@ fn many_crate_types_old_style_lib_location() {
         .build();
     p.cargo("build")
         .with_stderr_data(str![[r#"
-[WARNING] path `src/foo.rs` was erroneously implicitly accepted for library `foo`,
+[WARNING] Cargo.toml: path `src/foo.rs` was erroneously implicitly accepted for library `foo`,
 please rename the file to `src/lib.rs` or set lib.path in Cargo.toml
+[WARNING] `foo` (manifest) generated 1 warning
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -5057,7 +5055,8 @@ fn target_edition() {
 
     p.cargo("build -v")
         .with_stderr_data(str![[r#"
-[WARNING] `edition` is set on library `foo` which is deprecated
+[WARNING] Cargo.toml: `edition` is set on library `foo` which is deprecated
+[WARNING] `foo` (manifest) generated 1 warning
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `rustc [..]--edition=2018 [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -5244,7 +5243,7 @@ fn uplift_pdb_of_bin_on_windows() {
     assert!(!p.target_debug_dir().join("d.pdb").exists());
 }
 
-#[cargo_test]
+#[cargo_test(requires_host_split_debuginfo = "packed")]
 #[cfg(target_os = "linux")]
 fn uplift_dwp_of_bin_on_linux() {
     let p = project()
@@ -5893,7 +5892,7 @@ fn build_lib_only() {
     p.cargo("build --lib -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..]--crate-type lib --emit=[..]link[..] -L dependency=[ROOT]/foo/target/debug/deps`
+[RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..]--crate-type lib --emit=[..]link[..] -L dependency=[ROOT]/foo/target/debug/deps[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])

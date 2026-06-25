@@ -222,7 +222,7 @@ impl str::FromStr for Manifest {
 
     /// Read manifest data from string
     fn from_str(input: &str) -> ::std::result::Result<Self, Self::Err> {
-        let d: toml_edit::DocumentMut = input.parse().context("Manifest not valid TOML")?;
+        let d: toml_edit::DocumentMut = input.parse().context("manifest not valid TOML")?;
 
         Ok(Manifest { data: d })
     }
@@ -283,7 +283,7 @@ impl LocalManifest {
                 data = String::new();
             }
         }
-        let manifest = data.parse().context("Unable to parse Cargo.toml")?;
+        let manifest = data.parse().context("unable to parse Cargo.toml")?;
         Ok(LocalManifest {
             manifest,
             path: path.to_owned(),
@@ -351,6 +351,32 @@ impl LocalManifest {
                 );
                 (dep_key, table_path, dep)
             })
+    }
+
+    pub fn ensure_edition(&mut self) -> bool {
+        if self.embedded.is_none() {
+            return false;
+        }
+
+        let root = self.data.as_table_mut();
+        let package = root.entry("package").or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.set_position(Some(-1));
+            t.into()
+        });
+        let Some(package) = package.as_table_like_mut() else {
+            return false;
+        };
+
+        let mut changed = false;
+        package.entry("edition").or_insert_with(|| {
+            changed = true;
+            crate::core::features::Edition::LATEST_STABLE
+                .to_string()
+                .into()
+        });
+
+        changed
     }
 
     /// Add entry to a Cargo.toml.

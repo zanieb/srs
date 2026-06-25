@@ -107,8 +107,6 @@ pub struct PackageRegistry<'gctx> {
     /// This is constructed via [`PackageRegistry::register_lock`].
     /// See also [`LockedMap`].
     locked: LockedMap,
-    /// Packages allowed to be used, even if they are yanked.
-    yanked_whitelist: RefCell<HashSet<PackageId>>,
     source_config: SourceConfigMap<'gctx>,
 
     /// Patches registered during calls to [`PackageRegistry::patch`].
@@ -203,7 +201,6 @@ impl<'gctx> PackageRegistry<'gctx> {
             overrides: RefCell::new(Vec::new()),
             source_config,
             locked: HashMap::new(),
-            yanked_whitelist: RefCell::new(HashSet::new()),
             patches: HashMap::new(),
             patches_locked: false,
             patches_available: HashMap::new(),
@@ -282,15 +279,6 @@ impl<'gctx> PackageRegistry<'gctx> {
     pub fn add_override(&mut self, source: Box<dyn Source + 'gctx>) {
         self.overrides.borrow_mut().push(source.source_id());
         self.add_source(source, Kind::Override);
-    }
-
-    /// Allows a group of package to be available to query even if they are yanked.
-    pub fn add_to_yanked_whitelist(&self, iter: impl Iterator<Item = PackageId>) {
-        let pkgs = iter.collect::<Vec<_>>();
-        for (_, source) in self.sources.borrow().iter() {
-            source.add_to_yanked_whitelist(&pkgs);
-        }
-        self.yanked_whitelist.borrow_mut().extend(pkgs);
     }
 
     /// remove all residual state from previous lock files.
@@ -414,7 +402,9 @@ impl<'gctx> PackageRegistry<'gctx> {
                 let mut summaries = Vec::new();
                 source
                     .query(&dep, QueryKind::Exact, &mut |s| {
-                        summaries.push(s.into_summary())
+                        if let IndexSummary::Candidate(summary) = s {
+                            summaries.push(summary)
+                        }
                     })
                     .await
                     .with_context(|| format!("unable to update {}", source.source_id()))
@@ -533,7 +523,7 @@ impl<'gctx> PackageRegistry<'gctx> {
         debug!("loading source {}", source_id);
         let source = self
             .source_config
-            .load(source_id, &self.yanked_whitelist.borrow())
+            .load(source_id)
             .with_context(|| format!("unable to update {}", source_id))?;
         assert_eq!(source.source_id(), source_id);
 
@@ -562,7 +552,7 @@ impl<'gctx> PackageRegistry<'gctx> {
     }
 
     /// Queries path overrides from this registry.
-    async fn query_overrides(&self, dep: &Dependency) -> CargoResult<Option<IndexSummary>> {
+    async fn query_overrides(&self, dep: &Dependency) -> CargoResult<Option<Summary>> {
         let overrides = self.overrides.borrow();
         for &s in overrides.iter() {
             let dep = Dependency::new_override(dep.package_name(), s);
@@ -571,7 +561,11 @@ impl<'gctx> PackageRegistry<'gctx> {
                 .borrow()
                 .get(s)
                 .unwrap()
-                .query(&dep, QueryKind::Exact, &mut |s| results = Some(s))
+                .query(&dep, QueryKind::Exact, &mut |s| {
+                    if let IndexSummary::Candidate(s) = s {
+                        results = Some(s);
+                    }
+                })
                 .await?;
             if results.is_some() {
                 return Ok(results);
@@ -692,10 +686,9 @@ impl<'gctx> Registry for PackageRegistry<'gctx> {
             let patch = patches.remove(0);
             match override_summary {
                 Some(override_summary) => {
-                    self.warn_bad_override(override_summary.as_summary(), &patch)?;
-                    let override_summary =
-                        override_summary.map_summary(|summary| self.lock(summary));
-                    f(override_summary);
+                    self.warn_bad_override(&override_summary, &patch)?;
+                    let override_summary = self.lock(override_summary);
+                    f(IndexSummary::Candidate(override_summary));
                 }
                 None => f(IndexSummary::Candidate(patch)),
             }
@@ -787,17 +780,25 @@ impl<'gctx> Registry for PackageRegistry<'gctx> {
                 let mut to_warn = None;
                 let callback = &mut |summary| {
                     n += 1;
-                    to_warn = Some(summary);
+                    match summary {
+                        IndexSummary::Candidate(summary)
+                        | IndexSummary::Yanked(summary)
+                        | IndexSummary::Offline(summary)
+                        | IndexSummary::Unsupported(summary, _)
+                        | IndexSummary::Invalid(summary) => {
+                            to_warn = Some(summary);
+                        }
+                    }
                 };
                 query_with_context(&*source, dep, kind, callback).await?;
                 if n > 1 {
                     return Err(anyhow::anyhow!("found an override with a non-locked list"));
                 }
                 if let Some(to_warn) = to_warn {
-                    self.warn_bad_override(override_summary.as_summary(), to_warn.as_summary())?;
+                    self.warn_bad_override(&override_summary, &to_warn)?;
                 }
-                let override_summary = override_summary.map_summary(|summary| self.lock(summary));
-                f(override_summary);
+                let override_summary = self.lock(override_summary);
+                f(IndexSummary::Candidate(override_summary));
             }
         }
 
@@ -985,7 +986,13 @@ async fn summary_for_patch(
                 Vec::new()
             });
 
-        let orig_matches = orig_matches.into_iter().map(|s| s.into_summary()).collect();
+        let orig_matches = orig_matches
+            .into_iter()
+            .filter_map(|s| match s {
+                IndexSummary::Candidate(s) => Some(s),
+                _ => None,
+            })
+            .collect();
 
         let summary = Box::pin(summary_for_patch(
             original_patch,
@@ -1016,7 +1023,10 @@ async fn summary_for_patch(
         });
     let mut vers = name_summaries
         .iter()
-        .map(|summary| summary.as_summary().version())
+        .filter_map(|s| match s {
+            IndexSummary::Candidate(s) => Some(s.version()),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let found = match vers.len() {
         0 => "".to_string(),

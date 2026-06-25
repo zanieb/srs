@@ -1210,7 +1210,7 @@ fn cfg_rustflags_normal_source() {
     p.cargo("build --lib -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg bar`
+[RUNNING] `rustc --crate-name foo [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1219,7 +1219,7 @@ fn cfg_rustflags_normal_source() {
     p.cargo("build --bin=a -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a [..] --cfg bar`
+[RUNNING] `rustc --crate-name a [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1228,7 +1228,7 @@ fn cfg_rustflags_normal_source() {
     p.cargo("build --example=b -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name b [..] --cfg bar`
+[RUNNING] `rustc --crate-name b [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1237,9 +1237,9 @@ fn cfg_rustflags_normal_source() {
     p.cargo("test --no-run -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
 [EXECUTABLE] `[ROOT]/foo/target/debug/deps/a-[HASH][EXE]`
@@ -1251,9 +1251,9 @@ fn cfg_rustflags_normal_source() {
     p.cargo("bench --no-run -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
 [EXECUTABLE] `[ROOT]/foo/target/release/deps/foo-[HASH][EXE]`
 [EXECUTABLE] `[ROOT]/foo/target/release/deps/a-[HASH][EXE]`
@@ -1292,7 +1292,7 @@ fn cfg_rustflags_precedence() {
     p.cargo("build --lib -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg bar`
+[RUNNING] `rustc --crate-name foo [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1301,7 +1301,7 @@ fn cfg_rustflags_precedence() {
     p.cargo("build --bin=a -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a [..] --cfg bar`
+[RUNNING] `rustc --crate-name a [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1310,7 +1310,7 @@ fn cfg_rustflags_precedence() {
     p.cargo("build --example=b -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name b [..] --cfg bar`
+[RUNNING] `rustc --crate-name b [..] --cfg bar[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1319,9 +1319,9 @@ fn cfg_rustflags_precedence() {
     p.cargo("test --no-run -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
 [EXECUTABLE] `[ROOT]/foo/target/debug/deps/a-[HASH][EXE]`
@@ -1333,9 +1333,9 @@ fn cfg_rustflags_precedence() {
     p.cargo("bench --no-run -v")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
-[RUNNING] `rustc [..] --cfg bar`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
+[RUNNING] `rustc [..] --cfg bar[..]`
 [FINISHED] `bench` profile [optimized] target(s) in [ELAPSED]s
 [EXECUTABLE] `[ROOT]/foo/target/release/deps/foo-[HASH][EXE]`
 [EXECUTABLE] `[ROOT]/foo/target/release/deps/a-[HASH][EXE]`
@@ -1360,7 +1360,7 @@ fn target_rustflags_string_and_array_form1() {
     p1.cargo("check -v")
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg foo`
+[RUNNING] `rustc --crate-name foo [..] --cfg foo[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1380,7 +1380,7 @@ fn target_rustflags_string_and_array_form1() {
     p2.cargo("check -v")
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg foo`
+[RUNNING] `rustc --crate-name foo [..] --cfg foo[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1406,7 +1406,7 @@ fn target_rustflags_string_and_array_form2() {
     p1.cargo("check -v")
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg foo`
+[RUNNING] `rustc --crate-name foo [..] --cfg foo[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -1429,7 +1429,7 @@ fn target_rustflags_string_and_array_form2() {
     p2.cargo("check -v")
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --cfg foo`
+[RUNNING] `rustc --crate-name foo [..] --cfg foo[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])

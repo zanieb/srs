@@ -14,12 +14,14 @@ use super::SUSPICIOUS;
 use super::find_lint_or_group;
 use crate::CargoResult;
 use crate::GlobalContext;
-use crate::diagnostics::DiagnosticStats;
+use crate::core::MaybePackage;
+use crate::core::Workspace;
 use crate::diagnostics::Lint;
-use crate::diagnostics::LintLevel;
+use crate::diagnostics::LintLevelProduct;
 use crate::diagnostics::ManifestFor;
+use crate::diagnostics::ScopedDiagnosticStats;
 use crate::diagnostics::get_key_value_span;
-use crate::diagnostics::rel_cwd_manifest_path;
+use crate::diagnostics::workspace_rel_path;
 
 pub static LINT: &Lint = &Lint {
     name: "unknown_lints",
@@ -48,20 +50,81 @@ this-lint-does-not-exist = "warn"
 };
 
 #[instrument(skip_all)]
-pub fn unknown_lints(
+pub(crate) fn lint_manifest(
+    ws: &Workspace<'_>,
     manifest: ManifestFor<'_>,
     manifest_path: &Path,
-    cargo_lints: &TomlToolLints,
-    stats: &mut DiagnosticStats,
+    level: LintLevelProduct,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let (lint_level, source) = manifest.lint_level(cargo_lints, LINT);
+    let normalized_toml = match &manifest {
+        ManifestFor::Package(pkg) => pkg.manifest().normalized_toml(),
+        ManifestFor::Workspace {
+            maybe_pkg: MaybePackage::Virtual(vm),
+            ..
+        } => vm.normalized_toml(),
+        ManifestFor::Workspace {
+            maybe_pkg: MaybePackage::Package(_),
+            ..
+        } => {
+            // For real manifests, lint as a package, rather than a workspace
+            return Ok(());
+        }
+    };
 
-    if lint_level == LintLevel::Allow {
-        return Ok(());
+    let ws_lints = normalized_toml
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.lints.as_ref())
+        .and_then(|lints| lints.get("cargo"));
+    let pkg_lints = normalized_toml
+        .lints
+        .as_ref()
+        .map(|lints| &lints.lints)
+        .and_then(|lints| lints.get("cargo"));
+
+    if let Some(cargo_lints) = ws_lints {
+        lint_manifest_inner(
+            ws,
+            &manifest,
+            manifest_path,
+            &level,
+            cargo_lints,
+            pkg_stats,
+            gctx,
+        )?;
+    }
+    if let Some(cargo_lints) = pkg_lints {
+        lint_manifest_inner(
+            ws,
+            &manifest,
+            manifest_path,
+            &level,
+            cargo_lints,
+            pkg_stats,
+            gctx,
+        )?;
     }
 
-    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+    Ok(())
+}
+
+fn lint_manifest_inner(
+    ws: &Workspace<'_>,
+    manifest: &ManifestFor<'_>,
+    manifest_path: &Path,
+    level: &LintLevelProduct,
+    cargo_lints: &TomlToolLints,
+    pkg_stats: &mut ScopedDiagnosticStats<'_>,
+    gctx: &GlobalContext,
+) -> CargoResult<()> {
+    let LintLevelProduct {
+        level: lint_level,
+        source,
+    } = level;
+
+    let manifest_path = workspace_rel_path(ws, manifest_path);
     let mut unknown_lints = Vec::new();
     for lint_name in cargo_lints.keys().map(|name| name) {
         let Some(_) = find_lint_or_group(lint_name) else {
@@ -110,7 +173,7 @@ pub fn unknown_lints(
         }
 
         if emitted_source.is_none() {
-            emitted_source = Some(LINT.emitted_source(lint_level, source));
+            emitted_source = Some(LINT.emitted_source(*lint_level, *source));
             group = group.element(Level::NOTE.message(emitted_source.as_ref().unwrap()));
         }
         if let Some(help) = help.as_ref() {
@@ -118,7 +181,7 @@ pub fn unknown_lints(
         }
         report.push(group);
 
-        stats.record_lint(lint_level);
+        pkg_stats.record_lint(*lint_level);
         gctx.shell().print_report(&report, lint_level.force())?;
     }
 

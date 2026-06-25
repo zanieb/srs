@@ -198,7 +198,7 @@ use flate2::read::GzDecoder;
 use futures::FutureExt as _;
 use serde::Deserialize;
 use serde::Serialize;
-use tar::Archive;
+use tar::{Archive, EntryType};
 use tracing::debug;
 
 use crate::core::dependency::Dependency;
@@ -212,6 +212,8 @@ use crate::util::cache_lock::CacheLockMode;
 use crate::util::interning::InternedString;
 use crate::util::{CargoResult, Filesystem, GlobalContext, LimitErrorReader, restricted_names};
 use crate::util::{VersionExt, hex};
+
+pub use cargo_util_schemas::index::RegistryConfig;
 
 /// The `.cargo-ok` file is used to track if the source is already unpacked.
 /// See [`RegistrySource::unpack_package`] for more.
@@ -254,69 +256,12 @@ pub struct RegistrySource<'gctx> {
     ops: Box<dyn RegistryData + 'gctx>,
     /// Interface for managing the on-disk index.
     index: index::RegistryIndex<'gctx>,
-    /// A set of packages that should be allowed to be used, even if they are
-    /// yanked.
-    ///
-    /// This is populated from the entries in `Cargo.lock` to ensure that
-    /// `cargo update somepkg` won't unlock yanked entries in `Cargo.lock`.
-    /// Otherwise, the resolver would think that those entries no longer
-    /// exist, and it would trigger updates to unrelated packages.
-    yanked_whitelist: RefCell<HashSet<PackageId>>,
     /// Yanked versions that have already been selected during queries.
     ///
     /// As of this writing, this is for not emitting the `--precise <yanked>`
     /// warning twice, with the assumption of (`dep.package_name()` + `--precise`
     /// version) being sufficient to uniquely identify the same query result.
     selected_precise_yanked: RefCell<HashSet<(InternedString, semver::Version)>>,
-}
-
-/// The [`config.json`] file stored in the index.
-///
-/// The config file may look like:
-///
-/// ```json
-/// {
-///     "dl": "https://example.com/api/{crate}/{version}/download",
-///     "api": "https://example.com/api",
-///     "auth-required": false             # unstable feature (RFC 3139)
-/// }
-/// ```
-///
-/// [`config.json`]: https://doc.rust-lang.org/nightly/cargo/reference/registry-index.html#index-configuration
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct RegistryConfig {
-    /// Download endpoint for all crates.
-    ///
-    /// The string is a template which will generate the download URL for the
-    /// tarball of a specific version of a crate. The substrings `{crate}` and
-    /// `{version}` will be replaced with the crate's name and version
-    /// respectively.  The substring `{prefix}` will be replaced with the
-    /// crate's prefix directory name, and the substring `{lowerprefix}` will
-    /// be replaced with the crate's prefix directory name converted to
-    /// lowercase. The substring `{sha256-checksum}` will be replaced with the
-    /// crate's sha256 checksum.
-    ///
-    /// For backwards compatibility, if the string does not contain any
-    /// markers (`{crate}`, `{version}`, `{prefix}`, or `{lowerprefix}`), it
-    /// will be extended with `/{crate}/{version}/download` to
-    /// support registries like crates.io which were created before the
-    /// templating setup was created.
-    ///
-    /// For more on the template of the download URL, see [Index Configuration](
-    /// https://doc.rust-lang.org/nightly/cargo/reference/registry-index.html#index-configuration).
-    pub dl: String,
-
-    /// API endpoint for the registry. This is what's actually hit to perform
-    /// operations like yanks, owner modifications, publish new crates, etc.
-    /// If this is None, the registry does not support API commands.
-    pub api: Option<String>,
-
-    /// Whether all operations require authentication. See [RFC 3139].
-    ///
-    /// [RFC 3139]: https://rust-lang.github.io/rfcs/3139-cargo-alternative-registry-auth.html
-    #[serde(default)]
-    pub auth_required: bool,
 }
 
 /// Result from loading data from a registry.
@@ -480,11 +425,8 @@ impl<'gctx> RegistrySource<'gctx> {
     /// Creates a [`Source`] of a "remote" registry.
     /// It could be either an HTTP-based [`http_remote::HttpRegistry`] or
     /// a Git-based [`remote::RemoteRegistry`].
-    ///
-    /// * `yanked_whitelist` --- Packages allowed to be used, even if they are yanked.
     pub fn remote(
         source_id: SourceId,
-        yanked_whitelist: &HashSet<PackageId>,
         gctx: &'gctx GlobalContext,
     ) -> CargoResult<RegistrySource<'gctx>> {
         assert!(source_id.is_remote_registry());
@@ -501,28 +443,20 @@ impl<'gctx> RegistrySource<'gctx> {
             Box::new(remote::RemoteRegistry::new(source_id, gctx, &name)) as Box<_>
         };
 
-        Ok(RegistrySource::new(
-            source_id,
-            gctx,
-            &name,
-            ops,
-            yanked_whitelist,
-        ))
+        Ok(RegistrySource::new(source_id, gctx, &name, ops))
     }
 
     /// Creates a [`Source`] of a local registry, with [`local::LocalRegistry`] under the hood.
     ///
     /// * `path` --- The root path of a local registry on the file system.
-    /// * `yanked_whitelist` --- Packages allowed to be used, even if they are yanked.
     pub fn local(
         source_id: SourceId,
         path: &Path,
-        yanked_whitelist: &HashSet<PackageId>,
         gctx: &'gctx GlobalContext,
     ) -> RegistrySource<'gctx> {
         let name = short_name(source_id, false);
         let ops = local::LocalRegistry::new(path, gctx, &name);
-        RegistrySource::new(source_id, gctx, &name, Box::new(ops), yanked_whitelist)
+        RegistrySource::new(source_id, gctx, &name, Box::new(ops))
     }
 
     /// Creates a source of a registry. This is a inner helper function.
@@ -530,13 +464,11 @@ impl<'gctx> RegistrySource<'gctx> {
     /// * `name` --- Name of a path segment which may affect where `.crate`
     ///   tarballs, the registry index and cache are stored. Expect to be unique.
     /// * `ops` --- The underlying [`RegistryData`] type.
-    /// * `yanked_whitelist` --- Packages allowed to be used, even if they are yanked.
     fn new(
         source_id: SourceId,
         gctx: &'gctx GlobalContext,
         name: &str,
         ops: Box<dyn RegistryData + 'gctx>,
-        yanked_whitelist: &HashSet<PackageId>,
     ) -> RegistrySource<'gctx> {
         // Before starting to work on the registry, make sure that
         // `<cargo_home>/registry` is marked as excluded from indexing and
@@ -559,7 +491,6 @@ impl<'gctx> RegistrySource<'gctx> {
             gctx,
             source_id,
             index: index::RegistryIndex::new(source_id, ops.index_path(), gctx),
-            yanked_whitelist: RefCell::new(yanked_whitelist.clone()),
             ops,
             selected_precise_yanked: RefCell::new(HashSet::new()),
         }
@@ -779,12 +710,13 @@ impl<'gctx> Source for RegistrySource<'gctx> {
         if kind == QueryKind::Exact && req.is_locked() && !self.ops.is_updated() {
             debug!("attempting query without update");
             self.index
-                .query_inner(dep.package_name(), &req, &*self.ops, &mut |s| {
-                    if matches!(s, IndexSummary::Candidate(_) | IndexSummary::Yanked(_))
-                        && dep.matches(s.as_summary())
-                    {
-                        // We are looking for a package from a lock file so we do not care about yank
-                        callback(s)
+                .query_inner(dep.package_name(), &req, &*self.ops, &mut |is| {
+                    match &is {
+                        IndexSummary::Candidate(s) | IndexSummary::Yanked(s) if dep.matches(&s) => {
+                            // We are looking for a package from a lock file so we do not care about yank
+                            callback(is)
+                        }
+                        _ => {}
                     }
                 })
                 .await?;
@@ -807,10 +739,17 @@ impl<'gctx> Source for RegistrySource<'gctx> {
             .query_inner(dep.package_name(), &req, &*self.ops, &mut |s| {
                 let matched = match kind {
                     QueryKind::Exact | QueryKind::RejectedVersions => {
+                        let s = match &s {
+                            IndexSummary::Candidate(s)
+                            | IndexSummary::Yanked(s)
+                            | IndexSummary::Offline(s)
+                            | IndexSummary::Unsupported(s, _)
+                            | IndexSummary::Invalid(s) => s,
+                        };
                         if req.is_precise() && self.gctx.cli_unstable().unstable_options {
-                            dep.matches_prerelease(s.as_summary())
+                            dep.matches_prerelease(&s)
                         } else {
-                            dep.matches(s.as_summary())
+                            dep.matches(&s)
                         }
                     }
                     QueryKind::AlternativeNames => true,
@@ -819,19 +758,19 @@ impl<'gctx> Source for RegistrySource<'gctx> {
                 if !matched {
                     return;
                 }
-                // Next filter out all yanked packages. Some yanked packages may
-                // leak through if they're in a whitelist (aka if they were
-                // previously in `Cargo.lock`
                 match s {
                     s @ _ if kind == QueryKind::RejectedVersions => callback(s),
                     s @ IndexSummary::Candidate(_) => callback(s),
                     s @ IndexSummary::Yanked(_) => {
-                        if self.yanked_whitelist.borrow().contains(&s.package_id()) {
-                            callback(s);
-                        } else if req.is_precise() {
+                        // HACK: While source knows nothing about yank policy,
+                        // We still detect `cargo update --precise <yanked>`
+                        // so we can warn about the user-visible selection.
+                        //
+                        // We should consider also move this out from source query.
+                        if req.is_precise() {
                             precise_yanked_in_use = true;
-                            callback(s);
                         }
+                        callback(s);
                     }
                     IndexSummary::Unsupported(summary, v) => {
                         tracing::debug!(
@@ -892,13 +831,7 @@ impl<'gctx> Source for RegistrySource<'gctx> {
                     continue;
                 }
                 self.index
-                    .query_inner(name_permutation, &req, &*self.ops, &mut |s| {
-                        if !s.is_yanked() {
-                            f(s);
-                        } else if kind == QueryKind::AlternativeNames {
-                            f(s);
-                        }
-                    })
+                    .query_inner(name_permutation, &req, &*self.ops, &mut |s| f(s))
                     .await?;
             }
         }
@@ -955,19 +888,6 @@ impl<'gctx> Source for RegistrySource<'gctx> {
     fn describe(&self) -> String {
         self.source_id.display_index()
     }
-
-    fn add_to_yanked_whitelist(&self, pkgs: &[PackageId]) {
-        self.yanked_whitelist.borrow_mut().extend(pkgs);
-    }
-
-    async fn is_yanked(&self, pkg: PackageId) -> CargoResult<bool> {
-        self.index.is_yanked(pkg, &*self.ops).await
-    }
-}
-
-impl RegistryConfig {
-    /// File name of [`RegistryConfig`].
-    const NAME: &'static str = "config.json";
 }
 
 /// Get the maximum unpack size that Cargo permits
@@ -1069,6 +989,14 @@ fn unpack(
                 "invalid tarball downloaded, contains \
                      a file at {entry_path:?} which isn't under {prefix:?}",
             )
+        }
+
+        // Prevent unpacking symlinks and other unexpected entry types
+        match entry.header().entry_type() {
+            EntryType::Regular | EntryType::Directory => {}
+            t => anyhow::bail!(
+                "invalid tarball downloaded, contains an entry at {entry_path:?} with invalid type {t:?}",
+            ),
         }
 
         // Prevent unpacking the lockfile from the crate itself.
