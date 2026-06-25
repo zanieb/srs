@@ -10,6 +10,25 @@ use std::mem::transmute;
 use std::simd::*;
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn test_crc32() {
+    assert!(std::arch::is_aarch64_feature_detected!("crc"));
+
+    let a: u32 = 42;
+    let b: u64 = 0xdeadbeef;
+
+    assert_eq!(__crc32b(a, b as u8), 0xEB0E363F);
+    assert_eq!(__crc32h(a, b as u16), 0x9A54BD80);
+    assert_eq!(__crc32w(a, b as u32), 0xF491F059);
+    assert_eq!(__crc32d(a, b as u64), 0xD14BBEA6);
+
+    assert_eq!(__crc32cb(a, b as u8), 0xF67C32D8);
+    assert_eq!(__crc32ch(a, b as u16), 0x479108B8);
+    assert_eq!(__crc32cw(a, b as u32), 0x979F49F8);
+    assert_eq!(__crc32cd(a, b as u64), 0x0E6BE593);
+}
+
+#[cfg(target_arch = "aarch64")]
 unsafe fn test_vpmin_s8() {
     let a = i8x8::from([1, -2, 3, -4, 5, 6, 7, 8]);
     let b = i8x8::from([0, 3, 2, 5, 4, 7, 6, 9]);
@@ -272,6 +291,8 @@ fn main() {
         test_vminq_f32();
         test_vaddvq_f32();
         test_vrndnq_f32();
+
+        test_crc32();
     }
 }
 

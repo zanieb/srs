@@ -98,6 +98,14 @@ jobs:
           rustc +srs -Z unstable-options --print target-spec-json \
             | grep -q '"default-codegen-backend": "cranelift"'
 
+      - name: Verify AArch64 crc32fast
+        if: inputs.platform == 'macos'
+        env:
+          SRS_TARGET_CODEGEN_BACKEND: cranelift
+        run: |
+          cargo +srs run --locked \
+            --manifest-path scripts/fixtures/aarch64-crc32fast/Cargo.toml
+
       - name: Verify Cranelift panic unwinding
         if: runner.os == 'Linux'
         run: |

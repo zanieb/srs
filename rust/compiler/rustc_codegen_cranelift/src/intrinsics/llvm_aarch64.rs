@@ -494,6 +494,56 @@ pub(super) fn codegen_aarch64_llvm_intrinsic_call<'tcx>(
             });
         }
         */
+        "llvm.aarch64.crc32b"
+        | "llvm.aarch64.crc32h"
+        | "llvm.aarch64.crc32w"
+        | "llvm.aarch64.crc32x"
+        | "llvm.aarch64.crc32cb"
+        | "llvm.aarch64.crc32ch"
+        | "llvm.aarch64.crc32cw"
+        | "llvm.aarch64.crc32cx" => {
+            // ARM ARM v8-A: CRC32{,C}{B,H,W,X}.
+            // Backs core::arch::aarch64::__crc32{,c}{b,h,w,d}.
+            intrinsic_args!(fx, args => (crc, v); intrinsic);
+
+            let crc = crc.load_scalar(fx);
+            let v = v.load_scalar(fx);
+
+            let asm = match intrinsic {
+                "llvm.aarch64.crc32b" => "crc32b  w0, w0, w1",
+                "llvm.aarch64.crc32h" => "crc32h  w0, w0, w1",
+                "llvm.aarch64.crc32w" => "crc32w  w0, w0, w1",
+                "llvm.aarch64.crc32x" => "crc32x  w0, w0, x1",
+                "llvm.aarch64.crc32cb" => "crc32cb w0, w0, w1",
+                "llvm.aarch64.crc32ch" => "crc32ch w0, w0, w1",
+                "llvm.aarch64.crc32cw" => "crc32cw w0, w0, w1",
+                "llvm.aarch64.crc32cx" => "crc32cx w0, w0, x1",
+                _ => unreachable!(),
+            };
+
+            codegen_inline_asm_inner(
+                fx,
+                &[InlineAsmTemplatePiece::String(asm.into())],
+                &[
+                    CInlineAsmOperand::InOut {
+                        reg: InlineAsmRegOrRegClass::Reg(InlineAsmReg::AArch64(
+                            AArch64InlineAsmReg::x0,
+                        )),
+                        _late: true,
+                        in_value: crc,
+                        out_place: Some(ret),
+                    },
+                    CInlineAsmOperand::In {
+                        reg: InlineAsmRegOrRegClass::Reg(InlineAsmReg::AArch64(
+                            AArch64InlineAsmReg::x1,
+                        )),
+                        value: v,
+                    },
+                ],
+                InlineAsmOptions::NOSTACK | InlineAsmOptions::PURE | InlineAsmOptions::NOMEM,
+            );
+        }
+
         _ => {
             fx.tcx.dcx().warn(format!(
                 "unsupported AArch64 llvm intrinsic {}; replacing with trap",
