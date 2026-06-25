@@ -51,16 +51,16 @@ else
 fi
 
 # Build scripts and proc macros execute on the build host. Keep those helpers
-# on LLVM. On Apple silicon, start the integrated incremental-link lane with
-# LLVM target artifacts too, keep host-loadable artifacts off the experimental
-# linker, and request root-only signed incremental links for normal target
-# executables. Cranelift remains available as an explicit follow-up lane.
+# on LLVM and use LLVM for ordinary target artifacts by default. Cranelift
+# remains available as an explicit follow-up lane. On Apple silicon, also keep
+# host-loadable artifacts off the experimental linker and request root-only
+# signed incremental links for normal target executables.
 sld_native_incremental_args=()
 host_rustflags='["-Zcodegen-backend=llvm"]'
+export SRS_TARGET_CODEGEN_BACKEND="${SRS_TARGET_CODEGEN_BACKEND:-llvm}"
+append_target_rustflag "-Zcodegen-backend=${SRS_TARGET_CODEGEN_BACKEND}"
 if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
     host_rustflags='["-Zcodegen-backend=llvm","-C","linker=/usr/bin/clang"]'
-    export SRS_TARGET_CODEGEN_BACKEND="${SRS_TARGET_CODEGEN_BACKEND:-llvm}"
-    append_target_rustflag "-Zcodegen-backend=${SRS_TARGET_CODEGEN_BACKEND}"
     export SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS="${SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS:-1}"
     case "$SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS" in
         0) append_target_rustflag "-Zpreserve-duplicate-constants=no" ;;

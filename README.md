@@ -26,22 +26,21 @@ the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
   per-name snapshot, attaches copied SRS Cargo plus `sld`, and links that
   snapshot into rustup under a custom name.
 - `cargo-srs.sh`: the installed Cargo wrapper that keeps build scripts, proc
-  macros, and their host-side dependencies on LLVM, and starts the macOS arm64
-  incremental-link lane with LLVM target artifacts.
+  macros, their host-side dependencies, and ordinary target artifacts on LLVM
+  by default, and starts the macOS arm64 incremental-link lane.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
 bootstrap build back through LLVM. The Rust source tree makes the installed
-macOS arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
-artifacts. The installed Cargo wrapper keeps build scripts, proc macros, and
-their host-side dependencies on LLVM because those helpers run during the
-build and can exercise host intrinsics that Cranelift does not support yet.
-For the first integrated macOS arm64 incremental-link lane, the wrapper also
-selects LLVM for ordinary target artifacts. Set
+macOS arm64 and Linux x86_64 compilers prefer Cranelift when invoked directly.
+The installed Cargo wrapper keeps build scripts, proc macros, and their
+host-side dependencies on LLVM because helpers can exercise host intrinsics
+that Cranelift does not support yet. It also selects LLVM for ordinary target
+artifacts by default because workload runtime remains substantially faster
+with LLVM. Set
 `SRS_TARGET_CODEGEN_BACKEND=cranelift` to exercise the composed backend path
-explicitly. Linux target behavior remains unchanged. For macOS arm64, SRS bakes
-`sld` in as rustc's default linker.
+explicitly. For macOS arm64, SRS bakes `sld` in as rustc's default linker.
 
 ## Quick Start
 
@@ -139,9 +138,9 @@ run.
 ## Usage
 
 The SRS compiler still has Cranelift available. Its Cargo wrapper uses LLVM for
-host build helpers and, on macOS arm64, for ordinary target artifacts in the
-first integrated incremental-link lane. On macOS arm64 it links through the
-`sld` binary attached to the installed toolchain:
+host build helpers and ordinary target artifacts by default on Linux x86_64
+and macOS arm64. On macOS arm64 it links through the `sld` binary attached to
+the installed toolchain:
 
 ```bash
 cargo +srs build
