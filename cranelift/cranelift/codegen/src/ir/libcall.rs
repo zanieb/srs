@@ -63,7 +63,7 @@ pub enum LibCall {
 }
 
 impl fmt::Display for LibCall {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }

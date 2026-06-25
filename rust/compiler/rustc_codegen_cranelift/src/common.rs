@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use rustc_abi::{Float, Integer, Primitive};
@@ -13,6 +15,28 @@ use rustc_target::spec::{Arch, HasTargetSpec, Target};
 use crate::constant::ConstantCx;
 use crate::debuginfo::FunctionDebugContext;
 use crate::prelude::*;
+
+pub(crate) fn instance_symbol_name_for_object<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Cow<'tcx, str> {
+    symbol_name_for_object(tcx, tcx.symbol_name(instance).name)
+}
+
+pub(crate) fn symbol_name_for_object<'a>(tcx: TyCtxt<'_>, symbol_name: &'a str) -> Cow<'a, str> {
+    if let Some(exact_name) = symbol_name.strip_prefix('\x01') {
+        // Rustc uses LLVM's \x01 prefix for exact assembly labels. cranelift_object adds the
+        // platform prefix itself, so translate exact labels back to object-level names first.
+        let exact_name = if tcx.sess.target.is_like_darwin {
+            exact_name.strip_prefix('_').unwrap_or(exact_name)
+        } else {
+            exact_name
+        };
+        Cow::Borrowed(exact_name)
+    } else {
+        Cow::Borrowed(symbol_name)
+    }
+}
 
 pub(crate) fn pointer_ty(tcx: TyCtxt<'_>) -> types::Type {
     match tcx.data_layout.pointer_size().bits() {
@@ -116,13 +140,13 @@ pub(crate) fn codegen_icmp_imm(
 
         match intcc {
             IntCC::Equal => {
-                let lsb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_lsb, rhs_lsb);
-                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
+                let lsb_eq = fx.bcx.ins().icmp_imm_s(IntCC::Equal, lhs_lsb, rhs_lsb);
+                let msb_eq = fx.bcx.ins().icmp_imm_s(IntCC::Equal, lhs_msb, rhs_msb);
                 fx.bcx.ins().band(lsb_eq, msb_eq)
             }
             IntCC::NotEqual => {
-                let lsb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_lsb, rhs_lsb);
-                let msb_ne = fx.bcx.ins().icmp_imm(IntCC::NotEqual, lhs_msb, rhs_msb);
+                let lsb_ne = fx.bcx.ins().icmp_imm_s(IntCC::NotEqual, lhs_lsb, rhs_lsb);
+                let msb_ne = fx.bcx.ins().icmp_imm_s(IntCC::NotEqual, lhs_msb, rhs_msb);
                 fx.bcx.ins().bor(lsb_ne, msb_ne)
             }
             _ => {
@@ -132,16 +156,16 @@ pub(crate) fn codegen_icmp_imm(
                 //     msb_cc
                 // }
 
-                let msb_eq = fx.bcx.ins().icmp_imm(IntCC::Equal, lhs_msb, rhs_msb);
-                let lsb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_lsb, rhs_lsb);
-                let msb_cc = fx.bcx.ins().icmp_imm(intcc, lhs_msb, rhs_msb);
+                let msb_eq = fx.bcx.ins().icmp_imm_s(IntCC::Equal, lhs_msb, rhs_msb);
+                let lsb_cc = fx.bcx.ins().icmp_imm_s(intcc, lhs_lsb, rhs_lsb);
+                let msb_cc = fx.bcx.ins().icmp_imm_s(intcc, lhs_msb, rhs_msb);
 
                 fx.bcx.ins().select(msb_eq, lsb_cc, msb_cc)
             }
         }
     } else {
         let rhs = rhs as i64; // Truncates on purpose in case rhs is actually an unsigned value
-        fx.bcx.ins().icmp_imm(intcc, lhs, rhs)
+        fx.bcx.ins().icmp_imm_s(intcc, lhs, rhs)
     }
 }
 
@@ -262,7 +286,7 @@ pub(crate) fn create_wrapper_function(
 
         bcx.ins().return_(&results);
         bcx.seal_all_blocks();
-        bcx.finalize();
+        bcx.finalize(module.target_config());
     }
     module.define_function(wrapper_func_id, &mut ctx).unwrap();
 }
@@ -400,8 +424,9 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 key: None,
             });
             let base_ptr = self.bcx.ins().stack_addr(self.pointer_type, stack_slot, 0);
-            let misalign_offset = self.bcx.ins().band_imm(base_ptr, i64::from(align - 1));
-            let realign_offset = self.bcx.ins().irsub_imm(misalign_offset, i64::from(align));
+            let misalign_offset = self.bcx.ins().band_imm_s(base_ptr, i64::from(align - 1));
+            let align_value = self.bcx.ins().iconst(self.pointer_type, i64::from(align));
+            let realign_offset = self.bcx.ins().isub(align_value, misalign_offset);
             Pointer::new(self.bcx.ins().iadd(base_ptr, realign_offset))
         }
     }

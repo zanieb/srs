@@ -8,7 +8,7 @@ use crate::lexer::{Lexer, Pos, Token};
 type Result<T> = std::result::Result<T, Error>;
 
 /// Parse the top-level ISLE definitions and return their AST.
-pub fn parse(lexer: Lexer) -> Result<Vec<Def>> {
+pub fn parse(lexer: Lexer<'_>) -> Result<Vec<Def>> {
     let mut parser = Parser::new(lexer);
     let result = parser.parse_defs()?;
     Ok(result)
@@ -16,7 +16,7 @@ pub fn parse(lexer: Lexer) -> Result<Vec<Def>> {
 
 /// Parse without positional information. Provided mainly to support testing, to
 /// enable equality testing on structure alone.
-pub fn parse_without_pos(lexer: Lexer) -> Result<Vec<Def>> {
+pub fn parse_without_pos(lexer: Lexer<'_>) -> Result<Vec<Def>> {
     let mut parser = Parser::new_without_pos_tracking(lexer);
     parser.parse_defs()
 }

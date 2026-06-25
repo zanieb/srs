@@ -45,7 +45,7 @@ impl FromStr for StackSlotKind {
 }
 
 impl fmt::Display for StackSlotKind {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use self::StackSlotKind::*;
         f.write_str(match *self {
             ExplicitSlot => "explicit_slot",
@@ -131,7 +131,7 @@ impl StackSlotData {
 }
 
 impl fmt::Display for StackSlotData {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let align_shift = if self.align_shift != 0 {
             format!(", align = {}", 1u32 << self.align_shift)
         } else {
@@ -172,7 +172,7 @@ impl DynamicStackSlotData {
 }
 
 impl fmt::Display for DynamicStackSlotData {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.kind, self.dyn_ty)
     }
 }

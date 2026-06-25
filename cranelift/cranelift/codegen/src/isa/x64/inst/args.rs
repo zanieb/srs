@@ -864,7 +864,7 @@ impl ExtMode {
 }
 
 impl fmt::Debug for ExtMode {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             ExtMode::BL => "bl",
             ExtMode::BQ => "bq",
@@ -877,7 +877,7 @@ impl fmt::Debug for ExtMode {
 }
 
 impl fmt::Display for ExtMode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
@@ -979,7 +979,7 @@ impl CC {
 }
 
 impl fmt::Debug for CC {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             CC::O => "o",
             CC::NO => "no",
@@ -1003,7 +1003,7 @@ impl fmt::Debug for CC {
 }
 
 impl fmt::Display for CC {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }

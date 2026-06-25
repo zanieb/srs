@@ -181,7 +181,7 @@ impl Format {
 }
 
 impl core::fmt::Display for Format {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Format {
             name,
             operands,
@@ -232,7 +232,7 @@ pub struct Operand {
 }
 
 impl core::fmt::Display for Operand {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self {
             location,
             mutability,
@@ -284,7 +284,7 @@ pub enum RegClass {
 }
 
 impl core::fmt::Display for RegClass {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RegClass::Gpr => write!(f, "Gpr"),
             RegClass::Xmm => write!(f, "Xmm"),
@@ -426,7 +426,7 @@ impl Location {
 }
 
 impl core::fmt::Display for Location {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use Location::*;
         match self {
             imm8 => write!(f, "imm8"),

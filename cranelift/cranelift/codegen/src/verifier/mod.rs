@@ -103,7 +103,7 @@ pub struct VerifierError {
 impl core::error::Error for VerifierError {}
 
 impl Display for VerifierError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.context {
             None => write!(f, "{}: {}", self.location, self.message),
             Some(context) => write!(f, "{} ({}): {}", self.location, context, self.message),
@@ -248,7 +248,7 @@ impl From<VerifierErrors> for VerifierResult<()> {
 }
 
 impl Display for VerifierErrors {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for err in &self.0 {
             writeln!(f, "- {err}")?;
         }

@@ -119,7 +119,7 @@ pub struct DisplayGlobalValueData<'a> {
 }
 
 impl fmt::Display for DisplayGlobalValueData<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self.data {
             GlobalValueData::VMContext => write!(f, "vmctx"),
             GlobalValueData::Load {
@@ -166,7 +166,7 @@ impl fmt::Display for DisplayGlobalValueData<'_> {
 }
 
 impl fmt::Display for GlobalValueData {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::VMContext => write!(f, "vmctx"),
             Self::Load {

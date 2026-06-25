@@ -46,7 +46,7 @@ type VecArgPair = Vec<ArgPair>;
 
 /// The main entry point for lowering with ISLE.
 pub(crate) fn lower(
-    lower_ctx: &mut Lower<MInst>,
+    lower_ctx: &mut Lower<'_, MInst>,
     backend: &AArch64Backend,
     inst: Inst,
 ) -> Option<InstOutput> {
@@ -57,7 +57,7 @@ pub(crate) fn lower(
 }
 
 pub(crate) fn lower_branch(
-    lower_ctx: &mut Lower<MInst>,
+    lower_ctx: &mut Lower<'_, MInst>,
     backend: &AArch64Backend,
     branch: Inst,
     targets: &[MachLabel],

@@ -20,7 +20,7 @@ pub mod isle;
 //============================================================================
 // Lowering: convert instruction inputs to forms that we can use.
 
-fn get_as_extended_value(ctx: &mut Lower<Inst>, val: Value) -> Option<(Value, ExtendOp)> {
+fn get_as_extended_value(ctx: &mut Lower<'_, Inst>, val: Value) -> Option<(Value, ExtendOp)> {
     let inputs = ctx.get_value_as_source_or_const(val);
     let (insn, n) = inputs.inst.as_inst()?;
     if n != 0 {
@@ -72,13 +72,13 @@ pub(crate) fn lower_condcode(cc: IntCC) -> Cond {
 impl LowerBackend for AArch64Backend {
     type MInst = Inst;
 
-    fn lower(&self, ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
+    fn lower(&self, ctx: &mut Lower<'_, Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         isle::lower(ctx, self, ir_inst)
     }
 
     fn lower_branch(
         &self,
-        ctx: &mut Lower<Inst>,
+        ctx: &mut Lower<'_, Inst>,
         ir_inst: IRInst,
         targets: &[MachLabel],
     ) -> Option<()> {

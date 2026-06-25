@@ -7,6 +7,7 @@ use cranelift_module::DataId;
 use cranelift_object::ObjectProduct;
 use gimli::write::{Address, CieId, EhFrame, FrameTable, Section};
 use gimli::{Encoding, Format, RunTimeEndian};
+use target_lexicon::BinaryFormat;
 
 use super::emit::{DebugRelocName, address_for_data, address_for_func};
 use super::gcc_except_table::{
@@ -30,6 +31,8 @@ impl UnwindContext {
             Endianness::Little => RunTimeEndian::Little,
             Endianness::Big => RunTimeEndian::Big,
         };
+        let triple = module.isa().triple();
+        let is_macho = triple.binary_format == BinaryFormat::Macho;
         let mut frame_table = FrameTable::default();
 
         let cie_id = if let Some(mut cie) = module.isa().create_systemv_cie() {
@@ -53,10 +56,10 @@ impl UnwindContext {
                     } else if let target_lexicon::Architecture::Aarch64(_) =
                         module.isa().triple().architecture
                     {
+                        let format =
+                            if is_macho { gimli::DW_EH_PE_sdata4 } else { gimli::DW_EH_PE_sdata8 };
                         gimli::DwEhPe(
-                            gimli::DW_EH_PE_indirect.0
-                                | gimli::DW_EH_PE_pcrel.0
-                                | gimli::DW_EH_PE_sdata8.0,
+                            gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | format.0,
                         )
                     } else {
                         todo!()
@@ -86,24 +89,29 @@ impl UnwindContext {
                     )
                     .unwrap();
 
-                // Use indirection here to support PIC the case where rust_eh_personality is defined in
-                // another DSO.
-                let personality_ref = module
-                    .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
-                    .unwrap();
+                let personality_address = if is_macho {
+                    address_for_func(personality)
+                } else {
+                    // Use indirection here to support the PIC case where rust_eh_personality is
+                    // defined in another DSO.
+                    let personality_ref = module
+                        .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+                        .unwrap();
 
-                let mut personality_ref_data = DataDescription::new();
-                // Note: Must not use define_zeroinit. The unwinder can't handle this being in the .bss
-                // section.
-                let pointer_bytes = usize::from(module.target_config().pointer_bytes());
-                personality_ref_data.define(vec![0; pointer_bytes].into_boxed_slice());
-                let personality_func_ref =
-                    module.declare_func_in_data(personality, &mut personality_ref_data);
-                personality_ref_data.write_function_addr(0, personality_func_ref);
+                    let mut personality_ref_data = DataDescription::new();
+                    // Note: Must not use define_zeroinit. The unwinder can't handle this being in
+                    // the .bss section.
+                    let pointer_bytes = usize::from(module.target_config().pointer_bytes());
+                    personality_ref_data.define(vec![0; pointer_bytes].into_boxed_slice());
+                    let personality_func_ref =
+                        module.declare_func_in_data(personality, &mut personality_ref_data);
+                    personality_ref_data.write_function_addr(0, personality_func_ref);
 
-                module.define_data(personality_ref, &personality_ref_data).unwrap();
+                    module.define_data(personality_ref, &personality_ref_data).unwrap();
+                    address_for_data(personality_ref)
+                };
 
-                cie.personality = Some((code_ptr_encoding, address_for_data(personality_ref)));
+                cie.personality = Some((code_ptr_encoding, personality_address));
             }
 
             Some(frame_table.add_cie(cie))
@@ -121,6 +129,7 @@ impl UnwindContext {
         context: &Context,
     ) {
         let triple = module.isa().triple();
+        let is_macho = triple.binary_format == BinaryFormat::Macho;
         if matches!(triple.operating_system, target_lexicon::OperatingSystem::MacOSX { .. })
             && triple.architecture == target_lexicon::Architecture::X86_64
         {
@@ -204,7 +213,11 @@ impl UnwindContext {
 
                     let mut data = DataDescription::new();
                     data.define(gcc_except_table.writer.into_vec().into_boxed_slice());
-                    data.set_segment_section("", ".gcc_except_table", 0);
+                    if is_macho {
+                        data.set_segment_section("__TEXT", "__gcc_except_tab", 0);
+                    } else {
+                        data.set_segment_section("", ".gcc_except_table", 0);
+                    }
 
                     for reloc in &gcc_except_table.relocs {
                         match reloc.name {

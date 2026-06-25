@@ -14,13 +14,13 @@ where
 {
     type MInst = InstAndKind<P>;
 
-    fn lower(&self, ctx: &mut Lower<Self::MInst>, ir_inst: ir::Inst) -> Option<InstOutput> {
+    fn lower(&self, ctx: &mut Lower<'_, Self::MInst>, ir_inst: ir::Inst) -> Option<InstOutput> {
         isle::lower(ctx, self, ir_inst)
     }
 
     fn lower_branch(
         &self,
-        ctx: &mut Lower<Self::MInst>,
+        ctx: &mut Lower<'_, Self::MInst>,
         ir_inst: ir::Inst,
         targets: &[MachLabel],
     ) -> Option<()> {

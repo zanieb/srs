@@ -41,7 +41,7 @@ impl From<Block> for ProgramPoint {
 }
 
 impl fmt::Display for ProgramPoint {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Inst(x) => write!(f, "{x}"),
             Self::Block(x) => write!(f, "{x}"),
@@ -50,7 +50,7 @@ impl fmt::Display for ProgramPoint {
 }
 
 impl fmt::Debug for ProgramPoint {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ProgramPoint({self})")
     }
 }

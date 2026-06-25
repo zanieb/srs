@@ -124,7 +124,7 @@ impl fmt::Display for ConstantData {
     /// let data = ConstantData::from([3, 2, 1, 0, 0].as_ref()); // note the little-endian order
     /// assert_eq!(data.to_string(), "0x0000010203");
     /// ```
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.is_empty() {
             write!(f, "0x")?;
             for b in self.0.iter().rev() {

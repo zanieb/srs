@@ -725,7 +725,7 @@ mod serde {
     impl<'de> Visitor<'de> for LayoutVisitor {
         type Value = Layout;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(formatter, "a `cranelift_codegen::ir::Layout`")
         }
 

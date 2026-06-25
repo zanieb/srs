@@ -857,7 +857,7 @@ fn pretty_print_try_call(info: &TryCallInfo) -> String {
 }
 
 impl fmt::Debug for Inst {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "{}", self.pretty_print_inst(&mut Default::default()))
     }
 }

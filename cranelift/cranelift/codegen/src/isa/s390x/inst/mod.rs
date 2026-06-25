@@ -459,7 +459,7 @@ fn memarg_operands(memarg: &mut MemArg, collector: &mut impl OperandVisitor) {
     collector.reg_fixed_nonallocatable(gpr_preg(1));
 }
 
-fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl OperandVisitor>) {
+fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<'_, impl OperandVisitor>) {
     match inst {
         Inst::AluRRR { rd, rn, rm, .. } => {
             collector.reg_def(rd);

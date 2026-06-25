@@ -56,7 +56,7 @@ impl Isa {
 
 impl fmt::Display for Isa {
     // These names should be kept in sync with the crate features.
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Isa::X86 => write!(f, "x86"),
             Isa::Arm64 => write!(f, "arm64"),

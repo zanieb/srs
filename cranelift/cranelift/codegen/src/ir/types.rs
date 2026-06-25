@@ -419,7 +419,7 @@ impl Type {
 }
 
 impl Display for Type {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.is_int() {
             write!(f, "i{}", self.lane_bits())
         } else if self.is_float() {
@@ -438,7 +438,7 @@ impl Display for Type {
 }
 
 impl Debug for Type {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.is_int() {
             write!(f, "types::I{}", self.lane_bits())
         } else if self.is_float() {

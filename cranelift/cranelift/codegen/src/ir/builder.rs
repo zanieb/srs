@@ -390,7 +390,7 @@ mod tests {
         pos.insert_block(block0);
 
         // Opcode of the instruction that extends `iadd`'s materialized immediate.
-        fn ext_opcode(pos: &FuncCursor, iadd: crate::ir::Inst) -> Opcode {
+        fn ext_opcode(pos: &FuncCursor<'_>, iadd: crate::ir::Inst) -> Opcode {
             let imm = pos.func.dfg.inst_args(iadd)[1];
             let ext = pos.func.dfg.value_def(imm).unwrap_inst();
             pos.func.dfg.insts[ext].opcode()

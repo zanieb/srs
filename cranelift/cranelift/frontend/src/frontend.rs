@@ -85,7 +85,7 @@ impl FunctionBuilderContext {
 
 /// Implementation of the [`InstBuilder`] that has
 /// one convenience method per Cranelift IR instruction.
-pub struct FuncInstBuilder<'short, 'long: 'short> {
+pub struct FuncInstBuilder<'short, 'long> {
     builder: &'short mut FunctionBuilder<'long>,
     block: Block,
 }
@@ -1786,7 +1786,7 @@ block0:
 
     fn small_memcmp_helper(
         expected: &str,
-        f: impl FnOnce(&mut FunctionBuilder, &dyn TargetIsa, Value, Value) -> Value,
+        f: impl FnOnce(&mut FunctionBuilder<'_>, &dyn TargetIsa, Value, Value) -> Value,
     ) {
         use core::str::FromStr;
         use cranelift_codegen::isa;

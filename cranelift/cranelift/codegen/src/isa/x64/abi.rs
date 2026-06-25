@@ -97,7 +97,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator,
+        mut args: ArgsAccumulator<'_>,
     ) -> CodegenResult<(u32, Option<usize>)> {
         let is_fastcall = call_conv == CallConv::WindowsFastcall;
         let is_tail = call_conv == CallConv::Tail;

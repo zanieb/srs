@@ -156,7 +156,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator,
+        mut args: ArgsAccumulator<'_>,
     ) -> CodegenResult<(u32, Option<usize>)> {
         let is_apple_cc = call_conv == isa::CallConv::AppleAarch64;
         let is_winch_return = call_conv == isa::CallConv::Winch && args_or_rets == ArgsOrRets::Rets;

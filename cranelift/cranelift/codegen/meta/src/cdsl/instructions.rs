@@ -95,7 +95,7 @@ impl InstructionContent {
 pub(crate) type Instruction = Rc<InstructionContent>;
 
 impl fmt::Display for InstructionContent {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         if !self.operands_out.is_empty() {
             let operands_out = self
                 .operands_out

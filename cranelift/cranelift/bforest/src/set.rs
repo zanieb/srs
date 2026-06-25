@@ -203,8 +203,8 @@ where
 /// last element in the set.
 pub struct SetCursor<'a, K, C>
 where
-    K: 'a + Copy,
-    C: 'a + Comparator<K>,
+    K: Copy,
+    C: Comparator<K>,
 {
     root: &'a mut PackedOption<Node>,
     pool: &'a mut NodePool<SetTypes<K>>,
@@ -344,7 +344,7 @@ where
 /// An iterator visiting the elements of a `Set`.
 pub struct SetIter<'a, K>
 where
-    K: 'a + Copy,
+    K: Copy,
 {
     root: PackedOption<Node>,
     pool: &'a NodePool<SetTypes<K>>,

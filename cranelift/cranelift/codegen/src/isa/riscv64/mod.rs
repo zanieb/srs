@@ -238,7 +238,7 @@ impl TargetIsa for Riscv64Backend {
 }
 
 impl fmt::Display for Riscv64Backend {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MachBackend")
             .field("name", &self.name())
             .field("triple", &self.triple())

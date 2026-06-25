@@ -137,10 +137,7 @@ const ECLASS_ENODE_LIMIT: usize = 5;
 pub(crate) const EXTRACTOR_FUEL: u32 = 500;
 
 /// Context passed through node insertion and optimization.
-pub(crate) struct OptimizeCtx<'opt, 'analysis>
-where
-    'analysis: 'opt,
-{
+pub(crate) struct OptimizeCtx<'opt, 'analysis> {
     // Borrowed from EgraphPass:
     pub(crate) func: &'opt mut Function,
     pub(crate) value_to_opt_value: &'opt mut SecondaryMap<Value, Value>,
@@ -993,7 +990,7 @@ impl<'a> EgraphPass<'a> {
     /// skeleton.
     fn execute_skeleton_inst_simplification(
         simplification: SkeletonInstSimplification,
-        cursor: &mut FuncCursor,
+        cursor: &mut FuncCursor<'_>,
         value_to_opt_value: &mut SecondaryMap<Value, Value>,
         old_inst: Inst,
     ) {
@@ -1036,7 +1033,7 @@ impl<'a> EgraphPass<'a> {
         // re-processes it on its next iteration. This lets a freshly
         // produced/modified skeleton instruction be GVN'd and/or simplified
         // further.
-        fn reprocess_from(cursor: &mut FuncCursor, inst: Inst) {
+        fn reprocess_from(cursor: &mut FuncCursor<'_>, inst: Inst) {
             cursor.goto_inst(inst);
             cursor.prev_inst();
         }

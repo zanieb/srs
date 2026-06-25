@@ -62,7 +62,7 @@ impl core::error::Error for CodegenError {
 }
 
 impl core::fmt::Display for CodegenError {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CodegenError::Verifier(_) => write!(f, "Verifier errors"),
             CodegenError::ImplLimitExceeded => write!(f, "Implementation limit exceeded"),

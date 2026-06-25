@@ -2565,7 +2565,7 @@ block3:
     }
 
     fn import_func(
-        builder: &mut FunctionBuilder,
+        builder: &mut FunctionBuilder<'_>,
         params: impl IntoIterator<Item = ir::Type>,
         results: impl IntoIterator<Item = ir::Type>,
     ) -> ir::FuncRef {

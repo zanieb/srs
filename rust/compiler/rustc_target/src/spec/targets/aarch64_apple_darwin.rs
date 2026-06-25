@@ -18,7 +18,9 @@ pub(crate) fn target() -> Target {
         options: TargetOptions {
             mcount: "\u{1}mcount".into(),
             cpu: "apple-m1".into(),
-            max_atomic_width: Some(128),
+            // SRS defaults this target to cg_clif, which does not lower 128-bit atomics yet.
+            max_atomic_width: Some(64),
+            default_codegen_backend: Some("cranelift".into()),
             // FIXME: The leak sanitizer currently fails the tests, see #88132.
             supported_sanitizers: SanitizerSet::ADDRESS
                 | SanitizerSet::CFI

@@ -41,7 +41,7 @@ pub(crate) fn codegen_fn<'tcx>(
 ) -> CodegenedFunction {
     debug_assert!(!instance.args.has_infer());
 
-    let symbol_name = tcx.symbol_name(instance).name.to_string();
+    let symbol_name = instance_symbol_name_for_object(tcx, instance).into_owned();
     let _timer = tcx.prof.generic_activity_with_arg("codegen fn", &*symbol_name);
 
     let mir = tcx.instance_mir(instance.def);
@@ -119,7 +119,7 @@ pub(crate) fn codegen_fn<'tcx>(
 
     tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));
     fx.bcx.seal_all_blocks();
-    fx.bcx.finalize();
+    fx.bcx.finalize(fx.target_config);
 
     // Recover all necessary data from fx, before accessing func will prevent future access to it.
     let symbol_name = fx.symbol_name;
@@ -656,7 +656,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                             let val = operand.load_scalar(fx);
                             match layout.ty.kind() {
                                 ty::Bool => {
-                                    let res = fx.bcx.ins().icmp_imm(IntCC::Equal, val, 0);
+                                    let res = fx.bcx.ins().icmp_imm_s(IntCC::Equal, val, 0);
                                     CValue::by_val(res, layout)
                                 }
                                 ty::Uint(_) | ty::Int(_) => {
@@ -844,13 +844,13 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                         fx.bcx.ins().jump(loop_block, &[zero.into()]);
 
                         fx.bcx.switch_to_block(loop_block);
-                        let done = fx.bcx.ins().icmp_imm(IntCC::Equal, index, times as i64);
+                        let done = fx.bcx.ins().icmp_imm_s(IntCC::Equal, index, times as i64);
                         fx.bcx.ins().brif(done, done_block, &[], loop_block2, &[]);
 
                         fx.bcx.switch_to_block(loop_block2);
                         let to = lval.place_index(fx, index);
                         to.write_cvalue(fx, operand);
-                        let index = fx.bcx.ins().iadd_imm(index, 1);
+                        let index = fx.bcx.ins().iadd_imm_s(index, 1);
                         fx.bcx.ins().jump(loop_block, &[index.into()]);
 
                         fx.bcx.switch_to_block(done_block);
@@ -942,7 +942,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                 let count = codegen_operand(fx, count).load_scalar(fx);
 
                 let bytes = if elem_size != 1 {
-                    fx.bcx.ins().imul_imm(count, elem_size as i64)
+                    fx.bcx.ins().imul_imm_s(count, elem_size as i64)
                 } else {
                     count
                 };
@@ -995,7 +995,7 @@ pub(crate) fn codegen_place<'tcx>(
                     fx.bcx.ins().iconst(fx.pointer_type, offset as i64)
                 } else {
                     let len = codegen_array_len(fx, cplace);
-                    fx.bcx.ins().iadd_imm(len, -(offset as i64))
+                    fx.bcx.ins().iadd_imm_s(len, -(offset as i64))
                 };
                 cplace = cplace.place_index(fx, index);
             }
@@ -1022,7 +1022,7 @@ pub(crate) fn codegen_place<'tcx>(
                         let (ptr, len) = cplace.to_ptr_unsized();
                         cplace = CPlace::for_ptr_with_extra(
                             ptr.offset_i64(fx, elem_layout.size.bytes() as i64 * (from as i64)),
-                            fx.bcx.ins().iadd_imm(len, -(from as i64 + to as i64)),
+                            fx.bcx.ins().iadd_imm_s(len, -(from as i64 + to as i64)),
                             cplace.layout(),
                         );
                     }
@@ -1100,14 +1100,14 @@ fn codegen_panic_inner<'tcx>(
         return;
     }
 
-    let symbol_name = fx.tcx.symbol_name(instance).name;
+    let symbol_name = instance_symbol_name_for_object(fx.tcx, instance);
 
     let sig = Signature {
         params: args.iter().map(|&arg| AbiParam::new(fx.bcx.func.dfg.value_type(arg))).collect(),
         returns: vec![],
         call_conv: fx.target_config.default_call_conv,
     };
-    let func_id = fx.module.declare_function(symbol_name, Linkage::Import, &sig).unwrap();
+    let func_id = fx.module.declare_function(&symbol_name, Linkage::Import, &sig).unwrap();
     let func_ref = fx.module.declare_func_in_func(func_id, fx.bcx.func);
     if fx.clif_comments.enabled() {
         fx.add_comment(func_ref, format!("{:?}", symbol_name));

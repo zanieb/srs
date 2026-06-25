@@ -535,17 +535,17 @@ impl Removed {
 
 // Display ": value" or nothing at all for `()`.
 pub(super) trait ValDisp {
-    fn valfmt(&self, f: &mut fmt::Formatter) -> fmt::Result;
+    fn valfmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 }
 
 impl ValDisp for SetValue {
-    fn valfmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
+    fn valfmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
         Ok(())
     }
 }
 
 impl<T: fmt::Display> ValDisp for T {
-    fn valfmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn valfmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, ":{self}")
     }
 }
@@ -556,7 +556,7 @@ where
     F::Key: fmt::Display,
     F::Value: ValDisp,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Inner { size, keys, tree } => {
                 write!(f, "[ {}", tree[0])?;

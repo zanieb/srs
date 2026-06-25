@@ -26,7 +26,7 @@ pub(crate) fn maybe_create_entry_wrapper(
 
     if main_def_id.is_local() {
         let instance = Instance::mono(tcx, main_def_id);
-        if module.get_name(tcx.symbol_name(instance).name).is_none() {
+        if module.get_name(&instance_symbol_name_for_object(tcx, instance)).is_none() {
             return;
         }
     } else if !is_primary_cgu {
@@ -77,9 +77,9 @@ pub(crate) fn maybe_create_entry_wrapper(
 
         let instance = Instance::mono(tcx, rust_main_def_id);
 
-        let main_name = tcx.symbol_name(instance).name;
+        let main_name = instance_symbol_name_for_object(tcx, instance);
         let main_sig = get_function_sig(tcx, m.target_config().default_call_conv, instance);
-        let main_func_id = m.declare_function(main_name, Linkage::Import, &main_sig).unwrap();
+        let main_func_id = m.declare_function(&main_name, Linkage::Import, &main_sig).unwrap();
 
         let mut ctx = Context::new();
         ctx.func.signature = cmain_sig;
@@ -119,10 +119,10 @@ pub(crate) fn maybe_create_entry_wrapper(
                     DUMMY_SP,
                 );
 
-                let report_name = tcx.symbol_name(report).name;
+                let report_name = instance_symbol_name_for_object(tcx, report);
                 let report_sig = get_function_sig(tcx, m.target_config().default_call_conv, report);
                 let report_func_id =
-                    m.declare_function(report_name, Linkage::Import, &report_sig).unwrap();
+                    m.declare_function(&report_name, Linkage::Import, &report_sig).unwrap();
                 let report_func_ref = m.declare_func_in_func(report_func_id, bcx.func);
 
                 // FIXME do proper abi handling instead of expecting the pass mode to be identical
@@ -156,7 +156,7 @@ pub(crate) fn maybe_create_entry_wrapper(
 
             bcx.ins().return_(&[result]);
             bcx.seal_all_blocks();
-            bcx.finalize();
+            bcx.finalize(m.target_config());
         }
 
         if let Err(err) = m.define_function(cmain_func_id, &mut ctx) {

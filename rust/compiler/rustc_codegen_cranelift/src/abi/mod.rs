@@ -104,9 +104,9 @@ pub(crate) fn import_function<'tcx>(
     module: &mut dyn Module,
     inst: Instance<'tcx>,
 ) -> FuncId {
-    let name = tcx.symbol_name(inst).name;
+    let name = instance_symbol_name_for_object(tcx, inst);
     let sig = get_function_sig(tcx, module.target_config().default_call_conv, inst);
-    match module.declare_function(name, Linkage::Import, &sig) {
+    match module.declare_function(&name, Linkage::Import, &sig) {
         Ok(func_id) => func_id,
         Err(ModuleError::IncompatibleDeclaration(_)) => tcx.dcx().fatal(format!(
             "attempt to declare `{name}` as function, but it was already declared as static"
@@ -747,7 +747,7 @@ pub(crate) fn codegen_drop<'tcx>(
                 let ptr = ptr.get_addr(fx);
                 let drop_fn = crate::vtable::drop_fn_of_obj(fx, vtable);
 
-                let is_null = fx.bcx.ins().icmp_imm(IntCC::Equal, drop_fn, 0);
+                let is_null = fx.bcx.ins().icmp_imm_s(IntCC::Equal, drop_fn, 0);
                 let target_block = fx.get_block(target);
                 let continued = fx.bcx.create_block();
                 fx.bcx.ins().brif(is_null, target_block, &[], continued, &[]);

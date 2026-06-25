@@ -145,7 +145,7 @@ enum Call {
 }
 
 /// Emit instructions to produce a zero value in the given type.
-fn emit_zero(ty: Type, mut cur: FuncCursor) -> Value {
+fn emit_zero(ty: Type, mut cur: FuncCursor<'_>) -> Value {
     match ty {
         I128 => {
             let zero = cur.ins().iconst(I64, 0);

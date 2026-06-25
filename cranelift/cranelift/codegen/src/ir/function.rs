@@ -493,19 +493,19 @@ impl Function {
 pub struct DisplayFunction<'a>(&'a Function);
 
 impl<'a> fmt::Display for DisplayFunction<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_function(fmt, self.0)
     }
 }
 
 impl fmt::Display for Function {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_function(fmt, self)
     }
 }
 
 impl fmt::Debug for Function {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_function(fmt, self)
     }
 }
@@ -514,13 +514,13 @@ impl fmt::Debug for Function {
 pub struct DisplayFunctionSpec<'a>(&'a Function);
 
 impl<'a> fmt::Display for DisplayFunctionSpec<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_function_spec(fmt, self.0)
     }
 }
 
 impl<'a> fmt::Debug for DisplayFunctionSpec<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_function_spec(fmt, self.0)
     }
 }

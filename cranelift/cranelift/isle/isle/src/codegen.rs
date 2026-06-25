@@ -658,7 +658,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_block<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         block: &Block,
         ret_kind: ReturnKind,
         last_expr: &str,
@@ -671,7 +671,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_block_contents<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         block: &Block,
         ret_kind: ReturnKind,
         last_expr: &str,
@@ -912,14 +912,18 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
         Ok(())
     }
 
-    fn emit_expr<W: Write>(&self, ctx: &mut BodyContext<W>, result: BindingId) -> std::fmt::Result {
+    fn emit_expr<W: Write>(
+        &self,
+        ctx: &mut BodyContext<'_, W>,
+        result: BindingId,
+    ) -> std::fmt::Result {
         if ctx.is_bound.contains(&result) {
             return write!(ctx.out, "v{}", result.index());
         }
 
         let binding = &ctx.ruleset.bindings[result.index()];
 
-        let call = |ctx: &mut BodyContext<W>,
+        let call = |ctx: &mut BodyContext<'_, W>,
                     term: TermId,
                     parameters: &[BindingId],
                     get_sig: fn(&Term, &TypeEnv) -> Option<ExternalSig>| {
@@ -952,7 +956,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
             write!(ctx.out, ")")
         };
 
-        let extract_fields = |ctx: &mut BodyContext<W>,
+        let extract_fields = |ctx: &mut BodyContext<'_, W>,
                               field_bindings: &[BindingId],
                               fields: &Fields|
          -> std::fmt::Result {
@@ -1050,7 +1054,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_source<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         source: BindingId,
         constraint: Constraint,
     ) -> std::fmt::Result {
@@ -1064,7 +1068,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_constraint<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         source: BindingId,
         arm: &MatchArm,
     ) -> std::fmt::Result {
@@ -1123,7 +1127,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_fields<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         bindings: &[Option<BindingId>],
         fields: &Fields,
     ) -> std::fmt::Result {
@@ -1162,7 +1166,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_bool<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         val: bool,
     ) -> Result<(), std::fmt::Error> {
         write!(ctx.out, "{val}")
@@ -1170,7 +1174,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
 
     fn emit_int<W: Write>(
         &self,
-        ctx: &mut BodyContext<W>,
+        ctx: &mut BodyContext<'_, W>,
         val: i128,
         ty: TypeId,
     ) -> Result<(), std::fmt::Error> {

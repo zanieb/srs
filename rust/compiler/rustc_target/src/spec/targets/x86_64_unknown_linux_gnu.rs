@@ -7,6 +7,7 @@ pub(crate) fn target() -> Target {
     base.cpu = "x86-64".into();
     base.plt_by_default = false;
     base.max_atomic_width = Some(64);
+    base.default_codegen_backend = Some("cranelift".into());
     base.add_pre_link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &["-m64"]);
     base.stack_probes = StackProbeType::Inline;
     base.static_position_independent_executables = true;

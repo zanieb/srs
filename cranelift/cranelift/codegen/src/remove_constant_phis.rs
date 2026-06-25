@@ -229,7 +229,7 @@ pub fn do_remove_constant_phis(func: &mut Function, domtree: &mut DominatorTree)
     let bump =
         Bump::with_capacity(domtree.cfg_postorder().len() * 4 * core::mem::size_of::<Value>());
     let mut summaries =
-        SecondaryMap::<Block, BlockSummary>::with_capacity(domtree.cfg_postorder().len());
+        SecondaryMap::<Block, BlockSummary<'_>>::with_capacity(domtree.cfg_postorder().len());
 
     for b in domtree.cfg_rpo().copied() {
         let formals = func.dfg.block_params(b);

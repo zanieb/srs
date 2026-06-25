@@ -262,7 +262,7 @@ impl BlockArg {
 }
 
 impl Display for BlockArg {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             BlockArg::Value(v) => write!(f, "{v}"),
             BlockArg::TryCallRet(i) => write!(f, "ret{i}"),
@@ -295,7 +295,7 @@ impl From<Value> for BlockArg {
 include!(concat!(env!("OUT_DIR"), "/opcodes.rs"));
 
 impl Display for Opcode {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", opcode_name(*self))
     }
 }
@@ -397,7 +397,7 @@ impl DerefMut for VariableArgs {
 }
 
 impl Display for VariableArgs {
-    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         for (i, val) in self.0.iter().enumerate() {
             if i == 0 {
                 write!(fmt, "{val}")?;

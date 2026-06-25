@@ -404,7 +404,7 @@ pub trait ABIMachineSpec {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        args: ArgsAccumulator,
+        args: ArgsAccumulator<'_>,
     ) -> CodegenResult<(u32, Option<usize>)>;
 
     /// Generate a load from the stack.

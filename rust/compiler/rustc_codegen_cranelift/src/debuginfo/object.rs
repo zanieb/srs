@@ -86,10 +86,23 @@ impl WriteDebugInfo for ObjectProduct {
                 Relocation {
                     offset: u64::from(reloc.offset),
                     symbol,
-                    flags: RelocationFlags::Generic {
-                        kind: reloc.kind,
-                        encoding: RelocationEncoding::Generic,
-                        size: reloc.size * 8,
+                    flags: if self.object.format() == object::BinaryFormat::MachO
+                        && self.object.architecture() == object::Architecture::Aarch64
+                        && reloc.kind == object::RelocationKind::Relative
+                        && reloc.is_indirect
+                        && reloc.size == 4
+                    {
+                        RelocationFlags::MachO {
+                            r_type: object::macho::ARM64_RELOC_POINTER_TO_GOT,
+                            r_pcrel: true,
+                            r_length: 2,
+                        }
+                    } else {
+                        RelocationFlags::Generic {
+                            kind: reloc.kind,
+                            encoding: RelocationEncoding::Generic,
+                            size: reloc.size * 8,
+                        }
                     },
                     addend: i64::try_from(symbol_offset).unwrap() + reloc.addend,
                 },

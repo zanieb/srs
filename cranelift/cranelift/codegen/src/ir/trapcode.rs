@@ -93,7 +93,7 @@ impl TrapCode {
 }
 
 impl Display for TrapCode {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let identifier = match *self {
             Self::STACK_OVERFLOW => "stk_ovf",
             Self::HEAP_OUT_OF_BOUNDS => "heap_oob",
