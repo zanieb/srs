@@ -90,6 +90,11 @@ impl Cost {
             // "Expensive" arithmetic.
             Opcode::Imul => Cost::new(10),
 
+            // Branch tables represent bounds checking and indexed control
+            // flow, so prefer an equivalent conditional branch when one is
+            // available.
+            Opcode::BrTable => Cost::new(5),
+
             // Everything else.
             _ => {
                 // By default, be slightly more expensive than "simple"
@@ -174,5 +179,10 @@ mod tests {
         let b = Cost::new(11);
         assert_eq!(a + b, Cost::infinity());
         assert_eq!(b + a, Cost::infinity());
+    }
+
+    #[test]
+    fn branch_table_costs_more_than_conditional_branch() {
+        assert!(Cost::of_skeleton_op(Opcode::BrTable, 1) > Cost::of_skeleton_op(Opcode::Brif, 1));
     }
 }

@@ -1,12 +1,19 @@
 //! Codegen of a single function
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
+
 use cranelift_codegen::CodegenError;
+use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir::UserFuncName;
+use cranelift_codegen::ir::{ExternalName, Opcode, UserExternalName};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_hir::attrs::InlineAttr;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -28,9 +35,42 @@ pub(crate) struct CodegenedFunction {
     clif_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
+    inline_hint: bool,
 }
 
+const MAX_INLINE_INSTRUCTIONS: usize = 32;
+const MAX_INLINE_BLOCKS: usize = 3;
+const MAX_COMPOSED_INLINE_BLOCKS: usize = 2 * MAX_INLINE_BLOCKS;
+const MAX_TRIVIAL_IMPORT_MIR_OPERATIONS: usize = 4;
+const MAX_TRIVIAL_IMPORT_MIR_BLOCKS: usize = 2;
+// Repeated direct call sites provide a static profitability signal and avoid importing tiny
+// bodies across every one-off call boundary in the codegen unit.
+const MIN_REPEATED_IMPORT_CALLS: usize = 4;
+
 pub(crate) fn codegen_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cgu_name: Symbol,
+    debug_context: Option<&mut DebugContext>,
+    type_dbg: &mut TypeDebugContext<'tcx>,
+    cached_func: Function,
+    module: &mut dyn Module,
+    instance: Instance<'tcx>,
+    referenced_functions: &mut FxHashMap<FuncId, Instance<'tcx>>,
+) -> CodegenedFunction {
+    codegen_fn_with_id(
+        tcx,
+        cgu_name,
+        debug_context,
+        type_dbg,
+        cached_func,
+        module,
+        instance,
+        None,
+        referenced_functions,
+    )
+}
+
+fn codegen_fn_with_id<'tcx>(
     tcx: TyCtxt<'tcx>,
     cgu_name: Symbol,
     mut debug_context: Option<&mut DebugContext>,
@@ -38,6 +78,8 @@ pub(crate) fn codegen_fn<'tcx>(
     cached_func: Function,
     module: &mut dyn Module,
     instance: Instance<'tcx>,
+    existing_func_id: Option<FuncId>,
+    referenced_functions: &mut FxHashMap<FuncId, Instance<'tcx>>,
 ) -> CodegenedFunction {
     debug_assert!(!instance.args.has_infer());
 
@@ -56,7 +98,8 @@ pub(crate) fn codegen_fn<'tcx>(
 
     // Declare function
     let sig = get_function_sig(tcx, module.target_config().default_call_conv, instance);
-    let func_id = module.declare_function(&symbol_name, Linkage::Local, &sig).unwrap();
+    let func_id = existing_func_id
+        .unwrap_or_else(|| module.declare_function(&symbol_name, Linkage::Local, &sig).unwrap());
 
     // Make the FunctionBuilder
     let mut func_ctx = FunctionBuilderContext::new();
@@ -93,6 +136,7 @@ pub(crate) fn codegen_fn<'tcx>(
 
     let mut fx = FunctionCx {
         module,
+        referenced_functions,
         debug_context,
         tcx,
         target_config,
@@ -127,9 +171,11 @@ pub(crate) fn codegen_fn<'tcx>(
     let func_debug_cx = fx.func_debug_cx;
     let inline_asm = fx.inline_asm;
 
-    fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+    if existing_func_id.is_none() {
+        fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+    }
 
-    if crate::pretty_clif::should_write_ir(tcx.sess) {
+    if existing_func_id.is_none() && crate::pretty_clif::should_write_ir(tcx.sess) {
         crate::pretty_clif::write_clif_file(
             tcx.output_filenames(()),
             &symbol_name,
@@ -143,7 +189,337 @@ pub(crate) fn codegen_fn<'tcx>(
     // Verify function
     verify_func(tcx, &clif_comments, &func);
 
-    CodegenedFunction { symbol_name, func_id, func, clif_comments, func_debug_cx, inline_asm }
+    let inline_hint = matches!(
+        tcx.codegen_instance_attrs(instance.def).inline,
+        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. }
+    );
+
+    CodegenedFunction {
+        symbol_name,
+        func_id,
+        func,
+        clif_comments,
+        func_debug_cx,
+        inline_asm,
+        inline_hint,
+    }
+}
+
+pub(crate) fn codegen_post_monomorphization_inline_candidates<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cgu_name: Symbol,
+    module: &mut dyn Module,
+    catalog_module: &mut dyn Module,
+    referenced_functions: FxHashMap<FuncId, Instance<'tcx>>,
+) -> Result<Vec<CodegenedFunction>, CodegenError> {
+    const MAX_INLINE_MIR_OPERATIONS: usize = 64;
+    const MAX_INLINE_MIR_BLOCKS: usize = 6;
+    const MAX_IMPORT_DEPTH: usize = 1;
+
+    let is_source_candidate = |instance: Instance<'tcx>| {
+        if !matches!(instance.def, InstanceKind::Item(_))
+            || !tcx.is_mir_available(instance.def_id())
+        {
+            return false;
+        }
+        let attrs = tcx.codegen_instance_attrs(instance.def);
+        let inline_hint = matches!(
+            attrs.inline,
+            InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. }
+        );
+        if attrs.contains_extern_indicator()
+            || attrs
+                .flags
+                .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED)
+            || !attrs.target_features.is_empty()
+        {
+            return false;
+        }
+        let mir = tcx.instance_mir(instance.def);
+        // Hinted imports retain the wider existing limits. Only translate an unhinted root when
+        // its source MIR is small enough to become a trivial forwarder after composition.
+        let blocks = mir.basic_blocks.len();
+        let operations =
+            mir.basic_blocks.iter().map(|block| block.statements.len() + 1).sum::<usize>();
+        (inline_hint && blocks <= MAX_INLINE_MIR_BLOCKS && operations <= MAX_INLINE_MIR_OPERATIONS)
+            || (!inline_hint
+                && blocks <= MAX_TRIVIAL_IMPORT_MIR_BLOCKS
+                && operations <= MAX_TRIVIAL_IMPORT_MIR_OPERATIONS)
+    };
+
+    let mut referenced_functions = referenced_functions.into_iter().collect::<Vec<_>>();
+    referenced_functions.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
+
+    let mut roots = FxHashMap::default();
+    let mut instances = FxHashMap::default();
+    let mut pending = VecDeque::new();
+    for (func_id, instance) in referenced_functions {
+        if !is_source_candidate(instance) {
+            continue;
+        }
+        let catalog_func_id = import_function(tcx, catalog_module, instance);
+        roots.insert(catalog_func_id.as_u32(), func_id);
+        instances.insert(catalog_func_id.as_u32(), instance);
+        pending.push_back((catalog_func_id, instance, 0));
+    }
+
+    let mut translated_ids = FxHashMap::default();
+    let mut translated = Vec::new();
+    while let Some((func_id, instance, depth)) = pending.pop_front() {
+        if translated_ids.insert(func_id.as_u32(), ()).is_some() {
+            continue;
+        }
+
+        let mut candidate_references = FxHashMap::default();
+        translated.push(codegen_fn_with_id(
+            tcx,
+            cgu_name,
+            None,
+            &mut TypeDebugContext::default(),
+            Function::new(),
+            catalog_module,
+            instance,
+            Some(func_id),
+            &mut candidate_references,
+        ));
+
+        let mut candidate_references = candidate_references.into_iter().collect::<Vec<_>>();
+        candidate_references.sort_unstable_by_key(|(func_id, _)| func_id.as_u32());
+        for (referenced_func_id, referenced_instance) in candidate_references {
+            instances.entry(referenced_func_id.as_u32()).or_insert(referenced_instance);
+            if depth < MAX_IMPORT_DEPTH && is_source_candidate(referenced_instance) {
+                pending.push_back((referenced_func_id, referenced_instance, depth + 1));
+            }
+        }
+    }
+
+    // A root can be a tiny forwarder to another tiny body. Optimize the isolated catalogue
+    // before composing it so stack forwarding can prove temporary return slots unused. This does
+    // not optimize the ordinary CGU functions an extra time or make bodies with live stack state
+    // eligible for inlining.
+    for function in &mut translated {
+        if function.func.sized_stack_slots.is_empty() {
+            continue;
+        }
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.optimize(catalog_module.isa(), &mut ControlPlane::default())?;
+        if context.func.sized_stack_slots.values().all(|slot| slot.size == 0) {
+            function.func = context.func;
+        }
+    }
+
+    // Import one dependency level and compose it once, without recursively visiting callees or
+    // growing an unbounded catalogue.
+    inline_small_functions(catalog_module, &[], &mut translated)?;
+
+    let mut candidates = Vec::new();
+    for mut candidate in translated {
+        let Some(&func_id) = roots.get(&candidate.func_id.as_u32()) else {
+            continue;
+        };
+        if !is_composed_inline_candidate(&candidate) && !is_trivial_import_candidate(&candidate) {
+            continue;
+        }
+
+        let name_updates = candidate
+            .func
+            .params
+            .user_named_funcs()
+            .iter()
+            .map(|(name_ref, name)| {
+                let remapped = (name.namespace == 0)
+                    .then(|| instances.get(&name.index))
+                    .flatten()
+                    .map(|&instance| import_function(tcx, module, instance).as_u32());
+                (name_ref, name.namespace, remapped)
+            })
+            .collect::<Vec<_>>();
+        if name_updates.iter().any(|(_, namespace, remapped)| *namespace != 0 || remapped.is_none())
+        {
+            continue;
+        }
+        for (name_ref, _, remapped) in name_updates {
+            candidate.func.params.reset_user_func_name(
+                name_ref,
+                UserExternalName { namespace: 0, index: remapped.unwrap() },
+            );
+        }
+        candidate.func_id = func_id;
+        candidate.func.name = UserFuncName::user(0, func_id.as_u32());
+        candidates.push(candidate);
+    }
+    Ok(candidates)
+}
+
+pub(crate) fn inline_small_functions(
+    module: &dyn Module,
+    post_monomorphization_candidates: &[CodegenedFunction],
+    functions: &mut [CodegenedFunction],
+) -> Result<(), CodegenError> {
+    // The MIR inliner runs before monomorphization, so calls through generic traits can only
+    // become direct calls after cg_clif has translated them. Inline a conservative subset here
+    // to expose those calls to Cranelift's scalar optimizations without unbounded code growth.
+    //
+    // Keep this to call-free functions without stack slots or global values. Broader bodies have
+    // not yet proved safe under cg_clif's unwind, debug-info, and object-generation integration.
+    let mut callees = FxHashMap::default();
+    for function in functions.iter() {
+        if !is_small_inline_candidate(function) {
+            continue;
+        }
+
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.legalize(module.isa())?;
+        callees.insert(function.func_id.as_u32(), context.func);
+    }
+    let mut imported_callees = FxHashMap::default();
+    let mut trivial_imports = FxHashMap::default();
+    for function in post_monomorphization_candidates {
+        let func_id = function.func_id.as_u32();
+        let trivial = is_trivial_import_candidate(function);
+        if callees.contains_key(&func_id) || (!is_composed_inline_candidate(function) && !trivial) {
+            continue;
+        }
+
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.legalize(module.isa())?;
+        callees.insert(func_id, context.func);
+        imported_callees.insert(func_id, ());
+        if trivial {
+            trivial_imports.insert(func_id, ());
+        }
+    }
+
+    struct SmallFunctionInliner<'a> {
+        callees: &'a FxHashMap<u32, Function>,
+        imported_callees: &'a FxHashMap<u32, ()>,
+        trivial_imports: &'a FxHashMap<u32, ()>,
+        allowed_imports: &'a FxHashMap<u32, ()>,
+    }
+
+    impl Inline for SmallFunctionInliner<'_> {
+        fn inline(
+            &mut self,
+            caller: &Function,
+            _call_inst: Inst,
+            _call_opcode: Opcode,
+            callee: FuncRef,
+            _call_args: &[Value],
+        ) -> InlineCommand<'_> {
+            let ExternalName::User(callee_name) = caller.dfg.ext_funcs[callee].name else {
+                return InlineCommand::KeepCall;
+            };
+            let callee_name = &caller.params.user_named_funcs()[callee_name];
+            if callee_name.namespace != 0
+                || caller.name.get_user().is_some_and(|caller_name| {
+                    caller_name.namespace == callee_name.namespace
+                        && caller_name.index == callee_name.index
+                })
+                || (self.imported_callees.contains_key(&callee_name.index)
+                    && !self.trivial_imports.contains_key(&callee_name.index)
+                    && !self.allowed_imports.contains_key(&callee_name.index))
+            {
+                return InlineCommand::KeepCall;
+            }
+
+            match self.callees.get(&callee_name.index) {
+                Some(callee) => {
+                    InlineCommand::Inline { callee: Cow::Borrowed(callee), visit_callee: false }
+                }
+                None => InlineCommand::KeepCall,
+            }
+        }
+    }
+
+    for function in functions {
+        let mut imported_call_counts = FxHashMap::default();
+        for block in function.func.layout.blocks() {
+            for inst in function.func.layout.block_insts(block) {
+                let instruction = &function.func.dfg.insts[inst];
+                let func_ref = match instruction {
+                    cranelift_codegen::ir::InstructionData::Call { func_ref, .. }
+                    | cranelift_codegen::ir::InstructionData::TryCall { func_ref, .. } => *func_ref,
+                    _ => continue,
+                };
+                let ExternalName::User(callee_name) = function.func.dfg.ext_funcs[func_ref].name
+                else {
+                    continue;
+                };
+                let callee_name = &function.func.params.user_named_funcs()[callee_name];
+                if callee_name.namespace == 0 && imported_callees.contains_key(&callee_name.index) {
+                    *imported_call_counts.entry(callee_name.index).or_insert(0) += 1;
+                }
+            }
+        }
+        let allowed_imports: FxHashMap<u32, ()> = imported_call_counts
+            .into_iter()
+            .filter_map(|(func_id, count)| {
+                (count >= MIN_REPEATED_IMPORT_CALLS).then_some((func_id, ()))
+            })
+            .collect();
+
+        let mut context = Context::new();
+        context.func = std::mem::replace(&mut function.func, Function::new());
+        context.inline(SmallFunctionInliner {
+            callees: &callees,
+            imported_callees: &imported_callees,
+            trivial_imports: &trivial_imports,
+            allowed_imports: &allowed_imports,
+        })?;
+        function.func = context.func;
+    }
+
+    Ok(())
+}
+
+fn is_small_inline_candidate(function: &CodegenedFunction) -> bool {
+    is_inline_candidate_with_block_limit(function, MAX_INLINE_BLOCKS)
+}
+
+fn is_composed_inline_candidate(function: &CodegenedFunction) -> bool {
+    is_inline_candidate_with_block_limit(function, MAX_COMPOSED_INLINE_BLOCKS)
+}
+
+fn is_trivial_import_candidate(function: &CodegenedFunction) -> bool {
+    !function.inline_hint
+        && has_inline_candidate_structure(function, MAX_COMPOSED_INLINE_BLOCKS)
+        && function
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| function.func.layout.block_insts(block))
+            .filter(|&inst| {
+                !matches!(
+                    function.func.dfg.insts[inst].opcode(),
+                    Opcode::Nop | Opcode::Jump | Opcode::Return
+                )
+            })
+            .count()
+            <= 1
+}
+
+fn is_inline_candidate_with_block_limit(function: &CodegenedFunction, max_blocks: usize) -> bool {
+    function.inline_hint && has_inline_candidate_structure(function, max_blocks)
+}
+
+fn has_inline_candidate_structure(function: &CodegenedFunction, max_blocks: usize) -> bool {
+    function.inline_asm.is_empty()
+        && function.func.dfg.num_insts() <= MAX_INLINE_INSTRUCTIONS
+        && function.func.layout.blocks().count() <= max_blocks
+        && function.func.sized_stack_slots.values().all(|slot| slot.size == 0)
+        && function.func.dynamic_stack_slots.is_empty()
+        && function.func.global_values.is_empty()
+        && function.func.stack_limit.is_none()
+        && !function.func.layout.blocks().any(|block| {
+            function
+                .func
+                .layout
+                .block_insts(block)
+                .any(|inst| function.func.dfg.insts[inst].opcode().is_call())
+        })
 }
 
 pub(crate) fn compile_fn(
@@ -831,11 +1207,17 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's
                     } else if fx.clif_type(operand.layout().ty) == Some(types::I8) {
-                        let times = fx.bcx.ins().iconst(fx.pointer_type, times as i64);
-                        // FIXME use emit_small_memset where possible
                         let addr = lval.to_ptr().get_addr(fx);
                         let val = operand.load_scalar(fx);
-                        fx.bcx.call_memset(fx.target_config, addr, val, times);
+                        let align = dest_layout.align.abi.bytes().try_into().unwrap_or(128);
+                        fx.bcx.emit_small_memset_value(
+                            fx.target_config,
+                            addr,
+                            val,
+                            times,
+                            align,
+                            MemFlags::new(),
+                        );
                     } else {
                         let loop_block = fx.bcx.create_block();
                         let loop_block2 = fx.bcx.create_block();
@@ -938,17 +1320,39 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     .expect("expected pointee to have a layout");
                 let elem_size: u64 = pointee_layout.layout.size().bytes();
 
+                // Cranelift has no later pass that expands constant libc copies. Preserve the
+                // constant size here so the frontend can emit a small load/store sequence.
+                let constant_bytes = count
+                    .constant()
+                    .and_then(|constant| {
+                        crate::constant::eval_mir_constant(fx, constant).0.try_to_scalar_int()
+                    })
+                    .and_then(|count| count.to_target_usize(fx.tcx).checked_mul(elem_size));
+
                 let dst = dst.load_scalar(fx);
                 let src = codegen_operand(fx, src).load_scalar(fx);
-                let count = codegen_operand(fx, count).load_scalar(fx);
-
-                let bytes = if elem_size != 1 {
-                    fx.bcx.ins().imul_imm(count, elem_size as i64)
+                if let Some(bytes) = constant_bytes {
+                    let align = pointee_layout.layout.align.abi.bytes().try_into().unwrap_or(128);
+                    fx.bcx.emit_small_memory_copy(
+                        fx.target_config,
+                        dst,
+                        src,
+                        bytes,
+                        align,
+                        align,
+                        true,
+                        MemFlags::new(),
+                    );
                 } else {
-                    count
-                };
+                    let count = codegen_operand(fx, count).load_scalar(fx);
+                    let bytes = if elem_size != 1 {
+                        fx.bcx.ins().imul_imm(count, elem_size as i64)
+                    } else {
+                        count
+                    };
 
-                fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                    fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                }
             }
         },
     }

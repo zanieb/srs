@@ -314,11 +314,11 @@ fn reuse_workproduct_for_cgu(
     })
 }
 
-fn codegen_cgu_content(
-    tcx: TyCtxt<'_>,
+fn codegen_cgu_content<'tcx>(
+    tcx: TyCtxt<'tcx>,
     module: &mut dyn Module,
     cgu_name: rustc_span::Symbol,
-) -> (Option<DebugContext>, Vec<CodegenedFunction>, String) {
+) -> (Option<DebugContext>, Vec<CodegenedFunction>, FxHashMap<FuncId, Instance<'tcx>>, String) {
     let _timer = tcx.prof.generic_activity_with_arg("codegen cgu", cgu_name.as_str());
 
     let cgu = tcx.codegen_unit(cgu_name);
@@ -329,6 +329,7 @@ fn codegen_cgu_content(
     let mut type_dbg = TypeDebugContext::default();
     super::predefine_mono_items(tcx, module, &mono_items);
     let mut codegened_functions = vec![];
+    let mut referenced_functions = FxHashMap::default();
     for (mono_item, item_data) in mono_items {
         match mono_item {
             MonoItem::Fn(instance) => {
@@ -357,6 +358,7 @@ fn codegen_cgu_content(
                     Function::new(),
                     module,
                     instance,
+                    &mut referenced_functions,
                 );
                 codegened_functions.push(codegened_function);
             }
@@ -376,7 +378,7 @@ fn codegen_cgu_content(
     }
     crate::main_shim::maybe_create_entry_wrapper(tcx, module, false, cgu.is_primary());
 
-    (debug_context, codegened_functions, global_asm)
+    (debug_context, codegened_functions, referenced_functions, global_asm)
 }
 
 fn module_codegen(
@@ -387,8 +389,34 @@ fn module_codegen(
 ) -> OngoingModuleCodegen {
     let mut module = make_module(tcx.sess, cgu_name.as_str().to_string());
 
-    let (mut debug_context, codegened_functions, mut global_asm) =
+    let (mut debug_context, mut codegened_functions, referenced_functions, mut global_asm) =
         codegen_cgu_content(tcx, &mut module, cgu_name);
+
+    let mut inline_catalog_module =
+        make_module(tcx.sess, format!("{}.inline-catalog", cgu_name.as_str()));
+    let post_monomorphization_candidates =
+        match crate::base::codegen_post_monomorphization_inline_candidates(
+            tcx,
+            cgu_name,
+            &mut module,
+            &mut inline_catalog_module,
+            referenced_functions,
+        ) {
+            Ok(candidates) => candidates,
+            Err(err) => tcx
+                .dcx()
+                .fatal(format!("failed to prepare post-monomorphization inline candidates: {err}")),
+        };
+
+    if let Err(err) = tcx.prof.generic_activity("inline clif functions").run(|| {
+        crate::base::inline_small_functions(
+            &module,
+            &post_monomorphization_candidates,
+            &mut codegened_functions,
+        )
+    }) {
+        tcx.dcx().fatal(format!("failed to inline Cranelift functions: {err}"));
+    }
 
     let cgu_name = cgu_name.as_str().to_owned();
 
