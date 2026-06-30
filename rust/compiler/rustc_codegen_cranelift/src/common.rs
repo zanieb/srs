@@ -8,7 +8,7 @@ use rustc_middle::ty::TypeFoldable;
 use rustc_middle::ty::layout::{
     self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
-use rustc_span::{Spanned, Symbol};
+use rustc_span::{Spanned, Symbol, sym};
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{Arch, HasTargetSpec, Target};
 
@@ -96,6 +96,16 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
         ty::FnPtr(..) => pointer_ty(tcx),
         ty::RawPtr(pointee_ty, _) | ty::Ref(_, pointee_ty, _) => {
             if tcx.type_has_metadata(*pointee_ty, ty::TypingEnv::fully_monomorphized()) {
+                return None;
+            } else {
+                pointer_ty(tcx)
+            }
+        }
+        // Pattern types use the same machine representation as their base type.
+        ty::Pat(base, _) => return clif_type_from_ty(tcx, *base),
+        // Keeping thin `NonNull` values in SSA avoids repeatedly spilling iterator cursors.
+        ty::Adt(def, args) if tcx.is_diagnostic_item(sym::NonNull, def.did()) => {
+            if tcx.type_has_metadata(args.type_at(0), ty::TypingEnv::fully_monomorphized()) {
                 return None;
             } else {
                 pointer_ty(tcx)

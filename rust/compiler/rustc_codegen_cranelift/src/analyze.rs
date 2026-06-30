@@ -25,7 +25,11 @@ pub(crate) fn analyze(fx: &FunctionCx<'_, '_, '_>) -> IndexVec<Local, SsaKind> {
         for stmt in bb.statements.iter() {
             match &stmt.kind {
                 Assign(place_and_rval) => match &place_and_rval.1 {
-                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                    // An indirect place takes the address of the pointee, not of the pointer
+                    // local that forms the base of the place.
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                        if !place.as_ref().is_indirect_first_projection() =>
+                    {
                         flag_map[place.local] = SsaKind::NotSsa;
                     }
                     _ => {}

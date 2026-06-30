@@ -3,7 +3,7 @@ use std::result;
 use std::sync::Arc;
 
 use rustc_ast::{LitKind, MetaItemKind, token};
-use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::traits::{CodegenBackend, MirInlinerThresholds};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::jobserver::{self, Proxy};
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
@@ -26,6 +26,21 @@ use tracing::trace;
 use crate::util;
 
 pub type Result<T> = result::Result<T, ErrorGuaranteed>;
+
+pub(crate) fn apply_backend_mir_inliner_thresholds(
+    opts: &mut rustc_session::config::Options,
+    thresholds: Option<MirInlinerThresholds>,
+) {
+    let Some(thresholds) = thresholds else { return };
+
+    opts.unstable_opts
+        .cross_crate_inline_threshold
+        .get_or_insert(rustc_session::config::InliningThreshold::Sometimes(thresholds.cross_crate));
+    opts.unstable_opts.inline_mir_top_down_depth.get_or_insert(thresholds.top_down_depth);
+    opts.unstable_opts.inline_mir_forwarder_threshold.get_or_insert(thresholds.forwarder);
+    opts.unstable_opts.inline_mir_hint_threshold.get_or_insert(thresholds.hint);
+    opts.unstable_opts.inline_mir_threshold.get_or_insert(thresholds.default);
+}
 
 /// Represents a compiler session. Note that every `Compiler` contains a
 /// `Session`, but `Compiler` also contains some things that cannot be in
@@ -448,8 +463,13 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 }
             };
             codegen_backend.init(&sess);
+            apply_backend_mir_inliner_thresholds(
+                &mut sess.opts,
+                codegen_backend.mir_inliner_thresholds(),
+            );
             sess.replaced_intrinsics = FxHashSet::from_iter(codegen_backend.replaced_intrinsics());
             sess.thin_lto_supported = codegen_backend.thin_lto_supported();
+            sess.run_late_mir_sroa = codegen_backend.run_late_mir_sroa();
 
             let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
             let mut cfg = config::build_configuration(&sess, cfg);

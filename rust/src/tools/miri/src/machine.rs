@@ -1940,7 +1940,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
                 .any(|arg| !matches!(arg.kind(), ty::GenericArgKind::Lifetime(_)));
             let can_be_inlined = matches!(
                 ecx.tcx.sess.opts.unstable_opts.cross_crate_inline_threshold,
-                InliningThreshold::Always
+                Some(InliningThreshold::Always)
             ) || !matches!(
                 ecx.tcx.codegen_instance_attrs(instance.def).inline,
                 InlineAttr::Never
