@@ -13,9 +13,10 @@ use rustc_middle::ty::{ExistentialTraitRef, ScalarInt};
 
 use crate::prelude::*;
 
-pub(crate) struct ConstantCx {
+pub(crate) struct ConstantCx<'tcx> {
     todo: Vec<TodoItem>,
     anon_allocs: FxHashMap<AllocId, DataId>,
+    referenced_functions: FxHashMap<FuncId, Instance<'tcx>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -24,20 +25,34 @@ enum TodoItem {
     Static(DefId),
 }
 
-impl ConstantCx {
+impl<'tcx> ConstantCx<'tcx> {
     pub(crate) fn new() -> Self {
-        ConstantCx { todo: vec![], anon_allocs: FxHashMap::default() }
+        ConstantCx {
+            todo: vec![],
+            anon_allocs: FxHashMap::default(),
+            referenced_functions: FxHashMap::default(),
+        }
     }
 
-    pub(crate) fn finalize(mut self, tcx: TyCtxt<'_>, module: &mut dyn Module) {
+    pub(crate) fn finalize(
+        mut self,
+        tcx: TyCtxt<'tcx>,
+        module: &mut dyn Module,
+    ) -> FxHashMap<FuncId, Instance<'tcx>> {
         define_all_allocs(tcx, module, &mut self);
+        self.referenced_functions
     }
 }
 
-pub(crate) fn codegen_static(tcx: TyCtxt<'_>, module: &mut dyn Module, def_id: DefId) -> DataId {
+pub(crate) fn codegen_static<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    module: &mut dyn Module,
+    def_id: DefId,
+    referenced_functions: &mut FxHashMap<FuncId, Instance<'tcx>>,
+) -> DataId {
     let mut constants_cx = ConstantCx::new();
     constants_cx.todo.push(TodoItem::Static(def_id));
-    constants_cx.finalize(tcx, module);
+    referenced_functions.extend(constants_cx.finalize(tcx, module));
 
     data_id_for_static(
         tcx, module, def_id, false,
@@ -159,6 +174,7 @@ pub(crate) fn codegen_const_value<'tcx>(
                     }
                     GlobalAlloc::Function { instance, .. } => {
                         let func_id = crate::abi::import_function(fx.tcx, fx.module, instance);
+                        fx.referenced_functions.entry(func_id).or_insert(instance);
                         let local_func_id = fx.module.declare_func_in_func(func_id, fx.bcx.func);
                         fx.bcx.ins().func_addr(fx.pointer_type, local_func_id)
                     }
@@ -241,7 +257,7 @@ fn pointer_for_allocation<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, alloc_id: All
 }
 
 fn data_id_for_alloc_id(
-    cx: &mut ConstantCx,
+    cx: &mut ConstantCx<'_>,
     module: &mut dyn Module,
     alloc_id: AllocId,
     mutability: rustc_hir::Mutability,
@@ -254,7 +270,7 @@ fn data_id_for_alloc_id(
 
 pub(crate) fn data_id_for_vtable<'tcx>(
     tcx: TyCtxt<'tcx>,
-    cx: &mut ConstantCx,
+    cx: &mut ConstantCx<'tcx>,
     module: &mut dyn Module,
     ty: Ty<'tcx>,
     trait_ref: Option<ExistentialTraitRef<'tcx>>,
@@ -365,7 +381,7 @@ fn data_id_for_static(
     }
 }
 
-fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut ConstantCx) {
+fn define_all_allocs<'tcx>(tcx: TyCtxt<'tcx>, module: &mut dyn Module, cx: &mut ConstantCx<'tcx>) {
     let mut done = FxHashSet::default();
     while let Some(todo_item) = cx.todo.pop() {
         if !done.insert(todo_item) {
@@ -485,6 +501,7 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                 GlobalAlloc::Function { instance, .. } => {
                     assert_eq!(addend, 0);
                     let func_id = crate::abi::import_function(tcx, module, instance);
+                    cx.referenced_functions.entry(func_id).or_insert(instance);
                     let local_func_id = module.declare_func_in_data(func_id, &mut data);
                     data.write_function_addr(offset.bytes() as u32, local_func_id);
                     continue;

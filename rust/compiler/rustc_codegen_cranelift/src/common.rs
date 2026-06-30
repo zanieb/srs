@@ -3,12 +3,13 @@ use std::borrow::Cow;
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use rustc_abi::{Float, Integer, Primitive};
+use rustc_hir::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeFoldable;
 use rustc_middle::ty::layout::{
     self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
-use rustc_span::{Spanned, Symbol};
+use rustc_span::{Spanned, Symbol, sym};
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{Arch, HasTargetSpec, Target};
 
@@ -100,6 +101,34 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
             } else {
                 pointer_ty(tcx)
             }
+        }
+        // Pattern types use the same machine representation as their base type.
+        ty::Pat(base, _) => return clif_type_from_ty(tcx, *base),
+        // Keeping thin `NonNull` values in SSA avoids repeatedly spilling iterator cursors.
+        ty::Adt(def, args) if tcx.is_diagnostic_item(sym::NonNull, def.did()) => {
+            if tcx.type_has_metadata(args.type_at(0), ty::TypingEnv::fully_monomorphized()) {
+                return None;
+            } else {
+                pointer_ty(tcx)
+            }
+        }
+        // `NonZero<T>` and its niche-encoded `Option` have a single scalar ABI representation.
+        // Keep that value in SSA rather than materializing the wrapper in a stack slot. Other
+        // scalar ADTs can contain fields at nonzero offsets or zero-sized fields that the current
+        // scalar-place projection does not support.
+        ty::Adt(def, args)
+            if tcx.is_diagnostic_item(sym::NonZero, def.did())
+                || (tcx.is_lang_item(def.did(), LangItem::Option)
+                    && matches!(
+                        args.type_at(0).kind(),
+                        ty::Adt(inner_def, _)
+                            if tcx.is_diagnostic_item(sym::NonZero, inner_def.did())
+                    )) =>
+        {
+            let layout =
+                tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).ok()?;
+            let BackendRepr::Scalar(scalar) = layout.backend_repr else { return None };
+            scalar_to_clif_type(tcx, scalar)
         }
         ty::Param(_) => bug!("ty param {:?}", ty),
         _ => return None,
@@ -293,11 +322,12 @@ pub(crate) fn create_wrapper_function(
 
 pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) module: &'m mut dyn Module,
+    pub(crate) referenced_functions: &'m mut FxHashMap<FuncId, Instance<'tcx>>,
     pub(crate) debug_context: Option<&'clif mut DebugContext>,
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) target_config: TargetFrontendConfig, // Cached from module
     pub(crate) pointer_type: Type,                  // Cached from module
-    pub(crate) constants_cx: ConstantCx,
+    pub(crate) constants_cx: ConstantCx<'tcx>,
     pub(crate) func_debug_cx: Option<FunctionDebugContext>,
 
     pub(crate) cgu_name: Symbol,

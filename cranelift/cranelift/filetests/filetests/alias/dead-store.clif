@@ -1,0 +1,100 @@
+test optimize precise-output
+set opt_level=speed
+target x86_64
+
+;; A read-only load cannot alias a store, so the later store makes the first one dead.
+function %overwrite_across_readonly_load(i64, i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    store notrap v2, v0
+    v4 = load.i64 notrap readonly v1
+    store notrap v3, v0
+    return v4
+}
+
+; function %overwrite_across_readonly_load(i64, i64, i64, i64) -> i64 fast {
+; block0(v0: i64, v1: i64, v2: i64, v3: i64):
+;     v4 = load.i64 notrap readonly v1
+;     store notrap v3, v0
+;     return v4
+; }
+
+;; An ordinary load may observe the first store.
+function %load_barrier(i64, i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    store notrap v2, v0
+    v4 = load.i64 notrap v1
+    store notrap v3, v0
+    return v4
+}
+
+; function %load_barrier(i64, i64, i64, i64) -> i64 fast {
+; block0(v0: i64, v1: i64, v2: i64, v3: i64):
+;     store notrap v2, v0
+;     v4 = load.i64 notrap v1
+;     store notrap v3, v0
+;     return v4
+; }
+
+;; A readonly load that can trap can expose the first store's state.
+function %trapping_readonly_load_barrier(i64, i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    store notrap v2, v0
+    v4 = load.i64 readonly v1
+    store notrap v3, v0
+    return v4
+}
+
+; function %trapping_readonly_load_barrier(i64, i64, i64, i64) -> i64 fast {
+; block0(v0: i64, v1: i64, v2: i64, v3: i64):
+;     store notrap v2, v0
+;     v4 = load.i64 readonly v1
+;     store notrap v3, v0
+;     return v4
+; }
+
+;; A potentially trapping replacement must preserve the state written by the first store.
+function %trapping_store_barrier(i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    store notrap v1, v0
+    store v2, v0
+    return
+}
+
+; function %trapping_store_barrier(i64, i64, i64) fast {
+; block0(v0: i64, v1: i64, v2: i64):
+;     store notrap v1, v0
+;     store v2, v0
+;     return
+; }
+
+;; A potentially trapping original store must still execute.
+function %trapping_original_store_barrier(i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    store v1, v0
+    store notrap v2, v0
+    return
+}
+
+; function %trapping_original_store_barrier(i64, i64, i64) fast {
+; block0(v0: i64, v1: i64, v2: i64):
+;     store v1, v0
+;     store notrap v2, v0
+;     return
+; }
+
+;; A trap can expose the state written by the first store.
+function %trap_barrier(i64, i64, i64, i8) {
+block0(v0: i64, v1: i64, v2: i64, v3: i8):
+    store notrap v1, v0
+    trapz v3, user1
+    store notrap v2, v0
+    return
+}
+
+; function %trap_barrier(i64, i64, i64, i8) fast {
+; block0(v0: i64, v1: i64, v2: i64, v3: i8):
+;     store notrap v1, v0
+;     trapz v3, user1
+;     store notrap v2, v0
+;     return
+; }

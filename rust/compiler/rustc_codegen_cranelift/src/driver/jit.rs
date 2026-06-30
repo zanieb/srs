@@ -141,6 +141,7 @@ fn codegen_and_compile_fn<'tcx>(
             crate::PrintOnPanic(|| format!("{:?} {}", instance, tcx.symbol_name(instance).name));
 
         let cached_func = std::mem::replace(&mut cached_context.func, Function::new());
+        let mut referenced_functions = FxHashMap::default();
         let codegened_func = crate::base::codegen_fn(
             tcx,
             sym::dummy_cgu_name,
@@ -149,6 +150,7 @@ fn codegen_and_compile_fn<'tcx>(
             cached_func,
             module,
             instance,
+            &mut referenced_functions,
         );
 
         let mut global_asm = String::new();

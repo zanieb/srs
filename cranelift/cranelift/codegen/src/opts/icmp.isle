@@ -79,6 +79,29 @@
                       (iconst_u _ 1)))
       (subsume inner))
 
+;; Integer comparisons produce only 0 or 1, including after zero extension.
+;; Fold unsigned range checks that cannot distinguish either result.
+(rule (simplify (ugt (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 0 c))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (uge (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 1 c))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (ult (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 1 c))
+      (subsume (iconst_u bty 1)))
+(rule (simplify (ule (fits_in_64 (ty_int bty))
+                     (uextend_maybe _ (icmp _ _ _ _))
+                     (iconst_u _ c)))
+      (if-let true (u64_lt 0 c))
+      (subsume (iconst_u bty 1)))
+
 ;; Optimize select-of-uextend-of-icmp to select-of-icmp, because
 ;; select can take an I8 condition too.
 (rule (simplify
@@ -175,6 +198,13 @@
 (rule (simplify (sge (fits_in_64 (ty_int bty)) x smax @ (iconst_u cty y)))
        (if-let true (u64_eq y (ty_smax cty)))
        (eq bty x smax))
+
+;; Shift counts are masked to the value's width, so shifting the single set bit in `1` can never
+;; produce zero.
+(rule (simplify (eq bty (ishl ity (iconst_u ity 1) _) (iconst_u _ 0)))
+      (subsume (iconst_u bty 0)))
+(rule (simplify (ne bty (ishl ity (iconst_u ity 1) _) (iconst_u _ 0)))
+      (subsume (iconst_u bty 1)))
 
 ;; `band`/`bor` of 2 comparisons:
 (rule (simplify (band (fits_in_64 ty) (icmp ty cc1 x y) (icmp ty cc2 x y)))

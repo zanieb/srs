@@ -1898,7 +1898,8 @@ impl<'a> Verifier<'a> {
                 types::I16 => u16::MAX.into(),
                 types::I32 => u32::MAX.into(),
                 types::I64 => u64::MAX,
-                _ => unreachable!(),
+                // The general type checker reports invalid controlling types.
+                _ => return Ok(()),
             };
 
             let value = imm.bits() as u64;
@@ -2240,6 +2241,14 @@ mod tests {
     #[test]
     fn valid_iconst_32() {
         test_iconst_bounds_ok(u32::MAX as i64, types::I32);
+    }
+
+    #[test]
+    fn invalid_iconst_128() {
+        assert_err_with_msg!(
+            test_iconst_bounds(1, types::I128),
+            "invalid controlling type i128"
+        );
     }
 
     #[test]
