@@ -256,7 +256,7 @@ if [[ ! -x "$cargo_bin" ]]; then
 fi
 
 missing_toolchain_bins=()
-for bin in cargo-clippy clippy-driver; do
+for bin in cargo-clippy clippy-driver rustdoc; do
     if [[ ! -x "$toolchain_dir/bin/$bin" ]]; then
         missing_toolchain_bins+=("$bin")
     fi

@@ -24,8 +24,10 @@ pub unsafe fn f0() {
 
 // CHECK-LABEL: fn f1()
 // CHECK:       bb0: {
-// CHECK-NEXT:  sse2()
+// CHECK-NEXT:  return;
 pub unsafe fn f1() {
+    // SSE2 is enabled globally on x86_64, so this explicit attribute does not make the callee's
+    // effective target features different from the caller's.
     sse2();
 }
 
@@ -35,6 +37,17 @@ pub unsafe fn f1() {
 #[target_feature(enable = "avx")]
 pub unsafe fn f2() {
     nop();
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn ssse3() {}
+
+// CHECK-LABEL: fn f3()
+// CHECK:       bb0: {
+// CHECK-NEXT:  ssse3()
+pub unsafe fn f3() {
+    ssse3();
 }
 
 #[inline]

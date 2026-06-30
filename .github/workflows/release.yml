@@ -114,9 +114,11 @@ jobs:
           fi
           test -x "$snapshot/bin/cargo-clippy"
           test -x "$snapshot/bin/clippy-driver"
+          test -x "$snapshot/bin/rustdoc"
           test -x "$snapshot/lib/rustlib/$host/bin/sld"
           "$snapshot/bin/cargo-clippy" -V
           "$snapshot/bin/clippy-driver" -V
+          "$snapshot/bin/rustdoc" -V
           "$snapshot/lib/rustlib/$host/bin/sld" --version
 
           mkdir -p dist

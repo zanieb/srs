@@ -1501,7 +1501,7 @@ impl<'a> Parser<'a> {
     //                   | "spill_slot"
     //                   | "incoming_arg"
     //                   | "outgoing_arg"
-    // stack-slot-flag ::= "align" "=" Bytes | "key" "=" uimm64
+    // stack-slot-flag ::= "align" "=" Bytes | "key" "=" uimm64 | "reuse" "=" StackSlot(ss)
     fn parse_stack_slot_decl(&mut self) -> ParseResult<(StackSlot, StackSlotData)> {
         let ss = self.match_ss("expected stack slot number: ss«n»")?;
         self.match_token(Token::Equal, "expected '=' in stack slot declaration")?;
@@ -1520,6 +1520,7 @@ impl<'a> Parser<'a> {
 
         let mut align = 1;
         let mut key = None;
+        let mut reuse = None;
 
         while self.token() == Some(Token::Comma) {
             self.consume();
@@ -1539,6 +1540,11 @@ impl<'a> Parser<'a> {
                     let value = self.match_uimm64("expected `u64` value for `key` flag")?;
                     key = Some(StackSlotKey::new(value.into()));
                 }
+                Some(Token::Identifier("reuse")) => {
+                    self.consume();
+                    self.match_token(Token::Equal, "expected `=` after flag")?;
+                    reuse = Some(self.match_ss("expected stack slot after `reuse` flag")?);
+                }
                 _ => {
                     return Err(self.error("invalid flag for stack slot"));
                 }
@@ -1550,10 +1556,11 @@ impl<'a> Parser<'a> {
         }
         let align_shift = u8::try_from(align.ilog2()).unwrap(); // Always succeeds: range 0..=31.
 
-        let data = match key {
+        let mut data = match key {
             Some(key) => StackSlotData::new_with_key(kind, bytes as u32, align_shift, key),
             None => StackSlotData::new(kind, bytes as u32, align_shift),
         };
+        data.reuse = reuse;
 
         // Collect any trailing comments.
         self.token();

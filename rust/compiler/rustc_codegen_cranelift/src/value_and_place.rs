@@ -187,7 +187,22 @@ impl<'tcx> CValue<'tcx> {
     ) -> CValue<'tcx> {
         let layout = self.1;
         match self.0 {
-            CValueInner::ByVal(_) => unreachable!(),
+            CValueInner::ByVal(value) => {
+                let field_layout = layout.field(&*fx, usize::from(field));
+                // Scalar wrappers represented by `ByVal` have a single transparent field.
+                assert_eq!(layout.fields.offset(field.index()), Size::ZERO);
+                assert_eq!(layout.size, field_layout.size);
+                let BackendRepr::Scalar(field_scalar) = field_layout.backend_repr else {
+                    unreachable!("field of scalar value had layout {field_layout:?}")
+                };
+                let field_ty = scalar_to_clif_type(fx.tcx, field_scalar);
+                let value = if fx.bcx.func.dfg.value_type(value) == field_ty {
+                    value
+                } else {
+                    codegen_bitcast(fx, field_ty, value)
+                };
+                CValue::by_val(value, field_layout)
+            }
             CValueInner::ByValPair(val1, val2) => match layout.backend_repr {
                 BackendRepr::ScalarPair(_, _) => {
                     let val = match field.as_u32() {
@@ -329,6 +344,18 @@ impl<'tcx> CValue<'tcx> {
                     .insert(Ieee128::with_bits(u128::from(const_val)).into());
                 fx.bcx.ins().f128const(value)
             }
+            _ if clif_ty == types::I128
+                && matches!(layout.backend_repr, BackendRepr::Scalar(_)) =>
+            {
+                let const_val = const_val.to_bits(layout.size);
+                let lsb = fx.bcx.ins().iconst(types::I64, const_val as u64 as i64);
+                let msb = fx.bcx.ins().iconst(types::I64, (const_val >> 64) as u64 as i64);
+                fx.bcx.ins().iconcat(lsb, msb)
+            }
+            _ if clif_ty.is_int() && matches!(layout.backend_repr, BackendRepr::Scalar(_)) => {
+                let raw_val = const_val.size().truncate(const_val.to_bits(layout.size));
+                fx.bcx.ins().iconst(clif_ty, raw_val as i64)
+            }
             _ => panic!(
                 "CValue::const_val for non bool/char/float/integer/pointer type {:?} is not allowed",
                 layout.ty
@@ -394,6 +421,20 @@ impl<'tcx> CPlace<'tcx> {
         let stack_slot = fx.create_stack_slot(
             u32::try_from(layout.size.bytes()).unwrap(),
             u32::try_from(layout.align.bytes()).unwrap(),
+        );
+        CPlace { inner: CPlaceInner::Addr(stack_slot, None), layout }
+    }
+
+    pub(crate) fn new_reused_stack_slot(
+        fx: &mut FunctionCx<'_, '_, 'tcx>,
+        layout: TyAndLayout<'tcx>,
+        reuse: StackSlot,
+    ) -> CPlace<'tcx> {
+        assert!(layout.is_sized() && layout.size.bytes() != 0);
+        let stack_slot = fx.create_reused_stack_slot(
+            u32::try_from(layout.size.bytes()).unwrap(),
+            u32::try_from(layout.align.bytes()).unwrap(),
+            reuse,
         );
         CPlace { inner: CPlaceInner::Addr(stack_slot, None), layout }
     }
@@ -598,6 +639,11 @@ impl<'tcx> CPlace<'tcx> {
                 if dst_layout.size == Size::ZERO {
                     return;
                 }
+                if let CValueInner::ByRef(from_ptr, None) = from.0
+                    && to_ptr.has_same_location(from_ptr)
+                {
+                    return;
+                }
 
                 let mut flags = MemFlags::new();
                 flags.set_notrap();
@@ -638,23 +684,14 @@ impl<'tcx> CPlace<'tcx> {
                             _ => {}
                         }
 
-                        let from_addr = from_ptr.get_addr(fx);
-                        let to_addr = to_ptr.get_addr(fx);
                         let src_layout = from.1;
                         let size = dst_layout.size.bytes();
                         // `emit_small_memory_copy` uses `u8` for alignments, just use the maximum
                         // alignment that fits in a `u8` if the actual alignment is larger.
                         let src_align = src_layout.align.bytes().try_into().unwrap_or(128);
                         let dst_align = dst_layout.align.bytes().try_into().unwrap_or(128);
-                        fx.bcx.emit_small_memory_copy(
-                            fx.target_config,
-                            to_addr,
-                            from_addr,
-                            size,
-                            dst_align,
-                            src_align,
-                            true,
-                            flags,
+                        to_ptr.copy_from_nonoverlapping(
+                            fx, from_ptr, size, dst_align, src_align, flags,
                         );
                     }
                     CValueInner::ByRef(_from_ptr, Some(_extra)) => {
@@ -687,6 +724,14 @@ impl<'tcx> CPlace<'tcx> {
         let layout = self.layout();
 
         match self.inner {
+            CPlaceInner::Var(local, var) => {
+                let field_layout = layout.field(&*fx, field.index());
+                // A transparent scalar field is the same Cranelift variable with a new layout.
+                assert_eq!(layout.fields.offset(field.index()), Size::ZERO);
+                assert_eq!(layout.size, field_layout.size);
+                assert!(matches!(field_layout.backend_repr, BackendRepr::Scalar(_)));
+                return CPlace { inner: CPlaceInner::Var(local, var), layout: field_layout };
+            }
             CPlaceInner::VarPair(local, var1, var2) => {
                 let layout = layout.field(&*fx, field.index());
 
@@ -822,11 +867,25 @@ impl<'tcx> CPlace<'tcx> {
 
     pub(crate) fn place_deref(self, fx: &mut FunctionCx<'_, '_, 'tcx>) -> CPlace<'tcx> {
         let inner_layout = fx.layout_of(self.layout().ty.builtin_deref(true).unwrap());
+        // A direct shared argument whose pointee is `Freeze` is protected for the duration of
+        // the call. Preserve that fact on its direct dereference so Cranelift can distinguish
+        // these reads from writes through other reference arguments.
+        let readonly = matches!(
+            self.inner,
+            CPlaceInner::Var(local, _) | CPlaceInner::VarPair(local, _, _)
+                if (1..=fx.mir.arg_count).contains(&local.index())
+        ) && matches!(
+            self.layout().ty.kind(),
+            ty::Ref(_, pointee, Mutability::Not) if pointee.is_freeze(fx.tcx, fx.typing_env())
+        );
+        let pointer = |addr| {
+            if readonly { Pointer::new_readonly(addr) } else { Pointer::new(addr) }
+        };
         if fx.tcx.type_has_metadata(inner_layout.ty, ty::TypingEnv::fully_monomorphized()) {
             let (addr, extra) = self.to_cvalue(fx).load_scalar_pair(fx);
-            CPlace::for_ptr_with_extra(Pointer::new(addr), extra, inner_layout)
+            CPlace::for_ptr_with_extra(pointer(addr), extra, inner_layout)
         } else {
-            CPlace::for_ptr(Pointer::new(self.to_cvalue(fx).load_scalar(fx)), inner_layout)
+            CPlace::for_ptr(pointer(self.to_cvalue(fx).load_scalar(fx)), inner_layout)
         }
     }
 

@@ -35,7 +35,7 @@ pub use self::abi::AbiBuilderMethods;
 pub use self::asm::{
     AsmBuilderMethods, AsmCodegenMethods, GlobalAsmOperandRef, InlineAsmOperandRef,
 };
-pub use self::backend::{BackendTypes, CodegenBackend, ExtraBackendMethods};
+pub use self::backend::{BackendTypes, CodegenBackend, ExtraBackendMethods, MirInlinerThresholds};
 pub use self::builder::{BuilderMethods, OverflowOp};
 pub use self::consts::ConstCodegenMethods;
 pub use self::coverageinfo::CoverageInfoBuilderMethods;

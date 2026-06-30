@@ -22,7 +22,8 @@ pub(crate) const EXCEPTION_HANDLER_CATCH: u32 = 1;
 pub(crate) struct UnwindContext {
     endian: RunTimeEndian,
     frame_table: FrameTable,
-    cie_id: Option<CieId>,
+    plain_cie_id: Option<CieId>,
+    eh_cie_id: Option<CieId>,
 }
 
 impl UnwindContext {
@@ -35,7 +36,7 @@ impl UnwindContext {
         let is_macho = triple.binary_format == BinaryFormat::Macho;
         let mut frame_table = FrameTable::default();
 
-        let cie_id = if let Some(mut cie) = module.isa().create_systemv_cie() {
+        let (plain_cie_id, eh_cie_id) = if let Some(mut cie) = module.isa().create_systemv_cie() {
             let ptr_encoding = if pic_eh_frame {
                 gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
             } else {
@@ -44,8 +45,10 @@ impl UnwindContext {
 
             cie.fde_address_encoding = ptr_encoding;
 
-            // FIXME only add personality function and lsda when necessary: https://github.com/rust-lang/rust/blob/1f76d219c906f0112bb1872f33aa977164c53fa6/compiler/rustc_codegen_ssa/src/mir/mod.rs#L200-L204
-            if cfg!(feature = "unwinding") {
+            let eh_cie_id = if cfg!(feature = "unwinding") {
+                // Functions without exception handlers only need the plain CIE to unwind through
+                // them. Keep a separate augmented CIE for functions that also need an LSDA.
+                let mut eh_cie = cie.clone();
                 let code_ptr_encoding = if pic_eh_frame {
                     if module.isa().triple().architecture == target_lexicon::Architecture::X86_64 {
                         gimli::DwEhPe(
@@ -68,7 +71,7 @@ impl UnwindContext {
                     gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_absptr.0)
                 };
 
-                cie.lsda_encoding = Some(ptr_encoding);
+                eh_cie.lsda_encoding = Some(ptr_encoding);
 
                 // FIXME use eh_personality lang item instead
                 let personality = module
@@ -111,15 +114,19 @@ impl UnwindContext {
                     address_for_data(personality_ref)
                 };
 
-                cie.personality = Some((code_ptr_encoding, personality_address));
-            }
+                eh_cie.personality = Some((code_ptr_encoding, personality_address));
 
-            Some(frame_table.add_cie(cie))
+                Some(frame_table.add_cie(eh_cie))
+            } else {
+                None
+            };
+
+            (Some(frame_table.add_cie(cie)), eh_cie_id)
         } else {
-            None
+            (None, None)
         };
 
-        UnwindContext { endian, frame_table, cie_id }
+        UnwindContext { endian, frame_table, plain_cie_id, eh_cie_id }
     }
 
     pub(crate) fn add_function(
@@ -138,18 +145,28 @@ impl UnwindContext {
             return;
         }
 
-        let Some(unwind_info) =
-            context.compiled_code().unwrap().create_unwind_info(module.isa()).unwrap()
-        else {
+        let compiled_code = context.compiled_code().unwrap();
+        let Some(unwind_info) = compiled_code.create_unwind_info(module.isa()).unwrap() else {
             return;
         };
+        // Mach-O's system unwinder requires every FDE to use the same augmented CIE shape. A
+        // function that makes calls also needs LSDA entries for those calls even when it has no
+        // local handler: a null LSDA makes `_Unwind_RaiseException` fail before reaching a
+        // handler in an older frame. Truly call-free functions keep a null LSDA rather than an
+        // empty call-site table.
+        let has_call_sites = compiled_code.buffer.call_sites().next().is_some();
+        let needs_lsda = cfg!(feature = "unwinding")
+            && ((is_macho && has_call_sites)
+                || compiled_code
+                    .buffer
+                    .call_sites()
+                    .any(|call_site| !call_site.exception_handlers.is_empty()));
 
         match unwind_info {
             UnwindInfo::SystemV(unwind_info) => {
                 let mut fde = unwind_info.to_fde(address_for_func(func_id));
 
-                // FIXME only add personality function and lsda when necessary: https://github.com/rust-lang/rust/blob/1f76d219c906f0112bb1872f33aa977164c53fa6/compiler/rustc_codegen_ssa/src/mir/mod.rs#L200-L204
-                if cfg!(feature = "unwinding") {
+                if needs_lsda {
                     // FIXME use unique symbol name derived from function name
                     let lsda = module.declare_anonymous_data(false, false).unwrap();
 
@@ -170,7 +187,7 @@ impl UnwindContext {
                         .actions
                         .add(Action { kind: ActionKind::Catch(catch_type), next_action: None });
 
-                    for call_site in context.compiled_code().unwrap().buffer.call_sites() {
+                    for call_site in compiled_code.buffer.call_sites() {
                         if call_site.exception_handlers.is_empty() {
                             gcc_except_table_data.call_sites.0.push(CallSite {
                                 start: u64::from(call_site.ret_addr - 1),
@@ -243,7 +260,17 @@ impl UnwindContext {
                     fde.lsda = Some(address_for_data(lsda));
                 }
 
-                self.frame_table.add_fde(self.cie_id.unwrap(), fde);
+                let cie_id = if is_macho && cfg!(feature = "unwinding") {
+                    if !needs_lsda {
+                        fde.lsda = Some(Address::Constant(0));
+                    }
+                    self.eh_cie_id
+                } else if needs_lsda {
+                    self.eh_cie_id
+                } else {
+                    self.plain_cie_id
+                };
+                self.frame_table.add_fde(cie_id.unwrap(), fde);
             }
             UnwindInfo::WindowsX64(_) | UnwindInfo::WindowsArm64(_) => {
                 // Windows does not have debug info for its unwind info.

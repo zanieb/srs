@@ -1,0 +1,231 @@
+test optimize
+set opt_level=speed_and_size
+target x86_64
+
+function %repeat_unsigned_comparison(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block1, block4
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp uge v0, v3
+    brif v4, block2, block3
+
+block2:
+    return v0
+
+block3:
+    v5 = iconst.i64 3
+    return v5
+
+block4:
+    v6 = iconst.i64 4
+    return v6
+}
+
+; check: function %repeat_unsigned_comparison(i64) -> i64 fast {
+; check: block1:
+; nextln: jump block2
+; not: block3
+
+function %complement_unsigned_comparison(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block1, block4
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp ult v0, v3
+    brif v4, block2, block3
+
+block2:
+    v5 = iconst.i64 2
+    return v5
+
+block3:
+    return v0
+
+block4:
+    v6 = iconst.i64 4
+    return v6
+}
+
+; check: function %complement_unsigned_comparison(i64) -> i64 fast {
+; check: block1:
+; nextln: jump block3
+; not: block2
+
+function %repeat_unsigned_comparison_on_false_edge(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block4, block1
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp uge v0, v3
+    brif v4, block2, block3
+
+block2:
+    v5 = iconst.i64 2
+    return v5
+
+block3:
+    return v0
+
+block4:
+    v6 = iconst.i64 4
+    return v6
+}
+
+; check: function %repeat_unsigned_comparison_on_false_edge(i64) -> i64 fast {
+; check: block1:
+; nextln: jump block3
+; not: block2
+
+function %swapped_unsigned_comparison(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block1, block4
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp ule v3, v0
+    brif v4, block2, block3
+
+block2:
+    return v0
+
+block3:
+    v5 = iconst.i64 3
+    return v5
+
+block4:
+    v6 = iconst.i64 4
+    return v6
+}
+
+; check: function %swapped_unsigned_comparison(i64) -> i64 fast {
+; check: block1:
+; nextln: jump block2
+; not: block3
+
+function %preserve_fact_through_jump(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block1, block5
+
+block1:
+    jump block2
+
+block2:
+    v3 = iconst.i64 8
+    v4 = icmp uge v0, v3
+    brif v4, block3, block4
+
+block3:
+    return v0
+
+block4:
+    v5 = iconst.i64 4
+    return v5
+
+block5:
+    v6 = iconst.i64 5
+    return v6
+}
+
+; check: function %preserve_fact_through_jump(i64) -> i64 fast {
+; check: block2:
+; nextln: jump block3
+; not: block4
+
+function %preserve_comparison_value(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp uge v0, v1
+    brif v2, block1, block4
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp uge v0, v3
+    brif v4, block2(v4), block3(v4)
+
+block2(v5: i8):
+    return v5
+
+block3(v6: i8):
+    return v6
+
+block4:
+    v7 = iconst.i8 0
+    return v7
+}
+
+; check: function %preserve_comparison_value(i64) -> i8 fast {
+; check: block1:
+; nextln: jump block2
+; check: block2:
+; nextln: return v2
+; not: block3
+
+function %do_not_fold_at_merge(i64, i8) -> i64 {
+block0(v0: i64, v1: i8):
+    v2 = iconst.i64 8
+    v3 = icmp uge v0, v2
+    brif v3, block1, block4
+
+block1:
+    brif v1, block2, block4
+
+block2:
+    jump block4
+
+block4:
+    v4 = iconst.i64 8
+    v5 = icmp uge v0, v4
+    brif v5, block5, block6
+
+block5:
+    return v0
+
+block6:
+    v6 = iconst.i64 6
+    return v6
+}
+
+; check: function %do_not_fold_at_merge(i64, i8) -> i64 fast {
+; check: block4:
+; check: brif.i8
+
+function %do_not_fold_signed_comparison(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = icmp sge v0, v1
+    brif v2, block1, block4
+
+block1:
+    v3 = iconst.i64 8
+    v4 = icmp sge v0, v3
+    brif v4, block2, block3
+
+block2:
+    return v0
+
+block3:
+    v5 = iconst.i64 3
+    return v5
+
+block4:
+    v6 = iconst.i64 4
+    return v6
+}
+
+; check: function %do_not_fold_signed_comparison(i64) -> i64 fast {
+; check: block1:
+; check: brif.i8

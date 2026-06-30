@@ -198,7 +198,7 @@ declare_passes! {
     };
     mod simplify_comparison_integral : SimplifyComparisonIntegral;
     mod single_use_consts : SingleUseConsts;
-    mod sroa : ScalarReplacementOfAggregates;
+    mod sroa : ScalarReplacementOfAggregates, LateScalarReplacementOfAggregates;
     mod strip_debuginfo : StripDebugInfo;
     mod ssa_range_prop: SsaRangePropagation;
     mod unreachable_enum_branching : UnreachableEnumBranching;
@@ -759,6 +759,7 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
             &copy_prop::CopyProp,
             &dead_store_elimination::DeadStoreElimination::Final,
             &dest_prop::DestinationPropagation,
+            &sroa::LateScalarReplacementOfAggregates,
             &simplify::SimplifyLocals::Final,
             &multiple_return_terminators::MultipleReturnTerminators,
             &large_enums::EnumSizeOpt { discrepancy: 128 },

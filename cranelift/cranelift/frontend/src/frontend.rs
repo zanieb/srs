@@ -60,6 +60,12 @@ enum BlockStatus {
     Filled,
 }
 
+#[derive(Clone, Copy)]
+enum SmallMemsetValue {
+    Immediate(u8),
+    Runtime(Value),
+}
+
 impl FunctionBuilderContext {
     /// Creates a [`FunctionBuilderContext`] structure. The structure is automatically cleared after
     /// each [`FunctionBuilder`] completes translating a function.
@@ -870,8 +876,8 @@ impl<'a> FunctionBuilder<'a> {
         non_overlapping: bool,
         mut flags: MemFlagsData,
     ) {
-        // Currently the result of guess work, not actual profiling.
-        const THRESHOLD: u64 = 4;
+        // Profiled on the uv, Ruff, and ty application workloads.
+        const THRESHOLD: u64 = 8;
 
         if size == 0 {
             return;
@@ -964,6 +970,46 @@ impl<'a> FunctionBuilder<'a> {
         ch: u8,
         size: u64,
         buffer_align: u8,
+        flags: MemFlagsData,
+    ) {
+        self.emit_small_memset_impl(
+            config,
+            buffer,
+            SmallMemsetValue::Immediate(ch),
+            size,
+            buffer_align,
+            flags,
+        );
+    }
+
+    /// Optimised memset for a small constant size and a runtime byte value.
+    pub fn emit_small_memset_value(
+        &mut self,
+        config: TargetFrontendConfig,
+        buffer: Value,
+        ch: Value,
+        size: u64,
+        buffer_align: u8,
+        flags: MemFlagsData,
+    ) {
+        assert_eq!(self.func.dfg.value_type(ch), types::I8);
+        self.emit_small_memset_impl(
+            config,
+            buffer,
+            SmallMemsetValue::Runtime(ch),
+            size,
+            buffer_align,
+            flags,
+        );
+    }
+
+    fn emit_small_memset_impl(
+        &mut self,
+        config: TargetFrontendConfig,
+        buffer: Value,
+        ch: SmallMemsetValue,
+        size: u64,
+        buffer_align: u8,
         mut flags: MemFlagsData,
     ) {
         // Currently the result of guess work, not actual profiling.
@@ -980,7 +1026,7 @@ impl<'a> FunctionBuilder<'a> {
         );
         assert!(
             access_size >= u64::from(buffer_align),
-            "`size` is smaller than `dest` and `src`'s alignment value."
+            "`size` is smaller than `buffer`'s alignment value."
         );
 
         let (access_size, int_type) = if access_size <= 8 {
@@ -992,31 +1038,52 @@ impl<'a> FunctionBuilder<'a> {
         let load_and_store_amount = size / access_size;
 
         if load_and_store_amount > THRESHOLD {
-            let ch = self.ins().iconst(types::I8, i64::from(ch));
+            let ch = match ch {
+                SmallMemsetValue::Immediate(ch) => self.ins().iconst(types::I8, i64::from(ch)),
+                SmallMemsetValue::Runtime(ch) => ch,
+            };
             let size = self.ins().iconst(config.pointer_type(), size as i64);
             self.call_memset(config, buffer, ch, size);
-        } else {
-            if u64::from(buffer_align) >= access_size {
-                flags.set_aligned();
-            }
+            return;
+        }
 
-            let ch = u64::from(ch);
-            let raw_value = if int_type == types::I64 {
-                ch * 0x0101010101010101_u64
-            } else if int_type == types::I32 {
-                ch * 0x01010101_u64
-            } else if int_type == types::I16 {
-                (ch << 8) | ch
-            } else {
-                assert_eq!(int_type, types::I8);
-                ch
-            };
+        if u64::from(buffer_align) >= access_size {
+            flags.set_aligned();
+        }
 
-            let value = self.ins().iconst(int_type, raw_value as i64);
-            for i in 0..load_and_store_amount {
-                let offset = (access_size * i) as i32;
-                self.ins().store(flags, value, buffer, offset);
+        let value = match ch {
+            SmallMemsetValue::Immediate(ch) => {
+                let ch = u64::from(ch);
+                let raw_value = if int_type == types::I64 {
+                    ch * 0x0101010101010101_u64
+                } else if int_type == types::I32 {
+                    ch * 0x01010101_u64
+                } else if int_type == types::I16 {
+                    (ch << 8) | ch
+                } else {
+                    assert_eq!(int_type, types::I8);
+                    ch
+                };
+                self.ins().iconst(int_type, raw_value as i64)
             }
+            SmallMemsetValue::Runtime(ch) if int_type == types::I8 => ch,
+            SmallMemsetValue::Runtime(ch) => {
+                let ch = self.ins().uextend(int_type, ch);
+                let multiplier = if int_type == types::I64 {
+                    0x0101010101010101_u64
+                } else if int_type == types::I32 {
+                    0x01010101_u64
+                } else {
+                    assert_eq!(int_type, types::I16);
+                    0x0101_u64
+                };
+                self.ins().imul_imm(ch, multiplier as i64)
+            }
+        };
+
+        for i in 0..load_and_store_amount {
+            let offset = (access_size * i) as i32;
+            self.ins().store(flags, value, buffer, offset);
         }
     }
 
@@ -1410,7 +1477,7 @@ block0:
 
             let src = builder.use_var(x);
             let dest = builder.use_var(y);
-            let size = 8;
+            let size = 64;
             builder.emit_small_memory_copy(
                 frontend_config,
                 dest,
@@ -1431,12 +1498,26 @@ block0:
             &func,
             "function %sample() -> i32 system_v {
 block0:
-    v4 = iconst.i64 0
-    v1 -> v4
-    v3 = iconst.i64 0
-    v0 -> v3
+    v11 = iconst.i64 0
+    v1 -> v11
+    v10 = iconst.i64 0
+    v0 -> v10
     v2 = load.i64 aligned v0  ; v0 = 0
+    v3 = load.i64 aligned v0+8  ; v0 = 0
+    v4 = load.i64 aligned v0+16  ; v0 = 0
+    v5 = load.i64 aligned v0+24  ; v0 = 0
+    v6 = load.i64 aligned v0+32  ; v0 = 0
+    v7 = load.i64 aligned v0+40  ; v0 = 0
+    v8 = load.i64 aligned v0+48  ; v0 = 0
+    v9 = load.i64 aligned v0+56  ; v0 = 0
     store aligned v2, v1  ; v1 = 0
+    store aligned v3, v1+8  ; v1 = 0
+    store aligned v4, v1+16  ; v1 = 0
+    store aligned v5, v1+24  ; v1 = 0
+    store aligned v6, v1+32  ; v1 = 0
+    store aligned v7, v1+40  ; v1 = 0
+    store aligned v8, v1+48  ; v1 = 0
+    store aligned v9, v1+56  ; v1 = 0
     return v1  ; v1 = 0
 }
 ",
@@ -1532,6 +1613,55 @@ block0:
     v1 = iconst.i64 0x0101_0101_0101_0101
     store aligned v1, v0  ; v1 = 0x0101_0101_0101_0101, v0 = 0
     return v0  ; v0 = 0
+}
+",
+        );
+    }
+
+    #[test]
+    fn small_memset_value() {
+        let frontend_config = systemv_frontend_config();
+        let mut sig = Signature::new(frontend_config.default_call_conv);
+        sig.params.push(AbiParam::new(I8));
+        sig.returns.push(AbiParam::new(I32));
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut func = Function::with_name_signature(UserFuncName::testcase("sample"), sig);
+        {
+            let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+
+            let block0 = builder.create_block();
+            let y = builder.declare_var(frontend_config.pointer_type());
+            builder.append_block_params_for_function_params(block0);
+            builder.switch_to_block(block0);
+
+            let ch = builder.block_params(block0)[0];
+            let dest = builder.use_var(y);
+            let size = 8;
+            builder.emit_small_memset_value(
+                frontend_config,
+                dest,
+                ch,
+                size,
+                8,
+                MemFlagsData::new(),
+            );
+            builder.ins().return_(&[dest]);
+
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+
+        check(
+            &func,
+            "function %sample(i8) -> i32 system_v {
+block0(v0: i8):
+    v4 = iconst.i64 0
+    v1 -> v4
+    v2 = uextend.i64 v0
+    v3 = imul_imm v2, 0x0101_0101_0101_0101
+    store aligned v3, v1  ; v1 = 0
+    return v1  ; v1 = 0
 }
 ",
         );

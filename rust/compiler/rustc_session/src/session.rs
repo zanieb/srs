@@ -168,6 +168,9 @@ pub struct Session {
     /// Does the codegen backend support ThinLTO?
     pub thin_lto_supported: bool,
 
+    /// Should optimized MIR run SROA again after destination propagation?
+    pub run_late_mir_sroa: bool,
+
     /// Global per-session counter for MIR optimization pass applications.
     ///
     /// Used by `-Zmir-opt-bisect-limit` to assign an index to each
@@ -1125,6 +1128,7 @@ pub fn build_session(
         host_filesearch,
         replaced_intrinsics: FxHashSet::default(), // filled by `run_compiler`
         thin_lto_supported: true,                  // filled by `run_compiler`
+        run_late_mir_sroa: false,                  // filled by `run_compiler`
         mir_opt_bisect_eval_count: AtomicUsize::new(0),
         used_features: Lock::default(),
     };

@@ -1137,11 +1137,12 @@ fn translate_linkage(linkage: Linkage) -> (SymbolScope, bool) {
     let scope = match linkage {
         Linkage::Import => SymbolScope::Unknown,
         Linkage::Local => SymbolScope::Compilation,
+        Linkage::HiddenWeak => SymbolScope::Linkage,
         Linkage::Hidden => SymbolScope::Linkage,
         Linkage::Export | Linkage::Preemptible => SymbolScope::Dynamic,
     };
     // TODO: this matches rustc_codegen_cranelift, but may be wrong.
-    let weak = linkage == Linkage::Preemptible;
+    let weak = matches!(linkage, Linkage::HiddenWeak | Linkage::Preemptible);
     (scope, weak)
 }
 
