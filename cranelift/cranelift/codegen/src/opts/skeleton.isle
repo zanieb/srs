@@ -32,6 +32,16 @@
       (if-let dest (resolve_jump_table_entry jt idx))
       (jump dest))
 
+;; Scalar integer comparisons produce only zero or one, so a branch table
+;; indexed by a comparison can only select its first two destinations. Replace
+;; the table with a conditional branch, making its default destination
+;; unreachable and avoiding the branch-table bounds check in machine code.
+(rule (simplify_skeleton
+       (br_table (uextend _ cond @ (icmp (ty_int _) _ _ _)) jt))
+      (if-let zero_dest (resolve_jump_table_entry jt 0))
+      (if-let one_dest (resolve_jump_table_entry jt 1))
+      (brif cond one_dest zero_dest))
+
 ;; TODO: We can't simplify into unconditional traps yet. See the comment in
 ;; `simplify_skeleton_inst` for more details.
 ;;

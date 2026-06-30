@@ -291,7 +291,14 @@ struct NormalInliner<'tcx> {
 
 impl<'tcx> NormalInliner<'tcx> {
     fn past_depth_limit(&self) -> bool {
-        self.history.len() > HISTORY_DEPTH_LIMIT || self.top_down_counter > TOP_DOWN_DEPTH_LIMIT
+        let top_down_depth_limit = self
+            .tcx
+            .sess
+            .opts
+            .unstable_opts
+            .inline_mir_top_down_depth
+            .unwrap_or(TOP_DOWN_DEPTH_LIMIT);
+        self.history.len() > HISTORY_DEPTH_LIMIT || self.top_down_counter > top_down_depth_limit
     }
 }
 
@@ -838,8 +845,20 @@ fn check_codegen_attributes<'tcx, I: Inliner<'tcx>>(
         return Err("incompatible instruction set");
     }
 
-    let callee_feature_names = callee_attrs.target_features.iter().map(|f| f.name);
-    let this_feature_names = codegen_fn_attrs.target_features.iter().map(|f| f.name);
+    // Session-wide target features are inherited by every function, so an explicit attribute for
+    // one of them does not make the callee's effective feature set different from the caller's.
+    // Ignore those redundant attributes while retaining the exact-match requirement for features
+    // that are local to either function.
+    let callee_feature_names = callee_attrs
+        .target_features
+        .iter()
+        .map(|f| f.name)
+        .filter(|f| !tcx.sess.target_features.contains(f));
+    let this_feature_names = codegen_fn_attrs
+        .target_features
+        .iter()
+        .map(|f| f.name)
+        .filter(|f| !tcx.sess.target_features.contains(f));
     if callee_feature_names.ne(this_feature_names) {
         // In general it is not correct to inline a callee with target features that are a
         // subset of the caller. This is because the callee might contain calls, and the ABI of

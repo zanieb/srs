@@ -94,6 +94,7 @@ mod ranges;
 mod remove_constant_phis;
 mod result;
 mod scoped_hash_map;
+mod stack_load_forwarding;
 mod take_and_replace;
 mod unreachable_code;
 mod value_label;

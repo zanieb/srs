@@ -21,37 +21,60 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
 
     #[instrument(level = "debug", skip(self, tcx, body))]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        debug!(def_id = ?body.source.def_id());
-
-        // Avoid query cycles (coroutines require optimized MIR for layout).
-        if tcx.type_of(body.source.def_id()).instantiate_identity().skip_norm_wip().is_coroutine() {
-            return;
-        }
-
-        let mut excluded = excluded_locals(body);
-        let typing_env = body.typing_env(tcx);
-        loop {
-            debug!(?excluded);
-            let escaping = escaping_locals(tcx, &excluded, body);
-            debug!(?escaping);
-            let replacements = compute_flattening(tcx, typing_env, body, escaping);
-            debug!(?replacements);
-            let all_dead_locals = replace_flattened_locals(tcx, body, replacements);
-            if !all_dead_locals.is_empty() {
-                excluded.union(&all_dead_locals);
-                excluded = {
-                    let mut growable = GrowableBitSet::from(excluded);
-                    growable.ensure(body.local_decls.len());
-                    growable.into()
-                };
-            } else {
-                break;
-            }
-        }
+        run_pass(tcx, body);
     }
 
     fn is_required(&self) -> bool {
         false
+    }
+}
+
+/// Run SROA after destination propagation for backends that benefit from
+/// receiving scalarized optimized MIR.
+pub(super) struct LateScalarReplacementOfAggregates;
+
+impl<'tcx> crate::MirPass<'tcx> for LateScalarReplacementOfAggregates {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() >= 2 && sess.run_late_mir_sroa
+    }
+
+    #[instrument(level = "debug", skip(self, tcx, body))]
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        run_pass(tcx, body);
+    }
+
+    fn is_required(&self) -> bool {
+        false
+    }
+}
+
+fn run_pass<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    debug!(def_id = ?body.source.def_id());
+
+    // Avoid query cycles (coroutines require optimized MIR for layout).
+    if tcx.type_of(body.source.def_id()).instantiate_identity().skip_norm_wip().is_coroutine() {
+        return;
+    }
+
+    let mut excluded = excluded_locals(body);
+    let typing_env = body.typing_env(tcx);
+    loop {
+        debug!(?excluded);
+        let escaping = escaping_locals(tcx, &excluded, body);
+        debug!(?escaping);
+        let replacements = compute_flattening(tcx, typing_env, body, escaping);
+        debug!(?replacements);
+        let all_dead_locals = replace_flattened_locals(tcx, body, replacements);
+        if !all_dead_locals.is_empty() {
+            excluded.union(&all_dead_locals);
+            excluded = {
+                let mut growable = GrowableBitSet::from(excluded);
+                growable.ensure(body.local_decls.len());
+                growable.into()
+            };
+        } else {
+            break;
+        }
     }
 }
 

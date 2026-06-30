@@ -187,7 +187,22 @@ impl<'tcx> CValue<'tcx> {
     ) -> CValue<'tcx> {
         let layout = self.1;
         match self.0 {
-            CValueInner::ByVal(_) => unreachable!(),
+            CValueInner::ByVal(value) => {
+                let field_layout = layout.field(&*fx, usize::from(field));
+                // Scalar wrappers represented by `ByVal` have a single transparent field.
+                assert_eq!(layout.fields.offset(field.index()), Size::ZERO);
+                assert_eq!(layout.size, field_layout.size);
+                let BackendRepr::Scalar(field_scalar) = field_layout.backend_repr else {
+                    unreachable!("field of scalar value had layout {field_layout:?}")
+                };
+                let field_ty = scalar_to_clif_type(fx.tcx, field_scalar);
+                let value = if fx.bcx.func.dfg.value_type(value) == field_ty {
+                    value
+                } else {
+                    codegen_bitcast(fx, field_ty, value)
+                };
+                CValue::by_val(value, field_layout)
+            }
             CValueInner::ByValPair(val1, val2) => match layout.backend_repr {
                 BackendRepr::ScalarPair(_, _) => {
                     let val = match field.as_u32() {
@@ -328,6 +343,10 @@ impl<'tcx> CValue<'tcx> {
                     .constants
                     .insert(Ieee128::with_bits(u128::from(const_val)).into());
                 fx.bcx.ins().f128const(value)
+            }
+            _ if clif_ty.is_int() && matches!(layout.backend_repr, BackendRepr::Scalar(_)) => {
+                let raw_val = const_val.size().truncate(const_val.to_bits(layout.size));
+                fx.bcx.ins().iconst(clif_ty, raw_val as i64)
             }
             _ => panic!(
                 "CValue::const_val for non bool/char/float/integer/pointer type {:?} is not allowed",
@@ -638,23 +657,14 @@ impl<'tcx> CPlace<'tcx> {
                             _ => {}
                         }
 
-                        let from_addr = from_ptr.get_addr(fx);
-                        let to_addr = to_ptr.get_addr(fx);
                         let src_layout = from.1;
                         let size = dst_layout.size.bytes();
                         // `emit_small_memory_copy` uses `u8` for alignments, just use the maximum
                         // alignment that fits in a `u8` if the actual alignment is larger.
                         let src_align = src_layout.align.bytes().try_into().unwrap_or(128);
                         let dst_align = dst_layout.align.bytes().try_into().unwrap_or(128);
-                        fx.bcx.emit_small_memory_copy(
-                            fx.target_config,
-                            to_addr,
-                            from_addr,
-                            size,
-                            dst_align,
-                            src_align,
-                            true,
-                            flags,
+                        to_ptr.copy_from_nonoverlapping(
+                            fx, from_ptr, size, dst_align, src_align, flags,
                         );
                     }
                     CValueInner::ByRef(_from_ptr, Some(_extra)) => {
@@ -687,6 +697,14 @@ impl<'tcx> CPlace<'tcx> {
         let layout = self.layout();
 
         match self.inner {
+            CPlaceInner::Var(local, var) => {
+                let field_layout = layout.field(&*fx, field.index());
+                // A transparent scalar field is the same Cranelift variable with a new layout.
+                assert_eq!(layout.fields.offset(field.index()), Size::ZERO);
+                assert_eq!(layout.size, field_layout.size);
+                assert!(matches!(field_layout.backend_repr, BackendRepr::Scalar(_)));
+                return CPlace { inner: CPlaceInner::Var(local, var), layout: field_layout };
+            }
             CPlaceInner::VarPair(local, var1, var2) => {
                 let layout = layout.field(&*fx, field.index());
 
