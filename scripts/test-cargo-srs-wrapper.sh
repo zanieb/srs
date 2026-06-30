@@ -167,9 +167,27 @@ assert_env_contains linux-default "CARGO_BUILD_ARTIFACT_CACHE_DIR=$scratch/cargo
 assert_env_does_not_contain linux-default "SLD_INCREMENTAL_PADDING_PERCENT"
 assert_env_does_not_contain linux-default "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS"
 assert_env_does_not_contain linux-default "SLD_RUSTC_WORK_PRODUCT_PROVENANCE"
-assert_env_does_not_contain linux-default "SRS_TARGET_CODEGEN_BACKEND"
+assert_env_contains linux-default "SRS_TARGET_CODEGEN_BACKEND=llvm"
+assert_env_contains linux-default $'SRS_ENCODED_TARGET_RUSTFLAGS=-Zcodegen-backend=llvm'
 assert_env_does_not_contain linux-default "SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS"
 assert_env_does_not_contain linux-default "RUSTFLAGS"
+
+SRS_TARGET_CODEGEN_BACKEND=cranelift \
+SRS_TEST_UNAME_S=Linux \
+SRS_TEST_UNAME_M=x86_64 \
+    run_wrapper linux-cranelift build
+assert_args linux-cranelift \
+    -Z checksum-freshness \
+    -Z artifact-cache \
+    -Z host-config \
+    -Z target-applies-to-host \
+    --config 'target-applies-to-host=false' \
+    --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
+    build
+assert_env_contains linux-cranelift "SRS_TARGET_CODEGEN_BACKEND=cranelift"
+assert_env_contains linux-cranelift $'SRS_ENCODED_TARGET_RUSTFLAGS=-Zcodegen-backend=cranelift'
+assert_env_does_not_contain linux-cranelift "SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS"
+assert_env_does_not_contain linux-cranelift "RUSTFLAGS"
 
 SRS_CARGO_ARTIFACT_CACHE_STATS=1 \
 SRS_TEST_UNAME_S=Linux \
