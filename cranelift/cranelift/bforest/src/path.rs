@@ -696,7 +696,7 @@ impl<F: Forest> Path<F> {
 
 #[cfg(test)]
 impl<F: Forest> fmt::Display for Path<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.size == 0 {
             write!(f, "<empty path>")
         } else {

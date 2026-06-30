@@ -449,9 +449,9 @@ where
 /// after the last entry in the map.
 pub struct MapCursor<'a, K, V, C>
 where
-    K: Copy,
-    V: Copy,
-    C: Comparator<K>,
+    K: 'a + Copy,
+    V: 'a + Copy,
+    C: 'a + Comparator<K>,
 {
     root: &'a PackedOption<Node>,
     pool: &'a NodePool<MapTypes<K, V>>,
@@ -532,9 +532,9 @@ where
 /// after the last entry in the map.
 pub struct MapCursorMut<'a, K, V, C>
 where
-    K: Copy,
-    V: Copy,
-    C: Comparator<K>,
+    K: 'a + Copy,
+    V: 'a + Copy,
+    C: 'a + Comparator<K>,
 {
     root: &'a mut PackedOption<Node>,
     pool: &'a mut NodePool<MapTypes<K, V>>,
@@ -633,8 +633,8 @@ where
 /// An iterator visiting the key-value pairs of a `Map`.
 pub struct MapIter<'a, K, V>
 where
-    K: Copy,
-    V: Copy,
+    K: 'a + Copy,
+    V: 'a + Copy,
 {
     root: PackedOption<Node>,
     pool: &'a NodePool<MapTypes<K, V>>,

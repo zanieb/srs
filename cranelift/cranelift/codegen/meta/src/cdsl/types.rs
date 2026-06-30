@@ -79,7 +79,7 @@ impl ValueType {
 }
 
 impl fmt::Display for ValueType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ValueType::Lane(l) => l.fmt(f),
             ValueType::Vector(ref v) => v.fmt(f),
@@ -211,7 +211,7 @@ impl LaneType {
 }
 
 impl fmt::Display for LaneType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             LaneType::Float(_) => write!(f, "f{}", self.lane_bits()),
             LaneType::Int(_) => write!(f, "i{}", self.lane_bits()),
@@ -220,7 +220,7 @@ impl fmt::Display for LaneType {
 }
 
 impl fmt::Debug for LaneType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let inner_msg = format!("bits={}", self.lane_bits());
         write!(
             f,
@@ -329,13 +329,13 @@ impl VectorType {
 }
 
 impl fmt::Display for VectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}x{}", self.base, self.lane_count())
     }
 }
 
 impl fmt::Debug for VectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "VectorType(base={}, lanes={})",
@@ -402,13 +402,13 @@ impl DynamicVectorType {
 }
 
 impl fmt::Display for DynamicVectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}x{}xN", self.base, self.minimum_lane_count())
     }
 }
 
 impl fmt::Debug for DynamicVectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "DynamicVectorType(base={}, lanes={})",

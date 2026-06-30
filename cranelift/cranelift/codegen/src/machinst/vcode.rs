@@ -1617,7 +1617,7 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
 }
 
 impl<I: VCodeInst> Debug for VRegAllocator<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "VRegAllocator {{")?;
 
         let mut alias_keys = self.vreg_aliases.keys().cloned().collect::<Vec<_>>();
@@ -1632,7 +1632,7 @@ impl<I: VCodeInst> Debug for VRegAllocator<I> {
 }
 
 impl<I: VCodeInst> fmt::Debug for VCode<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "VCode {{")?;
         writeln!(f, "  Entry block: {}", self.entry.index())?;
 

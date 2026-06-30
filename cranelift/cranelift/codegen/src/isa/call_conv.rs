@@ -130,7 +130,7 @@ impl CallConv {
 }
 
 impl fmt::Display for CallConv {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match *self {
             Self::Fast => "fast",
             Self::Tail => "tail",

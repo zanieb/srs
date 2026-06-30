@@ -127,7 +127,7 @@ impl<T> fmt::Debug for PackedOption<T>
 where
     T: ReservedValue + fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.is_none() {
             write!(f, "None")
         } else {

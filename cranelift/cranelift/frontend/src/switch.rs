@@ -101,7 +101,7 @@ impl Switch {
 
     /// Binary search for the right `ContiguousCaseRange`.
     fn build_search_tree<'a>(
-        bx: &mut FunctionBuilder<'_>,
+        bx: &mut FunctionBuilder,
         val: Value,
         otherwise: Block,
         contiguous_case_ranges: &'a [ContiguousCaseRange],
@@ -152,7 +152,7 @@ impl Switch {
 
     /// Linear search for the right `ContiguousCaseRange`.
     fn build_search_branches<'a>(
-        bx: &mut FunctionBuilder<'_>,
+        bx: &mut FunctionBuilder,
         val: Value,
         otherwise: Block,
         contiguous_case_ranges: &'a [ContiguousCaseRange],
@@ -199,7 +199,7 @@ impl Switch {
     }
 
     fn build_jump_table(
-        bx: &mut FunctionBuilder<'_>,
+        bx: &mut FunctionBuilder,
         val: Value,
         otherwise: Block,
         first_index: EntryIndex,
@@ -265,7 +265,7 @@ impl Switch {
     /// * The function builder to emit to
     /// * The value to switch on
     /// * The default block
-    pub fn emit(self, bx: &mut FunctionBuilder<'_>, val: Value, otherwise: Block) {
+    pub fn emit(self, bx: &mut FunctionBuilder, val: Value, otherwise: Block) {
         // Validate that the type of `val` is sufficiently wide to address all cases.
         let max = self.cases.keys().max().copied().unwrap_or(0);
         let val_ty = bx.func.dfg.value_type(val);
@@ -279,7 +279,7 @@ impl Switch {
     }
 }
 
-fn icmp_imm_u128(bx: &mut FunctionBuilder<'_>, cond: IntCC, x: Value, y: u128) -> Value {
+fn icmp_imm_u128(bx: &mut FunctionBuilder, cond: IntCC, x: Value, y: u128) -> Value {
     if bx.func.dfg.value_type(x) != types::I128 {
         assert!(u64::try_from(y).is_ok());
         bx.ins().icmp_imm_s(cond, x, y as i64)

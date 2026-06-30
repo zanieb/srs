@@ -130,13 +130,13 @@ impl MemFlags {
 }
 
 impl fmt::Display for MemFlags {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "memflags{}", self.0)
     }
 }
 
 impl fmt::Debug for MemFlags {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         (self as &dyn fmt::Display).fmt(f)
     }
 }
@@ -395,7 +395,7 @@ impl From<MachMemFlags> for MemFlagsData {
 }
 
 impl fmt::Display for MemFlagsData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.flags)?;
         match self.alias_region() {
             None => {}

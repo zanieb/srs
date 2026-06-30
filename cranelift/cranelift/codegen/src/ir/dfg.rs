@@ -1432,7 +1432,7 @@ impl BlockData {
 pub struct DisplayInst<'a>(&'a DataFlowGraph, Inst);
 
 impl<'a> fmt::Display for DisplayInst<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let dfg = self.0;
         let inst = self.1;
 

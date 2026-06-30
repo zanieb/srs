@@ -93,7 +93,7 @@ fn gen_enum_all(name: &str, values: &[&'static str], fmt: &mut Formatter) {
 fn gen_to_and_from_str(name: &str, values: &[&'static str], fmt: &mut Formatter) {
     fmt.add_block(&format!("impl fmt::Display for {name}"), |fmt| {
         fmt.add_block(
-            "fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result",
+            "fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result",
             |fmt| {
                 fmt.add_block("f.write_str(match *self", |fmt| {
                     for v in values.iter() {
@@ -218,7 +218,7 @@ impl<'a> SettingOrPreset<'a> {
 fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
     let mut enum_table = UniqueSeqTable::new();
 
-    let mut descriptor_index_map: HashMap<SettingOrPreset<'_>, usize> = HashMap::new();
+    let mut descriptor_index_map: HashMap<SettingOrPreset, usize> = HashMap::new();
 
     // Generate descriptors.
     fmtln!(
@@ -284,7 +284,7 @@ fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
     fmtln!(fmt, "];");
 
     // Generate hash table.
-    let mut hash_entries: Vec<SettingOrPreset<'_>> = Vec::new();
+    let mut hash_entries: Vec<SettingOrPreset> = Vec::new();
     hash_entries.extend(group.settings.iter().map(SettingOrPreset::Setting));
     hash_entries.extend(group.presets.iter().map(SettingOrPreset::Preset));
 
@@ -364,7 +364,7 @@ fn gen_template(group: &SettingGroup, fmt: &mut Formatter) {
 fn gen_display(group: &SettingGroup, fmt: &mut Formatter) {
     fmt.add_block("impl fmt::Display for Flags", |fmt| {
         fmt.add_block(
-            "fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result",
+            "fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result",
             |fmt| {
                 fmtln!(fmt, "writeln!(f, \"[{}]\")?;", group.name);
                 fmt.add_block("for d in &DESCRIPTORS", |fmt| {

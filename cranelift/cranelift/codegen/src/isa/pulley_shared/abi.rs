@@ -55,7 +55,7 @@ where
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator<'_>,
+        mut args: ArgsAccumulator,
     ) -> CodegenResult<(u32, Option<usize>)> {
         // NB: make sure this method stays in sync with
         // `cranelift_pulley::interp::Vm::call`.

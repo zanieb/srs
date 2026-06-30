@@ -242,7 +242,7 @@ pub fn emit_unwind_info(
 }
 
 impl fmt::Display for X64Backend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MachBackend")
             .field("name", &self.name())
             .field("triple", &self.triple())

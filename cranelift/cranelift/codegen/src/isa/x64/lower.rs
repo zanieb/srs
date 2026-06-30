@@ -49,7 +49,7 @@ fn is_int_or_ref_ty(ty: Type) -> bool {
 /// Returns whether the given specified `input` is a result produced by an instruction with Opcode
 /// `op`.
 // TODO investigate failures with checking against the result index.
-fn matches_input(ctx: &mut Lower<'_, Inst>, input: InsnInput, op: Opcode) -> Option<IRInst> {
+fn matches_input(ctx: &mut Lower<Inst>, input: InsnInput, op: Opcode) -> Option<IRInst> {
     let inputs = ctx.get_input_as_source_or_const(input.insn, input.input);
     inputs.inst.as_inst().and_then(|(src_inst, _)| {
         let data = ctx.data(src_inst);
@@ -61,7 +61,7 @@ fn matches_input(ctx: &mut Lower<'_, Inst>, input: InsnInput, op: Opcode) -> Opt
 }
 
 /// Put the given input into possibly multiple registers, and mark it as used (side-effect).
-fn put_input_in_regs(ctx: &mut Lower<'_, Inst>, spec: InsnInput) -> ValueRegs<Reg> {
+fn put_input_in_regs(ctx: &mut Lower<Inst>, spec: InsnInput) -> ValueRegs<Reg> {
     let ty = ctx.input_ty(spec.insn, spec.input);
     let input = ctx.get_input_as_source_or_const(spec.insn, spec.input);
 
@@ -82,7 +82,7 @@ fn put_input_in_regs(ctx: &mut Lower<'_, Inst>, spec: InsnInput) -> ValueRegs<Re
 }
 
 /// Put the given input into a register, and mark it as used (side-effect).
-fn put_input_in_reg(ctx: &mut Lower<'_, Inst>, spec: InsnInput) -> Reg {
+fn put_input_in_reg(ctx: &mut Lower<Inst>, spec: InsnInput) -> Reg {
     put_input_in_regs(ctx, spec)
         .only_reg()
         .expect("Multi-register value not expected")
@@ -107,7 +107,7 @@ enum MergeableLoadSize {
 /// an `InsnInput`) and an offset from that address from which to perform the
 /// load.
 fn is_mergeable_load(
-    ctx: &mut Lower<'_, Inst>,
+    ctx: &mut Lower<Inst>,
     src_insn: IRInst,
     size: MergeableLoadSize,
 ) -> Option<(InsnInput, i32)> {
@@ -154,13 +154,13 @@ fn is_mergeable_load(
     }
 }
 
-fn input_to_imm(ctx: &mut Lower<'_, Inst>, spec: InsnInput) -> Option<u64> {
+fn input_to_imm(ctx: &mut Lower<Inst>, spec: InsnInput) -> Option<u64> {
     ctx.get_input_as_source_or_const(spec.insn, spec.input)
         .constant
 }
 
 fn emit_vm_call(
-    ctx: &mut Lower<'_, Inst>,
+    ctx: &mut Lower<Inst>,
     flags: &Flags,
     triple: &Triple,
     libcall: LibCall,
@@ -206,10 +206,7 @@ fn emit_vm_call(
 
 /// Returns whether the given input is a shift by a constant value less or equal than 3.
 /// The goal is to embed it within an address mode.
-fn matches_small_constant_shift(
-    ctx: &mut Lower<'_, Inst>,
-    spec: InsnInput,
-) -> Option<(InsnInput, u8)> {
+fn matches_small_constant_shift(ctx: &mut Lower<Inst>, spec: InsnInput) -> Option<(InsnInput, u8)> {
     matches_input(ctx, spec, Opcode::Ishl).and_then(|shift| {
         match input_to_imm(
             ctx,
@@ -233,7 +230,7 @@ fn matches_small_constant_shift(
 /// Lowers an instruction to one of the x86 addressing modes.
 ///
 /// Note: the 32-bit offset in Cranelift has to be sign-extended, which maps x86's behavior.
-fn lower_to_amode(ctx: &mut Lower<'_, Inst>, spec: InsnInput, offset: i32) -> Amode {
+fn lower_to_amode(ctx: &mut Lower<Inst>, spec: InsnInput, offset: i32) -> Amode {
     let flags = ctx
         .memflags(spec.insn)
         .expect("Instruction with amode should have memflags");
@@ -323,13 +320,13 @@ fn lower_to_amode(ctx: &mut Lower<'_, Inst>, spec: InsnInput, offset: i32) -> Am
 impl LowerBackend for X64Backend {
     type MInst = Inst;
 
-    fn lower(&self, ctx: &mut Lower<'_, Inst>, ir_inst: IRInst) -> Option<InstOutput> {
+    fn lower(&self, ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         isle::lower(ctx, self, ir_inst)
     }
 
     fn lower_branch(
         &self,
-        ctx: &mut Lower<'_, Inst>,
+        ctx: &mut Lower<Inst>,
         ir_inst: IRInst,
         targets: &[MachLabel],
     ) -> Option<()> {

@@ -153,7 +153,7 @@ impl IntCC {
 }
 
 impl Display for IntCC {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_str(self.to_static_str())
     }
 }
@@ -295,7 +295,7 @@ impl CondCode for FloatCC {
 }
 
 impl Display for FloatCC {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         use self::FloatCC::*;
         f.write_str(match *self {
             Ordered => "ord",

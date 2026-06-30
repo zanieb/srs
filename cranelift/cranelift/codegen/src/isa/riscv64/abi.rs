@@ -89,7 +89,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator<'_>,
+        mut args: ArgsAccumulator,
     ) -> CodegenResult<(u32, Option<usize>)> {
         // This implements the LP64D RISC-V ABI.
 

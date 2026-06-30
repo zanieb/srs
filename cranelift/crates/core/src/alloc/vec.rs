@@ -465,7 +465,7 @@ where
         {
             type Value = TryVec<T>;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a `wasmtime_core::alloc::Vec` sequence")
             }
 

@@ -89,7 +89,7 @@ impl Encoding {
 }
 
 impl fmt::Display for Encoding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Encoding::Rex(rex) => write!(f, "{rex}"),
             Encoding::Vex(vex) => write!(f, "{vex}"),
@@ -136,7 +136,7 @@ impl ModRmKind {
 }
 
 impl fmt::Display for ModRmKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ModRmKind::Digit(digit) => write!(f, "/{digit}"),
             ModRmKind::Reg => write!(f, "/r"),
@@ -374,7 +374,7 @@ impl From<Rex> for Encoding {
 }
 
 impl fmt::Display for Rex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(group1) = &self.opcodes.prefixes.group1 {
             write!(f, "{group1} + ")?;
         }
@@ -603,7 +603,7 @@ impl TryFrom<u8> for Group1Prefix {
 }
 
 impl fmt::Display for Group1Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Group1Prefix::Lock => write!(f, "0xF0"),
             Group1Prefix::REPNorBND => write!(f, "0xF2"),
@@ -648,7 +648,7 @@ impl TryFrom<u8> for Group2Prefix {
 }
 
 impl fmt::Display for Group2Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Group2Prefix::CSorBNT => write!(f, "0x2E"),
             Group2Prefix::SS => write!(f, "0x36"),
@@ -684,7 +684,7 @@ impl TryFrom<u8> for Group3Prefix {
 }
 
 impl fmt::Display for Group3Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Group3Prefix::OperandSizeOverride => write!(f, "0x66"),
         }
@@ -712,7 +712,7 @@ impl TryFrom<u8> for Group4Prefix {
 }
 
 impl fmt::Display for Group4Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Group4Prefix::AddressSizeOverride => write!(f, "0x67"),
         }
@@ -748,7 +748,7 @@ impl Imm {
 }
 
 impl fmt::Display for Imm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::None => write!(f, ""),
             Self::ib => write!(f, "ib"),
@@ -790,7 +790,7 @@ impl OpcodeMod {
 }
 
 impl fmt::Display for OpcodeMod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::rb => write!(f, "+rb"),
             Self::rw => write!(f, "+rw"),
@@ -824,7 +824,7 @@ impl VexPrefix {
 }
 
 impl fmt::Display for VexPrefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::_66 => write!(f, "66"),
             Self::_F3 => write!(f, "F3"),
@@ -856,7 +856,7 @@ impl VexEscape {
 }
 
 impl fmt::Display for VexEscape {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::_0F => write!(f, "0F"),
             Self::_0F3A => write!(f, "0F3A"),
@@ -914,7 +914,7 @@ impl Length {
 }
 
 impl fmt::Display for Length {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::L128 => write!(f, "128"),
             Self::L256 => write!(f, "256"),
@@ -955,7 +955,7 @@ impl WBit {
 }
 
 impl fmt::Display for WBit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::WIG => write!(f, "WIG"),
             Self::W0 => write!(f, "W0"),
@@ -1203,7 +1203,7 @@ impl From<Vex> for Encoding {
 }
 
 impl fmt::Display for Vex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "VEX.{}", self.length)?;
         if let Some(pp) = self.pp {
             write!(f, ".{pp}")?;
@@ -1404,7 +1404,7 @@ impl From<Evex> for Encoding {
 }
 
 impl fmt::Display for Evex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "EVEX.{}", self.length)?;
         if let Some(pp) = self.pp {
             write!(f, ".{pp}")?;

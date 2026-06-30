@@ -525,7 +525,7 @@ impl TypeSet {
 }
 
 impl fmt::Debug for TypeSet {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(fmt, "TypeSet(")?;
 
         let mut subsets = Vec::new();

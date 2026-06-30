@@ -598,7 +598,7 @@ fn write_user_stack_map_entries(w: &mut dyn Write, dfg: &DataFlowGraph, inst: In
 struct DisplayValues<'a>(&'a [Value]);
 
 impl<'a> fmt::Display for DisplayValues<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (i, val) in self.0.iter().enumerate() {
             if i == 0 {
                 write!(f, "{val}")?;

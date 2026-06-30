@@ -15,7 +15,7 @@ pub struct Errors {
 impl std::error::Error for Errors {}
 
 impl std::fmt::Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         if self.errors.is_empty() {
             return Ok(());
         }
@@ -171,7 +171,7 @@ impl Errors {
     #[cfg(feature = "fancy-errors")]
     fn emit(
         &self,
-        f: &mut std::fmt::Formatter<'_>,
+        f: &mut std::fmt::Formatter,
         diagnostics: Vec<Diagnostic<usize>>,
     ) -> std::fmt::Result {
         use codespan_reporting::term::termcolor;
@@ -198,7 +198,7 @@ impl Errors {
     #[cfg(not(feature = "fancy-errors"))]
     fn emit(
         &self,
-        f: &mut std::fmt::Formatter<'_>,
+        f: &mut std::fmt::Formatter,
         diagnostics: Vec<Diagnostic<usize>>,
     ) -> std::fmt::Result {
         let pos = |file_id: usize, offset| {

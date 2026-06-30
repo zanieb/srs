@@ -148,7 +148,7 @@ impl From<i64> for Imm64 {
 }
 
 impl Display for Imm64 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let x = self.0;
         if x < 10_000 {
             // Use decimal for small and negative numbers.
@@ -228,7 +228,7 @@ impl From<u64> for Uimm64 {
 ///   0x0001_ffff
 ///   0xffff_ffff_fff8_4400
 ///
-fn write_hex(x: u64, f: &mut Formatter<'_>) -> fmt::Result {
+fn write_hex(x: u64, f: &mut Formatter) -> fmt::Result {
     let mut pos = (64 - x.leading_zeros() - 1) & 0xf0;
     write!(f, "0x{:04x}", (x >> pos) & 0xffff)?;
     while pos > 0 {
@@ -239,7 +239,7 @@ fn write_hex(x: u64, f: &mut Formatter<'_>) -> fmt::Result {
 }
 
 impl Display for Uimm64 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let x = self.0;
         if x < 10_000 {
             // Use decimal for small numbers.
@@ -355,7 +355,7 @@ impl From<u32> for Uimm32 {
 }
 
 impl Display for Uimm32 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if self.0 < 10_000 {
             write!(f, "{}", self.0)
         } else {
@@ -471,7 +471,7 @@ impl From<u8> for Offset32 {
 }
 
 impl Display for Offset32 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         // 0 displays as an empty offset.
         if self.0 == 0 {
             return Ok(());
@@ -741,7 +741,7 @@ macro_rules! ieee_float {
         }
 
         impl Display for $name {
-            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            fn fmt(&self, f: &mut Formatter) -> fmt::Result {
                 format_float(u128::from(self.bits()), Self::EXPONENT_BITS, Self::SIGNIFICAND_BITS, f)
             }
         }
@@ -893,7 +893,7 @@ ieee_float! {
 /// w - exponent field width in bits
 /// t - trailing significand field width in bits
 ///
-fn format_float(bits: u128, w: u8, t: u8, f: &mut Formatter<'_>) -> fmt::Result {
+fn format_float(bits: u128, w: u8, t: u8, f: &mut Formatter) -> fmt::Result {
     debug_assert!(w > 0 && w <= 16, "Invalid exponent range");
     debug_assert!(1 + w + t <= 128, "Too large IEEE format for u128");
     debug_assert!((t + w + 1).is_power_of_two(), "Unexpected IEEE format size");

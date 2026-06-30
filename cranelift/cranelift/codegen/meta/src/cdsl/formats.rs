@@ -60,7 +60,7 @@ pub(crate) struct FormatStructure {
 }
 
 impl fmt::Display for InstructionFormat {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let imm_args = self
             .imm_fields
             .iter()

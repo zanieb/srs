@@ -52,7 +52,7 @@ impl AtomicRmwOp {
 }
 
 impl Display for AtomicRmwOp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let s = match self {
             AtomicRmwOp::Add => "add",
             AtomicRmwOp::Sub => "sub",

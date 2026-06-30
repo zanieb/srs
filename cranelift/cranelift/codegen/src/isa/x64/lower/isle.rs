@@ -263,7 +263,7 @@ macro_rules! sized_xmm_mem_helpers {
 
 /// The main entry point for lowering with ISLE.
 pub(crate) fn lower(
-    lower_ctx: &mut Lower<'_, MInst>,
+    lower_ctx: &mut Lower<MInst>,
     backend: &X64Backend,
     inst: Inst,
 ) -> Option<InstOutput> {
@@ -274,7 +274,7 @@ pub(crate) fn lower(
 }
 
 pub(crate) fn lower_branch(
-    lower_ctx: &mut Lower<'_, MInst>,
+    lower_ctx: &mut Lower<MInst>,
     backend: &X64Backend,
     branch: Inst,
     targets: &[MachLabel],

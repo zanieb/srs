@@ -15,7 +15,7 @@ pub enum KnownSymbol {
 }
 
 impl fmt::Display for KnownSymbol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }

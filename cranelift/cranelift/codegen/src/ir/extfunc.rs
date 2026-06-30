@@ -104,7 +104,7 @@ impl Signature {
     }
 }
 
-fn write_list(f: &mut fmt::Formatter<'_>, args: &[AbiParam]) -> fmt::Result {
+fn write_list(f: &mut fmt::Formatter, args: &[AbiParam]) -> fmt::Result {
     match args.split_first() {
         None => {}
         Some((first, rest)) => {
@@ -118,7 +118,7 @@ fn write_list(f: &mut fmt::Formatter<'_>, args: &[AbiParam]) -> fmt::Result {
 }
 
 impl fmt::Display for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "(")?;
         write_list(f, &self.params)?;
         write!(f, ")")?;
@@ -184,7 +184,7 @@ impl AbiParam {
 }
 
 impl fmt::Display for AbiParam {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.value_type)?;
         match self.extension {
             ArgumentExtension::None => {}
@@ -259,7 +259,7 @@ pub enum ArgumentPurpose {
 }
 
 impl fmt::Display for ArgumentPurpose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             Self::Normal => "normal",
             Self::StructArgument(size) => return write!(f, "sarg({size})"),
@@ -344,7 +344,7 @@ pub struct DisplayableExtFuncData<'a> {
 }
 
 impl<'a> fmt::Display for DisplayableExtFuncData<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.ext_func.colocated {
             write!(f, "colocated ")?;
         }

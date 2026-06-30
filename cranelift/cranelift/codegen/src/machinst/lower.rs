@@ -129,7 +129,7 @@ pub trait LowerBackend {
     /// out-edge.
     ///
     /// Returns `None` if no lowering for the instruction was found.
-    fn lower(&self, ctx: &mut Lower<'_, Self::MInst>, inst: Inst) -> Option<InstOutput>;
+    fn lower(&self, ctx: &mut Lower<Self::MInst>, inst: Inst) -> Option<InstOutput>;
 
     /// Lower a block-terminating group of branches (which together can be seen
     /// as one N-way branch), given a vcode MachLabel for each target.
@@ -137,7 +137,7 @@ pub trait LowerBackend {
     /// Returns `None` if no lowering for the branch was found.
     fn lower_branch(
         &self,
-        ctx: &mut Lower<'_, Self::MInst>,
+        ctx: &mut Lower<Self::MInst>,
         inst: Inst,
         targets: &[MachLabel],
     ) -> Option<()>;

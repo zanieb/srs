@@ -132,7 +132,7 @@ impl Reg {
 }
 
 impl core::fmt::Debug for Reg {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         if VReg::from(self.0) == VReg::invalid() {
             write!(f, "<invalid>")
         } else if let Some(spillslot) = self.to_spillslot() {
@@ -179,7 +179,7 @@ impl RealReg {
 }
 
 impl core::fmt::Debug for RealReg {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         Reg::from(*self).fmt(f)
     }
 }
@@ -205,7 +205,7 @@ impl VirtualReg {
 }
 
 impl core::fmt::Debug for VirtualReg {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         Reg::from(*self).fmt(f)
     }
 }

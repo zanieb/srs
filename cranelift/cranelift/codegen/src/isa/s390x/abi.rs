@@ -305,7 +305,7 @@ impl ABIMachineSpec for S390xMachineDeps {
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
-        mut args: ArgsAccumulator<'_>,
+        mut args: ArgsAccumulator,
     ) -> CodegenResult<(u32, Option<usize>)> {
         assert_ne!(
             call_conv,

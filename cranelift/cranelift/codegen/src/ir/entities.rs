@@ -400,7 +400,7 @@ pub enum AnyEntity {
 }
 
 impl fmt::Display for AnyEntity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Function => write!(f, "function"),
             Self::Block(r) => r.fmt(f),
@@ -422,7 +422,7 @@ impl fmt::Display for AnyEntity {
 }
 
 impl fmt::Debug for AnyEntity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         (self as &dyn fmt::Display).fmt(f)
     }
 }

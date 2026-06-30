@@ -193,19 +193,13 @@ macro_rules! entity_impl {
         $crate::entity_impl!($entity);
 
         impl $crate::__core::fmt::Display for $entity {
-            fn fmt(
-                &self,
-                f: &mut $crate::__core::fmt::Formatter<'_>,
-            ) -> $crate::__core::fmt::Result {
+            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
                 write!(f, concat!($display_prefix, "{}"), self.0)
             }
         }
 
         impl $crate::__core::fmt::Debug for $entity {
-            fn fmt(
-                &self,
-                f: &mut $crate::__core::fmt::Formatter<'_>,
-            ) -> $crate::__core::fmt::Result {
+            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
                 (self as &dyn $crate::__core::fmt::Display).fmt(f)
             }
         }
@@ -261,19 +255,13 @@ macro_rules! entity_impl {
         }
 
         impl $crate::__core::fmt::Display for $entity {
-            fn fmt(
-                &self,
-                f: &mut $crate::__core::fmt::Formatter<'_>,
-            ) -> $crate::__core::fmt::Result {
+            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
                 write!(f, concat!($display_prefix, "{}"), self.as_u32())
             }
         }
 
         impl $crate::__core::fmt::Debug for $entity {
-            fn fmt(
-                &self,
-                f: &mut $crate::__core::fmt::Formatter<'_>,
-            ) -> $crate::__core::fmt::Result {
+            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
                 (self as &dyn $crate::__core::fmt::Display).fmt(f)
             }
         }

@@ -41,7 +41,7 @@ impl PartialEq for VecAvl {
 }
 
 impl fmt::Display for VecAvl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             VecAvl::Static { size } => write!(f, "{size}"),
         }
@@ -83,7 +83,7 @@ impl VecElementWidth {
 }
 
 impl fmt::Display for VecElementWidth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "e{}", self.bits())
     }
 }
@@ -103,7 +103,7 @@ impl VecLmul {
 }
 
 impl fmt::Display for VecLmul {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             VecLmul::LmulF8 => write!(f, "mf8"),
             VecLmul::LmulF4 => write!(f, "mf4"),
@@ -126,7 +126,7 @@ impl VecTailMode {
 }
 
 impl fmt::Display for VecTailMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             VecTailMode::Agnostic => write!(f, "ta"),
             VecTailMode::Undisturbed => write!(f, "tu"),
@@ -144,7 +144,7 @@ impl VecMaskMode {
 }
 
 impl fmt::Display for VecMaskMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             VecMaskMode::Agnostic => write!(f, "ma"),
             VecMaskMode::Undisturbed => write!(f, "mu"),
@@ -176,7 +176,7 @@ impl VType {
 }
 
 impl fmt::Display for VType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "{}, {}, {}, {}",
@@ -211,7 +211,7 @@ impl VState {
 }
 
 impl fmt::Display for VState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "#avl={}, #vtype=({})", self.avl, self.vtype)
     }
 }
@@ -309,7 +309,7 @@ impl VecInstOverlapInfo for VecAluOpRRRR {
 }
 
 impl fmt::Display for VecAluOpRRRR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = format!("{self:?}");
         s.make_ascii_lowercase();
         let (opcode, category) = s.split_at(s.len() - 2);
@@ -355,7 +355,7 @@ impl VecInstOverlapInfo for VecAluOpRRRImm5 {
 }
 
 impl fmt::Display for VecAluOpRRRImm5 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = format!("{self:?}");
         s.make_ascii_lowercase();
         let (opcode, category) = s.split_at(s.len() - 2);
@@ -639,7 +639,7 @@ impl VecInstOverlapInfo for VecAluOpRRR {
 }
 
 impl fmt::Display for VecAluOpRRR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let suffix_length = match self {
             VecAluOpRRR::VmergeVVM | VecAluOpRRR::VmergeVXM | VecAluOpRRR::VfmergeVFM => 3,
             _ => 2,
@@ -770,7 +770,7 @@ impl VecInstOverlapInfo for VecAluOpRRImm5 {
 }
 
 impl fmt::Display for VecAluOpRRImm5 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let suffix_length = match self {
             VecAluOpRRImm5::VmergeVIM => 3,
             _ => 2,
@@ -982,7 +982,7 @@ impl VecInstOverlapInfo for VecAluOpRR {
 }
 
 impl fmt::Display for VecAluOpRR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             VecAluOpRR::VmvSX => "vmv.s.x",
             VecAluOpRR::VmvXS => "vmv.x.s",
@@ -1051,7 +1051,7 @@ impl VecInstOverlapInfo for VecAluOpRImm5 {
 }
 
 impl fmt::Display for VecAluOpRImm5 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             VecAluOpRImm5::VmvVI => "vmv.v.i",
         })

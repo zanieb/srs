@@ -26,7 +26,7 @@ pub fn do_nan_canonicalization(func: &mut Function, has_vector_support: bool) {
 /// Returns true/false based on whether the instruction is a floating-point
 /// arithmetic operation. This ignores operations like `fneg`, `fabs`, or
 /// `fcopysign` that only operate on the sign bit of a floating point value.
-fn is_fp_arith(pos: &mut FuncCursor<'_>, inst: Inst) -> bool {
+fn is_fp_arith(pos: &mut FuncCursor, inst: Inst) -> bool {
     match pos.func.dfg.insts[inst] {
         InstructionData::Unary { opcode, .. } => {
             opcode == Opcode::Ceil
@@ -53,7 +53,7 @@ fn is_fp_arith(pos: &mut FuncCursor<'_>, inst: Inst) -> bool {
 }
 
 /// Append a sequence of canonicalizing instructions after the given instruction.
-fn add_nan_canon_seq(pos: &mut FuncCursor<'_>, inst: Inst, has_vector_support: bool) {
+fn add_nan_canon_seq(pos: &mut FuncCursor, inst: Inst, has_vector_support: bool) {
     // Select the instruction result, result type. Replace the instruction
     // result and step forward before inserting the canonicalization sequence.
     let val = pos.func.dfg.first_result(inst);
@@ -66,7 +66,7 @@ fn add_nan_canon_seq(pos: &mut FuncCursor<'_>, inst: Inst, has_vector_support: b
     // is NaN, assign the result to `inst`.
     let comparison = FloatCC::Unordered;
 
-    let vectorized_scalar_select = |pos: &mut FuncCursor<'_>, canon_nan: Value, ty: types::Type| {
+    let vectorized_scalar_select = |pos: &mut FuncCursor, canon_nan: Value, ty: types::Type| {
         let canon_nan = pos.ins().scalar_to_vector(ty, canon_nan);
         let new_res = pos.ins().scalar_to_vector(ty, new_res);
         let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
@@ -74,14 +74,14 @@ fn add_nan_canon_seq(pos: &mut FuncCursor<'_>, inst: Inst, has_vector_support: b
         let simd_result = pos.ins().bitselect(is_nan, canon_nan, new_res);
         pos.ins().with_result(val).extractlane(simd_result, 0);
     };
-    let scalar_select = |pos: &mut FuncCursor<'_>, canon_nan: Value| {
+    let scalar_select = |pos: &mut FuncCursor, canon_nan: Value| {
         let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
         pos.ins()
             .with_result(val)
             .select(is_nan, canon_nan, new_res);
     };
 
-    let vector_select = |pos: &mut FuncCursor<'_>, canon_nan: Value| {
+    let vector_select = |pos: &mut FuncCursor, canon_nan: Value| {
         let is_nan = pos.ins().fcmp(comparison, new_res, new_res);
         let is_nan = pos.ins().bitcast(val_type, MemFlagsData::new(), is_nan);
         pos.ins()

@@ -57,7 +57,7 @@ impl TryFrom<i32> for Imm8 {
 }
 
 impl fmt::Display for Imm8 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "$0x{:x}", self.0)
     }
 }
@@ -142,7 +142,7 @@ impl TryFrom<i32> for Imm16 {
 }
 
 impl fmt::Display for Imm16 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "$0x{:x}", self.0)
     }
 }
@@ -231,7 +231,7 @@ impl From<i32> for Imm32 {
 }
 
 impl fmt::Display for Imm32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "$0x{:x}", self.0)
     }
 }
@@ -308,7 +308,7 @@ impl From<u64> for Imm64 {
 }
 
 impl fmt::Display for Imm64 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "$0x{:x}", self.0)
     }
 }

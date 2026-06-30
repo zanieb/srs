@@ -214,7 +214,7 @@ impl TargetIsa for S390xBackend {
 }
 
 impl fmt::Display for S390xBackend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MachBackend")
             .field("name", &self.name())
             .field("triple", &self.triple())

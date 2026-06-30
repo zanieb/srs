@@ -293,7 +293,7 @@ pub enum DataValueCastFailure {
 impl core::error::Error for DataValueCastFailure {}
 
 impl Display for DataValueCastFailure {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             DataValueCastFailure::TryInto(from, to) => {
                 write!(f, "unable to cast data value of type {from} to type {to}")

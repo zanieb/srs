@@ -731,7 +731,7 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
 
 /// The main entry point for lowering with ISLE.
 pub(crate) fn lower(
-    lower_ctx: &mut Lower<'_, MInst>,
+    lower_ctx: &mut Lower<MInst>,
     backend: &Riscv64Backend,
     inst: Inst,
 ) -> Option<InstOutput> {
@@ -743,7 +743,7 @@ pub(crate) fn lower(
 
 /// The main entry point for branch lowering with ISLE.
 pub(crate) fn lower_branch(
-    lower_ctx: &mut Lower<'_, MInst>,
+    lower_ctx: &mut Lower<MInst>,
     backend: &Riscv64Backend,
     branch: Inst,
     targets: &[MachLabel],

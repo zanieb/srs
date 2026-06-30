@@ -52,7 +52,7 @@ where
 /// APIs that force allocation of an owned copy.
 pub enum TryCow<'a, B>
 where
-    B: TryToOwned + ?Sized,
+    B: 'a + TryToOwned + ?Sized,
 {
     /// Borrowed data.
     Borrowed(&'a B),

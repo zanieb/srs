@@ -77,7 +77,7 @@ impl<'a> CFGPrinter<'a> {
 }
 
 impl<'a> Display for CFGPrinter<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+    fn fmt(&self, f: &mut Formatter) -> Result {
         self.write(f)
     }
 }

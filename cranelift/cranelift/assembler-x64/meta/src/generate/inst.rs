@@ -268,7 +268,7 @@ impl dsl::Inst {
             &format!("{impl_block} core::fmt::Display for {struct_name}"),
             |f| {
                 f.add_block(
-                    "fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result",
+                    "fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result",
                     |f| {
                         if self.custom.contains(Display) {
                             fmtln!(f, "crate::custom::display::{}(f, self)", self.name());

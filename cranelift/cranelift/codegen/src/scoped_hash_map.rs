@@ -19,7 +19,7 @@ struct Val<V> {
 }
 
 /// A view into an occupied entry in a `ScopedHashMap`. It is part of the `Entry` enum.
-pub struct OccupiedEntry<'a, K, V> {
+pub struct OccupiedEntry<'a, K: 'a, V: 'a> {
     entry: crate::ctxhash::OccupiedEntry<'a, K, Val<V>>,
 }
 
@@ -31,7 +31,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
 }
 
 /// A view into a vacant entry in a `ScopedHashMap`. It is part of the `Entry` enum.
-pub struct VacantEntry<'a, K, V> {
+pub struct VacantEntry<'a, K: 'a, V: 'a> {
     entry: InsertLoc<'a, K, V>,
     depth: u32,
     generation: u32,
@@ -39,7 +39,7 @@ pub struct VacantEntry<'a, K, V> {
 
 /// Where to insert from a `VacantEntry`. May be vacant or occupied in
 /// the underlying map because of lazy (generation-based) deletion.
-enum InsertLoc<'a, K, V> {
+enum InsertLoc<'a, K: 'a, V: 'a> {
     Vacant(crate::ctxhash::VacantEntry<'a, K, Val<V>>),
     Occupied(crate::ctxhash::OccupiedEntry<'a, K, Val<V>>),
 }
@@ -66,7 +66,7 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
 /// A view into a single entry in a map, which may either be vacant or occupied.
 ///
 /// This enum is constructed from the `entry` method on `ScopedHashMap`.
-pub enum Entry<'a, K, V> {
+pub enum Entry<'a, K: 'a, V: 'a> {
     Occupied(OccupiedEntry<'a, K, V>),
     Vacant(VacantEntry<'a, K, V>),
 }

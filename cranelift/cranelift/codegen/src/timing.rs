@@ -91,7 +91,7 @@ impl Pass {
 }
 
 impl fmt::Display for Pass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(self.description())
     }
 }
@@ -184,7 +184,7 @@ mod enabled {
     }
 
     impl fmt::Display for PassTimes {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             writeln!(f, "======== ========  ==================================")?;
             writeln!(f, "   Total     Self  Pass")?;
             writeln!(f, "-------- --------  ----------------------------------")?;
@@ -195,7 +195,7 @@ mod enabled {
                 }
 
                 // Write a duration as secs.millis, trailing space.
-                fn fmtdur(mut dur: Duration, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fn fmtdur(mut dur: Duration, f: &mut fmt::Formatter) -> fmt::Result {
                     // Round to nearest ms by adding 500us.
                     dur += Duration::new(0, 500_000);
                     let ms = dur.subsec_millis();

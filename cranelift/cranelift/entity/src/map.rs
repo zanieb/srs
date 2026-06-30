@@ -357,7 +357,7 @@ where
         {
             type Value = SecondaryMap<K, V>;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("struct SecondaryMap")
             }
 

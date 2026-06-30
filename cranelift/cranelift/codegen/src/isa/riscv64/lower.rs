@@ -12,13 +12,13 @@ pub mod isle;
 impl LowerBackend for Riscv64Backend {
     type MInst = Inst;
 
-    fn lower(&self, ctx: &mut Lower<'_, Inst>, ir_inst: IRInst) -> Option<InstOutput> {
+    fn lower(&self, ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         isle::lower(ctx, self, ir_inst)
     }
 
     fn lower_branch(
         &self,
-        ctx: &mut Lower<'_, Inst>,
+        ctx: &mut Lower<Inst>,
         ir_inst: IRInst,
         targets: &[MachLabel],
     ) -> Option<()> {
