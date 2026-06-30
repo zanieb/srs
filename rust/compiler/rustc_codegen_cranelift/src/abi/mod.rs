@@ -15,6 +15,8 @@ use cranelift_module::ModuleError;
 use rustc_abi::{CanonAbi, ExternAbi, X86Call};
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_codegen_ssa::errors::CompilerBuiltinsCannotCall;
+use rustc_index::IndexVec;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::layout::FnAbiOf;
@@ -117,6 +119,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     /// Instance must be monomorphized
     pub(crate) fn get_function_ref(&mut self, inst: Instance<'tcx>) -> FuncRef {
         let func_id = import_function(self.tcx, self.module, inst);
+        self.referenced_functions.entry(func_id).or_insert(inst);
         let func_ref = self.module.declare_func_in_func(func_id, self.bcx.func);
 
         if self.clif_comments.enabled() {
@@ -228,6 +231,38 @@ fn make_local_place<'tcx>(
     place
 }
 
+struct ReusableStackSlot<'tcx> {
+    place: CPlace<'tcx>,
+    occupants: DenseBitSet<Local>,
+}
+
+fn aggregate_destination_place<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    local: Local,
+    destinations: &IndexVec<Local, Option<crate::analyze::AggregateDestination>>,
+) -> Option<CPlace<'tcx>> {
+    let mut current = local;
+    let mut fields = SmallVec::<[FieldIdx; 4]>::new();
+    while let Some(destination) = destinations[current] {
+        fields.push(destination.field);
+        current = destination.parent;
+        if fields.len() > destinations.len() {
+            return None;
+        }
+    }
+    if current != RETURN_PLACE {
+        return None;
+    }
+
+    let mut place = fx.get_local_place(RETURN_PLACE);
+    place.try_to_ptr()?;
+    for field in fields.into_iter().rev() {
+        place = place.place_field(fx, field);
+    }
+    debug_assert_eq!(place.layout().ty, fx.monomorphize(fx.mir.local_decls[local].ty));
+    Some(place)
+}
+
 pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_block: Block) {
     fx.bcx.append_block_params_for_function_params(start_block);
 
@@ -235,6 +270,7 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
     fx.bcx.ins().nop();
 
     let ssa_analyzed = crate::analyze::analyze(fx);
+    let aggregate_destinations = crate::analyze::aggregate_destinations(fx);
 
     self::comments::add_args_header_comment(fx);
 
@@ -351,13 +387,63 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
         }
     }
 
+    let mut reusable_stack_locals = DenseBitSet::new_empty(fx.mir.local_decls.len());
+    let max_reusable_align = if fx.tcx.sess.target.arch == Arch::S390x { 8 } else { 16 };
+    for local in fx.mir.vars_and_temps_iter() {
+        let ty = fx.monomorphize(fx.mir.local_decls[local].ty);
+        let layout = fx.layout_of(ty);
+        if !ssa_analyzed[local].is_ssa(fx, ty)
+            && layout.size != Size::ZERO
+            && layout.size.bytes() < u64::from(u32::MAX - 16)
+            && layout.align.bytes() <= max_reusable_align
+            && aggregate_destinations[local].is_none()
+        {
+            reusable_stack_locals.insert(local);
+        }
+    }
+    let storage_conflicts = crate::analyze::storage_conflicts(fx, &reusable_stack_locals);
+    if storage_conflicts.is_none() {
+        reusable_stack_locals.clear();
+    }
+    let mut reusable_stack_slots = Vec::<ReusableStackSlot<'tcx>>::new();
+
     for local in fx.mir.vars_and_temps_iter() {
         let ty = fx.monomorphize(fx.mir.local_decls[local].ty);
         let layout = fx.layout_of(ty);
 
         let is_ssa = ssa_analyzed[local].is_ssa(fx, ty);
 
-        let place = make_local_place(fx, local, layout, is_ssa);
+        let aggregate_place = aggregate_destination_place(fx, local, &aggregate_destinations);
+        let place = if let Some(place) = aggregate_place {
+            place
+        } else if reusable_stack_locals.contains(local) {
+            let storage_conflicts = storage_conflicts.as_ref().unwrap();
+            let reusable = reusable_stack_slots.iter().position(|slot| {
+                slot.place.layout().size == layout.size
+                    && slot.place.layout().align.abi == layout.align.abi
+                    && slot
+                        .occupants
+                        .iter()
+                        .all(|occupant| !storage_conflicts[local].contains(occupant))
+            });
+
+            if let Some(index) = reusable {
+                let slot = &mut reusable_stack_slots[index];
+                slot.occupants.insert(local);
+                let reuse = slot.place.to_ptr().stack_slot_id().unwrap();
+                let place = CPlace::new_reused_stack_slot(fx, layout, reuse);
+                self::comments::add_local_place_comments(fx, place, local);
+                place
+            } else {
+                let place = make_local_place(fx, local, layout, false);
+                let mut occupants = DenseBitSet::new_empty(fx.mir.local_decls.len());
+                occupants.insert(local);
+                reusable_stack_slots.push(ReusableStackSlot { place, occupants });
+                place
+            }
+        } else {
+            make_local_place(fx, local, layout, is_ssa)
+        };
         assert_eq!(fx.local_map.push(place), local);
     }
 

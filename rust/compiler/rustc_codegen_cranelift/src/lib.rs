@@ -23,6 +23,7 @@ extern crate rustc_hir;
 extern crate rustc_incremental;
 extern crate rustc_index;
 extern crate rustc_log;
+extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_symbol_mangling;
@@ -39,7 +40,7 @@ use std::sync::Arc;
 
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::traits::{CodegenBackend, MirInlinerThresholds};
 use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
 use rustc_log::tracing::info;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
@@ -150,6 +151,20 @@ impl CodegenBackend for CraneliftCodegenBackend {
         if config.jit_mode && !sess.opts.output_types.should_codegen() {
             sess.dcx().fatal("JIT mode doesn't work with `cargo check`");
         }
+    }
+
+    fn mir_inliner_thresholds(&self) -> Option<MirInlinerThresholds> {
+        Some(MirInlinerThresholds {
+            cross_crate: 500,
+            top_down_depth: 12,
+            forwarder: 60,
+            hint: 800,
+            default: 100,
+        })
+    }
+
+    fn run_late_mir_sroa(&self) -> bool {
+        true
     }
 
     fn target_config(&self, sess: &Session) -> TargetConfig {

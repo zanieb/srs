@@ -19,6 +19,20 @@ use crate::back::archive::ArArchiveBuilderBuilder;
 use crate::back::link::link_binary;
 use crate::{CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
 
+/// Backend-specific defaults for the MIR inliner's cost thresholds.
+///
+/// Codegen backends without their own function inliner can use this to ask the
+/// shared MIR inliner to do more work. Explicit `-Zinline-mir-*` options always
+/// take precedence over these defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MirInlinerThresholds {
+    pub cross_crate: usize,
+    pub top_down_depth: usize,
+    pub forwarder: usize,
+    pub hint: usize,
+    pub default: usize,
+}
+
 pub trait BackendTypes {
     type Function: CodegenObject;
     type BasicBlock: Copy;
@@ -39,6 +53,18 @@ pub trait CodegenBackend {
     fn name(&self) -> &'static str;
 
     fn init(&self, _sess: &Session) {}
+
+    fn mir_inliner_thresholds(&self) -> Option<MirInlinerThresholds> {
+        None
+    }
+
+    /// Whether optimized MIR should run SROA again after destination propagation.
+    ///
+    /// Backends that do not have a later memory-to-register pass can use this to
+    /// expose aggregate fields that only stop escaping late in the MIR pipeline.
+    fn run_late_mir_sroa(&self) -> bool {
+        false
+    }
 
     fn print(&self, _req: &PrintRequest, _out: &mut String, _sess: &Session) {}
 

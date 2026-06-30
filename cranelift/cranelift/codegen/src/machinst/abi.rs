@@ -1233,8 +1233,37 @@ impl<M: ABIMachineSpec> Callee<M> {
         let mut end_offset: u32 = 0;
         let mut sized_stackslots = PrimaryMap::new();
         let mut sized_stackslot_keys = SecondaryMap::new();
+        let mut allocation_sizes = SecondaryMap::<StackSlot, u32>::new();
+        let mut allocation_align_shifts = SecondaryMap::<StackSlot, u8>::new();
 
         for (stackslot, data) in f.sized_stack_slots.iter() {
+            let allocation = if let Some(reuse) = data.reuse {
+                if !f.sized_stack_slots.is_valid(reuse)
+                    || reuse.as_u32() >= stackslot.as_u32()
+                    || f.sized_stack_slots[reuse].reuse.is_some()
+                {
+                    return Err(CodegenError::Unsupported(
+                        "a reused stack slot must reference a valid, earlier allocation slot"
+                            .into(),
+                    ));
+                }
+                reuse
+            } else {
+                stackslot
+            };
+            allocation_sizes[allocation] = allocation_sizes[allocation].max(data.size);
+            allocation_align_shifts[allocation] =
+                allocation_align_shifts[allocation].max(data.align_shift);
+        }
+
+        for (stackslot, data) in f.sized_stack_slots.iter() {
+            if let Some(reuse) = data.reuse {
+                debug_assert_eq!(stackslot.as_u32() as usize, sized_stackslots.len());
+                sized_stackslots.push(sized_stackslots[reuse]);
+                sized_stackslot_keys[stackslot] = data.key;
+                continue;
+            }
+
             // We start our computation possibly unaligned where the previous
             // stackslot left off.
             let unaligned_start_offset = end_offset;
@@ -1243,15 +1272,16 @@ impl<M: ABIMachineSpec> Callee<M> {
             //
             // We always at least machine-word-align slots, but also
             // satisfy the user's requested alignment.
-            debug_assert!(data.align_shift < 32);
-            let align = core::cmp::max(M::word_bytes(), 1u32 << data.align_shift);
+            let align_shift = allocation_align_shifts[stackslot];
+            debug_assert!(align_shift < 32);
+            let align = core::cmp::max(M::word_bytes(), 1u32 << align_shift);
             let mask = align - 1;
             let start_offset = checked_round_up(unaligned_start_offset, mask)
                 .ok_or(CodegenError::ImplLimitExceeded)?;
 
             // The end offset is the start offset increased by the size
             end_offset = start_offset
-                .checked_add(data.size)
+                .checked_add(allocation_sizes[stackslot])
                 .ok_or(CodegenError::ImplLimitExceeded)?;
 
             debug_assert_eq!(stackslot.as_u32() as usize, sized_stackslots.len());

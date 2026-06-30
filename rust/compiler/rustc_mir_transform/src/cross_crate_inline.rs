@@ -17,6 +17,8 @@ pub(super) fn provide(providers: &mut Providers) {
 
 fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     let codegen_fn_attrs = tcx.codegen_fn_attrs(def_id);
+    let cross_crate_inline_threshold =
+        tcx.sess.opts.unstable_opts.cross_crate_inline_threshold.unwrap_or_default();
     // If this has an extern indicator, then this function is globally shared and thus will not
     // generate cgu-internal copies which would make it cross-crate inlinable.
     if codegen_fn_attrs.contains_extern_indicator() {
@@ -31,7 +33,7 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     }
 
     // From this point on, it is valid to return true or false.
-    if tcx.sess.opts.unstable_opts.cross_crate_inline_threshold == InliningThreshold::Always {
+    if cross_crate_inline_threshold == InliningThreshold::Always {
         return true;
     }
 
@@ -87,7 +89,7 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return false;
     }
 
-    let threshold = match tcx.sess.opts.unstable_opts.cross_crate_inline_threshold {
+    let threshold = match cross_crate_inline_threshold {
         InliningThreshold::Always => return true,
         InliningThreshold::Sometimes(threshold) => threshold,
         InliningThreshold::Never => return false,

@@ -833,6 +833,7 @@ mod desc {
         "one of supported execution strategies (`same-thread`, or `cross-thread`)";
     pub(crate) const parse_inlining_threshold: &str =
         "either a boolean (`yes`, `no`, `on`, `off`, etc), or a non-negative number";
+    pub(crate) const parse_opt_inlining_threshold: &str = parse_inlining_threshold;
     pub(crate) const parse_llvm_module_flag: &str = "<key>:<type>:<value>:<behavior>. Type must currently be `u32`. Behavior should be one of (`error`, `warning`, `require`, `override`, `append`, `appendunique`, `max`, `min`)";
     pub(crate) const parse_function_return: &str = "`keep` or `thunk-extern`";
     pub(crate) const parse_wasm_c_abi: &str = "`spec`";
@@ -1952,6 +1953,19 @@ pub mod parse {
         true
     }
 
+    pub(crate) fn parse_opt_inlining_threshold(
+        slot: &mut Option<InliningThreshold>,
+        v: Option<&str>,
+    ) -> bool {
+        let mut threshold = InliningThreshold::default();
+        if parse_inlining_threshold(&mut threshold, v) {
+            *slot = Some(threshold);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn parse_llvm_module_flag(
         slot: &mut Vec<(String, u32, String)>,
         v: Option<&str>,
@@ -2250,7 +2264,7 @@ options! {
         "control details of coverage instrumentation"),
     crate_attr: Vec<String> = (Vec::new(), parse_string_push, [TRACKED],
         "inject the given attribute in the crate"),
-    cross_crate_inline_threshold: InliningThreshold = (InliningThreshold::Sometimes(100), parse_inlining_threshold, [TRACKED],
+    cross_crate_inline_threshold: Option<InliningThreshold> = (None, parse_opt_inlining_threshold, [TRACKED],
         "threshold to allow cross crate inlining of functions"),
     debug_info_for_profiling: bool = (false, parse_bool, [TRACKED],
         "emit discriminators and other data necessary for AutoFDO"),
@@ -2385,6 +2399,8 @@ options! {
         "inlining threshold when the caller is a simple forwarding function (default: 30)"),
     inline_mir_hint_threshold: Option<usize> = (None, parse_opt_number, [TRACKED],
         "inlining threshold for functions with inline hint (default: 100)"),
+    inline_mir_top_down_depth: Option<usize> = (None, parse_opt_number, [TRACKED],
+        "maximum number of nested multi-call MIR inlining expansions (default: 5)"),
     inline_mir_preserve_debug: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "when MIR inlining, whether to preserve debug info for callee variables \
         (default: preserve for debuginfo != None, otherwise remove)"),

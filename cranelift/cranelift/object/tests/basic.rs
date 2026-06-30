@@ -6,6 +6,7 @@ use cranelift_entity::EntityRef;
 use cranelift_frontend::*;
 use cranelift_module::*;
 use cranelift_object::*;
+use object::SymbolScope;
 
 #[test]
 fn error_on_incompatible_sig_in_declare_function() {
@@ -32,11 +33,7 @@ fn error_on_incompatible_sig_in_declare_function() {
 }
 
 fn define_simple_function(module: &mut ObjectModule) -> FuncId {
-    let sig = Signature {
-        params: vec![],
-        returns: vec![],
-        call_conv: CallConv::SystemV,
-    };
+    let sig = module.make_signature();
 
     let func_id = module
         .declare_function("abc", Linkage::Local, &sig)
@@ -55,6 +52,49 @@ fn define_simple_function(module: &mut ObjectModule) -> FuncId {
     module.define_function(func_id, &mut ctx).unwrap();
 
     func_id
+}
+
+#[test]
+fn hidden_weak_function_symbol() {
+    use object::{Object as _, ObjectSymbol as _};
+
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ] {
+        let flag_builder = settings::builder();
+        let isa_builder = cranelift_codegen::isa::lookup_by_name(triple).unwrap();
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .unwrap();
+        let mut module =
+            ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
+
+        let sig = module.make_signature();
+        let func_id = module
+            .declare_function("abc", Linkage::HiddenWeak, &sig)
+            .unwrap();
+        assert_eq!(define_simple_function(&mut module), func_id);
+
+        let product = module.finish();
+        let symbol_id = product.functions[func_id].unwrap().0;
+        let symbol = product.object.symbol(symbol_id);
+        assert_eq!(symbol.scope, SymbolScope::Linkage, "target {triple}");
+        assert!(symbol.weak, "target {triple}");
+
+        let bytes = product.emit().expect("emit object file");
+        let file = object::File::parse(&*bytes).expect("parse emitted object");
+        let symbol = file
+            .symbols()
+            .find(|symbol| {
+                symbol
+                    .name()
+                    .is_ok_and(|name| matches!(name, "abc" | "_abc"))
+            })
+            .unwrap_or_else(|| panic!("find function symbol for target {triple}"));
+        assert!(symbol.is_weak(), "target {triple}: {symbol:?}");
+    }
 }
 
 #[test]

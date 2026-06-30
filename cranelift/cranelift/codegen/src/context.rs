@@ -173,6 +173,10 @@ impl Context {
             self.canonicalize_nans(isa)?;
         }
 
+        if opt_level != OptLevel::None {
+            crate::stack_load_forwarding::forward_stack_loads(&mut self.func, isa.endianness());
+        }
+
         self.legalize(isa)?;
 
         self.compute_cfg();
@@ -183,6 +187,7 @@ impl Context {
         self.func.dfg.resolve_all_aliases();
 
         if opt_level != OptLevel::None {
+            crate::branch_fact::fold_redundant_unsigned_branches(&mut self.func, &self.cfg);
             self.egraph_pass(isa, ctrl_plane)?;
         }
 

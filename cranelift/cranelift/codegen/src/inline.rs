@@ -1511,7 +1511,11 @@ fn create_stack_slots(func: &mut ir::Function, callee: &ir::Function) -> u32 {
     func.sized_stack_slots
         .reserve(callee.sized_stack_slots.len());
     for slot in callee.sized_stack_slots.values() {
-        func.sized_stack_slots.push(slot.clone());
+        let mut slot = slot.clone();
+        slot.reuse = slot
+            .reuse
+            .map(|reuse| ir::StackSlot::from_u32(offset + reuse.as_u32()));
+        func.sized_stack_slots.push(slot);
     }
 
     offset

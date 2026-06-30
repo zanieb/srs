@@ -81,6 +81,7 @@ pub use crate::machinst::{
 };
 
 mod alias_analysis;
+mod branch_fact;
 mod constant_hash;
 mod context;
 mod ctxhash;
@@ -94,6 +95,7 @@ mod ranges;
 mod remove_constant_phis;
 mod result;
 mod scoped_hash_map;
+mod stack_load_forwarding;
 mod take_and_replace;
 mod unreachable_code;
 mod value_label;
