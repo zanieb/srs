@@ -3,6 +3,7 @@
 use cranelift_codegen::ir::immediates::Offset32;
 use rustc_abi::Endian;
 use rustc_middle::ty::SimdAlign;
+use rustc_target::spec::Arch;
 
 use super::*;
 use crate::prelude::*;
@@ -16,6 +17,49 @@ fn report_simd_type_validation_error(
     fx.tcx.dcx().span_err(span, format!("invalid monomorphization of `{}` intrinsic: expected SIMD input type, found non-SIMD `{}`", intrinsic, ty));
     // Prevent verifier error
     fx.bcx.ins().trap(TrapCode::user(1 /* unreachable */).unwrap());
+}
+
+fn use_native_i8x8_ops(fx: &FunctionCx<'_, '_, '_>, ty: Type) -> bool {
+    // Keep this narrow until surrounding SIMD operations are native too. Mixing native vector
+    // comparisons with per-lane operations can otherwise add more materialization than it removes.
+    fx.tcx.sess.target.arch == Arch::AArch64 && ty == types::I8X8
+}
+
+fn try_codegen_native_simd_int_comparison<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    int_cc: IntCC,
+    x: CValue<'tcx>,
+    y: CValue<'tcx>,
+    ret: CPlace<'tcx>,
+) -> bool {
+    let vector_ty = clif_vector_type(fx.tcx, x.layout());
+    if vector_ty != clif_vector_type(fx.tcx, ret.layout())
+        || !use_native_i8x8_ops(fx, vector_ty)
+    {
+        return false;
+    }
+
+    let x = x.load_scalar(fx);
+    let y = y.load_scalar(fx);
+    let result = fx.bcx.ins().icmp(int_cc, x, y);
+    ret.write_cvalue(fx, CValue::by_val(result, ret.layout()));
+    true
+}
+
+fn try_codegen_native_simd_splat<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    value: CValue<'tcx>,
+    ret: CPlace<'tcx>,
+) -> bool {
+    let vector_ty = clif_vector_type(fx.tcx, ret.layout());
+    if !use_native_i8x8_ops(fx, vector_ty) {
+        return false;
+    }
+
+    let value = value.load_scalar(fx);
+    let result = fx.bcx.ins().splat(vector_ty, value);
+    ret.write_cvalue(fx, CValue::by_val(result, ret.layout()));
+    true
 }
 
 pub(super) fn codegen_simd_intrinsic_call<'tcx>(
@@ -54,7 +98,29 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            // FIXME use vector instructions when possible
+            let int_cc = match (x.layout().ty.simd_size_and_type(fx.tcx).1.kind(), intrinsic) {
+                (ty::Uint(_) | ty::Int(_), sym::simd_eq) => Some(IntCC::Equal),
+                (ty::Uint(_) | ty::Int(_), sym::simd_ne) => Some(IntCC::NotEqual),
+                (ty::Uint(_), sym::simd_lt) => Some(IntCC::UnsignedLessThan),
+                (ty::Uint(_), sym::simd_le) => Some(IntCC::UnsignedLessThanOrEqual),
+                (ty::Uint(_), sym::simd_gt) => Some(IntCC::UnsignedGreaterThan),
+                (ty::Uint(_), sym::simd_ge) => Some(IntCC::UnsignedGreaterThanOrEqual),
+                (ty::Int(_), sym::simd_lt) => Some(IntCC::SignedLessThan),
+                (ty::Int(_), sym::simd_le) => Some(IntCC::SignedLessThanOrEqual),
+                (ty::Int(_), sym::simd_gt) => Some(IntCC::SignedGreaterThan),
+                (ty::Int(_), sym::simd_ge) => Some(IntCC::SignedGreaterThanOrEqual),
+                _ => None,
+            };
+            let used_native_vector = int_cc.is_some_and(|int_cc| {
+                try_codegen_native_simd_int_comparison(fx, int_cc, x, y, ret)
+            });
+            if used_native_vector {
+                let ret_block = fx.get_block(target);
+                fx.bcx.ins().jump(ret_block, &[]);
+                return;
+            }
+
+            // FIXME use vector instructions for remaining targets and types when possible
             simd_pair_for_each_lane(fx, x, y, ret, &|fx, lane_ty, res_lane_ty, x_lane, y_lane| {
                 let res_lane = match (lane_ty.kind(), intrinsic) {
                     (ty::Uint(_), sym::simd_eq) => fx.bcx.ins().icmp(IntCC::Equal, x_lane, y_lane),
@@ -370,9 +436,11 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 );
             }
 
-            for i in 0..lane_count {
-                let ret_lane = ret.place_lane(fx, i.into());
-                ret_lane.write_cvalue(fx, value);
+            if !try_codegen_native_simd_splat(fx, value, ret) {
+                for i in 0..lane_count {
+                    let ret_lane = ret.place_lane(fx, i.into());
+                    ret_lane.write_cvalue(fx, value);
+                }
             }
         }
 

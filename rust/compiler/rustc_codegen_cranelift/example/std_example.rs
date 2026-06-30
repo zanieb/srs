@@ -1,13 +1,18 @@
 #![feature(core_intrinsics, coroutines, coroutine_trait, repr_simd, tuple_trait, unboxed_closures)]
 #![allow(internal_features)]
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::asm;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::convert::TryFrom;
 use std::hint::black_box;
 use std::io::Write;
+use std::num::{NonZeroI128, NonZeroUsize};
 use std::ops::Coroutine;
+use std::ptr::NonNull;
 
 fn main() {
     println!("{:?}", std::env::args().collect::<Vec<_>>());
@@ -52,6 +57,24 @@ fn main() {
 
     assert_eq!(i64::MAX.checked_mul(2), None);
 
+    let pointee = 1234_u64;
+    let pointer = black_box(&pointee as *const u64);
+    assert_eq!(unsafe { *reference_through_raw_pointer(pointer) }, pointee);
+    assert_eq!(unsafe { raw_pointer_through_raw_pointer(pointer).read() }, pointee);
+    test_small_copy_nonoverlapping();
+    test_stack_copy_nonoverlapping();
+
+    let mut nonnull_pointee = 5678_u64;
+    let nonnull = NonNull::from(&mut nonnull_pointee);
+    assert_eq!(unsafe { nonnull_as_ptr(nonnull).read() }, nonnull_pointee);
+    assert_eq!(nonnull_dangling().as_ptr().addr(), 1);
+
+    for (raw, expected) in [(4, (0, 4, 0)), (7, (0, 4, 3)), (8, (1, 8, 0))] {
+        let inner = NonZeroUsize::new(black_box(raw)).unwrap();
+        let (bucket, bucket_len, entry) = nonzero_location(inner);
+        assert_eq!((bucket, bucket_len.get(), entry), expected);
+    }
+
     assert_eq!(-128i8, (-128i8).saturating_sub(1));
     assert_eq!(127i8, 127i8.saturating_sub(-128));
     assert_eq!(-128i8, (-128i8).saturating_add(-128));
@@ -68,6 +91,12 @@ fn main() {
     assert!(0i128.checked_div(2i128).is_some());
     assert!(0u128.checked_div(2u128).is_some());
     assert_eq!(1u128 + 2, 3);
+
+    let mut nonzero_i128 = NonZeroI128::new(2).unwrap();
+    unsafe {
+        std::ptr::write_volatile(&mut nonzero_i128, NonZeroI128::new(1).unwrap());
+    }
+    assert_eq!(nonzero_i128.get(), 1);
 
     assert_eq!(0b100010000000000000000000000000000u128 >> 10, 0b10001000000000000000000u128);
     assert_eq!(0xFEDCBA987654321123456789ABCDEFu128 >> 64, 0xFEDCBA98765432u128);
@@ -115,6 +144,11 @@ fn main() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         test_simd();
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(jit)))]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        unsafe { test_aarch64_crc32() };
     }
 
     Box::pin(
@@ -179,6 +213,32 @@ fn main() {
     println!("{:?}", STATIC_WITH_MAYBE_NESTED_BOX);
 }
 
+#[inline(never)]
+fn test_small_copy_nonoverlapping() {
+    let source = black_box([11_u32, 22, 33]);
+    let mut destination = black_box([0_u32; 3]);
+    unsafe {
+        std::intrinsics::copy_nonoverlapping(source.as_ptr(), destination.as_mut_ptr(), 3);
+    }
+    assert_eq!(destination, source);
+
+    let bytes = black_box([0_u8, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let unaligned = unsafe { bytes.as_ptr().add(1).cast::<u64>().read_unaligned() };
+    assert_eq!(unaligned, u64::from_ne_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
+}
+
+#[inline(never)]
+fn test_stack_copy_nonoverlapping() {
+    fn check<const N: usize>(source: [u64; N]) {
+        let copy = source;
+        assert_eq!(copy, source);
+    }
+
+    check(black_box([11_u64; 10]));
+    check(black_box([22_u64; 15]));
+    check(black_box([33_u64; 16]));
+}
+
 fn panic(_: u128) {
     panic!();
 }
@@ -222,6 +282,50 @@ unsafe fn test_crc32() {
     assert_eq!(_mm_crc32_u16(a, b as u16), 1200687288);
     assert_eq!(_mm_crc32_u32(a, b as u32), 2543798776);
     assert_eq!(_mm_crc32_u64(a as u64, b as u64), 241952147);
+}
+
+#[cfg(all(target_arch = "aarch64", not(jit)))]
+#[target_feature(enable = "crc")]
+unsafe fn test_aarch64_crc32() {
+    let crc = 42;
+    let data = 0xdead_beef_dead_beefu64;
+
+    assert_eq!(__crc32b(crc, data as u8), 3943577151);
+    assert_eq!(__crc32cb(crc, data as u8), 4135334616);
+    assert_eq!(__crc32h(crc, data as u16), 2589244800);
+    assert_eq!(__crc32ch(crc, data as u16), 1200687288);
+    assert_eq!(__crc32w(crc, data as u32), 4103204953);
+    assert_eq!(__crc32cw(crc, data as u32), 2543798776);
+    assert_eq!(__crc32d(crc, data), 3931439525);
+    assert_eq!(__crc32cd(crc, data), 133363847);
+}
+
+#[inline(never)]
+unsafe fn reference_through_raw_pointer<'a>(pointer: *const u64) -> &'a u64 {
+    unsafe { &*pointer }
+}
+
+#[inline(never)]
+fn raw_pointer_through_raw_pointer(pointer: *const u64) -> *const u64 {
+    &raw const *pointer
+}
+
+#[inline(never)]
+fn nonnull_as_ptr(pointer: NonNull<u64>) -> *mut u64 {
+    pointer.as_ptr()
+}
+
+#[inline(never)]
+fn nonnull_dangling() -> NonNull<u8> {
+    NonNull::dangling()
+}
+
+#[inline(never)]
+fn nonzero_location(inner: NonZeroUsize) -> (usize, NonZeroUsize, usize) {
+    let bucket = usize::try_from(inner.ilog2()).unwrap();
+    let bucket_len = NonZeroUsize::new(1_usize.checked_shl(inner.ilog2()).unwrap()).unwrap();
+    let entry = inner.get() - bucket_len.get();
+    (bucket - 2, bucket_len, entry)
 }
 
 #[cfg(target_arch = "x86_64")]

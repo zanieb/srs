@@ -678,21 +678,46 @@ fn codegen_regular_intrinsic_call<'tcx>(
         }
 
         sym::write_bytes | sym::volatile_set_memory => {
-            intrinsic_args!(fx, args => (dst, val, count); intrinsic);
-            let val = val.load_scalar(fx);
-            let count = count.load_scalar(fx);
+            let [dst, val, count] = args else {
+                bug_on_incorrect_arg_count(intrinsic);
+            };
+
+            let dst = codegen_operand(fx, &dst.node);
+            let val = codegen_operand(fx, &val.node);
 
             let pointee_ty = dst.layout().ty.builtin_deref(true).unwrap();
-            let pointee_size = fx.layout_of(pointee_ty).size.bytes();
-            let count = if pointee_size != 1 {
-                fx.bcx.ins().imul_imm(count, pointee_size as i64)
-            } else {
-                count
-            };
+            let pointee_layout = fx.layout_of(pointee_ty);
+            let pointee_size = pointee_layout.size.bytes();
+            let constant_bytes = (intrinsic == sym::write_bytes)
+                .then(|| count.node.constant())
+                .flatten()
+                .and_then(|constant| {
+                    crate::constant::eval_mir_constant(fx, constant).0.try_to_scalar_int()
+                })
+                .and_then(|count| count.to_target_usize(fx.tcx).checked_mul(pointee_size));
+
+            let val = val.load_scalar(fx);
             let dst_ptr = dst.load_scalar(fx);
-            // FIXME make the memset actually volatile when switching to emit_small_memset
-            // FIXME use emit_small_memset
-            fx.bcx.call_memset(fx.target_config, dst_ptr, val, count);
+            if let Some(bytes) = constant_bytes {
+                let align = pointee_layout.align.abi.bytes().try_into().unwrap_or(128);
+                fx.bcx.emit_small_memset_value(
+                    fx.target_config,
+                    dst_ptr,
+                    val,
+                    bytes,
+                    align,
+                    MemFlags::new(),
+                );
+            } else {
+                let count = codegen_operand(fx, &count.node).load_scalar(fx);
+                let count = if pointee_size != 1 {
+                    fx.bcx.ins().imul_imm(count, pointee_size as i64)
+                } else {
+                    count
+                };
+                // FIXME make volatile_set_memory actually volatile.
+                fx.bcx.call_memset(fx.target_config, dst_ptr, val, count);
+            }
         }
         sym::ctlz | sym::ctlz_nonzero => {
             intrinsic_args!(fx, args => (arg); intrinsic);

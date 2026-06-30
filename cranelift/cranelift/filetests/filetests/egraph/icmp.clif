@@ -34,6 +34,88 @@ block0(v1: i64, v2: i64):
 ;     return v4
 ; }
 
+function %bool_ugt_large(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp ne v0, v1
+    v3 = uextend.i64 v2
+    v4 = iconst.i64 0xffff_ffff
+    v5 = icmp ugt v3, v4
+    return v5
+}
+
+; function %bool_ugt_large(i64) -> i8 fast {
+; block0(v0: i64):
+;     v6 = iconst.i8 0
+;     return v6  ; v6 = 0
+; }
+
+function %bool_uge_two(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp ne v0, v1
+    v3 = iconst.i8 2
+    v4 = icmp uge v2, v3
+    return v4
+}
+
+; function %bool_uge_two(i64) -> i8 fast {
+; block0(v0: i64):
+;     v5 = iconst.i8 0
+;     return v5  ; v5 = 0
+; }
+
+function %bool_ult_two(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp ne v0, v1
+    v3 = uextend.i64 v2
+    v4 = iconst.i64 2
+    v5 = icmp ult v3, v4
+    return v5
+}
+
+; function %bool_ult_two(i64) -> i8 fast {
+; block0(v0: i64):
+;     v6 = iconst.i8 1
+;     return v6  ; v6 = 1
+; }
+
+function %bool_ule_one(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = icmp ne v0, v1
+    v3 = iconst.i8 1
+    v4 = icmp ule v2, v3
+    return v4
+}
+
+; function %bool_ule_one(i64) -> i8 fast {
+; block0(v0: i64):
+;     v3 = iconst.i8 1
+;     return v3  ; v3 = 1
+; }
+
+;; Vector comparisons produce all-ones lane masks rather than scalar 0 or 1.
+function %vector_bool_uge_two(i8x16, i8x16) -> i8x16 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = icmp.i8x16 ne v0, v1
+    v3 = iconst.i8 2
+    v4 = splat.i8x16 v3
+    v5 = icmp.i8x16 uge v2, v4
+    return v5
+}
+
+; function %vector_bool_uge_two(i8x16, i8x16) -> i8x16 fast {
+;     const0 = 0x02020202020202020202020202020202
+;
+; block0(v0: i8x16, v1: i8x16):
+;     v2 = icmp ne v0, v1
+;     v6 = vconst.i8x16 const0
+;     v5 = icmp uge v2, v6  ; v6 = const0
+;     return v5
+; }
+
 function %icmp_simplify_does_not_build_iconst_i128() -> i8 {
 block0:
     v0 = iconst.i64 0x6350_5050_5050_3750

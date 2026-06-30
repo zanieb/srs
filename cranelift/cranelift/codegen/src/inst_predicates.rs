@@ -32,7 +32,7 @@ fn is_load_with_defined_trapping(opcode: Opcode, data: &InstructionData) -> bool
 /// Does the given instruction have any side-effect that would preclude it from being removed when
 /// its value is unused?
 #[inline(always)]
-fn has_side_effect(func: &Function, inst: Inst) -> bool {
+pub(crate) fn has_observable_side_effect(func: &Function, inst: Inst) -> bool {
     let data = &func.dfg.insts[inst];
     let opcode = data.opcode();
     trivially_has_side_effects(opcode) || is_load_with_defined_trapping(opcode, data)
@@ -83,14 +83,14 @@ pub fn is_mergeable_for_egraph(func: &Function, inst: Inst) -> bool {
         && !op.can_load()
         && !op.can_store()
         // Can only have idempotent side-effects.
-        && (!has_side_effect(func, inst) || op.side_effects_idempotent())
+        && (!has_observable_side_effect(func, inst) || op.side_effects_idempotent())
 }
 
-/// Does the given instruction have any side-effect as per [has_side_effect], or else is a load,
-/// but not the get_pinned_reg opcode?
+/// Does the given instruction have any side-effect as per
+/// [has_observable_side_effect], or else is a load, but not the get_pinned_reg opcode?
 pub fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
     let op = func.dfg.insts[inst].opcode();
-    op != Opcode::GetPinnedReg && (has_side_effect(func, inst) || op.can_load())
+    op != Opcode::GetPinnedReg && (has_observable_side_effect(func, inst) || op.can_load())
 }
 
 /// Is the given instruction a constant value (`iconst`, `fconst`) that can be
