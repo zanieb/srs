@@ -1,12 +1,17 @@
 //! Codegen of a single function
 
+use std::borrow::Cow;
+
 use cranelift_codegen::CodegenError;
+use cranelift_codegen::inline::{Inline, InlineCommand};
 use cranelift_codegen::ir::UserFuncName;
+use cranelift_codegen::ir::{ExternalName, Opcode};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_hir::attrs::InlineAttr;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -28,6 +33,7 @@ pub(crate) struct CodegenedFunction {
     clif_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
+    inline_hint: bool,
 }
 
 pub(crate) fn codegen_fn<'tcx>(
@@ -143,7 +149,104 @@ pub(crate) fn codegen_fn<'tcx>(
     // Verify function
     verify_func(tcx, &clif_comments, &func);
 
-    CodegenedFunction { symbol_name, func_id, func, clif_comments, func_debug_cx, inline_asm }
+    let inline_hint = matches!(
+        tcx.codegen_instance_attrs(instance.def).inline,
+        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force { .. }
+    );
+
+    CodegenedFunction {
+        symbol_name,
+        func_id,
+        func,
+        clif_comments,
+        func_debug_cx,
+        inline_asm,
+        inline_hint,
+    }
+}
+
+pub(crate) fn inline_small_functions(
+    module: &dyn Module,
+    functions: &mut [CodegenedFunction],
+) -> Result<(), CodegenError> {
+    // The MIR inliner runs before monomorphization, so calls through generic traits can only
+    // become direct calls after cg_clif has translated them. Inline a conservative subset here
+    // to expose those calls to Cranelift's scalar optimizations without unbounded code growth.
+    //
+    // Keep this to call-free functions without stack slots or global values. Broader bodies have
+    // not yet proved safe under cg_clif's unwind, debug-info, and object-generation integration.
+    const MAX_INLINE_INSTRUCTIONS: usize = 32;
+    const MAX_INLINE_BLOCKS: usize = 3;
+
+    let mut callees = FxHashMap::default();
+    for function in functions.iter() {
+        if !function.inline_hint
+            || function.func.dfg.num_insts() > MAX_INLINE_INSTRUCTIONS
+            || function.func.layout.blocks().count() > MAX_INLINE_BLOCKS
+            || !function.func.sized_stack_slots.is_empty()
+            || !function.func.dynamic_stack_slots.is_empty()
+            || !function.func.global_values.is_empty()
+            || function.func.stack_limit.is_some()
+            || function.func.layout.blocks().any(|block| {
+                function
+                    .func
+                    .layout
+                    .block_insts(block)
+                    .any(|inst| function.func.dfg.insts[inst].opcode().is_call())
+            })
+        {
+            continue;
+        }
+
+        let mut context = Context::new();
+        context.func = function.func.clone();
+        context.legalize(module.isa())?;
+        callees.insert(function.func_id.as_u32(), context.func);
+    }
+
+    struct SmallFunctionInliner<'a> {
+        callees: &'a FxHashMap<u32, Function>,
+    }
+
+    impl Inline for SmallFunctionInliner<'_> {
+        fn inline(
+            &mut self,
+            caller: &Function,
+            _call_inst: Inst,
+            _call_opcode: Opcode,
+            callee: FuncRef,
+            _call_args: &[Value],
+        ) -> InlineCommand<'_> {
+            let ExternalName::User(callee_name) = caller.dfg.ext_funcs[callee].name else {
+                return InlineCommand::KeepCall;
+            };
+            let callee_name = &caller.params.user_named_funcs()[callee_name];
+            if callee_name.namespace != 0
+                || caller.name.get_user().is_some_and(|caller_name| {
+                    caller_name.namespace == callee_name.namespace
+                        && caller_name.index == callee_name.index
+                })
+            {
+                return InlineCommand::KeepCall;
+            }
+
+            match self.callees.get(&callee_name.index) {
+                Some(callee) => {
+                    InlineCommand::Inline { callee: Cow::Borrowed(callee), visit_callee: false }
+                }
+                None => InlineCommand::KeepCall,
+            }
+        }
+    }
+
+    for function in functions {
+        let mut context = Context::new();
+        context.func = std::mem::replace(&mut function.func, Function::new());
+        context.inline(SmallFunctionInliner { callees: &callees })?;
+        function.func = context.func;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn compile_fn(
@@ -831,11 +934,17 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's
                     } else if fx.clif_type(operand.layout().ty) == Some(types::I8) {
-                        let times = fx.bcx.ins().iconst(fx.pointer_type, times as i64);
-                        // FIXME use emit_small_memset where possible
                         let addr = lval.to_ptr().get_addr(fx);
                         let val = operand.load_scalar(fx);
-                        fx.bcx.call_memset(fx.target_config, addr, val, times);
+                        let align = dest_layout.align.abi.bytes().try_into().unwrap_or(128);
+                        fx.bcx.emit_small_memset_value(
+                            fx.target_config,
+                            addr,
+                            val,
+                            times,
+                            align,
+                            MemFlags::new(),
+                        );
                     } else {
                         let loop_block = fx.bcx.create_block();
                         let loop_block2 = fx.bcx.create_block();
@@ -938,17 +1047,39 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     .expect("expected pointee to have a layout");
                 let elem_size: u64 = pointee_layout.layout.size().bytes();
 
+                // Cranelift has no later pass that expands constant libc copies. Preserve the
+                // constant size here so the frontend can emit a small load/store sequence.
+                let constant_bytes = count
+                    .constant()
+                    .and_then(|constant| {
+                        crate::constant::eval_mir_constant(fx, constant).0.try_to_scalar_int()
+                    })
+                    .and_then(|count| count.to_target_usize(fx.tcx).checked_mul(elem_size));
+
                 let dst = dst.load_scalar(fx);
                 let src = codegen_operand(fx, src).load_scalar(fx);
-                let count = codegen_operand(fx, count).load_scalar(fx);
-
-                let bytes = if elem_size != 1 {
-                    fx.bcx.ins().imul_imm(count, elem_size as i64)
+                if let Some(bytes) = constant_bytes {
+                    let align = pointee_layout.layout.align.abi.bytes().try_into().unwrap_or(128);
+                    fx.bcx.emit_small_memory_copy(
+                        fx.target_config,
+                        dst,
+                        src,
+                        bytes,
+                        align,
+                        align,
+                        true,
+                        MemFlags::new(),
+                    );
                 } else {
-                    count
-                };
+                    let count = codegen_operand(fx, count).load_scalar(fx);
+                    let bytes = if elem_size != 1 {
+                        fx.bcx.ins().imul_imm(count, elem_size as i64)
+                    } else {
+                        count
+                    };
 
-                fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                    fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                }
             }
         },
     }

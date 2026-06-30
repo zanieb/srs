@@ -387,8 +387,16 @@ fn module_codegen(
 ) -> OngoingModuleCodegen {
     let mut module = make_module(tcx.sess, cgu_name.as_str().to_string());
 
-    let (mut debug_context, codegened_functions, mut global_asm) =
+    let (mut debug_context, mut codegened_functions, mut global_asm) =
         codegen_cgu_content(tcx, &mut module, cgu_name);
+
+    if let Err(err) = tcx
+        .prof
+        .generic_activity("inline clif functions")
+        .run(|| crate::base::inline_small_functions(&module, &mut codegened_functions))
+    {
+        tcx.dcx().fatal(format!("failed to inline Cranelift functions: {err}"));
+    }
 
     let cgu_name = cgu_name.as_str().to_owned();
 

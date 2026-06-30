@@ -125,4 +125,59 @@ impl Pointer {
             PointerBase::Dangling(_align) => unreachable!(),
         }
     }
+
+    /// Copy a constant number of non-overlapping bytes into this pointer.
+    ///
+    /// Keep bounded copies that involve a known stack slot in explicit stack operations. This
+    /// lets Cranelift forward values through the temporary slot before `stack_addr` legalization
+    /// hides the slot identity. Arbitrary-pointer copies retain the frontend's profiled threshold.
+    pub(crate) fn copy_from_nonoverlapping(
+        self,
+        fx: &mut FunctionCx<'_, '_, '_>,
+        source: Pointer,
+        size: u64,
+        dest_align: u8,
+        source_align: u8,
+        mut flags: MemFlags,
+    ) {
+        const MAX_STACK_COPY_REGISTERS: u64 = 16;
+
+        if size == 0 {
+            return;
+        }
+
+        let involves_stack = matches!(self.base, PointerBase::Stack(_))
+            || matches!(source.base, PointerBase::Stack(_));
+        let access_size = (1_u64 << size.trailing_zeros()).min(8);
+        let register_count = size / access_size;
+
+        if involves_stack && register_count <= MAX_STACK_COPY_REGISTERS {
+            if u64::from(dest_align) >= access_size && u64::from(source_align) >= access_size {
+                flags.set_aligned();
+            }
+            let ty = Type::int((access_size * 8) as u16).unwrap();
+            let values: Vec<_> = (0..register_count)
+                .map(|index| {
+                    let offset = Offset32::new((access_size * index).try_into().unwrap());
+                    (source.offset(fx, offset).load(fx, ty, flags), offset)
+                })
+                .collect();
+            for (value, offset) in values {
+                self.offset(fx, offset).store(fx, value, flags);
+            }
+        } else {
+            let source = source.get_addr(fx);
+            let dest = self.get_addr(fx);
+            fx.bcx.emit_small_memory_copy(
+                fx.target_config,
+                dest,
+                source,
+                size,
+                dest_align,
+                source_align,
+                true,
+                flags,
+            );
+        }
+    }
 }
