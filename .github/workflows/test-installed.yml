@@ -96,12 +96,20 @@ jobs:
       - name: Verify SRS default backend
         run: |
           case "${{ inputs.platform }}" in
-            linux) expected_backend=llvm ;;
-            macos) expected_backend=cranelift ;;
+            linux)
+              printf 'fn main() {}\n' > "$RUNNER_TEMP/default-backend.rs"
+              rustc +srs --emit=llvm-ir \
+                "$RUNNER_TEMP/default-backend.rs" \
+                -o "$RUNNER_TEMP/default-backend.ll"
+              grep -q 'target triple = "x86_64-unknown-linux-gnu"' \
+                "$RUNNER_TEMP/default-backend.ll"
+              ;;
+            macos)
+              rustc +srs -Z unstable-options --print target-spec-json \
+                | grep -q '"default-codegen-backend": "cranelift"'
+              ;;
             *) exit 2 ;;
           esac
-          rustc +srs -Z unstable-options --print target-spec-json \
-            | grep -q "\"default-codegen-backend\": \"$expected_backend\""
 
       - name: Verify AArch64 crc32fast
         if: inputs.platform == 'macos'

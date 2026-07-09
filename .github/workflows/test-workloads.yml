@@ -68,6 +68,8 @@ jobs:
       - name: Verify uv panic unwinding
         if: matrix.name == 'uv' && inputs.platform == 'linux'
         working-directory: workload
+        env:
+          RUSTFLAGS: -Zcodegen-backend=cranelift
         run: |
           for test in \
             keyring::tests::fetch_url_no_host \

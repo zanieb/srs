@@ -1807,8 +1807,8 @@ impl Step for CraneliftCodegenBackend {
             .arg("--manifest-path")
             .arg(builder.src.join("compiler/rustc_codegen_cranelift/Cargo.toml"));
         if target.triple == "x86_64-unknown-linux-gnu" {
-            // SRS uses Cranelift as the default backend on Linux, where `catch_unwind`
-            // requires cg_clif's opt-in unwinding support.
+            // SRS supports Cranelift on Linux, where `catch_unwind` requires
+            // cg_clif's opt-in unwinding support.
             cargo.arg("--features").arg("unwinding");
         }
         rustc_cargo_env(builder, &mut cargo, target);
