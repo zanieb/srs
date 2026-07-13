@@ -1,12 +1,13 @@
 //#Config:incremental-added-archive-text
 //#Object:runtime.c
 //#Object:incremental-added-archive-reserve.S
+//#Object:incremental-added-archive-unaligned-reserve.S
 //#Object:incremental-added-archive-unwind.c
 //#Archive:incremental-added-archive-root.S,incremental-added-archive-zz-retired.S
 //#RunEnabled:true
 //#DiffEnabled:false
 //#LinkArgs:-lSystem
-//#SldExtraLinkArgs:--incremental-padding-percent=300 -dead_strip
+//#SldExtraLinkArgs:--incremental-padding-percent=200 -dead_strip
 //#TestIncremental:true
 //#TestIncrementalCompareFull:false
 //#TestIncrementalPrivateSignedMachOOutput:true
@@ -30,13 +31,15 @@
 #include "../common/runtime.h"
 
 extern int incremental_added_archive_reserve(void);
+extern int incremental_added_archive_unaligned_reserve(void);
 extern int incremental_added_archive_runtime(void);
 extern int incremental_added_archive_verify_unwind(void* expected_ip);
 
 void main(void) {
   exit_syscall(incremental_added_archive_verify_unwind(0) &&
                        incremental_added_archive_runtime() == 42 &&
-                       incremental_added_archive_reserve() == 0
+                       incremental_added_archive_reserve() == 0 &&
+                       incremental_added_archive_unaligned_reserve() == 0
                    ? 42
                    : 1);
 }

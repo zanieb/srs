@@ -38808,8 +38808,12 @@ fn grown_macho_text_section_activation(
             ));
         }
 
-        let alignment = crate::alignment::Alignment::new(current_text.align().max(1))
-            .context("Invalid grown Mach-O text section alignment")?;
+        let alignment = crate::alignment::Alignment::new(
+            current_text
+                .align()
+                .max(crate::macho::MACHO_INSTRUCTION_ALIGNMENT),
+        )
+        .context("Invalid grown Mach-O text section alignment")?;
         let data_size =
             u64::try_from(current_data.len()).context("Grown Mach-O text section is too large")?;
         let padding = (u128::from(data_size) * u128::from(padding_percent)).div_ceil(100);
@@ -39300,8 +39304,10 @@ fn macho_text_section_activation(
         ));
     }
 
-    let alignment = crate::alignment::Alignment::new(text.align().max(1))
-        .context("Invalid activated Mach-O text section alignment")?;
+    let alignment = crate::alignment::Alignment::new(
+        text.align().max(crate::macho::MACHO_INSTRUCTION_ALIGNMENT),
+    )
+    .context("Invalid activated Mach-O text section alignment")?;
     let data_size =
         u64::try_from(data.len()).context("Activated Mach-O text section is too large")?;
     let padding = (u128::from(data_size) * u128::from(padding_percent)).div_ceil(100);
@@ -46946,8 +46952,14 @@ fn added_macho_archive_text_member(
                         .to_owned(),
                 ));
             };
-            let alignment = crate::alignment::Alignment::new(section.align().max(1))
-                .context("Invalid added Mach-O archive member section alignment")?;
+            let minimum_alignment = if section_name == b"__text" {
+                crate::macho::MACHO_INSTRUCTION_ALIGNMENT
+            } else {
+                1
+            };
+            let alignment =
+                crate::alignment::Alignment::new(section.align().max(minimum_alignment))
+                    .context("Invalid added Mach-O archive member section alignment")?;
             let data_size = u64::try_from(data.len())
                 .context("Added Mach-O archive member section is too large")?;
             allocated_section_indices.insert(section.index());
@@ -90063,6 +90075,15 @@ mod tests {
                     private_external: false,
                 },
             ]
+        );
+        assert_eq!(
+            member
+                .sections
+                .iter()
+                .find(|section| section.section_name == "__TEXT,__text")
+                .unwrap()
+                .alignment_exponent,
+            2
         );
 
         let resolution = MachOSymbolResolutionRecord {
