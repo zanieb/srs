@@ -176,6 +176,7 @@ pub(crate) const MACHO_START_MEM_ADDRESS: u64 = 0x1_0000_0000;
 
 /// The command alignment is 8B for 64-bit platforms.
 pub(crate) const MACHO_COMMAND_ALIGNMENT: usize = 8;
+pub(crate) const MACHO_INSTRUCTION_ALIGNMENT: u64 = 4;
 pub(crate) const MACHO_PAGE_SIZE: u64 = 0x4000;
 pub(crate) const MACHO_GOT_ENTRY_SIZE: u64 = 8;
 pub(crate) const MACHO_STUB_SIZE: u64 = 12;
@@ -1022,7 +1023,15 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         &self,
         section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<u64> {
-        Ok(2u64.pow(section.align(LE)))
+        let alignment = 2u64.pow(section.align(LE));
+        // Mach-O assemblers can emit executable sections without an explicit alignment, as
+        // rustc's separate inline-assembly objects do. AArch64 instructions still require
+        // 4-byte alignment regardless of the section header's declared alignment.
+        Ok(if section.is_executable() {
+            alignment.max(MACHO_INSTRUCTION_ALIGNMENT)
+        } else {
+            alignment
+        })
     }
 
     fn relocations(
