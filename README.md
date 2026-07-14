@@ -32,16 +32,16 @@ the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
-bootstrap build back through LLVM. The Rust source tree makes the installed
-macOS arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
-artifacts. The installed Cargo wrapper keeps build scripts, proc macros, and
-their host-side dependencies on LLVM because those helpers run during the
-build and can exercise host intrinsics that Cranelift does not support yet.
-For the first integrated macOS arm64 incremental-link lane, the wrapper also
-selects LLVM for ordinary target artifacts. Set
-`SRS_TARGET_CODEGEN_BACKEND=cranelift` to exercise the composed backend path
-explicitly. Linux target behavior remains unchanged. For macOS arm64, SRS bakes
-`sld` in as rustc's default linker.
+bootstrap build back through LLVM. The installed Linux x86_64 compiler follows
+that LLVM default, while the Rust source tree makes the bare macOS arm64
+compiler prefer Cranelift for normal target artifacts. The installed Cargo
+wrapper keeps build scripts, proc macros, and their host-side dependencies on
+LLVM because those helpers run during the build and can exercise host
+intrinsics that Cranelift does not support yet. For the first integrated macOS
+arm64 incremental-link lane, the wrapper also selects LLVM for ordinary target
+artifacts. Set `SRS_TARGET_CODEGEN_BACKEND=cranelift` on macOS or pass
+`-Zcodegen-backend=cranelift` on Linux to exercise the composed backend path
+explicitly. For macOS arm64, SRS bakes `sld` in as rustc's default linker.
 
 ## Quick Start
 

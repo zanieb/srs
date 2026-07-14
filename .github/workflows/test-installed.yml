@@ -95,8 +95,21 @@ jobs:
 
       - name: Verify SRS default backend
         run: |
-          rustc +srs -Z unstable-options --print target-spec-json \
-            | grep -q '"default-codegen-backend": "cranelift"'
+          case "${{ inputs.platform }}" in
+            linux)
+              printf 'fn main() {}\n' > "$RUNNER_TEMP/default-backend.rs"
+              rustc +srs --emit=llvm-ir \
+                "$RUNNER_TEMP/default-backend.rs" \
+                -o "$RUNNER_TEMP/default-backend.ll"
+              grep -q 'target triple = "x86_64-unknown-linux-gnu"' \
+                "$RUNNER_TEMP/default-backend.ll"
+              ;;
+            macos)
+              rustc +srs -Z unstable-options --print target-spec-json \
+                | grep -q '"default-codegen-backend": "cranelift"'
+              ;;
+            *) exit 2 ;;
+          esac
 
       - name: Verify AArch64 crc32fast
         if: inputs.platform == 'macos'
@@ -115,7 +128,7 @@ jobs:
               assert!(std::panic::catch_unwind(|| panic!("expected panic")).is_err());
           }
           EOF
-          rustc +srs -C panic=unwind \
+          rustc +srs -Zcodegen-backend=cranelift -C panic=unwind \
             "$RUNNER_TEMP/catch-unwind.rs" \
             -o "$RUNNER_TEMP/catch-unwind"
           "$RUNNER_TEMP/catch-unwind"
